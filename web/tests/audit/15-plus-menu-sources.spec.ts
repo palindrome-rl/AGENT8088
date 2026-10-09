@@ -49,6 +49,10 @@ test('a command sent with an attachment is refused rather than silently dropping
     name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hello'),
   })
   await expect(page.getByText('notes.txt')).toBeVisible({ timeout: 15000 })
+  // The filename appears immediately, before upload/extraction completes.
+  // Sending during upload is deliberately ignored; exercise the ready-file
+  // command guard instead of racing that separate protection.
+  await expect(page.locator('[data-promptbar]').getByRole('status', { name: '' }).filter({ hasText: /^Ready$/ })).toBeVisible({ timeout: 30000 })
 
   await composer(page).fill('/tools')
   await composer(page).press('Enter')

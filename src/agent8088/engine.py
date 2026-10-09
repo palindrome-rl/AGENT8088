@@ -516,6 +516,9 @@ MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 
+# Shared starting allowance for CLI, Web UI, gateways and direct engine calls.
+DEFAULT_MAX_TURNS = 50
+
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
@@ -14306,7 +14309,7 @@ def describe_capabilities() -> str:
               f"Model token limits: {model_context:,} context / {model_output:,} output",
               f"Permission mode: {PERMISSION_MODE}",
               f"Sandbox backend: {_resolve_sandbox_backend()}",
-              f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
+              f"Max turns per request: {APP_CONFIG.get('max_turns', str(DEFAULT_MAX_TURNS))}",
               ""]
 
     # --- Tools, grouped by what kind of access they need ---
@@ -15761,7 +15764,7 @@ def _consult_llmrouter(config, messages, eligible):
                       "applied": False, "latency_ms": 0}
 
 
-def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
+def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
                     on_token=None, interrupt_check=None, trace=None,

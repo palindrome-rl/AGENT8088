@@ -24,6 +24,28 @@ def test_configured_max_turns_still_wins(monkeypatch):
     assert cli.Session().max_turns == 7
 
 
+def test_gateway_uses_the_shared_starting_allowance(monkeypatch):
+    from agent8088.gateway import agent_bridge
+    monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {})
+    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 50
+    assert agent_bridge._turn_max_turns("plan-only") == 50
+    monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {"max_turns": "7"})
+    assert agent_bridge._turn_max_turns("full-auto") == 7
+
+
+def test_direct_engine_and_cli_defaults_agree():
+    import inspect
+    from agent8088 import cli
+    assert inspect.signature(engine._run_agent_loop).parameters["max_turns"].default == cli.DEFAULT_MAX_TURNS
+
+
+def test_capability_report_uses_the_shared_default(monkeypatch):
+    monkeypatch.setattr(engine, "APP_CONFIG", {})
+    assert "Max turns per request: 50" in engine.describe_capabilities()
+    monkeypatch.setattr(engine, "APP_CONFIG", {"max_turns": "120"})
+    assert "Max turns per request: 120" in engine.describe_capabilities()
+
+
 def test_unparseable_max_turns_falls_back_to_the_default(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {"max_turns": "not-a-number"}, raising=False)
