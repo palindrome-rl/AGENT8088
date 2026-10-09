@@ -95,6 +95,39 @@ def test_a_stream_reset_drops_only_the_broken_round(monkeypatch, out, session):
     assert "broken fragment" not in text
 
 
+def _long_thought(messages, **kwargs):
+    kwargs["on_token"]("reasoning", "\n".join(f"line {i}" for i in range(1, 9)))
+    return "answer"
+
+
+def test_a_long_thought_shows_its_first_lines_and_how_to_see_the_rest(monkeypatch, out, session):
+    session.show_reasoning = True
+    _chat(monkeypatch, _long_thought)
+    text = out.getvalue()
+
+    assert "line 5" in text and "line 6" not in text
+    assert "3 more lines — /thoughts 1" in text
+
+
+def test_thoughts_prints_the_last_turn_in_full(monkeypatch, out, session):
+    session.show_reasoning = True
+    _chat(monkeypatch, _long_thought)
+    cli.cmd_thoughts("1")
+    assert "line 8" in out.getvalue()
+
+    cli.cmd_thoughts("9")
+    assert "usage" in out.getvalue()
+
+
+def test_reasoning_full_prints_every_line(monkeypatch, out, session):
+    session.show_reasoning = True
+    cli.cmd_reasoning("full")
+    _chat(monkeypatch, _long_thought)
+    text = out.getvalue()
+
+    assert "line 8" in text and "more lines" not in text
+
+
 def test_an_interrupted_turn_keeps_its_reasoning(monkeypatch, out, session):
     session.show_reasoning = True
 
