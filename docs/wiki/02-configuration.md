@@ -246,12 +246,15 @@ never does — and a recalled memory can never authorise a tool call.
 
 ### Dynamic turn budget
 
-`max_turns` is what a request *starts* with, not what it is allowed. A run that
-is still producing new, successful tool results has not failed, so ending it on
-a number chosen before the task began throws away real work. When the loop is
-one round from its soft limit and that round ran a new, non-repeated tool whose
-result did not fail, it is granted another block of rounds — up to a hard
-ceiling of `max_turns x dynamic_turns_ceiling_multiplier`.
+`max_turns` is the starting allowance, not a fixed hard cap. The default is
+**50 rounds**, shared by the CLI, Web UI and messaging gateways. Set
+`max_turns` in `config.txt` or use `/maxturns <int>` to override it.
+Older saved sessions without this setting retain the current value on resume.
+
+At a block boundary, growth requires more than half the block's rounds to
+produce fresh, successful work. Extensions add another block of rounds up to
+`max_turns x dynamic_turns_ceiling_multiplier` (200 at the defaults).
+Repetition and failed calls do not earn extensions.
 
 The signals come from state the loop already tracks, so extension costs no
 extra tokens and the model cannot request rounds it has not earned: a run that
@@ -260,6 +263,7 @@ them and ends where it is.
 
 | Key | Default | Purpose |
 |---|---|---|
+| `max_turns` | `50` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
 | `dynamic_turns_ceiling_multiplier` | `4` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 

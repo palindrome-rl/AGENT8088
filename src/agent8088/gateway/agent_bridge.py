@@ -26,7 +26,7 @@ def _turn_max_turns(mode: str) -> int:
     it needs more rounds than a normal exchange. Mirrors cli.py's
     _turn_max_turns; a flat cap here truncated large multi-file plans
     mid-write on the gateway (the CLI never had this problem)."""
-    configured = int(A.APP_CONFIG.get("max_turns", "10"))
+    configured = int(A.APP_CONFIG.get("max_turns", str(A.DEFAULT_MAX_TURNS)))
     if mode == "plan-only":
         return max(configured, PLAN_MODE_MIN_TURNS)
     return configured
