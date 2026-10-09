@@ -2,7 +2,7 @@ import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield, Pencil, X, ListPlus } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
-import { useWebSocket, drainPromptQueue } from '@/hooks/useWebSocket'
+import { useWebSocket, drainPromptQueue, planTaskOf } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -243,9 +243,10 @@ export function PromptBar() {
     // (in the socket handler) free of async work.
     if (isStreaming) {
       const queuedText = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
-      if (!queuedText.startsWith('/')) {
+      const queuedPlanTask = planTaskOf(queuedText)
+      if (!queuedText.startsWith('/') || queuedPlanTask) {
         try {
-          await ensureSession(queuedText)
+          await ensureSession(queuedPlanTask || queuedText)
         } catch (error) {
           setSessionError(error instanceof Error ? error.message : 'Could not create a session')
           return
@@ -279,6 +280,19 @@ export function PromptBar() {
       }
       setSessionError('')
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
+      const planTask = planTaskOf(trimmed)
+      if (planTask) {
+        // `/plan <task>` runs as a chat turn on the server, so it is a message
+        // the user sent: show it and name the session after it, as a chat
+        // message does. It used to vanish from the transcript.
+        try {
+          await ensureSession(planTask)
+        } catch (error) {
+          setSessionError(error instanceof Error ? error.message : 'Could not create a session')
+          return
+        }
+        addMessage({ role: 'user', content: trimmed })
+      }
       if (cmd.toLowerCase() === 'raw') {
         setRawResult(null)
         setRawLoading(true)

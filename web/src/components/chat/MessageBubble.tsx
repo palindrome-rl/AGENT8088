@@ -1,6 +1,9 @@
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { CodeBlock } from './CodeBlock'
+import { ThinkingTrace } from './ThinkingTrace'
+import { ToolChip } from './ToolChip'
+import { ToolDiffStrip } from './ToolDiffStrip'
 import { scrubMarkup } from '@/lib/scrub'
 import { FileText } from 'lucide-react'
 
@@ -36,7 +39,23 @@ export function MessageBubble({ message }: { message: ChatMessage }) {
     <div className="msg-enter mx-auto flex max-w-3xl justify-start px-6 py-2">
       <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-zinc-200 bg-zinc-100/90 px-4 py-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/90">
         <div className="mb-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Agent8088</div>
-        {message.format === 'terminal' ? (
+        {/* The finished turn's thinking and tool activity, kept from the live view. */}
+        {message.reasoning && <ThinkingTrace reasoning={message.reasoning} />}
+        {message.tools?.length ? (
+          <div className="mb-2">
+            <div data-testid="message-tool-rows">
+              {message.tools.map((tool, i) => (
+                <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
+              ))}
+            </div>
+            <ToolDiffStrip
+              diffs={message.tools
+                .map((tool) => tool.diff)
+                .filter((d): d is NonNullable<typeof d> => !!d)}
+            />
+          </div>
+        ) : null}
+        {!message.content ? null : message.format === 'terminal' ? (
           <pre className="max-h-[60vh] max-w-full overflow-auto whitespace-pre rounded-lg border border-zinc-200 bg-zinc-50 p-3 font-mono text-[12px] leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200">
             {scrubMarkup(message.content)}
           </pre>

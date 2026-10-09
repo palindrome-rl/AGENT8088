@@ -6,12 +6,13 @@ import { ToolChip } from './ToolChip'
 import { ToolDiffStrip } from './ToolDiffStrip'
 import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
+import { PlanApprovalCard } from '@/components/plan/PlanApprovalCard'
 import { PromptBar } from './PromptBar'
 import { RawPanel } from './RawPanel'
 import { scrubMarkup, displayMessages } from '@/lib/scrub'
 
 export function ChatPanel() {
-  const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
+  const { messages, toolEvents, isStreaming, streamingText, streamingReasoning } = useSessionStore()
   const { theme, rawPanelOpen } = useUIStore()
   const paletteShortcut = navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl+K'
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -61,7 +62,7 @@ export function ChatPanel() {
         {/* Tool activity is visible even before answer text arrives. */}
         {isStreaming && (
           <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
-            <ThinkingTrace />
+            <ThinkingTrace reasoning={streamingReasoning} live={isStreaming} />
             <div data-testid="tool-rows">
               {toolEvents.map((tool, i) => (
                 <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
@@ -78,6 +79,7 @@ export function ChatPanel() {
           </div>
         )}
         <ApprovalCard />
+        <PlanApprovalCard />
       </div>
       {isStreaming && (
         <div className="mx-auto w-full max-w-3xl px-6 py-2">

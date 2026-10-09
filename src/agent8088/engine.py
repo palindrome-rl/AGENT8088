@@ -11908,7 +11908,7 @@ def _environment_diagnostic() -> str:
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
-    global _last_tool_output, _last_tool_name
+    global _last_tool_output, _last_tool_name, _last_write_diff
     try:
         args = json.loads(arguments)
     except Exception:
@@ -11931,6 +11931,9 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     will_audit = _audit_applies(name, args, depth)
     snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
 
+    # A diff belongs to the call that wrote it. Left over, it was shown again on
+    # every later tool result -- a blocked write, a read, the next session.
+    _last_write_diff = None
     try:
         result = run_tool(name, args, depth=depth)
     except subprocess.TimeoutExpired:

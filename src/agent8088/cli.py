@@ -2296,11 +2296,25 @@ def do_chat(query):
     # the region is only repainted when something actually changed.
     with esc, Live(console=console, auto_refresh=False, transient=True) as _rich_live, \
             _ThrottledLive(_rich_live) as live:
+        def flush_reasoning():
+            # The live region only shows the tail of the reasoning and is erased
+            # when the turn ends. A finished round's reasoning is printed once
+            # above it instead, so it stays in the scrollback. Only ever filled
+            # when S.show_reasoning is on (see on_token); masked like the live view.
+            if not reasoning_parts:
+                return
+            text = A._mask_system_content("".join(reasoning_parts)).strip()
+            reasoning_parts.clear()
+            if text:
+                console.print(Panel(Text(text, style="dim italic"), title="[dim]thought[/dim]",
+                                    box=box.MINIMAL, border_style="grey50"))
+
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
             # finished tool call stops being the thing on screen, so the filter is
             # cleared here and prose after a tool result streams normally again.
             if msg.startswith("thinking"):
+                flush_reasoning()
                 stream.reset()
             live.update(_StatusLine(msg, turn_start, tokens_ref, interruptible=msg.startswith("thinking")))
             return nullcontext()
@@ -2341,6 +2355,11 @@ def do_chat(query):
 
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
+
+        def _on_calls(calls):
+            # The round's reasoning belongs above the tool rows it led to.
+            flush_reasoning()
+            on_calls(calls)
 
         def _on_result(name, result):
             on_result(name, result)
@@ -2412,7 +2431,7 @@ def do_chat(query):
                 # extraction call runs, so it goes on a background thread and the
                 # user never waits for it. The gateway and cron stay synchronous.
                 memory_background=True,
-                spin=spin, on_calls=on_calls, on_tool=on_tool,
+                spin=spin, on_calls=_on_calls, on_tool=on_tool,
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
                 on_status=on_status, on_stream_reset=on_stream_reset,
@@ -2433,6 +2452,7 @@ def do_chat(query):
             A._plan_on_escalation = None
             A._plan_on_approval = None
 
+    flush_reasoning()  # the last round's, above the answer (or the interrupt note)
     elapsed = time.time() - turn_start
     if answer is None:
         partial = stream.prose_text().strip()

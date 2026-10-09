@@ -61,11 +61,24 @@ export function scrubMarkup(text: string): string {
   return out.replace(/<\/?(?:arg_value|arg_key|tool_call)>/g, '')
 }
 
+// A blocked tool call's result is the approval request itself:
+// ESCALATION_REQUEST, mode, change type, paths, reason -- separated by the unit
+// separator (\u001f). Parsed so it is shown as words, not as that raw code.
+export function parseEscalation(text: string): { changeType: string; paths: string; reason: string } | null {
+  const body = scrubMarkup(text || '').trim()
+  if (!body.startsWith('ESCALATION_REQUEST\u001f')) return null
+  const parts = body.split('\u001f')
+  if (parts.length < 5) return null
+  return { changeType: parts[2], paths: parts[3], reason: parts.slice(4).join(' ').trim() }
+}
+
 // The engine stores tool feedback as user turns. Hide that feedback when
 // restoring history, while retaining real user messages (including errors).
 export function displayMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.filter((message, index) => {
-    if (message.role === 'assistant') return Boolean(scrubMarkup(message.content).trim())
+    if (message.role === 'assistant') {
+      return Boolean(scrubMarkup(message.content).trim() || message.tools?.length || message.reasoning?.length)
+    }
     if (message.role !== 'user') return false
     if (message.content.startsWith('Tool result (')) return false
     const previous = messages[index - 1]
