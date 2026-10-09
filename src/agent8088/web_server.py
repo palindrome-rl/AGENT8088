@@ -1216,6 +1216,7 @@ async def resume_session(body: SessionActionBody):
     C.S.trajectory_state = (data.get("trajectory_state", {})
                             if isinstance(data.get("trajectory_state", {}), dict) else {})
     C.S.name = safe_name
+    C.S.last_usage = None  # the previous session's last turn, not this one's
     C.S.temperature = float(data.get("temperature", 0.1))
     # Same as the CLI's loader: keep the live value when the file predates
     # the setting, rather than resetting it to a literal.
@@ -1931,6 +1932,9 @@ def _safe_artifact_path(A, rel: str) -> Path | None:
 async def list_artifacts(rel: str = ""):
     """List one directory under artifacts/ with type info per entry."""
     A = _eng()
+    if not rel and not A.ARTIFACTS_ROOT.exists():
+        # A fresh install has written nothing yet: an empty folder, not an error.
+        return {"root": str(A.ARTIFACTS_ROOT.resolve()), "cwd": "", "parent": None, "items": []}
     target = _safe_artifact_path(A, rel)
     if target is None or not target.exists() or not target.is_dir():
         return _error(f"not found: {rel}", 404)
@@ -1940,7 +1944,9 @@ async def list_artifacts(rel: str = ""):
         for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
             if entry.name.startswith(".") or entry.name == "__pycache__":
                 continue
-            rel_child = str(entry.relative_to(base))
+            # Forward slashes on every OS: the UI splits paths on "/" for its
+            # breadcrumb, and a Windows "sub\deeper" became a single crumb.
+            rel_child = entry.relative_to(base).as_posix()
             if entry.is_dir():
                 items.append({"name": entry.name, "path": rel_child, "type": "dir",
                               "size": None, "modified": entry.stat().st_mtime})
@@ -1957,7 +1963,7 @@ async def list_artifacts(rel: str = ""):
     return {
         "root": str(base),
         "cwd": rel,
-        "parent": str(Path(rel).parent) if rel else None,
+        "parent": Path(rel).parent.as_posix() if rel else None,
         "items": items,
     }
 

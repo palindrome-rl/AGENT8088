@@ -116,7 +116,6 @@ Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
 | `/temp <float>` | Config Page | `POST /api/preferences` |
 | `/maxturns <int>` | Config Page | `POST /api/preferences` |
 | `/save <file>` | Chat export | Client-side download |
-| `/clear` | Chat reset | `POST /api/sessions/reset` |
 | `/exit` `/quit` | Session end | WS close |
 | **Gateway** `/new` | Sessions Page | `POST /api/sessions/new` |
 | **Gateway** `/stop` | Prompt Bar interrupt | `WS {type:interrupt}` |

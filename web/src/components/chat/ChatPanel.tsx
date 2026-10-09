@@ -1,4 +1,7 @@
 import { useRef, useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { apiFetch } from '@/lib/api'
+import type { ToolSpec } from '@/types/api'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { MessageBubble } from './MessageBubble'
@@ -23,6 +26,16 @@ export function ChatPanel() {
 
 
   const isEmpty = messages.length === 0 && !isStreaming
+  // Counted from the server (same query as the Tools page); it was a
+  // hard-coded "32 tools across 14 modes" long after both numbers grew.
+  const { data: tools } = useQuery({
+    queryKey: ['tools'],
+    queryFn: () => apiFetch<ToolSpec[]>('/api/tools', { action: 'load the tool list' }),
+    enabled: isEmpty,
+  })
+  const toolsSubtitle = tools
+    ? `${tools.length} tools across ${new Set(tools.map((tool) => tool.mode)).size} modes`
+    : 'See what the agent can use'
 
   return (
     <div className="flex h-full flex-col">
@@ -43,7 +56,7 @@ export function ChatPanel() {
               <SuggestionCard title="Ask anything" subtitle="Research, write code, analyze" />
               <SuggestionCard title="Run a command" subtitle="Type / for all commands" />
               <SuggestionCard title="Plan a task" subtitle="Use /plan to propose & execute" />
-              <SuggestionCard title="Browse tools" subtitle="32 tools across 14 modes" />
+              <SuggestionCard title="Browse tools" subtitle={toolsSubtitle} />
             </div>
 
             <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-400 dark:text-zinc-600">

@@ -94,7 +94,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   setRawLoading: (rawLoading) => set({ rawLoading }),
   setSessionName: (sessionName) => set(s => ({ sessionName,
     status: s.status ? { ...s.status, session_name: sessionName } : null })),
-  clearChat: () => set({
+  clearChat: () => set((s) => ({
     messages: [],
     isStreaming: false,
     streamingText: '',
@@ -104,7 +104,10 @@ export const useSessionStore = create<SessionState>((set) => ({
     // Queued prompts were written for the conversation being cleared.
     promptQueue: [],
     queuePaused: false,
-  }),
+    // The status bar's "last turn" belonged to the old conversation (every
+    // New chat / resume / delete path clears the chat through here).
+    status: s.status ? { ...s.status, last_usage: null } : s.status,
+  })),
   addMessage: (message) => set((s) => ({ messages: [...s.messages, message] })),
   setStatus: (status) => set({ status }),
   setConnection: (connection) => set({ connection }),
