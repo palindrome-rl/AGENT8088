@@ -75,7 +75,7 @@ def test_expired_budget_stops_before_fallback(api, engine, monkeypatch):
         clock[0] = 11
         raise Failure(503, "timeout")
 
-    with pytest.raises(RuntimeError, match="Turn budget exceeded"):
+    with pytest.raises(RuntimeError, match="Time budget exceeded"):
         api(primary, lambda kw: response())
     assert [name for name, _ in api.calls] == ["primary"]
 
@@ -98,7 +98,7 @@ def test_backoff_does_not_outlive_the_budget(api, engine, monkeypatch):
     monkeypatch.setattr(engine, "API_MAX_RETRIES", 2)
     monkeypatch.setattr(engine, "API_RETRY_INITIAL_DELAY_MS", 5000)
     monkeypatch.setattr(engine, "API_RETRY_JITTER_RATIO", 0)
-    with pytest.raises(RuntimeError, match="Turn budget exceeded"):
+    with pytest.raises(RuntimeError, match="Time budget exceeded"):
         api(fail(), lambda kw: response())
     assert clock[0] <= 1.001
     assert len(api.calls) == 1
@@ -173,7 +173,7 @@ def test_stream_expiry_closes_the_stream_without_trying_a_fallback(api, engine, 
         def close(self):
             closed.append(True)
 
-    with pytest.raises(RuntimeError, match="Turn budget exceeded"):
+    with pytest.raises(RuntimeError, match="Time budget exceeded"):
         api(lambda kw: Stream(), lambda kw: response(), on_token=lambda *a: None)
     assert closed
     assert len(api.calls) == 1
@@ -194,7 +194,7 @@ def test_late_response_does_not_execute_tools_and_reports_the_budget(engine, mon
     monkeypatch.setattr(engine, "exec_tool", lambda *a, **k: calls.append(1))
     result = engine.run_agent([{"role": "user", "content": "calculate 2+2"}], budget=budget,
                               max_turns=1, on_answer=answers.append, tools_def=[], allowed_tools={"calculate"})
-    assert result.startswith("Turn budget exceeded")
+    assert result.startswith("Time budget exceeded")
     assert calls == [] and answers == [result]
 
 
