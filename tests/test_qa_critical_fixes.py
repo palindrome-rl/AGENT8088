@@ -12,10 +12,10 @@ from agent8088 import engine
 # A fresh install started every run at 10 rounds, which is below what a
 # multi-step task needs before the dynamic ceiling has any progress to grow on.
 
-def test_default_max_turns_is_thirty(monkeypatch):
+def test_default_max_turns_is_fifty(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {}, raising=False)
-    assert cli.Session().max_turns == 30
+    assert cli.Session().max_turns == 50
 
 
 def test_configured_max_turns_still_wins(monkeypatch):
@@ -27,7 +27,7 @@ def test_configured_max_turns_still_wins(monkeypatch):
 def test_unparseable_max_turns_falls_back_to_the_default(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {"max_turns": "not-a-number"}, raising=False)
-    assert cli.Session().max_turns == 30
+    assert cli.Session().max_turns == 50
 
 
 def test_max_turns_is_documented_in_the_shipped_config():
@@ -95,46 +95,46 @@ def test_a_budget_within_its_limits_reports_nothing():
 # Raising the floor to 30 must not quietly replace growth with a bigger fixed
 # number: 30 is what a run STARTS with, and progress still buys more.
 
-def _policy(max_turns=30, **kwargs):
+def _policy(max_turns=50, **kwargs):
     return engine._turn_policy(max_turns, **kwargs)
 
 
-def test_default_run_still_starts_at_thirty_and_can_grow():
+def test_default_run_still_starts_at_fifty_and_can_grow():
     policy = _policy()
-    assert policy.limit == 30
-    assert policy.ceiling == 30 * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
+    assert policy.limit == 50
+    assert policy.ceiling == 50 * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
     assert policy.ceiling > policy.limit, "growth disabled at the new default"
 
 
 def test_growth_is_granted_only_at_the_boundary():
     policy = _policy()
-    for _ in range(30):
+    for _ in range(50):
         policy.record_round(fresh=True, output="ok")
     assert policy.extend(0) is None, "extended in the middle of a block"
-    assert policy.extend(29) == (30, 35), "no extension at the boundary"
+    assert policy.extend(49) == (50, 55), "no extension at the boundary"
 
 
 def test_a_productive_run_earns_more_rounds():
     policy = _policy()
-    for _ in range(30):                      # every round did something new
+    for _ in range(50):                      # every round did something new
         policy.record_round(fresh=True, output="ok")
-    assert policy.extend(29) == (30, 35)
-    assert policy.limit == 35
+    assert policy.extend(49) == (50, 55)
+    assert policy.limit == 55
 
 
 def test_a_stalled_run_earns_nothing():
     policy = _policy()
-    for _ in range(30):                      # repeats: nothing fresh
+    for _ in range(50):                      # repeats: nothing fresh
         policy.record_round(fresh=False, output="ok")
-    assert policy.extend(29) is None
-    assert policy.limit == 30
+    assert policy.extend(49) is None
+    assert policy.limit == 50
 
 
 def test_failing_work_does_not_count_as_progress():
     policy = _policy()
-    for _ in range(30):                      # fresh, but every call failed
+    for _ in range(50):                      # fresh, but every call failed
         policy.record_round(fresh=True, output="Error: command failed")
-    assert policy.extend(29) is None
+    assert policy.extend(49) is None
 
 
 def test_growth_stops_at_the_ceiling():
@@ -147,7 +147,7 @@ def test_growth_stops_at_the_ceiling():
         # Prove progress for every round of the block about to be judged.
         for _ in range(policy.limit):
             policy.record_round(fresh=True, output="ok")
-    assert policy.limit == policy.ceiling == 120
+    assert policy.limit == policy.ceiling == 200
     for _ in range(policy.limit):
         policy.record_round(fresh=True, output="ok")
     assert policy.extend(policy.limit - 1) is None, "grew past the ceiling"
@@ -155,10 +155,10 @@ def test_growth_stops_at_the_ceiling():
 
 def test_growth_can_still_be_switched_off():
     policy = _policy(dynamic=False)
-    assert policy.limit == policy.ceiling == 30
-    for _ in range(30):
+    assert policy.limit == policy.ceiling == 50
+    for _ in range(50):
         policy.record_round(fresh=True, output="ok")
-    assert policy.extend(29) is None
+    assert policy.extend(49) is None
 
 
 # --- "says it's done with phase 3 but the task folder is empty" ------------

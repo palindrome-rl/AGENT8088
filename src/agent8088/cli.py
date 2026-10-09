@@ -245,7 +245,7 @@ from agent8088.logging_setup import configure_logging
 # floor, not the cap. It was 10, which a multi-step task spent before it had
 # produced the progress the ceiling grows on -- the run died mid-task and
 # reported a budget error rather than an answer.
-DEFAULT_MAX_TURNS = 30
+DEFAULT_MAX_TURNS = 50
 
 class Session:
     def __init__(self):
