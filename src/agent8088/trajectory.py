@@ -12,6 +12,7 @@ MAX_TEXT = 240
 MAX_EVIDENCE = 6
 
 
+MAX_WRITTEN = 50
 MAX_UNTESTED = 8
 MAX_VERIFICATION_REQUESTS = 2
 
@@ -74,6 +75,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "verification_requested": False,
         "verification_requests": 0,
         "untested_changes": [],
+        "written_paths": [],
         "tests_requested": False,
         "consecutive_setbacks": 0,
         "stalled": False,
@@ -151,6 +153,15 @@ class TrajectoryState:
             if path not in changed:
                 changed.append(path)
                 del changed[:-MAX_UNTESTED]
+        if mutated and path and operation["status"] == "done":
+            # Where the work actually landed. The answer quotes this, because a
+            # run whose writes were redirected into the sandbox workspace reads
+            # as a false completion claim when the user checks the folder they
+            # named and finds it empty.
+            written = self.data.setdefault("written_paths", [])
+            if path not in written:
+                written.append(path)
+                del written[:-MAX_WRITTEN]
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self.data["verification"] = "pending"
@@ -212,6 +223,13 @@ class TrajectoryState:
             # A new untested change re-arms the one-shot: the previous nudge was
             # about different files.
             self.data["tests_requested"] = False
+
+    def mutation_count(self) -> int:
+        return int(self.data.get("mutation_count") or 0)
+
+    def written_paths(self) -> list[str]:
+        """Paths this run wrote successfully, first write first."""
+        return list(self.data.get("written_paths") or [])
 
     def changed_code_paths(self) -> list[str]:
         """Code files this run wrote, newest last."""
