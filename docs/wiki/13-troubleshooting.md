@@ -436,8 +436,7 @@ Note this is separate from `ssrf_allow_hosts`, which governs the HTTP *tools*.
 
 Use a temporary `AGENT8088_HOME` and a configuration path you know does not
 exist. Tests must not load personal settings or rely on leftovers from another
-test. The root maintainer suite is not shipped in this release; public
-regression checks live under `scripts/installer_checks/`.
+test. The regression checks live under `scripts/installer_checks/`.
 
 ### Duplicate function silently ignored
 

@@ -10,15 +10,23 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC = "palindrome-rl/AGENT8088"
 BRANCH = "AGENT8088-v1.2"
+# Third-party repositories the Windows installer legitimately downloads from.
+VENDOR = {"astral-sh/uv", "git-for-windows/git", "microsoft/terminal"}
+_SLUG = re.compile(r"(?:github\.com|githubusercontent\.com)/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)")
 
 
 @pytest.mark.parametrize("name", ["install.ps1", "install.sh"])
 def test_install_and_recovery_stay_on_the_public_release(name):
+    """Every repository an installer reaches for is the public one.
+
+    Enumerated rather than checked against a list of names that must not
+    appear: a slug this test has never heard of still fails here, which a
+    deny-list cannot do."""
     source = (ROOT / name).read_text(encoding="utf-8")
     assert PUBLIC in source and BRANCH in source
-    assert "RT-Internal-DS" not in source
-    assert "staging-1.2" not in source
-    assert "agent8088-installer.pages.dev" not in source
+    slugs = {slug.removesuffix(".git") for slug in _SLUG.findall(source)}
+    assert slugs - VENDOR == {PUBLIC}, sorted(slugs)
+    # A public clone is anonymous: no credential prompt, no token scope.
     assert "private repository" not in source
     assert "repo scope" not in source
 

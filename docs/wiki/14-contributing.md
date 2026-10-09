@@ -4,8 +4,7 @@
 
 ## Setup
 
-This release branch does not include the root Python `tests/` directory.
-Runtime installs do not need it. For a public change, start from the v1.2 branch:
+Start from the v1.2 branch:
 
 ```sh
 git clone --branch AGENT8088-v1.2 https://github.com/palindrome-rl/AGENT8088.git
@@ -15,9 +14,9 @@ python -m venv .venv
 AGENT8088_CONFIG=/nonexistent .venv/bin/python scripts/verify_features.py
 ```
 
-Install **both** extras. Without `gateway`, `test_gateway_core.py` and
-`test_gateway_startup.py` fail at import (they import the Slack/Discord
-adapters directly) and look like real breakage.
+Install **both** extras. Without `gateway`, anything importing the
+Slack/Discord adapters fails at import rather than skipping, which looks like
+real breakage but is a missing optional dependency.
 
 ## Non-negotiable safety rules
 
@@ -56,8 +55,8 @@ my_tool|What it does|mode=http_get|args=query|url=https://api.example.com?q={que
 Pick an existing `mode` and it inherits that mode's permission gating
 automatically. Then:
 
-1. Add a test in `tests/` asserting the spec and, if it has logic, its behaviour.
-2. If it's a new `mode`, add gating in `check_permission()` **and** a test for
+1. Add a check asserting the spec and, if it has logic, its behaviour.
+2. If it's a new `mode`, add gating in `check_permission()` **and** a check for
    each permission mode.
 3. Update `expected_tools` in `scripts/verify_everything.py` — it's the single
    source of truth for the inventory, and the count assertions derive from it.
@@ -96,7 +95,7 @@ history has a repro that failed before and passed after.
 ## Before opening a PR
 
 ```sh
-AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest scripts/installer_checks/ -q
 .venv/bin/python scripts/check_duplicate_defs.py
 VERIFY_HOME="$(mktemp -d)"; AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
   .venv/bin/python scripts/verify_features.py; rm -rf -- "$VERIFY_HOME"

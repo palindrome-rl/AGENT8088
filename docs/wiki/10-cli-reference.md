@@ -42,7 +42,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--web-port PORT` | Web UI server port (default `8180`) |
 | `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
-| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment; the benchmark adapter supplies a disposable task container. |
+| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment that supplies a disposable task container. |
 | `--logs [MODE]` | Print the operational log; pass `follow` to tail it in real time. Bare `--logs` prints the last `--limit` lines and exits |
 | `-n`, `--limit LIMIT` | With `--logs`: number of lines to print (default 50) |
 | `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |

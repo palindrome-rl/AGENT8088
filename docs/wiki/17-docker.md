@@ -10,7 +10,7 @@ adapters, Playwright Chromium, the WhatsApp bridge, and the Docker CLI for
 ## Quick start
 
 ```sh
-cd /path/to/Agent8088-Features-added        # docker-compose.yml lives here
+cd /path/to/AGENT8088        # docker-compose.yml lives here
 
 docker compose run --rm agent8088 --setup    # first-time config wizard
 docker compose run --rm agent8088            # interactive REPL
@@ -94,8 +94,13 @@ Everything persists in the `agent8088-data` named volume, mounted at
 Inspect or back it up:
 
 ```sh
-docker volume inspect agent8088-features-added_agent8088-data
+docker volume inspect agent8088_agent8088-data
 ```
+
+Compose prefixes the volume with the project name, which defaults to the
+directory holding `docker-compose.yml` — lowercased, with punctuation stripped.
+A clone in a differently named directory has a differently named volume;
+`docker volume ls` shows the real one.
 
 ## Starting fresh
 
@@ -122,9 +127,8 @@ volumes:
 ## What the Dockerfile does not include
 
 - **`dev` extras** (pytest, ruff, pip-audit) — not needed to run the agent.
-  The image excludes `tests/`, and this public release does not track the
-  root Python suite. Run those tests from a separate maintainer checkout;
-  installing `.[dev]` inside this image cannot provide the missing files.
+  Run the checks in [Testing & Verification](12-testing-and-verification.md)
+  from a repository checkout rather than inside the image.
 
 - **The `repomap` extra** (`tree-sitter`, `tree-sitter-language-pack`) — the
   Dockerfile only installs `.[gateway]`, so `repo_map` degrades to a clean
@@ -155,9 +159,8 @@ Or without Compose:
 docker build -t agent8088 .
 ```
 
-The `.dockerignore` excludes `.venv`, `.git`, `tests/`, `docs/`, `artifacts/`
-and `research/` — only the source, `pyproject.toml`, `README.md` and `assets/`
-go into the image.
+The `.dockerignore` excludes `.venv`, `.git`, `docs/` and `artifacts/` — only
+the source, `pyproject.toml`, `README.md` and `assets/` go into the image.
 
 ## Troubleshooting
 

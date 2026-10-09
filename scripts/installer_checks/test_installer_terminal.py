@@ -115,7 +115,7 @@ Write-Output (ConvertTo-PowerShellLiteral "C:\\Users\\O'Brien")
 def test_windows_installer_urls_use_the_public_repository():
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     assert '$RepoSlug = "palindrome-rl/AGENT8088"' in source
-    assert "tayyabimam1/Agent8088-Features-added" not in source
+    assert source.count("$RepoSlug =") == 1
 
 
 def test_winget_no_applicable_update_accepts_a_working_terminal_alias():

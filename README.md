@@ -183,9 +183,8 @@ importing installed Python/Node packages, checking Chromium and OCR resources,
 and validating WebUI assets. A stale resume marker or partial dependency folder
 triggers repair instead of being treated as success.
 
-The installers do not add the `[dev]` extra (pytest, ruff, pip-audit), and the
-root Python `tests/` suite is not included in this release branch. Neither is
-needed to install or run Agent8088.
+The installers do not add the `[dev]` extra (pytest, ruff, pip-audit). It is
+not needed to install or run Agent8088.
 
 ---
 

@@ -4,7 +4,7 @@ Agent8088 - Clean CLI with banner + animated spinner.
 
 A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
-  - one-shot / benchmark mode (query as args, optional --trace)
+  - one-shot / headless mode (query as args, optional --trace)
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request  # readline enables input history
 from collections import Counter
@@ -446,11 +446,11 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
 LAUNCH_DIR = Path(os.getcwd()).resolve()
 PROJECT_ROOT = _configured_project_root(APP_CONFIG, LAUNCH_DIR)
 ARTIFACTS_ROOT = (PROJECT_ROOT / "artifacts").resolve()
-# Set by an evaluation harness that runs Agent8088 inside a throwaway task
-# container (Terminal-Bench under Harbor). The container is the sandbox: there
-# is no user home to protect, the task's files are the deliverable, and the run
-# is graded on exact paths. Environment-only on purpose -- a model that can
-# write config.txt must not be able to flip it.
+# Set by an automated harness that runs Agent8088 inside a throwaway task
+# container. The container is the sandbox: there is no user home to protect,
+# the task's files are the deliverable, and the run is graded on exact paths.
+# Environment-only on purpose -- a model that can write config.txt must not be
+# able to flip it.
 DISPOSABLE_CONTAINER = os.environ.get("AGENT8088_DISPOSABLE_CONTAINER", "").strip() == "1"
 if DISPOSABLE_CONTAINER:
     # Scratch output must not land inside the graded project tree.
@@ -484,12 +484,12 @@ TIMEOUT_SECONDS = _config_number("timeout_seconds", 120, int, {
 CONTEXT_WINDOW = _config_int("context_window", 32768)
 # Characters per token for the context-size estimate. 4 suits English prose on
 # OpenAI tokenizers; code, JSON and the Qwen tokenizer run nearer 3 (measured
-# 2.9-3.3 on Terminal-Bench conversations). Over-estimating the free space ends
+# 2.9-3.3 on tool-heavy agent conversations). Over-estimating the free space ends
 # in the server's "maximum context length" rejection, which ends the turn.
 CHARS_PER_TOKEN = max(1.0, _config_float("chars_per_token", 4.0))
 # Characters of one tool result shown to the model before it is cut (the rest
-# stays reachable through read_content). 3,000 by default; a benchmark profile
-# can match the output window of the agents it is compared with.
+# stays reachable through read_content). 3,000 by default; raise it to match
+# the output window another tool expects.
 TOOL_RESULT_MAX_CHARS = max(500, _config_int("tool_result_max_chars", 3000))
 # Not clamped to CONTEXT_WINDOW here -- that constant is only the *global*
 # fallback context, not the active model's real one. _active_model_token_limits
@@ -526,8 +526,8 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
-# doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
-# at one output limit sets it to that limit.
+# doubles the completion limit). 0 = no ceiling. Set it to pin every retry to
+# one fixed output limit.
 LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
 # Floor for the completion cap a length cut-off earns (A3.1). The old behaviour
 # clamped every retry to 1024 tokens, which no real tool call fits — after two
@@ -4820,7 +4820,7 @@ SUBAGENT_SPECS = load_subagent_specs(AGENTS_DIR, USER_AGENTS_DIR)
 # UI hook: a presentation layer (e.g. the Rich CLI) may set this to a factory
 #   subagent_ui(agent_type, task, depth) -> dict of run_agent hooks
 # with any of the keys: spin, on_calls, on_tool, on_result, done(answer).
-# Left None, sub-agents run silently (benchmark, one-shot, plain REPL) — so this
+# Left None, sub-agents run silently (headless, one-shot, plain REPL) — so this
 # is fully backward-compatible. Kept out of the loop, same as every other hook.
 subagent_ui = None
 # Front-end hook: the commands the person can type (CLI slash commands, gateway
@@ -6276,7 +6276,7 @@ def _without_read_only_substitutions(command: str):
     """`command` with each $(...) whose inner command is itself read-only
     replaced by a plain word, innermost first; None when one is not.
 
-    Seen in the benchmark: a model checked the file it had just written with
+    Seen in practice: a model checked the file it had just written with
     `echo "report: [$(cat report.txt)]"`, and refusing every substitution
     counted that check as a new change. Backticks stay refused outright, and
     anything left unresolved (arithmetic, unbalanced text) is refused by the
@@ -11846,7 +11846,7 @@ def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> boo
     """Whether a shell call ran, successfully, a code file this run changed
     while that change still waits for a check.
 
-    Seen in the glm-5.3-flash benchmark: after writing fib.py, `python fib.py`
+    Seen in practice on small fast models: after writing fib.py, `python fib.py`
     counted as yet another change, re-armed the verification nudge, and the
     model re-ran the same check twice. Named by file name, so `python3
     ./src/fib.py` and `cd src && python3 fib.py` both count; a failing or

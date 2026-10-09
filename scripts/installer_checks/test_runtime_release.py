@@ -19,7 +19,7 @@ def runtime(monkeypatch, tmp_path):
     capabilities.reset()
 
 
-def test_length_recovery_respects_available_context_without_a_maintainer_config(runtime, monkeypatch):
+def test_length_recovery_respects_available_context_without_a_local_config(runtime, monkeypatch):
     calls = []
 
     def completion(messages, tools, max_tokens=None, **kwargs):
