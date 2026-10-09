@@ -5912,7 +5912,10 @@ def cmd_resume(rest):
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.name = name
     S.temperature = float(data.get("temperature", 0.1))
-    S.max_turns = int(data.get("max_turns", 10))
+    # Fall back to what this session already has, not to a literal: a session
+    # file written before this setting existed used to pull max_turns back down
+    # to 10, silently discarding both config.txt and a /maxturns set this run.
+    S.max_turns = int(data.get("max_turns", S.max_turns))
     S.show_trace = bool(data.get("show_trace", False))
     S.show_reasoning = bool(data.get("show_reasoning", False))
     A.SHOW_REASONING = S.show_reasoning

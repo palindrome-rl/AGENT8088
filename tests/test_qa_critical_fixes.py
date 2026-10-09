@@ -267,3 +267,46 @@ def test_an_unsandboxed_shell_mutation_gets_no_workspace_note(monkeypatch, tmp_p
     operation = traj.before_tool("execute_shell")
     traj.after_tool(operation, "ok", failed=False, blocked=False, mutated=True, path="")
     assert "sandbox workspace" not in engine._with_task_notes("Done.", traj)
+
+
+# --- The same fixes must hold on the Web UI surface -------------------------
+# Found while checking parity: loading a session whose file predates a given
+# setting reset that setting to a hardcoded 10, on BOTH surfaces. A user who
+# set 120 and then opened a saved session silently got 10 back -- the most
+# likely reading of "I raised max_turns to 120 but it's still set to".
+
+def test_cli_session_restore_keeps_the_current_max_turns(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "APP_CONFIG", {}, raising=False)
+    session = cli.Session()
+    session.max_turns = 120
+    restored = int({}.get("max_turns", session.max_turns))   # the restore expression
+    assert restored == 120, "a session without max_turns clobbered the live value"
+
+
+def test_cli_session_restore_does_not_hardcode_ten():
+    from pathlib import Path
+    from agent8088 import cli
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    assert 'data.get("max_turns", 10)' not in source
+
+
+def test_web_session_restore_does_not_hardcode_ten():
+    from pathlib import Path
+    from agent8088 import web_server
+    source = Path(web_server.__file__).read_text(encoding="utf-8")
+    assert 'data.get("max_turns", 10)' not in source
+
+
+def test_web_limits_fallback_is_the_shared_default():
+    from pathlib import Path
+    from agent8088 import web_server
+    source = Path(web_server.__file__).read_text(encoding="utf-8")
+    assert '"max_turns": C.S.max_turns if (C := _cl()) else 10' not in source
+
+
+def test_the_web_ceiling_admits_the_grown_budget():
+    """max_turns 30 grows to 120; the Web UI must not reject what the CLI allows."""
+    from agent8088 import web_server, cli
+    ceiling = cli.DEFAULT_MAX_TURNS * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
+    assert web_server._MAX_TURNS_CEILING >= ceiling
