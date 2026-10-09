@@ -4,6 +4,24 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.2 branch maintenance - 2026-10-09
+
+### Fixed
+
+- Requests now start with 50 rounds consistently across the CLI, Web UI,
+  gateways and direct engine calls; productive runs retain bounded growth.
+- Resuming older sessions without a stored turn limit preserves the current
+  setting instead of silently resetting it to 10.
+- Time, token and cost budget messages identify the limit actually reached.
+- Controller-generated output-location notes identify sandbox workspace output
+  when it differs from the project folder.
+- The Web UI `+` menu starts search and memory requests rather than backend
+  configuration commands. Commands with ready attachments are refused without
+  discarding the composer or files, including while another turn is running.
+
+Public repository URLs, installation scripts, update channel, version 1.2.0,
+MIT license and existing public-specific UI fixes are unchanged.
+
 ## v1.2 branch maintenance - 2026-10-07
 
 ### Improved

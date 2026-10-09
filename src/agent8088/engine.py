@@ -516,6 +516,9 @@ MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
 
+# Shared starting allowance for CLI, Web UI, gateways and direct engine calls.
+DEFAULT_MAX_TURNS = 50
+
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
@@ -3069,7 +3072,7 @@ def _check_model_budget():
     reason = _active_budget.exceeded()
     left = _active_budget.seconds_left()
     if reason or left is not None and left <= 0:
-        raise TurnBudgetExceeded(reason or "Turn budget exceeded: time limit reached.")
+        raise TurnBudgetExceeded(reason or "Time budget exceeded: time limit reached.")
     return left
 
 
@@ -14324,7 +14327,7 @@ def describe_capabilities() -> str:
               f"Model token limits: {model_context:,} context / {model_output:,} output",
               f"Permission mode: {PERMISSION_MODE}",
               f"Sandbox backend: {_resolve_sandbox_backend()}",
-              f"Max turns per request: {APP_CONFIG.get('max_turns', '10')}",
+              f"Max turns per request: {APP_CONFIG.get('max_turns', str(DEFAULT_MAX_TURNS))}",
               ""]
 
     # --- Tools, grouped by what kind of access they need ---
@@ -14520,14 +14523,21 @@ class _TurnBudget:
         if self.max_seconds:
             elapsed = time.monotonic() - self.started - self.idle_seconds
             if elapsed > self.max_seconds:
-                return (f"Turn budget exceeded: {elapsed:.0f} seconds elapsed "
-                        f"(limit {self.max_seconds}). Raise {self.seconds_setting} in "
-                        f"config.txt or split the task into smaller requests.")
+                # Named "Time budget", not "Turn budget": this is a wall clock,
+                # and calling it a turn budget sent a reporter to raise
+                # max_turns, which could not have changed this outcome. The
+                # literal "seconds elapsed" is load-bearing -- cli._run_end_reason
+                # keys on it to classify the ending as time_budget.
+                return (f"Time budget exceeded: {elapsed:.0f} seconds elapsed "
+                        f"(limit {self.max_seconds}s). This is a wall-clock limit, "
+                        f"not a turn limit -- raising max_turns will not change it. "
+                        f"Raise {self.seconds_setting} in config.txt or split the "
+                        f"task into smaller requests.")
         if self.max_tokens and self.total_tokens >= self.max_tokens:
-            return (f"Turn budget exceeded: {self.total_tokens} tokens used "
+            return (f"Token budget exceeded: {self.total_tokens} tokens used "
                     f"(limit {self.max_tokens}). Raise max_turn_tokens in config.txt.")
         if self.max_cost and self.cost_usd >= self.max_cost:
-            return (f"Turn budget exceeded: ${self.cost_usd:.4f} spent "
+            return (f"Cost budget exceeded: ${self.cost_usd:.4f} spent "
                     f"(limit ${self.max_cost:.4f}). Raise max_turn_cost_usd in config.txt.")
         return None
 
@@ -14552,7 +14562,7 @@ def _human_wait():
     console.input() in the CLI, a threading.Event in the browser. Plan mode is
     the one mode with a wall-clock budget on by default, so charging the user's
     reading to it meant a plan approved after a few minutes' thought had no
-    budget left to run in and died reporting "Turn budget exceeded".
+    budget left to run in and died reporting "Time budget exceeded".
     """
     started = time.monotonic()
     try:
@@ -15678,14 +15688,62 @@ DELIVERABLES_CHECK_NUDGE = (
 POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
 
 
+def _redirected_write_locations(trajectory) -> list[str]:
+    """Directories this run wrote into that are NOT where the user is looking.
+
+    Shell commands and file writes are moved into the sandbox workspace, so
+    "create phase4 here" lands in ARTIFACTS_ROOT rather than the project the
+    user named. Asking the model to disclose that did not work -- a 26B model
+    answered "I have created the folder phase4" with no path regardless -- so
+    the controller states it instead.
+    """
+    if trajectory is None or ARTIFACTS_ROOT == PROJECT_ROOT:
+        return []
+    artifacts, seen = str(ARTIFACTS_ROOT), []
+    for raw in trajectory.written_paths():
+        try:
+            parent = str(Path(raw).parent)
+        except (OSError, ValueError):
+            continue
+        if (parent == artifacts or parent.startswith(artifacts + os.sep)) and parent not in seen:
+            seen.append(parent)
+    return seen
+
+
+def _workspace_note(trajectory) -> str:
+    """One line saying where this run's output actually is, or "".
+
+    Write tools report the file they touched, so those are named exactly. A
+    shell command reports no path -- `mkdir phase5 && echo ... > phase5/p.txt`
+    is opaque to the controller -- so when the sandbox is what moved the work,
+    the workspace itself is named instead. That case is the reported one.
+    """
+    if trajectory is None or ARTIFACTS_ROOT == PROJECT_ROOT:
+        return ""
+    if locations := _redirected_write_locations(trajectory):
+        shown = ", ".join(locations[:3])
+        extra = f" (and {len(locations) - 3} more)" if len(locations) > 3 else ""
+        return (f"Files written to: {shown}{extra} -- the sandbox workspace, "
+                f"not {PROJECT_ROOT}.")
+    if trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
+        return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
+                f"with a relative path is there, not under {PROJECT_ROOT}.")
+    return ""
+
+
 def _with_task_notes(answer: str, trajectory) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
-    unverified change, or the task-state review."""
+    unverified change, the task-state review, and where any writes landed."""
+    notes = []
     if trajectory is not None and trajectory.needs_verification():
-        return answer + ("\n\nVerification note: changes were made, but no fresh automated "
-                         "verification evidence was recorded.")
-    if trajectory is not None and (review := trajectory.review()):
-        return answer + f"\n\nTask-state note: {review}"
+        notes.append("Verification note: changes were made, but no fresh automated "
+                     "verification evidence was recorded.")
+    elif trajectory is not None and (review := trajectory.review()):
+        notes.append(f"Task-state note: {review}")
+    if location_note := _workspace_note(trajectory):
+        notes.append(location_note)
+    for note in notes:
+        answer += f"\n\n{note}"
     return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
@@ -15724,7 +15782,7 @@ def _consult_llmrouter(config, messages, eligible):
                       "applied": False, "latency_ms": 0}
 
 
-def _run_agent_loop(messages, *, max_turns=10, temperature=0.1, spin=None,
+def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
                     on_token=None, interrupt_check=None, trace=None,

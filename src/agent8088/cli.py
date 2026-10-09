@@ -240,6 +240,13 @@ from agent8088.logging_setup import configure_logging
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+# Rounds a run STARTS with. The dynamic ceiling (engine.DYNAMIC_TURNS_CEILING_
+# MULTIPLIER) grows this while the run keeps making progress, so this is the
+# floor, not the cap. It was 10, which a multi-step task spent before it had
+# produced the progress the ceiling grows on -- the run died mid-task and
+# reported a budget error rather than an answer.
+DEFAULT_MAX_TURNS = A.DEFAULT_MAX_TURNS
+
 class Session:
     def __init__(self):
         config = A.APP_CONFIG
@@ -250,9 +257,9 @@ class Session:
         except ValueError:
             self.temperature = 0.1
         try:
-            self.max_turns = int(config.get("max_turns", "10"))
+            self.max_turns = int(config.get("max_turns", str(DEFAULT_MAX_TURNS)))
         except ValueError:
-            self.max_turns = 10
+            self.max_turns = DEFAULT_MAX_TURNS
         self.show_trace = config.get("show_trace", "0").lower() in {"1", "true", "on", "yes"}
         self.show_reasoning = config.get("show_reasoning", "0").lower() in {"1", "true", "on", "yes"}
         A.SHOW_REASONING = self.show_reasoning
@@ -5965,7 +5972,10 @@ def cmd_resume(rest):
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.name = name
     S.temperature = float(data.get("temperature", 0.1))
-    S.max_turns = int(data.get("max_turns", 10))
+    # Fall back to what this session already has, not to a literal: a session
+    # file written before this setting existed used to pull max_turns back down
+    # to 10, silently discarding both config.txt and a /maxturns set this run.
+    S.max_turns = int(data.get("max_turns", S.max_turns))
     S.show_trace = bool(data.get("show_trace", False))
     S.show_reasoning = bool(data.get("show_reasoning", False))
     A.SHOW_REASONING = S.show_reasoning

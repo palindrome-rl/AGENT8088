@@ -95,6 +95,12 @@ def _cl():
     return _cli
 
 
+def _default_max_turns() -> int:
+    """The CLI's starting turn budget. Imported lazily, like _cl(), so the
+    two surfaces cannot drift to different defaults."""
+    return _cl().DEFAULT_MAX_TURNS
+
+
 # === Tool-call markup scrubbing ===
 # The engine's tool protocol rides in the CONTENT channel: the model literally
 # types `<flower>FUNCTION<flower>: name <flower>ARGS<flower>: {...}` as ordinary
@@ -1192,7 +1198,9 @@ async def resume_session(body: SessionActionBody):
                             if isinstance(data.get("trajectory_state", {}), dict) else {})
     C.S.name = safe_name
     C.S.temperature = float(data.get("temperature", 0.1))
-    C.S.max_turns = int(data.get("max_turns", 10))
+    # Same as the CLI's loader: keep the live value when the file predates
+    # the setting, rather than resetting it to a literal.
+    C.S.max_turns = int(data.get("max_turns", C.S.max_turns))
     C.S.show_trace = bool(data.get("show_trace", False))
     C.S.show_reasoning = bool(data.get("show_reasoning", False))
     C.S.disabled_skills = set(data.get("disabled_skills", []))
@@ -1993,7 +2001,7 @@ async def get_limits():
     """Show all limits."""
     A = _eng()
     return {
-        "max_turns": C.S.max_turns if (C := _cl()) else 10,
+        "max_turns": C.S.max_turns if (C := _cl()) else _default_max_turns(),
         "max_turn_seconds": A.MAX_TURN_SECONDS,
         "max_turn_tokens": A.MAX_TURN_TOKENS,
         "max_turn_cost_usd": A.MAX_TURN_COST_USD,

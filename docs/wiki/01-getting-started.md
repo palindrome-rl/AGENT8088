@@ -195,6 +195,19 @@ isolated from your filesystem and network. Without it Agent8088 falls back to
 Docker, and if neither exists shell and code execution are refused outright
 rather than prompted for. See [Sandboxing](06-sandboxing.md).
 
+## Turn limits and generated output
+
+Requests start with 50 rounds by default; `/maxturns <int>` changes the starting
+allowance. Productive runs can earn more rounds within a hard ceiling. Time,
+token and cost limits are separate, so raising the turn allowance does not
+override those limits. See [Configuration](02-configuration.md#dynamic-turn-budget).
+
+When work lands in the sandbox workspace rather than the project folder, the
+final answer includes a location note. In the Web UI, the `+` menu's Web search
+and Memory recall options start normal requests, not configuration commands.
+Slash commands do not accept attachments: remove the files or send a normal
+message instead. Refused commands leave the staged files intact.
+
 ## Where things live
 
 | Path | What |

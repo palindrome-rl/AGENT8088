@@ -49,6 +49,26 @@ prompt_paths=~
 # Writes to these paths are always blocked, even in edit mode:
 # blocked_paths=/etc,/home,~/.ssh
 
+# --- agent rounds ---
+# How many rounds (model call + tool calls) one request STARTS with. This is a
+# floor, not a cap: a run that keeps producing new, successful tool results
+# earns more rounds, up to max_turns * dynamic_turns_ceiling_multiplier. Change
+# it here, or at any time with `/maxturns <n>` in the REPL, which writes it back
+# to this file.
+max_turns=50
+# How far progress may grow max_turns. 1 disables growth and restores a hard
+# fixed limit of exactly max_turns rounds.
+# dynamic_turns_ceiling_multiplier=4
+# Rounds granted per extension once progress is shown.
+# dynamic_turns_extension=5
+#
+# These bound ROUNDS. The separate wall-clock/token/cost ceilings bound what
+# those rounds may consume, and raising max_turns does not raise them:
+#   max_turn_seconds            wall clock for one whole turn (0 = off)
+#   plan_audit_timeout_seconds  wall clock for ONE auditor sub-run
+#   max_turn_tokens             tokens per turn (0 = off)
+#   max_turn_cost_usd           dollars per turn (0 = off)
+
 # --- model ---
 # Active provider (built-in base URLs are used automatically). Leave unset for
 # no configured default -- get_client() then falls through its own precedence

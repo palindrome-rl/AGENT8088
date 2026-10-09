@@ -170,7 +170,7 @@ sensitive-file floor still applies unconditionally.
 | `/model setup` | Add or update a provider profile |
 | `/models [provider]` | Fuzzy model picker, fetched live |
 | `/temp <float>` | Sampling temperature |
-| `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
+| `/maxturns <int>` | Starting rounds per prompt, default 50; productive runs can grow within the dynamic ceiling (same as `/limits max_turns`). Separate time/token/cost limits still apply. |
 | `/reasoning` | Toggle reasoning display |
 | `/tool-selection [hybrid\|full\|auto]` | Show or set how native tool schemas are narrowed per request — see [Tool-calling compatibility](05-model-providers.md#tool-calling-compatibility) |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |

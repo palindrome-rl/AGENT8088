@@ -251,6 +251,12 @@ export function PromptBar() {
           return
         }
       }
+      if (queuedText.startsWith('/') && readyAttachments.length > 0) {
+        setSessionError(
+          `Commands don't take attachments. Remove ${readyAttachments.length === 1 ? 'the attached file' : 'the attached files'} ` +
+          `or send a message instead of a /command.`)
+        return
+      }
       enqueuePrompt({
         kind: queuedText.startsWith('/') ? 'command' : 'chat',
         text: queuedText,
@@ -261,6 +267,17 @@ export function PromptBar() {
       return
     }
     if (trimmed.startsWith('/')) {
+      // A command frame carries no attachments, so sending one while files are
+      // staged used to drop them silently -- the user saw their files vanish
+      // and the command run as if nothing had been attached. Refuse instead,
+      // and leave the composer untouched so nothing has to be re-added.
+      if (readyAttachments.length > 0) {
+        setSessionError(
+          `Commands don't take attachments. Remove ${readyAttachments.length === 1 ? 'the attached file' : 'the attached files'} ` +
+          `or send a message instead of a /command.`)
+        return
+      }
+      setSessionError('')
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
       if (cmd.toLowerCase() === 'raw') {
         setRawResult(null)
@@ -467,8 +484,14 @@ export function PromptBar() {
           </div>
           <div className="p-1">
             {[
-              { label: 'Web search', Icon: Plus, action: () => { setText('/search '); inputRef.current?.focus() } },
-              { label: 'Memory recall', Icon: Plus, action: () => { setText('/memory '); inputRef.current?.focus() } },
+              // These prime a REQUEST, not a slash command. '/search' and
+              // '/memory' are backend-management commands (configure the search
+              // provider; turn memory on/off) -- inserting them meant the + menu
+              // never ran a search or a recall, and because the text then began
+              // with '/' the message was dispatched as a command, which silently
+              // discarded any attached files.
+              { label: 'Web search', Icon: Plus, action: () => { setText('Search the web for '); inputRef.current?.focus() } },
+              { label: 'Memory recall', Icon: Plus, action: () => { setText('What do you remember about '); inputRef.current?.focus() } },
               { label: 'Attach files', Icon: Paperclip, action: () => fileInputRef.current?.click() },
               { label: 'Image analysis', Icon: ImagePlus, action: () => { setShowImageUpload(true) } },
             ].map(({ label, Icon, action }, i) => (
