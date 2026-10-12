@@ -52,6 +52,7 @@ than a design choice.
 | `logging_setup.py` | Daily-rotating JSONL operational log, attached to the `agent8088` logger tree |
 | `testing_support.py` | Shared test/verification helpers |
 | `completion.py` | Completion checks: unfinished-work wording, required files, multi-part requests, the continuation budget |
+| `app_check.py` | Smoke test behind `check_app`: headless-browser page check, script syntax check |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |
@@ -115,11 +116,15 @@ says to *continue*, never to give a final answer:
    cue in its sentence is a verb like write/create/save, so an input file is not
    one), and files this run wrote that the reply names, must exist and be
    non-empty.
-3. **Multi-part requests.** A numbered or bulleted list, or explicit "and also /
+3. **Smoke test.** The pages and scripts the run wrote are checked once per state
+   of the work with [`check_app`](04-tools.md#check_app) (Chromium for pages, a
+   syntax check for scripts). `report` mode shows the result in the answer's notes;
+   `enforce` mode sends a failure back to fix, up to twice a request.
+4. **Multi-part requests.** A numbered or bulleted list, or explicit "and also /
    then" clauses (two or more), becomes a checklist in the task state. Parts whose
    key words neither the reply nor the written file names mention are listed.
    A single-paragraph request builds no checklist.
-4. **Verification.** Changed work with no passing check gets "Continue, and also
+5. **Verification.** Changed work with no passing check gets "Continue, and also
    run what you changed". The tests reminder fires only when the project already
    has a test suite and the changed file is library code: not a scratch dir, the
    system temp dir, or an entry-point or one-off script (scrapers, downloaders).
