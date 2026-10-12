@@ -847,11 +847,33 @@ def _sandbox_runtime_version(config: dict) -> str:
 
 
 SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
-SANDBOX_ALLOWED_DOMAINS = [
-    value.strip()
-    for value in APP_CONFIG.get("sandbox_allowed_domains", "").split(",")
-    if value.strip()
-]
+# Hosts a typical coding task installs from or reads docs on. The sandbox
+# network stays closed unless config.txt sets sandbox_allowed_domains; the word
+# `default` there expands to this list, so `sandbox_allowed_domains=default`
+# lets `npm install`, `pip install` and `git clone` work inside the sandbox.
+_DEFAULT_SANDBOX_ALLOWED_DOMAINS = (
+    "pypi.org", "files.pythonhosted.org", "bootstrap.pypa.io",
+    "registry.npmjs.org", "registry.yarnpkg.com", "nodejs.org",
+    "github.com", "*.github.com", "*.githubusercontent.com", "gitlab.com", "bitbucket.org",
+    "crates.io", "static.crates.io", "index.crates.io", "proxy.golang.org", "sum.golang.org",
+    "repo.maven.apache.org", "rubygems.org", "conda.anaconda.org", "repo.anaconda.com",
+    "cdn.jsdelivr.net", "unpkg.com", "huggingface.co", "*.huggingface.co", "*.hf.co",
+    "docs.python.org", "developer.mozilla.org", "*.readthedocs.io", "docs.rs",
+)
+
+
+def _sandbox_allowed_domains(config: dict) -> list:
+    domains = []
+    for value in str(config.get("sandbox_allowed_domains") or "").split(","):
+        value = value.strip()
+        if value.lower() == "default":
+            domains.extend(_DEFAULT_SANDBOX_ALLOWED_DOMAINS)
+        elif value and value.lower() != "none":
+            domains.append(value)
+    return list(dict.fromkeys(domains))
+
+
+SANDBOX_ALLOWED_DOMAINS = _sandbox_allowed_domains(APP_CONFIG)
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
@@ -5441,6 +5463,7 @@ _SANDBOX_NETWORK_FAILURE_RE = re.compile(
     r"|name or service not known|nodename nor servname|getaddrinfo (?:failed|ENOTFOUND|EAI_AGAIN)"
     r"|network is unreachable|failed to establish a new connection"
     r"|tunnel connection failed|CONNECT tunnel failed"
+    r"|tunneling socket could not be established|not in sandbox_allowed_domains"
     # Windows: DNS (curl.exe, PowerShell) and the sandbox firewall (WinError 10013).
     r"|no such host is known|remote name could not be resolved"
     r"|forbidden by its access permissions",
@@ -5571,28 +5594,34 @@ def _timeout_note(result: str) -> str:
 def _sandbox_network_note(result: str, source: str) -> str:
     """The note to append when sandboxed code keeps hitting the closed network.
 
-    The sandbox reaches only the hosts in sandbox_allowed_domains (none by
-    default; none at all on the Docker fallback), and nothing in a failed fetch
-    says so. Counted like every other config blocker.
+    The sandbox reaches only the hosts in sandbox_allowed_domains (none unless
+    config.txt sets it), and nothing in a failed fetch says so. Counted like every other config blocker. The Windows sandbox filters no
+    network at all, so a failure there is not the sandbox and gets no note.
     """
     if not _SANDBOX_NETWORK_FAILURE_RE.search(result or ""):
+        return ""
+    backend = _resolve_sandbox_backend()
+    if backend == "native" and sys.platform == "win32":
         return ""
     if not _count_blocker("sandbox_network"):
         return ""
     hosts = sorted({urllib.parse.urlsplit(url).hostname or ""
                     for url in _SHELL_HTTP_URL.findall(source or "")} - {""})
     needed = ", ".join(hosts) or "the host this task needs"
-    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "none"
-    if _resolve_sandbox_backend() == "docker":
-        setting = ("Commands are running in the Docker fallback, which has no network "
-                   "at all, because the native sandbox is not set up. The user can "
-                   "set it up with `agent8088 --sandbox-setup` (on Linux it needs "
-                   "bubblewrap, socat and ripgrep), then add "
-                   f"`sandbox_allowed_domains={needed}` to {_config_file()}.")
+    allowed = ", ".join(SANDBOX_ALLOWED_DOMAINS[:6]) or "none"
+    if len(SANDBOX_ALLOWED_DOMAINS) > 6:
+        allowed += f" and {len(SANDBOX_ALLOWED_DOMAINS) - 6} more"
+    add = (f"add {needed} to `sandbox_allowed_domains` in {_config_file()} (the word "
+           "`default` in that list adds the common package registries and code hosts)")
+    if backend == "docker" and _docker_network_closed():
+        setting = ("Commands are running in the Docker fallback with no network "
+                   "(`docker_network=none`, or its allowlist proxy could not start). "
+                   "The user can set up the native sandbox with `agent8088 "
+                   "--sandbox-setup`, or set `docker_network=allowlist` and "
+                   f"{add}.")
     else:
         setting = (f"Sandboxed commands reach only the hosts in `sandbox_allowed_domains` "
-                   f"in {_config_file()} (currently: {allowed}). The user can add "
-                   f"`sandbox_allowed_domains={needed}` there and restart Agent8088.")
+                   f"(currently: {allowed}). The user can {add}, then restart Agent8088.")
     return (f"\n{_HARNESS_PREFIX}The sandbox has blocked network access "
             f"{CONFIG_BLOCKER_NOTE_AFTER} times this turn. This is a setting, not a "
             f"problem to work around. {setting} Only the user can change config.txt. "
@@ -8768,7 +8797,14 @@ def _exec_browser(args: dict) -> str:
 # ---------------------------------------------------------------------------
 DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
 GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
-DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none")
+# docker_network=none (the default) gives the container no network.
+# `allowlist` puts it on an --internal network whose only way out is a proxy
+# container enforcing sandbox_allowed_domains, the list the native runtime
+# enforces. Any other value is passed to `docker run --network` unfiltered.
+DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none").strip() or "none"
+_EGRESS_PROXY_IMAGE = "python:3.11-slim"
+_EGRESS_PROXY_PORT = 3128
+_docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
 # Native availability has two stages: binaries on PATH, then one real no-op
@@ -9015,7 +9051,7 @@ def sandbox_status() -> dict:
     resolved = _resolve_sandbox_backend()
     detail = {
         "native": "OS-native isolation via sandbox-runtime",
-        "docker": "Docker fallback with no network and capped resources",
+        "docker": "Docker fallback with capped resources",
         "unavailable": "native runtime and Docker are unavailable",
     }[resolved]
     missing = _native_sandbox_missing_requirements()
@@ -9061,7 +9097,7 @@ def sandbox_status() -> dict:
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
-        "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
+        "network": _sandbox_network_summary(resolved),
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
         "failure": (failure or "")[:300],
@@ -9434,10 +9470,44 @@ def verify_sandbox_backend() -> dict:
     return status
 
 
-SANDBOX_DOCKER_IMPACT = ("commands run in a container with no network; "
-                         "installs/downloads will fail")
-SANDBOX_DOCKER_NOTE = ("[note: this ran in the Docker sandbox — no network and a different "
-                       "image than the host; pip/npm installs and downloads fail here]")
+def _docker_network_closed() -> bool:
+    """True when Docker sandbox containers get no network at all."""
+    if DOCKER_NETWORK == "none":
+        return True
+    if DOCKER_NETWORK != "allowlist":
+        return False
+    return not SANDBOX_ALLOWED_DOMAINS or ("none", []) in _docker_egress.values()
+
+
+def _sandbox_network_summary(backend: str) -> str:
+    """What sandboxed commands can reach on `backend`, for /sandbox and notes."""
+    if backend == "native" and sys.platform == "win32":
+        # The DSH Windows backend confines writes only; it has no network policy.
+        return "not restricted (the Windows sandbox limits file writes only)"
+    if backend == "docker" and DOCKER_NETWORK not in ("allowlist", "none"):
+        return f"Docker network {DOCKER_NETWORK!r} (not filtered)"
+    if backend == "docker" and _docker_network_closed():
+        return "blocked"
+    return ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked"
+
+
+def _sandbox_docker_impact() -> str:
+    if _docker_network_closed():
+        return "commands run in a container with no network; installs/downloads will fail"
+    return "commands run in a container; network is limited to sandbox_allowed_domains"
+
+
+def _sandbox_docker_note() -> str:
+    # The container sees only artifacts/, mounted at /workspace: say so, or the
+    # model retypes the host path it was given and its first command fails.
+    where = f"/workspace here is {ARTIFACTS_ROOT} on the host and the only folder visible"
+    if _docker_network_closed():
+        net = "no network, so pip/npm installs and downloads fail here"
+    elif DOCKER_NETWORK == "allowlist":
+        net = "network limited to sandbox_allowed_domains"
+    else:
+        net = f"Docker network {DOCKER_NETWORK!r}"
+    return f"[note: this ran in the Docker sandbox — {where}; {net}]"
 
 
 def _report_sandbox(status: dict | None = None) -> None:
@@ -9462,9 +9532,9 @@ def _report_sandbox(status: dict | None = None) -> None:
                 capabilities.SANDBOX, active="docker",
                 preferred="docker" if by_choice else "native",
                 state=capabilities.OK if by_choice else capabilities.DEGRADED,
-                reason=reason, impact=SANDBOX_DOCKER_IMPACT,
+                reason=reason, impact=_sandbox_docker_impact(),
                 fix="" if by_choice else "/sandbox setup (installs the native runtime)",
-                model_note=SANDBOX_DOCKER_NOTE)
+                model_note=_sandbox_docker_note())
         else:
             capabilities.report(
                 capabilities.SANDBOX, active="", preferred="native",
@@ -9476,12 +9546,26 @@ def _report_sandbox(status: dict | None = None) -> None:
         _log.debug("sandbox capability report failed", exc_info=True)
 
 
+def _docker_shell_path_hint(target) -> str:
+    """Where a shell command finds a file just written, when commands run in
+    Docker: only artifacts/ is mounted there, at /workspace."""
+    entry = capabilities.get(capabilities.SANDBOX)
+    if entry is None or entry.active != "docker":
+        return ""
+    try:
+        relative = Path(target).resolve().relative_to(ARTIFACTS_ROOT)
+    except ValueError:
+        return (" (shell commands run in Docker and cannot see this file: only "
+                f"{ARTIFACTS_ROOT} is mounted there, at /workspace)")
+    return f" (shell commands see it as /workspace/{relative.as_posix()})"
+
+
 def _sandbox_model_note() -> str:
     """The Docker caveat for a sandboxed command's result, or "". Reads the
     registry only (no `docker info` per command)."""
     entry = capabilities.get(capabilities.SANDBOX)
     if entry is not None and entry.active == "docker":
-        return entry.model_note or SANDBOX_DOCKER_NOTE
+        return _sandbox_docker_note()  # live: the egress proxy may have failed since
     return ""
 
 
@@ -9651,8 +9735,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     command = _to_container_path(command, workspace_path)
     container_command = (["python", "-c", command] if python_code else
                          (["-lc", command] if git_image else ["sh", "-lc", command]))
+    network, network_args = _docker_egress_args()
     argv = [
-        "docker", "run", "--rm", "--name", container_name, "--network", DOCKER_NETWORK,
+        "docker", "run", "--rm", "--name", container_name, "--network", network,
+        *network_args,
         "--memory", "512m", "--cpus", "1", "--pids-limit", "256",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--mount", (f"type=bind,src={workspace},dst=/workspace"
@@ -9696,6 +9782,62 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         _mark_docker_sandbox_broken(result)
         return _docker_unavailable_error()
     return result
+
+
+def _docker_egress_args() -> tuple:
+    """The --network value and proxy environment for a sandbox container."""
+    if DOCKER_NETWORK != "allowlist":
+        return DOCKER_NETWORK, []
+    if not SANDBOX_ALLOWED_DOMAINS:
+        return "none", []
+    key = hashlib.sha256(",".join(sorted(SANDBOX_ALLOWED_DOMAINS)).encode()).hexdigest()[:10]
+    if key not in _docker_egress:
+        _docker_egress[key] = _start_docker_egress(key)
+    return _docker_egress[key]
+
+
+def _start_docker_egress(key: str) -> tuple:
+    """Create the internal network and its allowlist proxy, or fail closed.
+
+    Both are named after the allowlist and left running for the next session,
+    so a changed list gets its own pair. Any failure gives the container no
+    network at all and is logged once; it is never retried in this process.
+    """
+    network, proxy = f"agent8088-egress-{key}", f"agent8088-egress-proxy-{key}"
+
+    def docker(*args):
+        return subprocess.run(["docker", *args], capture_output=True, text=True,
+                              timeout=60)
+
+    try:
+        if docker("network", "inspect", network).returncode != 0:
+            made = docker("network", "create", "--internal", network)
+            if made.returncode != 0 and "already exists" not in made.stderr:
+                raise RuntimeError(made.stderr.strip() or "network create failed")
+        if docker("inspect", "-f", "{{.State.Running}}", proxy).stdout.strip() != "true":
+            docker("rm", "-f", proxy)
+            unavailable = _ensure_docker_image(_EGRESS_PROXY_IMAGE)
+            if unavailable:
+                raise RuntimeError(unavailable)
+            source = Path(__file__).with_name("egress_proxy.py").read_text(encoding="utf-8")
+            started = docker(
+                "run", "-d", "--name", proxy, "--network", "bridge",
+                "--memory", "128m", "--cpus", "0.5", "--pids-limit", "128",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--entrypoint", "python", _EGRESS_PROXY_IMAGE, "-u", "-B", "-c", source,
+                str(_EGRESS_PROXY_PORT), *SANDBOX_ALLOWED_DOMAINS)
+            if started.returncode != 0:
+                raise RuntimeError(started.stderr.strip() or "proxy did not start")
+        joined = docker("network", "connect", network, proxy)
+        if joined.returncode != 0 and "already exists" not in joined.stderr:
+            raise RuntimeError(joined.stderr.strip() or "network connect failed")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        _log.warning("Docker sandbox egress proxy unavailable, so no network: %s", exc)
+        return "none", []
+    url = f"http://{proxy}:{_EGRESS_PROXY_PORT}"
+    env = [f"{name}={url}" for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")]
+    env += ["NO_PROXY=localhost,127.0.0.1", "no_proxy=localhost,127.0.0.1"]
+    return network, [arg for item in env for arg in ("-e", item)]
 
 
 def _sandbox_required_error() -> str:
@@ -11710,7 +11852,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(fetched)
             _last_write_diff = None  # binary output -- a text diff would be noise
-            result = f"Wrote {len(fetched)} bytes to {target} (fetched from {source_url})"
+            result = (f"Wrote {len(fetched)} bytes to {target} (fetched from {source_url})"
+                      + _docker_shell_path_hint(target))
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
@@ -11803,7 +11946,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         else:
             target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
-        result = f"Wrote {len(content)} bytes to {target}"
+        result = f"Wrote {len(content)} bytes to {target}" + _docker_shell_path_hint(target)
         if shadowed is not None:
             result += (f" — NOT {shadowed}. A bare filename is stored in "
                        f"artifacts/; pass that absolute path if you meant to "

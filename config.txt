@@ -181,7 +181,14 @@ browser_hitl=1
 # If neither is available, shell and code execution are refused.
 sandbox_backend=native
 sandbox_runtime_version=0.0.73
-# sandbox_allowed_domains=api.example.com
+# Hosts sandboxed commands may reach. Unset or `none`: no network. The word
+# `default` adds the common package registries, code hosts and docs sites
+# (PyPI, npm, GitHub, crates.io, ...), so npm/pip installs and git clone work:
+# sandbox_allowed_domains=default,api.example.com
+# The Windows sandbox confines file writes only and does not filter the network.
+# Docker fallback network: `none` (default), `allowlist` (only the hosts above,
+# through a small proxy container), or a Docker network name (unfiltered).
+# docker_network=none
 # Seconds allowed for pulling a missing container image. This is deliberately
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.

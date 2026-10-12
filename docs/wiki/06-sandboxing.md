@@ -41,10 +41,11 @@ container images, low overhead.
 |---|---|
 | macOS | Node.js 20.11+, `ripgrep` |
 | Linux | Node.js 20.11+, `bubblewrap`, `socat`, `ripgrep` |
-| Windows | Node.js 20.11+, one UAC prompt to create a restricted sandbox account |
+| Windows | Node.js 20.11+ — no admin prompt |
 
-The Windows prompt provisions a low-privilege local account that sandboxed
-commands run as — that's why it's a one-time elevation.
+On Windows the sandbox restricts file writes (a restricted token plus NTFS
+ACLs on the current account); it does not filter the network, and `/sandbox`
+says so.
 
 ## Docker fallback
 
@@ -56,7 +57,11 @@ docker_network=none
 ```
 
 `docker_network=none` is the safer default — no network from inside the
-container at all.
+container at all. `docker_network=allowlist` gives the container the same
+allowlist the native runtime enforces: it joins an internal Docker network
+whose only way out is a small proxy container (`agent8088-egress-proxy-*`,
+left running between sessions) that allows only `sandbox_allowed_domains`.
+If the proxy cannot start, the container gets no network.
 
 Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that
@@ -70,6 +75,11 @@ Sandboxed commands have no network unless you allow specific domains:
 ```ini
 sandbox_allowed_domains=api.example.com,pypi.org
 ```
+
+`default` in the list adds the common package registries, code hosts and docs
+sites (PyPI, npm, GitHub, crates.io, Go proxy, Maven Central, RubyGems, conda,
+Hugging Face, ...), so `sandbox_allowed_domains=default` is enough for most
+`npm install` / `pip install` / `git clone` tasks.
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP
