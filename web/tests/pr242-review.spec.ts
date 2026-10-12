@@ -38,7 +38,7 @@ test('plan card stays available if the approval could not be delivered', async (
   await page.evaluate(() => { (window as any).__socket.readyState = 3 })
   await page.getByRole('button', { name: 'Run in full-auto' }).click()
   await expect(page.getByText('Plan Proposal', { exact: true })).toBeVisible()
-  await expect(page.getByRole('alert')).toContainText('Approval could not be sent')
+  await expect(page.getByRole('alert').filter({ hasText: 'Approval could not be sent' })).toBeVisible()
   await page.getByRole('button', { name: 'Run in full-auto' }).click()
   await expect(page.getByText('Plan Proposal', { exact: true })).toHaveCount(0)
   expect(await page.evaluate(() => (window as any).__sent)).toEqual({
