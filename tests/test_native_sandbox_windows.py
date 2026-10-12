@@ -6,8 +6,16 @@ rather than requiring actual Windows hardware - the Win32 API behavior itself
 `.claude/plans/2026-08-19_154753-windows-acl-native-sandbox.md` Task 10.
 """
 import base64
+import pytest
 
 from agent8088 import engine
+
+
+@pytest.fixture(autouse=True)
+def supported_node_probe(monkeypatch):
+    # These argv/ACL tests use fake executable paths, not an installed Node.
+    monkeypatch.setattr(engine.subprocess, "run", lambda *a, **kw: type(
+        "Result", (), {"stdout": "v22.11.0", "returncode": 0})())
 
 
 def test_windows_shell_command_uses_argv_safe_bridge(monkeypatch):
