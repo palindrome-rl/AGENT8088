@@ -53,7 +53,8 @@ def chat(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "S", fresh)
     monkeypatch.setattr(web_server, "_validated_attachments", lambda *a, **k: [])
     saves = []
-    monkeypatch.setattr(cli, "_save_active_session", lambda: saves.append(1))
+    # The turn saves its own Session (not whichever chat is viewed).
+    monkeypatch.setattr(web_server, "_save_session", lambda C, S: saves.append(1))
 
     def run(body, ws=None, text="hello"):
         engine = _Engine(tmp_path, body)
