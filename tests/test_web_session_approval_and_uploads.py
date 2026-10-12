@@ -56,16 +56,16 @@ class _Cli:
         self.S = _Session()
         self._session_system_prompt = "sys"
 
-    def _turn_max_turns(self, mode):
+    def _turn_max_turns(self, mode, session=None):
         return 25
 
-    def _estimate_context_pct(self):
+    def _estimate_context_pct(self, session=None):
         return 0
 
     def _save_active_session(self):
         pass
 
-    def _active_tool_specs(self):
+    def _active_tool_specs(self, session=None):
         return {}
 
 
@@ -195,7 +195,7 @@ def test_new_and_resumed_sessions_start_with_no_session_approvals(monkeypatch, t
     session_file = tmp_path / "saved.json"
     session_file.write_text(json.dumps({"messages": []}), encoding="utf-8")
     cli = SimpleNamespace(
-        S=SimpleNamespace(max_turns=50), _save_active_session=lambda: None,
+        S=SimpleNamespace(max_turns=50, name=""), _save_active_session=lambda: None,
         _session_name=lambda name: name, _session_path=lambda name: tmp_path / f"{name}.json")
     monkeypatch.setattr(web, "_cl", lambda: cli)
 
@@ -212,7 +212,7 @@ def test_resume_replaces_unknown_display_settings_with_defaults(monkeypatch, tmp
     (tmp_path / "odd.json").write_text(
         json.dumps({"messages": [], "verbose": "loud", "usage_mode": "all"}), encoding="utf-8")
     cli = SimpleNamespace(
-        S=SimpleNamespace(max_turns=50), _save_active_session=lambda: None,
+        S=SimpleNamespace(max_turns=50, name=""), _save_active_session=lambda: None,
         _session_name=lambda name: name, _session_path=lambda name: tmp_path / f"{name}.json")
     monkeypatch.setattr(web, "_cl", lambda: cli)
 

@@ -1160,7 +1160,7 @@ def _blank_session(C, name: str = ""):
     S.trace_path = ""
     S.last_usage = None
     S.live_turn = None
-    S.disabled_skills = set(C.S.disabled_skills)
+    S.disabled_skills = set(getattr(C.S, "disabled_skills", ()))
     S.name = name
     S.id = uuid.uuid4().hex
     return S

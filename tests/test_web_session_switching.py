@@ -42,7 +42,7 @@ class _Engine:
     def current_rate_limit_status(self, provider):
         return None
 
-    def grant_escalation(self):
+    def grant_escalation(self, *args):
         self.granted += 1
 
 
@@ -150,7 +150,8 @@ def test_approval_identifies_its_chat_and_can_be_answered_after_switching_back(e
     verdicts = []
 
     def body(messages, kwargs, engine):
-        verdicts.append(kwargs["on_escalation"]("write_file", "write report.md"))
+        verdicts.append(kwargs["on_escalation"](
+            "write_file", "ESCALATION_REQUEST\x1fworkspace-write\x1fwrite\x1freport.md\x1fwrite report.md"))
         return "ok"
 
     thread, ws, engine = _start(env, body)
