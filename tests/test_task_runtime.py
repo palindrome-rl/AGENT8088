@@ -45,6 +45,29 @@ def test_cancelled_task_does_not_resume(tmp_path):
     assert row["state"] == "cancelled"
 
 
+def test_running_legacy_checkpoint_without_worker_pid_can_resume(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    try:
+        task_id = store.create("legacy task", tmp_path, [{"role": "user", "content": "resume"}])
+        store.update(task_id, state="running")
+        operation = store.start_operation(task_id, "write_file", {"filename": "report.txt"})
+        # Reopen an actual pre-worker-ownership schema, exercising migration.
+        store.db.execute("ALTER TABLE tasks DROP COLUMN worker_pid")
+        store.db.commit()
+        store.close()
+        store = TaskStore(tmp_path / "tasks.db")
+        calls = []
+        row = run_task("legacy task", lambda *a, **k: calls.append(1) or "TASK_COMPLETE",
+                       store=store, workspace=tmp_path, task_id=task_id)
+        assert calls == [1]
+        assert row["state"] == "completed"
+        assert row["worker_pid"] == 0
+        assert next(op for op in store.recent_operations(task_id)
+                    if op["id"] == operation)["state"] == "unknown"
+    finally:
+        store.close()
+
+
 def test_end_during_worker_keeps_task_until_final_checkpoint(tmp_path):
     store = TaskStore(tmp_path / "tasks.db")
     task_id = store.create("review", tmp_path, [{"role": "user", "content": "review"}])
