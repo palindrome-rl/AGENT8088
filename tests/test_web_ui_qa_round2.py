@@ -40,7 +40,7 @@ def test_nested_paths_use_forward_slashes(monkeypatch, tmp_path):
 def test_resume_clears_the_previous_sessions_last_turn(monkeypatch, tmp_path):
     (tmp_path / "saved.json").write_text(json.dumps({"messages": []}), encoding="utf-8")
     fake = SimpleNamespace(
-        S=SimpleNamespace(max_turns=50, last_usage={"seconds": 85.6, "tokens": 615}),
+        S=SimpleNamespace(max_turns=50, name="", last_usage={"seconds": 85.6, "tokens": 615}),
         _save_active_session=lambda: None,
         _session_name=lambda name: name, _session_path=lambda name: tmp_path / f"{name}.json")
     monkeypatch.setattr(web, "_cl", lambda: fake)

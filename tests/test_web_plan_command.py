@@ -92,16 +92,16 @@ class _PlanCli:
         self.S = _PlanSession()
         self._session_system_prompt = "sys"
 
-    def _turn_max_turns(self, mode):
+    def _turn_max_turns(self, mode, session=None):
         return 25
 
-    def _estimate_context_pct(self):
+    def _estimate_context_pct(self, session=None):
         return 0
 
     def _save_active_session(self):
         pass
 
-    def _active_tool_specs(self):
+    def _active_tool_specs(self, session=None):
         return {}
 
 
