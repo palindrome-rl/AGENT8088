@@ -3770,7 +3770,7 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
 
     A catalog changes rarely; embed all of it once rather than making every user
     turn pay for 48 tool descriptions. The existing embedder has its own circuit
-    breaker, so a missing embedding model degrades to full tool exposure.
+    breaker, so a missing embedding model degrades to keyword-only ranking.
     """
     entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
                for name in sorted(names) if name in TOOL_SPECS]
@@ -3879,14 +3879,46 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+_TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
+
+
+def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
+                            allowed: set[str], reason: str,
+                            semantic: list[int] | None = None) -> set[str]:
+    """Narrow the schema set without the embedding leg.
+
+    Used whenever hybrid ranking cannot run or its two rankers disagree. The old
+    behaviour was to offer the full catalog, which on a small model costs tens of
+    thousands of prompt tokens and offers many wrong tools, so the feature
+    failed silently in exactly the situation (no embedder) it was added for.
+    BM25 alone, plus the always-on and pinned tools, is the fallback; when a
+    semantic ranking exists but shares nothing with BM25 the union of both top
+    lists is used instead.
+    """
+    if reason not in _TOOL_SELECTION_FALLBACK_LOGGED:
+        _TOOL_SELECTION_FALLBACK_LOGGED.add(reason)
+        _log.info("tool selection: %s; ranking by keyword match instead of offering "
+                  "the full tool catalog", reason)
+    top_k = TOOL_SELECTION_TOP_K
+    ranked = _bm25_tool_ranking(query, texts)[:top_k]
+    if semantic:
+        ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
+    picked = {names[index] for index in ranked}
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    return _apply_tool_intent_guards(query, selected, set(allowed))
+
+
 def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
                                   provider: str = "", model: str = "") -> set[str]:
-    """Choose direct schemas before the model sees a request, or fail open.
+    """Choose direct schemas before the model sees a request.
 
     This is deliberately not a chat-model router. BM25 handles literal tool
     language and the existing embedding endpoint handles paraphrases; RRF keeps
-    either signal from dominating. If the semantic leg is unavailable or the two
-    rankers have no shared candidate, retain the old full catalog.
+    either signal from dominating. If the semantic leg is unavailable, BM25 alone
+    chooses the schemas; if the two rankers have no shared candidate, the union
+    of both top lists is offered. The full catalog is only offered when
+    selection is off ("full" mode, an unmeasured model in "auto" mode, or a
+    catalog no larger than the top-k).
     """
     selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
     if selected_mode == "auto":
@@ -3896,21 +3928,23 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         return set(allowed)
     names, texts, vectors = _tool_selection_index(set(allowed))
     if len(vectors) != len(names):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "no embedder available")
     try:
         active_embedder = memory.embedder()
         query_vector = active_embedder.embed_one(query) if active_embedder else []
     except Exception as exc:  # noqa: BLE001 - optional performance path
         _log.debug("tool selection query embedding unavailable: %s", exc)
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     if not query_vector:
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
     semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed,
+                                       "the keyword and semantic rankings share no candidate",
+                                       semantic=semantic)
     scores = Counter()
     for ranking in (lexical, semantic):
         for position, index in enumerate(ranking, 1):
@@ -12517,6 +12551,20 @@ def strip_tool_json(text: str) -> str:
     return text.strip()
 
 
+def _unknown_tool_call_instruction(native_tools: bool) -> str:
+    """How the unknown-tool correction tells the model to retry.
+
+    A model on a native tool-calling backend sees its tools as schemas, not as
+    text. Teaching it the text-marker syntax in the correction invites it to
+    write ✿FUNCTION✿ lines into its reply, which the marker salvage then has to
+    recover. Name the format the model is actually using.
+    """
+    if native_tools:
+        return "Either call one of those through the tool-calling interface, using its schema"
+    return ("Either call one of those with the exact format "
+            '`✿FUNCTION✿: name ✿ARGS✿: {"arg": "value"}`')
+
+
 def _attempted_tool_names(text: str) -> list:
     """Tool names the model *tried* to call, valid or not — used for error handling
     when find_tool_calls() finds nothing runnable (e.g. a hallucinated tool)."""
@@ -16547,9 +16595,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                      if gated else
                      f"Error: the tool '{name}' does not exist. ") +
                     f"Available tools are: {available}. "
-                    "Either call one of those with the exact format "
-                    '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
-                    "or, if no tool fits, answer the user directly in plain text "
+                    + _unknown_tool_call_instruction(_native_tools_enabled(
+                        round_tools_def, loop_provider or "")) +
+                    ", or, if no tool fits, answer the user directly in plain text "
                     "without mentioning tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
