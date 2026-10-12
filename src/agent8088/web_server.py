@@ -8,6 +8,7 @@ the same run_agent(), run_tool(), and cmd_* functions the CLI uses.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -96,6 +97,8 @@ def _cl():
     if _cli is None:
         from agent8088 import cli as _c
         _cli = _c
+        # Session files this process creates through cli helpers say "web".
+        _cli.S.source = "web"
     return _cli
 
 
@@ -319,9 +322,15 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _serialize_session_changes(request: Request, call_next):
-    """Keep session switching and compaction outside running chat/command turns."""
+    """Keep session switching and compaction outside running commands.
+
+    A running chat turn is bound to its own Session object, so switching chats
+    no longer touches it: the session endpoints then refuse only what would
+    change the running chat (or run a second model call)."""
     if (request.url.path.startswith("/api/sessions/")
             and request.method in {"POST", "PATCH", "DELETE"}):
+        if _running:
+            return await call_next(request)
         if not _TURN_LOCK.acquire(blocking=False):
             return _error(ANOTHER_TURN_RUNNING, 409)
         try:
@@ -406,6 +415,10 @@ async def get_status():
         "context_pct": C._estimate_context_pct(),
         "permission_mode": A.PERMISSION_MODE,
         "session_name": S.name or "",
+        "session_id": _sid(S),
+        # The chat that owns the running task, which may not be the one shown.
+        "running_session": ({"id": _running["id"], "name": _running["session"].name}
+                            if _running else None),
         "last_usage": S.last_usage,
         "rate_limit_status": A.current_rate_limit_status(C._active_provider_name()),
         "verbose": S.verbose,
@@ -1053,6 +1066,146 @@ async def get_review(review_id: str):
     return payload
 
 
+# --- Viewed chat vs running chat ------------------------------------------
+# C.S is the chat being viewed and may be replaced by another Session object at
+# any time (New chat, Resume). A chat turn binds the Session it started on and
+# writes messages, traces and saves only to that object, so switching chats
+# mid-turn never moves its output. One turn at a time (_TURN_LOCK).
+_running: dict = {}          # {"session": Session, "id": str} while a chat turn runs
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
+RUNNING_SESSION_BUSY = ("“{name}” is running a task. Stop it or wait for it to finish, "
+                        "then try again.")
+
+
+def _save_session_file(path, data: dict) -> None:
+    """Use the CLI's atomic writer, including private-file permissions."""
+    from .cli import save_session_file
+    save_session_file(Path(path), data)
+
+
+def _read_session_file(path) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _file_session_id(data: dict) -> str:
+    sid = data.get("id")
+    return sid if isinstance(sid, str) and _SESSION_ID_RE.fullmatch(sid) else ""
+
+
+def _sid(S) -> str:
+    """The Session's stable id, assigned on first use (old files have none)."""
+    sid = getattr(S, "id", "")
+    if not sid:
+        sid = S.id = uuid.uuid4().hex
+    return sid
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _save_session(C, S) -> None:
+    """cli._save_active_session for any Session, not only the viewed one.
+    The file's id/source/created_at win over memory; unnamed drafts stay unsaved."""
+    if not S.name:
+        return
+    path = C._session_path(S.name)
+    previous = _read_session_file(path)
+    S.id = _file_session_id(previous) or _sid(S)
+    _save_session_file(path, {
+        "version": 2,
+        "id": S.id,
+        "source": previous.get("source") or "web",
+        "model": f"{C._active_provider_name()}:{C.A.MODEL_NAME}",
+        "created_at": previous.get("created_at") or _now_iso(),
+        "updated_at": _now_iso(),
+        "name": S.name,
+        "messages": S.messages,
+        "trajectory_state": S.trajectory_state,
+        "temperature": S.temperature,
+        "max_turns": S.max_turns,
+        "show_trace": S.show_trace,
+        "show_reasoning": S.show_reasoning,
+        "disabled_skills": sorted(S.disabled_skills),
+        "verbose": S.verbose,
+        "usage_mode": S.usage_mode,
+        "last_trace": S.last_trace,
+        "conversation_trace": S.conversation_trace,
+        "trace_path": S.trace_path,
+    })
+
+
+def _blank_session(C, name: str = ""):
+    """A new Session object with the viewed chat's preferences and no history."""
+    S = copy.copy(C.S)
+    S.messages = []
+    S.trajectory_state = {}
+    S.last_trace = None
+    S.conversation_trace = []
+    S.trace_path = ""
+    S.last_usage = None
+    S.live_turn = None
+    S.disabled_skills = set(getattr(C.S, "disabled_skills", ()))
+    S.name = name
+    S.id = uuid.uuid4().hex
+    return S
+
+
+def _load_session(C, name: str, data: dict):
+    """A Session object for a saved file; the viewed chat is not touched."""
+    S = _blank_session(C, name)
+    messages = data.get("messages", [])
+    S.messages = list(messages) if isinstance(messages, list) else []
+    state = data.get("trajectory_state", {})
+    S.trajectory_state = state if isinstance(state, dict) else {}
+    S.temperature = float(data.get("temperature", 0.1))
+    # Same as the CLI's loader: keep the live value when the file predates
+    # the setting, rather than resetting it to a literal.
+    S.max_turns = int(data.get("max_turns", S.max_turns))
+    S.show_trace = bool(data.get("show_trace", False))
+    S.show_reasoning = bool(data.get("show_reasoning", False))
+    S.disabled_skills = set(data.get("disabled_skills", []))
+    # Validated as the CLI's loader does: an unknown value left no option
+    # selected in the Preferences form.
+    S.verbose = data.get("verbose", "on") if data.get("verbose") in {"on", "off", "full"} else "on"
+    S.usage_mode = (data.get("usage_mode", "tokens")
+                    if data.get("usage_mode") in {"off", "tokens", "full"} else "tokens")
+    S.last_trace = data.get("last_trace")
+    trace = data.get("conversation_trace", [])
+    S.conversation_trace = trace if isinstance(trace, list) else []
+    S.trace_path = str(data.get("trace_path") or "")
+    S.id = _file_session_id(data) or S.id
+    return S
+
+
+def _owns_running_turn(name: str) -> bool:
+    return bool(_running) and bool(name) and _running["session"].name == name
+
+
+def _save_outgoing_view(C) -> None:
+    """Save the viewed chat before switching away, unless the running turn
+    owns it (that turn saves it itself)."""
+    if C.S is not _running.get("session"):
+        _save_session(C, C.S)
+
+
+def _turn_session(C, session_id):
+    """The Session a chat frame runs on: the viewed chat, or the saved chat with
+    that id (a prompt queued in one chat can be sent after the user moved on)."""
+    if not session_id or session_id == _sid(C.S):
+        return C.S
+    if C.SESSIONS_DIR.exists():
+        for path in C.SESSIONS_DIR.glob("*.json"):
+            data = _read_session_file(path)
+            if _file_session_id(data) == session_id:
+                return _load_session(C, path.stem, data)
+    return None
+
+
 @app.get("/api/sessions")
 async def list_sessions():
     """List all named sessions."""
@@ -1064,6 +1217,8 @@ async def list_sessions():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 sessions.append({
+                    "id": _file_session_id(data) or None,
+                    "running": _owns_running_turn(path.stem),
                     "name": path.stem,
                     "message_count": len(data.get("messages", [])),
                     "updated": time.strftime("%Y-%m-%d %H:%M",
@@ -1116,16 +1271,18 @@ async def rename_session(name: str, body: SessionRenameBody):
         return _error(f"session exists: {new_name} (use another name)", 409)
     if old_name == new_name:
         return {"ok": True, "name": new_name}
+    if _owns_running_turn(old_name):
+        return _error(RUNNING_SESSION_BUSY.format(name=old_name), 409)
     active = C.S.name == old_name
     try:
         old_path.rename(new_path)
         if active:
             C.S.name = new_name
-            C._save_active_session()
+            _save_session(C, C.S)
         else:
             data = json.loads(new_path.read_text(encoding="utf-8"))
             data["name"] = new_name
-            C._write_private_text(new_path, json.dumps(data, indent=2))
+            _save_session_file(new_path, data)
     except (OSError, json.JSONDecodeError) as exc:
         return _error(f"could not rename session: {exc}", 500)
     return {"ok": True, "name": new_name}
@@ -1141,40 +1298,32 @@ async def delete_session(name: str):
     path = C._session_path(safe_name)
     if not path.exists():
         return _error(f"session not found: {safe_name}", 404)
+    if _owns_running_turn(safe_name):
+        return _error(RUNNING_SESSION_BUSY.format(name=safe_name), 409)
     active = C.S.name == safe_name
     try:
         path.unlink()
     except OSError as exc:
         return _error(f"could not delete session: {exc}", 500)
     if active:
-        # Replace references, never clear in place: a turn running in another
-        # WebSocket still holds the old objects (run_agent captured them at
-        # turn start); in-place clear yanked the checklist out from under it
-        # and crashed after_tool with KeyError: 'checklist'.
-        C.S.messages = []
-        C.S.trajectory_state = {}
-        C.S.last_trace = None
-        C.S.conversation_trace = []
-        C.S.trace_path = ""
-        C.S.last_usage = None
-        C.S.name = ""
+        # A new object, never a clear in place (KeyError: 'checklist' when a
+        # turn still held the old one).
+        C.S = _blank_session(C)
     return {"ok": True, "name": safe_name, "active": active}
 
 @app.post("/api/sessions/new")
 async def new_session(body: SessionActionBody):
     """Create a named session, or start an unnamed draft when name is blank."""
     C = _cl()
+    # Allowed while a turn runs: the turn keeps its own Session object, and
+    # C.S becomes a new one (never cleared in place).
     if not body.name.strip():
-        C._save_active_session()
-        # Replace, not clear in place — a running turn in another WebSocket
-        # still holds these objects (KeyError: 'checklist' otherwise).
-        C.S.messages = []
-        C.S.trajectory_state = {}
-        C.S.last_trace = None
-        C.S.last_usage = None
-        C.S.name = ""
+        _save_outgoing_view(C)
+        C.S = _blank_session(C)
+        # ponytail: grants are one global list, so switching chats mid-run
+        # revokes the running chat's too (it re-asks); per-chat sets if that annoys.
         _session_allowlist.clear()
-        return {"ok": True, "name": ""}
+        return {"ok": True, "name": "", "id": C.S.id}
     try:
         safe_name = C._session_name(body.name)
     except ValueError as exc:
@@ -1182,15 +1331,13 @@ async def new_session(body: SessionActionBody):
     path = C._session_path(safe_name)
     if path.exists():
         return _error(f"session exists: {safe_name} (use /resume)", 409)
-    C._save_active_session()
-    C.S.messages = []
-    C.S.trajectory_state = {}
-    C.S.last_trace = None
-    C.S.last_usage = None
-    C.S.name = safe_name
-    C._save_active_session()
+    _save_outgoing_view(C)
+    C.S = _blank_session(C, safe_name)
+    _save_session(C, C.S)
+    # ponytail: grants are one global list, so switching chats mid-run
+    # revokes the running chat's too (it re-asks); per-chat sets if that annoys.
     _session_allowlist.clear()
-    return {"ok": True, "name": safe_name}
+    return {"ok": True, "name": safe_name, "id": C.S.id}
 
 
 @app.post("/api/sessions/resume")
@@ -1204,48 +1351,41 @@ async def resume_session(body: SessionActionBody):
     path = C._session_path(safe_name)
     if not path.exists():
         return _error(f"session not found: {safe_name}", 404)
+    if _owns_running_turn(safe_name):
+        # Back to the chat whose task is running: view its live Session.
+        _save_outgoing_view(C)
+        C.S = _running["session"]
+        return {"ok": True, "name": safe_name, "id": _running["id"],
+                "messages": len(C.S.messages), "running": True}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return _exc_error(exc)
-    C._save_active_session()
-    messages = data.get("messages", [])
-    # Replace, not mutate in place — a running turn in another WebSocket still
-    # holds the old objects (KeyError: 'checklist' / torn context otherwise).
-    C.S.messages = list(messages) if isinstance(messages, list) else []
-    C.S.trajectory_state = (data.get("trajectory_state", {})
-                            if isinstance(data.get("trajectory_state", {}), dict) else {})
-    C.S.name = safe_name
-    C.S.last_usage = None  # the previous session's last turn, not this one's
-    C.S.temperature = float(data.get("temperature", 0.1))
-    # Same as the CLI's loader: keep the live value when the file predates
-    # the setting, rather than resetting it to a literal.
-    C.S.max_turns = int(data.get("max_turns", C.S.max_turns))
-    C.S.show_trace = bool(data.get("show_trace", False))
-    C.S.show_reasoning = bool(data.get("show_reasoning", False))
-    C.S.disabled_skills = set(data.get("disabled_skills", []))
-    # Validated as the CLI's loader does: an unknown value left no option
-    # selected in the Preferences form.
-    C.S.verbose = data.get("verbose", "on") if data.get("verbose") in {"on", "off", "full"} else "on"
-    C.S.usage_mode = (data.get("usage_mode", "tokens")
-                      if data.get("usage_mode") in {"off", "tokens", "full"} else "tokens")
+    if not isinstance(data, dict):
+        return _error("could not load session: invalid session file", 400)
+    loaded = _load_session(C, safe_name, data)
     _session_allowlist.clear()
-    return {"ok": True, "name": safe_name, "messages": len(messages)}
+    _save_outgoing_view(C)
+    # A new object, never mutated in place: a running turn keeps its own.
+    C.S = loaded
+    return {"ok": True, "name": safe_name, "id": loaded.id, "messages": len(loaded.messages)}
 
 
 @app.post("/api/sessions/reset")
 async def reset_session():
     """Clear active session, retain name."""
     C = _cl()
-    # Replace, not clear in place — a running turn in another WebSocket still
-    # holds these objects (KeyError: 'checklist' otherwise).
-    C.S.messages = []
-    C.S.trajectory_state = {}
-    C.S.last_trace = None
-    C.S.conversation_trace = []
-    C.S.trace_path = ""
-    C.S.last_usage = None
-    C._save_active_session()
+    if C.S is _running.get("session"):
+        return _error(RUNNING_SESSION_BUSY.format(name=C.S.name or "This chat"), 409)
+    # Replace, not clear in place (KeyError: 'checklist' otherwise).
+    S = C.S
+    S.messages = []
+    S.trajectory_state = {}
+    S.last_trace = None
+    S.conversation_trace = []
+    S.trace_path = ""
+    S.last_usage = None
+    _save_session(C, S)
     return {"ok": True}
 
 
@@ -1253,13 +1393,17 @@ async def reset_session():
 async def compact_session(body: SessionActionBody):
     """Compact conversation — summarize older turns."""
     C = _cl()
+    if _running:
+        # Compaction is a model call of its own; one agent task runs at a time.
+        return _error(ANOTHER_TURN_RUNNING, 409)
+    S = C.S  # the chat being compacted, even if the view changes meanwhile
     keep = body.keep or 6
     # The CLI's cmd_compact calls A.run_agent with a summarization prompt.
     # We delegate to the same logic.
-    if len(C.S.messages) <= keep * 2:
+    if len(S.messages) <= keep * 2:
         return {"ok": True, "message": "Nothing to compact"}
-    older = C.S.messages[:-keep] if keep > 0 else C.S.messages
-    recent = C.S.messages[-keep:] if keep > 0 else []
+    older = S.messages[:-keep] if keep > 0 else S.messages
+    recent = S.messages[-keep:] if keep > 0 else []
     # _history_message: an image turn's content is a list of parts, and its
     # base64 must never reach the summary prompt.
     transcript = "\n".join(
@@ -1279,8 +1423,8 @@ async def compact_session(body: SessionActionBody):
                 max_turns=1, temperature=0.0,
             ),
         )
-        C.S.messages[:] = [{"role": "assistant", "content": f"[Compacted summary]\n{summary}"}] + recent
-        C._save_active_session()
+        S.messages[:] = [{"role": "assistant", "content": f"[Compacted summary]\n{summary}"}] + recent
+        _save_session(C, S)
         return {"ok": True, "summary": summary}
     except Exception as exc:
         return _exc_error(exc)
@@ -1630,10 +1774,24 @@ async def get_dump():
 
 @app.get("/api/history")
 async def get_history():
-    """Full current conversation."""
+    """Full current conversation, plus whether it owns the running task and
+    any approval that task is waiting on (so it can be answered after
+    switching back to this chat)."""
     C = _cl()
-    return {"messages": [_history_message(message) for message in C.S.messages],
-            "conversation_trace": C.S.conversation_trace}
+    S = C.S
+    sid = _sid(S)
+
+    def waiting(store):
+        return [entry["frame"] for entry in list(store.values())
+                if entry.get("session_id") == sid and "frame" in entry]
+
+    return {"messages": [_history_message(message) for message in S.messages],
+            "conversation_trace": S.conversation_trace,
+            "session_id": sid,
+            "name": S.name or "",
+            "running": S is _running.get("session"),
+            "pending_approvals": waiting(_pending_approvals),
+            "pending_plan_approvals": waiting(_pending_plan_approvals)}
 
 
 # Browser uploads are deliberately raw request bodies rather than multipart:
@@ -1646,20 +1804,20 @@ _ATTACHMENT_MAX_COUNT = 5
 _ATTACHMENT_CONTEXT_HEADER = "\n\n[Agent8088 attachment context — not shown in chat]\n"
 
 
-def _attachment_session(C) -> str:
-    name = str(C.S.name or "web-session")
+def _attachment_session(C, S=None) -> str:
+    name = str((S or C.S).name or "web-session")
     return re.sub(r"[^A-Za-z0-9_-]", "_", name)[:80] or "web-session"
 
 
-def _attachment_index(A, C) -> Path:
-    directory = A.ARTIFACTS_ROOT / ".web-attachments" / _attachment_session(C)
+def _attachment_index(A, C, S=None) -> Path:
+    directory = A.ARTIFACTS_ROOT / ".web-attachments" / _attachment_session(C, S)
     directory.mkdir(parents=True, exist_ok=True)
     return directory / "index.json"
 
 
-def _read_attachments(A, C) -> dict:
+def _read_attachments(A, C, S=None) -> dict:
     try:
-        loaded = json.loads(_attachment_index(A, C).read_text(encoding="utf-8"))
+        loaded = json.loads(_attachment_index(A, C, S).read_text(encoding="utf-8"))
         return loaded if isinstance(loaded, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
@@ -1713,13 +1871,13 @@ def _attachment_named_path(A, directory: Path, attachment_id: str, filename: str
     return None if is_sensitive is None or is_sensitive(str(path)) else path
 
 
-def _attachment_file(A, C, attachment_id: str, metadata: dict) -> Path | None:
+def _attachment_file(A, C, attachment_id: str, metadata: dict, S=None) -> Path | None:
     """The stored file for one upload, under either layout.
 
     Looked up by its exact name, not "the only file in the folder": document
     processing keeps a .document-jobs folder beside the file it reads.
     """
-    directory = _attachment_index(A, C).parent
+    directory = _attachment_index(A, C, S).parent
     folder = directory / attachment_id
     named = folder / str(metadata.get("name") or "")
     if metadata.get("name") and named.parent == folder and named.is_file():
@@ -1832,10 +1990,10 @@ async def delete_attachment(attachment_id: str):
     return {"ok": True}
 
 
-def _validated_attachments(ids: Any, A, C) -> list[dict]:
+def _validated_attachments(ids: Any, A, C, S=None) -> list[dict]:
     if not isinstance(ids, list) or len(ids) > _ATTACHMENT_MAX_COUNT:
         raise ValueError("invalid attachments")
-    entries = _read_attachments(A, C)
+    entries = _read_attachments(A, C, S)
     resolved = []
     for attachment_id in ids:
         if not isinstance(attachment_id, str) or not re.fullmatch(r"[a-f0-9]{32}", attachment_id):
@@ -1843,7 +2001,7 @@ def _validated_attachments(ids: Any, A, C) -> list[dict]:
         metadata = entries.get(attachment_id)
         if metadata is None:
             raise ValueError("attachment does not belong to this session")
-        stored = _attachment_file(A, C, attachment_id, metadata)
+        stored = _attachment_file(A, C, attachment_id, metadata, S)
         if stored is None:
             raise ValueError("attachment is no longer available")
         resolved.append({"id": attachment_id, "name": metadata["name"],
@@ -2239,19 +2397,19 @@ async def websocket_endpoint(ws: WebSocket):
     def _busy() -> bool:
         return turn is not None and not turn.done()
 
-    async def _notify_turn_complete():
+    async def _notify_turn_complete(session_id):
         try:
-            await ws.send_json({"type": "turn_complete"})
+            await ws.send_json({"type": "turn_complete", "session_id": session_id})
         except Exception:
             # The socket may have closed between the turn finishing and this
             # notification being sent.
             pass
 
-    def _turn_finished(done: asyncio.Task):
+    def _turn_finished(done: asyncio.Task, msg: dict):
         nonlocal turn
         if turn is done:
             turn = None
-        asyncio.create_task(_notify_turn_complete())
+        asyncio.create_task(_notify_turn_complete(msg.get("_session_id", "")))
 
     try:
         while True:
@@ -2268,7 +2426,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 handler = _handle_chat if msg_type == "chat" else _handle_command
                 turn = asyncio.create_task(_run_turn(handler, ws, msg, A, C))
-                turn.add_done_callback(_turn_finished)
+                turn.add_done_callback(lambda done, msg=msg: _turn_finished(done, msg))
             elif msg_type == "interrupt":
                 # Signal this socket's turn; run_agent polls its event.is_set.
                 _interrupt_turn_of(ws)
@@ -2306,7 +2464,8 @@ async def _run_turn(handler, ws: WebSocket, msg: dict, A, C) -> None:
     except Exception as exc:
         log.exception("turn failed")
         try:
-            await ws.send_json({"type": "error", "message": scrub_markup(str(exc))})
+            await ws.send_json({"type": "error", "message": scrub_markup(str(exc)),
+                                "session_id": msg.get("_session_id", "")})
         except Exception:
             pass
 
@@ -2328,8 +2487,8 @@ _NO_SESSION_SCOPE = frozenset({"git_remote_write", "plan_approval"})
 # (id(ws)). A single process-wide event let any tab stop any other tab's turn,
 # and a new chat cleared it while an older turn was still running.
 _turn_interrupts: dict = {}
-# Every turn mutates the one shared session (S.messages); two at once from two
-# tabs interleaved their messages. The second is refused, not queued.
+# One agent task at a time (the engine's plan callbacks and grants are
+# process-wide). A second is refused here; the browser queues it instead.
 _TURN_LOCK = threading.Lock()
 ANOTHER_TURN_RUNNING = ("Another turn is already running (in another tab or window). "
                         "Wait for it to finish or stop it there, then send this again.")
@@ -2361,8 +2520,15 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     text = msg.get("text", "")
     if not text.strip():
         return
+    # The chat this turn belongs to, fixed now: switching chats later does
+    # not move the turn's output.
+    S = _turn_session(C, msg.get("session_id"))
+    if S is None:
+        await ws.send_json({"type": "error", "session_id": msg.get("session_id"),
+                            "message": "That chat no longer exists, so this message was not sent."})
+        return
     try:
-        attachments = _validated_attachments(msg.get("attachments", []), A, C)
+        attachments = _validated_attachments(msg.get("attachments", []), A, C, S)
     except ValueError as exc:
         await ws.send_json({"type": "error", "message": str(exc)})
         return
@@ -2370,22 +2536,53 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     if not _TURN_LOCK.acquire(blocking=False):
         await ws.send_json({"type": "error", "message": ANOTHER_TURN_RUNNING})
         return
+    msg["_session_id"] = _sid(S)
+    _running.update(session=S, id=msg["_session_id"])
     interrupt = threading.Event()
     _turn_interrupts[id(ws)] = interrupt
     handed_off = [False]  # set the moment the agent thread owns the lock
     try:
-        await _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C)
+        await _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C, S)
     finally:
         if not handed_off[0]:
             if _turn_interrupts.get(id(ws)) is interrupt:
                 _turn_interrupts.pop(id(ws), None)
+            _running.clear()
             _TURN_LOCK.release()
 
 
-async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C):
+def _record_turn_trace(C, S, query, trace, elapsed, interrupted=False):
+    """cli._record_trace for the turn's own Session (that one reads the global,
+    i.e. whichever chat is being viewed when the turn ends)."""
+    S.live_turn = None
+    if trace is None:
+        return
+    S.last_trace = trace
+    S.conversation_trace.append({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "input": query,
+        "steps": trace,
+        "seconds": round(elapsed, 3),
+        "interrupted": interrupted,
+        "usage": C.A.turn_usage(),
+    })
+    if S.trace_path:
+        try:
+            C._write_private_text(S.trace_path, json.dumps({
+                "version": 2, "session": S.name or None, "model": C.A.MODEL_NAME,
+                "messages": S.messages, "trajectory_state": S.trajectory_state,
+                "trace": S.conversation_trace}, indent=2))
+        except OSError as exc:
+            log.warning("could not update trace export: %s", exc)
+            S.trace_path = ""
+
+
+async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C, S):
     """The turn itself, under _TURN_LOCK. Once its thread starts, that thread
-    owns the lock (handed_off[0] is True) and releases it when the turn ends."""
-    S = C.S
+    owns the lock (handed_off[0] is True) and releases it when the turn ends.
+    Every event carries session_id (the turn's chat), and every write goes to
+    S, never to C.S, which is whatever chat the user is viewing."""
+    session_id = _sid(S)
 
     # Append user message
     images = []
@@ -2450,13 +2647,14 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
     # returns None in Python 3.10+. This is the core fix.
     loop = asyncio.get_running_loop()
 
+    def emit(event: dict):
+        event["session_id"] = session_id
+        asyncio.run_coroutine_threadsafe(ws.send_json(event), loop)
+
     def spin(msg_str):
         elapsed = time.time() - turn_start
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "spin", "message": msg_str,
-                          "elapsed": elapsed, "tokens": tokens_ref[0]}),
-            loop,
-        )
+        emit({"type": "spin", "message": msg_str,
+              "elapsed": elapsed, "tokens": tokens_ref[0]})
         from contextlib import nullcontext
         return nullcontext()
 
@@ -2470,7 +2668,7 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
         # the partial text it has shown, and the scrubber starts over with it.
         nonlocal scrubber
         scrubber = _StreamScrubber()
-        asyncio.run_coroutine_threadsafe(ws.send_json({"type": "stream_reset"}), loop)
+        emit({"type": "stream_reset"})
 
     def on_token(kind, delta):
         # Count characters, not chunks — each callback is one streaming delta
@@ -2481,30 +2679,18 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
         clean = scrubber.feed(delta)
         if not clean:
             return
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "token", "kind": kind, "delta": clean}),
-            loop,
-        )
+        emit({"type": "token", "kind": kind, "delta": clean})
 
     def on_calls(calls):
         call_list = [{"name": c.get("name", ""), "args": c.get("arguments", {})}
                      for c in calls] if calls else []
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "tool_calls", "calls": call_list}),
-            loop,
-        )
+        emit({"type": "tool_calls", "calls": call_list})
 
     def on_tool(name):
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "tool_start", "name": name}),
-            loop,
-        )
+        emit({"type": "tool_start", "name": name})
 
     def on_result(name, result):
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json(_tool_result_payload(name, result)),
-            loop,
-        )
+        emit(_tool_result_payload(name, result))
 
     def on_escalation(name, result):
         """Approval flow — send to WebSocket, wait for a keyed response.
@@ -2523,16 +2709,15 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
             A.grant_escalation(change_type, paths)
             return True
         esc_id = f"esc-{int(time.time()*1000)}-{id(result)}"
+        # session_id + frame: the request stays with its chat, and
+        # GET /api/history re-offers it after the user switches back.
+        frame = {"type": "escalation", "tool_name": name, "change_type": change_type,
+                 "description": scrub_markup(result)[:1000], "id": esc_id,
+                 "session_id": session_id}
         entry = {"event": threading.Event(), "approved": False, "session_scope": False,
-                 "owner": id(ws)}
+                 "owner": id(ws), "session_id": session_id, "frame": frame}
         _pending_approvals[esc_id] = entry
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "escalation", "tool_name": name,
-                          "change_type": change_type,
-                          "description": scrub_markup(result)[:1000],
-                          "id": esc_id}),
-            loop,
-        )
+        emit(dict(frame))
         entry["event"].wait(timeout=ESCALATION_WAIT_SECONDS)
         entry = _pending_approvals.pop(esc_id, entry)
         approved = entry.get("approved", False)
@@ -2549,12 +2734,9 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
 
     def _plan_on_step(idx, total, step_text, tool_name, status, result):
         """Render plan checklists in the UI (mirrors the CLI's _plan_on_step)."""
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "plan_step", "index": idx, "total": total,
-                          "step_text": step_text, "tool_name": tool_name,
-                          "status": status, "result": result}),
-            loop,
-        )
+        emit({"type": "plan_step", "index": idx, "total": total,
+              "step_text": step_text, "tool_name": tool_name,
+              "status": status, "result": result})
 
     def _plan_on_escalation(escalation_text):
         """Route plan write-step escalations to the ApprovalCard."""
@@ -2569,13 +2751,12 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
         gate; the mode also has to be one the browser is allowed to ask for.
         """
         plan_id = f"plan-{int(time.time()*1000)}-{id(escalation_text)}"
-        entry = {"event": threading.Event(), "mode": "", "owner": id(ws)}
+        frame = {"type": "plan_approval", "plan": escalation_text[:2000], "id": plan_id,
+                 "session_id": session_id}
+        entry = {"event": threading.Event(), "mode": "", "owner": id(ws),
+                 "session_id": session_id, "frame": frame}
         _pending_plan_approvals[plan_id] = entry
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "plan_approval", "plan": escalation_text[:2000],
-                          "id": plan_id}),
-            loop,
-        )
+        emit(dict(frame))
         entry["event"].wait(timeout=PLAN_APPROVAL_WAIT_SECONDS)
         entry = _pending_plan_approvals.pop(plan_id, entry)
         mode = entry.get("mode", "")
@@ -2584,17 +2765,13 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
     def on_answer(answer):
         elapsed = time.time() - turn_start
         if answer.lstrip().startswith(_ERROR_ANSWER_PREFIXES):
-            asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "error", "message": scrub_markup(answer.split("\n\nLatest tool result:", 1)[0])}), loop)
+            emit({"type": "error", "message": scrub_markup(answer.split("\n\nLatest tool result:", 1)[0])})
             return
-        asyncio.run_coroutine_threadsafe(
-            ws.send_json({"type": "answer", "text": scrub_markup(answer),
-                          "usage": {"seconds": elapsed, "tokens": tokens_ref[0],
-                                    "context": C._estimate_context_pct()},
-                          "rate_limit_status": A.current_rate_limit_status(
-                              C._active_provider_name())}),
-            loop,
-        )
+        emit({"type": "answer", "text": scrub_markup(answer),
+              "usage": {"seconds": elapsed, "tokens": tokens_ref[0],
+                        "context": C._estimate_context_pct(S)},
+              "rate_limit_status": A.current_rate_limit_status(
+                  C._active_provider_name())})
 
     # Run the agent in a thread to not block the event loop
     def _run():
@@ -2607,8 +2784,8 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
             A._plan_on_approval = _plan_on_approval
             A.run_agent(
                 S.messages,
-                document_root=_attachment_index(A, C).parent.resolve(),
-                max_turns=C._turn_max_turns(A.PERMISSION_MODE),
+                document_root=_attachment_index(A, C, S).parent.resolve(),
+                max_turns=C._turn_max_turns(A.PERMISSION_MODE, S),
                 temperature=S.temperature,
                 memory_run_id=S.name or None,
                 memory_source_channel="web",
@@ -2618,52 +2795,41 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
                 on_answer=on_answer, on_token=on_token,
                 on_status=on_status, on_stream_reset=on_stream_reset,
                 interrupt_check=interrupt.is_set, trace=trace,
-                system_prompt=C._session_system_prompt,
-                tools_def=lambda: A.build_tools_def(C._active_tool_specs()),
-                allowed_tools=lambda: set(C._active_tool_specs()),
+                system_prompt=lambda: C._session_system_prompt(S),
+                tools_def=lambda: A.build_tools_def(C._active_tool_specs(S)),
+                allowed_tools=lambda: set(C._active_tool_specs(S)),
                 trajectory_state=S.trajectory_state,
-                on_trajectory_state=lambda _state: C._save_active_session(),
+                on_trajectory_state=lambda _state: _save_session(C, S),
             )
             elapsed = time.time() - turn_start
             S.last_usage = {"seconds": elapsed,
                              "tokens": tokens_ref[0],
-                             "context": C._estimate_context_pct()}
-            # The CLI's do_chat calls this same helper on every successful
-            # turn (cli.py's own success path) -- the web path built `trace`
-            # above but never recorded it, so GET /api/history's
-            # conversation_trace (what the Sessions page's trace viewer
-            # reads) stayed empty even with "Show trace" on.
-            C._record_trace(text, trace, elapsed)
-            C._save_active_session()
-            asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "session_saved", "name": S.name or ""}),
-                loop,
-            )
+                             "context": C._estimate_context_pct(S)}
+            # The CLI's do_chat records the trace on every successful turn;
+            # GET /api/history's conversation_trace (the Sessions page's trace
+            # viewer) stayed empty with "Show trace" on until the web did too.
+            _record_turn_trace(C, S, text, trace, elapsed)
+            _save_session(C, S)
+            emit({"type": "session_saved", "name": S.name or ""})
         except A.AgentInterrupted:
             elapsed = time.time() - turn_start
-            C._record_trace(text, trace, elapsed, interrupted=True)
-            _save_session_quietly(C)
-            asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "interrupted", "elapsed": elapsed,
-                              "partial": ""}),
-                loop,
-            )
+            _record_turn_trace(C, S, text, trace, elapsed, interrupted=True)
+            _save_session_quietly(C, S)
+            emit({"type": "interrupted", "elapsed": elapsed, "partial": ""})
         except Exception as exc:
             import traceback
             traceback.print_exc()
             # The question (and any tool steps) are already in S.messages;
             # keep them for a resume rather than losing the turn with the error.
-            _save_session_quietly(C)
-            asyncio.run_coroutine_threadsafe(
-                ws.send_json({"type": "error", "message": scrub_markup(str(exc))}),
-                loop,
-            )
+            _save_session_quietly(C, S)
+            emit({"type": "error", "message": scrub_markup(str(exc))})
         finally:
             A._plan_on_step = None
             A._plan_on_escalation = None
             A._plan_on_approval = None
             if _turn_interrupts.get(id(ws)) is interrupt:
                 _turn_interrupts.pop(id(ws), None)
+            _running.clear()
             _TURN_LOCK.release()
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -2675,9 +2841,9 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
     await loop.run_in_executor(None, thread.join)
 
 
-def _save_session_quietly(C) -> None:
+def _save_session_quietly(C, S) -> None:
     try:
-        C._save_active_session()
+        _save_session(C, S)
     except Exception as exc:  # noqa: BLE001 -- never replace the turn's own error
         log.warning("could not save the session: %s", exc)
 
@@ -2694,7 +2860,10 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
         # The web runner owns the equivalent streamed path.
         A.enter_plan_mode()
         if str(args).strip():
-            await _handle_chat(ws, {"text": str(args)}, A, C)
+            # Keep the original frame: the socket's completion callback reads
+            # the owning session id that _handle_chat assigns to it.
+            msg["text"] = str(args)
+            await _handle_chat(ws, msg, A, C)
         else:
             await ws.send_json({"type": "command_result", "command": command,
                                 "result": "plan mode — reads only. Agent8088 will research, propose a "

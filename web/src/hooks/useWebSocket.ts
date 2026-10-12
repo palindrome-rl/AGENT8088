@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { scrubMarkup } from '@/lib/scrub'
-import type { ChatMessage, StatusInfo, WSClientMessage, WSEvent } from '@/types/api'
+import type { ChatMessage, PendingApprovalFrame, StatusInfo, WSClientMessage, WSEvent } from '@/types/api'
 
 /* ─────────────────────────────────────────────────────────
  * SINGLE SHARED WEBSOCKET
@@ -48,6 +48,11 @@ function wireSocket(ws: WebSocket) {
       // A frame we cannot parse is not worth tearing the socket down for.
       return
     }
+    // A turn event belongs to the chat that started the turn. Switching chats
+    // does not move it: events for another chat update that chat's badge, and
+    // its saved history is re-read when the user opens it.
+    const eventSession = data.session_id || ''
+    const visible = !eventSession || eventSession === useSessionStore.getState().sessionId
     switch (data.type) {
       case 'status':
         setStatus(data.data)
@@ -61,7 +66,7 @@ function wireSocket(ws: WebSocket) {
         }
         break
       case 'spin':
-        if (interruptRequested) break
+        if (interruptRequested || !visible) break
         setStreaming(true)
         if (data.message === 'thinking...') reasoningBreak = true
         useSessionStore.getState().setActivity(data.message === 'thinking...'
@@ -69,7 +74,7 @@ function wireSocket(ws: WebSocket) {
           : data.message)
         break
       case 'token':
-        if (interruptRequested) break
+        if (interruptRequested || !visible) break
         if (data.kind === 'reasoning') {
           if (data.delta) {
             appendStreamingReasoning(data.delta, reasoningBreak)
@@ -86,6 +91,7 @@ function wireSocket(ws: WebSocket) {
         // The reply broke off mid-stream and is being retried: drop the
         // fragment already shown so the retry doesn't append to it. Only the
         // current step's reasoning is the fragment; earlier steps stay.
+        if (!visible) break
         useSessionStore.setState((s) => ({
           streamingText: '',
           streamingReasoning: reasoningBreak ? s.streamingReasoning : s.streamingReasoning.slice(0, -1),
@@ -95,17 +101,17 @@ function wireSocket(ws: WebSocket) {
       case 'tool_calls':
         break
       case 'tool_start':
-        if (interruptRequested) break
+        if (interruptRequested || !visible) break
         reasoningBreak = true
         addToolEvent(data.name)
         useSessionStore.getState().setActivity(data.name === 'web_search' ? 'Searching the web' : `Running ${data.name}`)
         break
       case 'tool_result':
-        if (interruptRequested) break
+        if (interruptRequested || !visible) break
         updateToolEvent(data.name, data.result, data.diff)
         break
       case 'plan_step':
-        if (interruptRequested) break
+        if (interruptRequested || !visible) break
         updatePlanStep({
           index: data.index,
           stepText: data.step_text,
@@ -115,18 +121,19 @@ function wireSocket(ws: WebSocket) {
         })
         break
       case 'escalation':
-        setApprovalPending({
-          id: data.id,
-          toolName: data.tool_name,
-          changeType: data.change_type,
-          description: data.description,
-        })
-        break
       case 'plan_approval':
-        setPlanApprovalPending({ id: data.id, plan: data.plan })
-        void syncSession()  // the engine is in plan-only now; show it while the card waits
+        // Kept with its chat: the card shows there, and a background chat
+        // gets a "needs approval" badge until the user opens it.
+        offerApproval(data)
+        if (!visible) useSessionStore.getState().setAttention(eventSession, 'approval')
+        // the engine is in plan-only now; show it while the card waits
+        if (data.type === 'plan_approval') void syncSession()
         break
       case 'answer':
+        if (!visible) {
+          useSessionStore.getState().setAttention(eventSession, 'done')
+          break
+        }
         if (interruptRequested) break
         {
           const current = useSessionStore.getState().status
@@ -140,10 +147,17 @@ function wireSocket(ws: WebSocket) {
         resetStreaming()
         break
       case 'interrupted':
-        stopLocally()
+        if (visible) stopLocally()
         break
       case 'error':
         console.error('Agent error:', data.message)
+        if (!visible) {
+          // Saved progress stays in that chat; flag it instead of showing the
+          // error in the chat being viewed.
+          useSessionStore.getState().setAttention(eventSession, 'failed')
+          pauseQueueIfPending()
+          break
+        }
         setApprovalPending(null)
         setPlanApprovalPending(null)
         addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}`, ...turnTrace() })
@@ -152,20 +166,30 @@ function wireSocket(ws: WebSocket) {
         break
       case 'turn_complete':
         {
+          // An approval cannot outlive the turn that asked for it.
+          const ui = useUIStore.getState()
+          if (ui.approvalPending?.sessionId === eventSession) setApprovalPending(null)
+          if (ui.planApprovalPending?.sessionId === eventSession) setPlanApprovalPending(null)
+          useSessionStore.getState().setRunningSession(null)
           const wasInterrupted = interruptRequested
           interruptRequested = false
           if (wasInterrupted) pauseQueueIfPending()
-          else drainPromptQueue()
         }
-        setStreaming(false)
-        resetStreaming()
+        if (visible) {
+          setStreaming(false)
+          resetStreaming()
+        }
+        // Clear the finished turn before starting the queued one. Otherwise
+        // that cleanup also clears the next turn's streaming/Stop state.
+        drainPromptQueue()
         // A turn can change the permission mode itself (/plan enters plan-only,
         // an approved plan switches to the mode it runs in, a declined one stays
         // in plan-only), and the mode picker kept showing the old one.
         void syncSession()
+        void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
         break
       case 'session_saved':
-        if (data.name) setSessionName(data.name)
+        if (data.name && visible) setSessionName(data.name)
         void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
         break
       case 'command_result':
@@ -270,20 +294,60 @@ function ensureConnection() {
   wireSocket(ws)
 }
 
-async function syncSession(includeHistory = false) {
+/** Show an approval request in the chat that owns it (see ApprovalCard). */
+function offerApproval(frame: PendingApprovalFrame | Extract<WSEvent, { type: 'escalation' | 'plan_approval' }>) {
+  const { setApprovalPending, setPlanApprovalPending } = useUIStore.getState()
+  if (frame.type === 'escalation') {
+    setApprovalPending({
+      id: frame.id,
+      toolName: frame.tool_name,
+      changeType: frame.change_type,
+      description: frame.description,
+      sessionId: frame.session_id,
+    })
+  } else {
+    setPlanApprovalPending({ id: frame.id, plan: frame.plan, sessionId: frame.session_id })
+  }
+}
+
+/** Re-read the viewed chat from the server: name, id, the running task and,
+ *  with includeHistory, its messages and any approval its task waits on.
+ *  Also what the sidebar calls after switching chats. */
+export async function syncSession(includeHistory = false) {
   try {
     const statusResponse = await fetch('/api/status')
     if (!statusResponse.ok) return
     const status = await statusResponse.json() as StatusInfo
-    useSessionStore.getState().setStatus(status)
-    useSessionStore.getState().setSessionName(status.session_name || '')
+    const store = useSessionStore.getState()
+    store.setStatus(status)
+    store.setSessionName(status.session_name || '')
+    store.setSessionId(status.session_id || '')
+    // Only a turn this tab started sends it turn_complete, so the server can
+    // clear a stale running task here but never set one.
+    if (status.running_session === null) store.setRunningSession(null)
 
     if (!includeHistory) return
     const historyResponse = await fetch('/api/history')
     if (!historyResponse.ok) return
-    const history = await historyResponse.json() as { messages?: ChatMessage[] }
+    const history = await historyResponse.json() as {
+      messages?: ChatMessage[]
+      session_id?: string
+      running?: boolean
+      pending_approvals?: PendingApprovalFrame[]
+      pending_plan_approvals?: PendingApprovalFrame[]
+    }
     if (Array.isArray(history.messages)) {
       useSessionStore.getState().setMessages(history.messages)
+    }
+    if (history.session_id) useSessionStore.getState().setAttention(history.session_id, null)
+    // Back in the chat whose task is still running: show it as working.
+    if (history.running && history.session_id
+        && useSessionStore.getState().runningSession?.id === history.session_id) {
+      useSessionStore.getState().setActivity('Working')
+      useSessionStore.getState().setStreaming(true)
+    }
+    for (const frame of [...(history.pending_approvals ?? []), ...(history.pending_plan_approvals ?? [])]) {
+      offerApproval(frame)
     }
   } catch {
     // The WebSocket reconnect loop remains the source of truth if the API is unavailable.
@@ -298,9 +362,15 @@ function sendFrame(msg: WSClientMessage): boolean {
   }
   if (msg.type === 'chat' || msg.type === 'command') {
     interruptRequested = false
-    useSessionStore.getState().resetStreaming()
-    useSessionStore.getState().setActivity('Working')
-    useSessionStore.getState().setStreaming(true)
+    const store = useSessionStore.getState()
+    const target = (msg.type === 'chat' && msg.session_id) || store.sessionId
+    store.setRunningSession({ id: target, name: target === store.sessionId ? store.sessionName : '' })
+    // Only the chat being viewed shows the turn streaming.
+    if (target === store.sessionId) {
+      store.resetStreaming()
+      store.setActivity('Working')
+      store.setStreaming(true)
+    }
   }
   if (sharedWs && sharedWs.readyState === WebSocket.OPEN) {
     try {
@@ -320,6 +390,7 @@ function sendFrame(msg: WSClientMessage): boolean {
   }
   outbox.push(msg)
   store.setStreaming(false)
+  store.setRunningSession(null)
   store.setSendFailure(
     'Not connected to Agent8088 — this message is queued and will be sent '
     + 'as soon as the connection is back.',
@@ -344,15 +415,22 @@ export function drainPromptQueue() {
   if (!next) return
   store.removeQueuedPrompt(next.id)
   if (next.kind === 'command') {
+    // Commands act on the chat being viewed.
     const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
     if (planTaskOf(next.text)) store.addMessage({ role: 'user', content: next.text })
     sendFrame({ type: 'command', command, args: rest.join(' ') })
     return
   }
   // The transcript echo happens here rather than at enqueue time, so a queued
-  // prompt does not appear to have been asked before it actually runs.
-  store.addMessage({ role: 'user', content: next.text, attachments: next.attachments })
-  sendFrame({ type: 'chat', text: next.text, attachments: next.attachmentIds })
+  // prompt does not appear to have been asked before it actually runs. It runs
+  // in the chat it was typed in, which may no longer be the one on screen.
+  const target = next.sessionId || store.sessionId
+  if (target === store.sessionId) {
+    store.addMessage({ role: 'user', content: next.text, attachments: next.attachments })
+  }
+  sendFrame({ type: 'chat', text: next.text, attachments: next.attachmentIds, session_id: target || undefined })
+  useSessionStore.getState().setRunningSession({
+    id: target, name: target === store.sessionId ? store.sessionName : next.sessionName ?? '' })
 }
 
 /** A turn that stopped or failed holds the queue for the user to look at. */

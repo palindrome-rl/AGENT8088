@@ -274,6 +274,7 @@ class Session:
         self.live_turn = None
         self.live_turn_started = 0.0
         self.name = ""
+        self.source = "cli"
         # Set by the interactive REPL only: its first chat turn creates a saved
         # session. One-shot/--prompt-file runs stay ephemeral.
         self.autosave = False
@@ -421,7 +422,7 @@ def _session_path(name):
     return SESSIONS_DIR / f"{_session_name(name)}.json"
 
 
-# Which interface creates new session files; web_server sets "web".
+# Default for older Session adapters without a source attribute.
 SESSION_SOURCE = "cli"
 _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -458,7 +459,7 @@ def build_session_data(name, previous=None):
         "version": 2,
         "id": session_id,
         "name": name,
-        "source": source if source in ("cli", "web") else SESSION_SOURCE,
+        "source": source if source in ("cli", "web") else getattr(S, "source", SESSION_SOURCE),
         "model": f"{_active_provider_name()}:{A.MODEL_NAME}",
         "created_at": previous.get("created_at") or now,
         "updated_at": now,
@@ -549,16 +550,17 @@ def _save_preferences():
     _save_active_session()
 
 
-def _active_skills():
-    A.set_disabled_skills(S.disabled_skills)
+def _active_skills(session=None):
+    disabled = (session or S).disabled_skills
+    A.set_disabled_skills(disabled)
     return {name: skill for name, skill in A.SKILL_PACKAGES.items()
-            if name not in S.disabled_skills}
+            if name not in disabled}
 
 
-def _active_tool_specs():
+def _active_tool_specs(session=None):
     skill_tools = {tool for skill in A.SKILL_PACKAGES.values()
                    for tool in skill.get("tools", {})}
-    active_skill_tools = {tool for skill in _active_skills().values()
+    active_skill_tools = {tool for skill in _active_skills(session).values()
                           for tool in skill.get("tools", {})}
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
@@ -574,9 +576,9 @@ def _active_provider_name():
     return A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or "default"
 
 
-def _session_system_prompt():
-    specs = _active_tool_specs()
-    return A.compose_system_prompt(specs=specs, skills=_active_skills())
+def _session_system_prompt(session=None):
+    specs = _active_tool_specs(session)
+    return A.compose_system_prompt(specs=specs, skills=_active_skills(session))
 
 
 # ---------------------------------------------------------------------------
@@ -2361,14 +2363,15 @@ def _await_memory_capture(stored_ref):
     _report_memory_capture(list(stored_ref))
 
 
-def _turn_max_turns(mode):
+def _turn_max_turns(mode, session=None):
     """Round budget for this turn. A plan-mode turn does three things in one turn —
     research, propose, then execute everything the user approved — so it needs more
     rounds than a normal exchange. The alternative, raising the cap mid-turn when
     the approval lands, means reaching into the agent loop; this stays outside it."""
+    max_turns = (session or S).max_turns
     if mode == "plan-only":
-        return max(S.max_turns, PLAN_MODE_MIN_TURNS)
-    return S.max_turns
+        return max(max_turns, PLAN_MODE_MIN_TURNS)
+    return max_turns
 
 
 def do_chat(query):
@@ -7206,7 +7209,7 @@ _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit")))
 # ---------------------------------------------------------------------------
 # Main REPL
 # ---------------------------------------------------------------------------
-def _estimate_context_pct():
+def _estimate_context_pct(session=None):
     """Prompt-token estimate against the active model's context window — a
     progress hint. Anchored on the server's last real usage.prompt_tokens for
     this conversation when there is one, else CHARS_PER_TOKEN (see
@@ -7216,7 +7219,8 @@ def _estimate_context_pct():
     # is the module-level build from import time and no longer matches it (it
     # still carries the prose tool catalogue this session omits), so the meter
     # was reporting a prompt that is not sent.
-    tokens = A.estimate_prompt_tokens(S.messages, _session_system_prompt())
+    session = session or S
+    tokens = A.estimate_prompt_tokens(session.messages, _session_system_prompt(session))
     ctx_window, _ = A._active_model_token_limits()
     if not ctx_window:
         return 0

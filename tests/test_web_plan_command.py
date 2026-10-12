@@ -45,7 +45,8 @@ def test_inline_plan_uses_web_chat_runner(monkeypatch):
     asyncio.run(web_server._handle_command(socket, {"command": "plan", "args": "audit the app"}, engine, cli))
 
     assert engine.entered_plan_mode
-    assert seen == [(socket, {"text": "audit the app"}, engine, cli)]
+    assert seen == [(socket, {"command": "plan", "args": "audit the app",
+                              "text": "audit the app"}, engine, cli)]
     assert socket.events == []
 
 
@@ -92,16 +93,16 @@ class _PlanCli:
         self.S = _PlanSession()
         self._session_system_prompt = "sys"
 
-    def _turn_max_turns(self, mode):
+    def _turn_max_turns(self, mode, session=None):
         return 25
 
-    def _estimate_context_pct(self):
+    def _estimate_context_pct(self, session=None):
         return 0
 
     def _save_active_session(self):
         pass
 
-    def _active_tool_specs(self):
+    def _active_tool_specs(self, session=None):
         return {}
 
 
