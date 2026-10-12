@@ -4352,8 +4352,8 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     ]
     lines.append("Mandatory routing — call the matching tool before writing an answer:")
     lines.append(
-        "- When a tool error has suggested_action, relay it exactly; never invent admin rights, "
-        "paths, executables, or setup commands.")
+        "- Act on a tool error's suggested_action yourself; ask the user only for what only "
+        "they can do; never invent admin rights, paths, executables, or setup commands.")
     if "read_text" in specs:
         lines.append("- A direct request to read a file MUST call read_text.")
     if "execute_shell" in specs:
@@ -9817,8 +9817,9 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
             "edit_file: they act on this computer's files, not the sandbox. Programs "
             "outside the agent's own runtime may be refused. Creating virtual "
             "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder, use the packages the agent's "
-            "Python already has, or ask the user to install what is missing.")
+            "here: keep outputs under that folder and use the packages the agent's "
+            "Python already has or another tool; ask the user to install something "
+            "only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
@@ -11848,7 +11849,8 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
     stem = program[:-4] if program.lower().endswith(".exe") else program
     hint = _INSTALL_HINTS.get(stem.lower())
     if hint or (os.sep not in str(missing) and "/" not in str(missing) and "." not in stem):
-        action = (f"`{stem}` is not installed or not on PATH: {hint}. Tell the user; do not try to install it yourself."
+        action = (f"`{stem}` is not installed or not on PATH. Do the job another way with the tools you "
+                  f"have if you can; otherwise tell the user ({hint}). Do not try to install it yourself."
                   if hint else f"`{stem}` is not installed or not on PATH. Use another tool, or tell the user it is missing.")
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
@@ -11975,7 +11977,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except PermissionError as e:
         target = f": {e.filename}" if getattr(e, "filename", None) else ""
         result = efficiency.tool_error('permission_denied', f'The operating system denied access{target}.',
-            'Ask the user to resolve access or choose an accessible path. Do not bypass permissions.')
+            'Choose an accessible path or another way to do this; ask the user only if this exact '
+            'path is required. Do not bypass permissions.')
     except (ValueError, TypeError) as e:
         result = efficiency.tool_error('invalid_input', str(e),
             'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)

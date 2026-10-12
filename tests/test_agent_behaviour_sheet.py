@@ -126,3 +126,25 @@ def test_a_refused_path_names_the_real_boundary(engine, monkeypatch, tmp_path):
     action = json.loads(result.split("\n", 1)[1])["suggested_action"]
     assert str(tmp_path) in action and "allowed_paths" in action
     assert not outside.exists()
+
+
+# --- do the work; hand it to the user only when only they can -------------------
+
+def test_suggested_actions_are_acted_on_not_relayed(engine):
+    prompt = engine.current_system_prompt(native_tools=True)
+    assert "Act on a tool error's suggested_action yourself" in prompt
+    assert "relay it exactly" not in prompt
+
+
+def test_harness_notes_try_another_way_before_the_user(engine, monkeypatch, tmp_path):
+    note = engine._explain_sandbox_denial("mkdir: /x: Permission denied", tmp_path, "mkdir /x")
+    assert "ask the user to install what is missing" not in note
+    assert "only when nothing available can do the job" in note
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", "C:/locked/file.txt")
+
+    monkeypatch.setattr(engine, "run_tool", denied)
+    action = json.loads(engine.exec_tool("read_text", json.dumps({"filename": "a"}))
+                        .split("\n", 1)[1])["suggested_action"]
+    assert action.startswith("Choose an accessible path or another way")
