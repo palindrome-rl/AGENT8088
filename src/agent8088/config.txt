@@ -69,6 +69,10 @@ max_turns=50
 #   max_turn_tokens             tokens per turn (0 = off)
 #   max_turn_cost_usd           dollars per turn (0 = off)
 
+# Continuations a final reply that admits unfinished work, or leaves a requested
+# part or output undone, may earn per run (0 = off).
+# completion_gate_max_continuations=3
+
 # --- model ---
 # Active provider (built-in base URLs are used automatically). Leave unset for
 # no configured default -- get_client() then falls through its own precedence

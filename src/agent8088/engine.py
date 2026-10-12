@@ -532,6 +532,11 @@ MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
 LENGTH_RETRY_MAX_TOKENS = max(0, _config_int("length_retry_max_tokens", 0))
+
+# Completion gate: a final text reply that admits the work is unfinished, or
+# leaves a requested part or output undone, is sent back to the model at most
+# this many times per run. 0 turns the gate off.
+COMPLETION_GATE_MAX = max(0, _config_int("completion_gate_max_continuations", 3))
 # Floor for the completion cap a length cut-off earns (A3.1). The old behaviour
 # clamped every retry to 1024 tokens, which no real tool call fits — after two
 # cut-offs a large file write became impossible for the rest of the run. The
@@ -15824,6 +15829,132 @@ def _with_task_notes(answer: str, trajectory) -> str:
     for note in notes:
         answer += f"\n\n{note}"
     return answer
+
+# --- Completion gate: a final text reply that admits the task is unfinished ---
+# The loop accepts any text-only reply as the answer. These checks send such a
+# reply back (see COMPLETION_GATE_MAX) so the remaining work gets done.
+_HANDBACK_RE = re.compile(
+    r"\?|\b(?:would you like|do you want|shall i|should i|want me to|let me know|"
+    r"if you want|please (?:confirm|provide|send|share|approve|choose|decide|tell)|"
+    r"approval|approve|permission|credentials?|api[ _-]?key|password|ambiguous|"
+    r"which (?:one|option|version)|clarify|blocked|waiting (?:for|on) you)\b",
+    re.IGNORECASE)
+_UNFINISHED_RE = re.compile(
+    r"\bnot (?:done|finished|complete|ready|fully \w+) yet\b"
+    r"|\bnot (?:yet )?(?:finished|completed)\b"
+    r"|\b(?:still|remains?|remaining) (?:incomplete|unfinished)\b"
+    r"|\b(?:is|are) (?:still )?(?:incomplete|unfinished)\b"
+    r"|\b(?:haven't|have not|hasn't|has not) (?:yet )?(?:completed|finished|done|implemented|written|created|saved)\b"
+    r"|\bstill (?:need|needs|have|has) to\b"
+    r"|\bremaining (?:steps|work|tasks|items|parts)\b"
+    r"|\bpartially\b|\bonly (?:part|partly|partially|some|one|two|half)\b"
+    r"|\b(?:could not|couldn't|cannot|can't|unable to) (?:fully )?complete\b"
+    r"|(?-i:\bTODO\b)",
+    re.IGNORECASE)
+
+
+def _hands_back_to_user(text: str) -> bool:
+    """The reply asks the person something, or says only the person can unblock it."""
+    return bool(_HANDBACK_RE.search(text))
+
+
+def _announces_unfinished(text: str) -> bool:
+    """True when a final reply says work remains. Questions, requests for approval
+    or credentials, and blockers only the person can clear are not unfinished work."""
+    text = str(text or "").strip()
+    return bool(text) and bool(_UNFINISHED_RE.search(text)) and not _hands_back_to_user(text)
+
+
+_PART_LINE_RE = re.compile(r"^[ \t]*\d{1,2}[.)][ \t]+(\S.*?)[ \t]*$", re.MULTILINE)
+_PART_SPLIT_RE = re.compile(
+    r"[;\n]+|(?<=[.!?])\s+(?=(?:also|then|next|finally)\b)|\s+and then\s+", re.IGNORECASE)
+
+
+def _request_parts(text: str) -> list[str]:
+    """The separate asks in a multi-part request: numbered items, or clauses joined
+    by 'and then' / 'also' / semicolons. Empty when there are fewer than two."""
+    text = str(text or "")
+    parts = [m.group(1) for m in _PART_LINE_RE.finditer(text)]
+    if len(parts) < 2:
+        parts = [p.strip(" .") for p in _PART_SPLIT_RE.split(text)]
+        parts = [p for p in parts if len(p.split()) >= 2]
+    return parts[:6] if len(parts) >= 2 else []
+
+
+_PART_STOP = frozenset({
+    "should", "would", "could", "there", "their", "about", "which", "these", "those",
+    "please", "after", "before", "other", "using", "where", "while", "being", "every",
+    "again", "first", "make", "sure"})
+
+
+def _missing_parts(parts: list[str], answer: str) -> list[int]:
+    """1-based numbers of the request parts the reply does not mention. Loose on
+    purpose: a part is covered when the reply cites its number or half of its
+    keywords (5-letter stems) appear in it."""
+    reply = answer.lower()
+    missing = []
+    for number, part in enumerate(parts, 1):
+        if re.search(rf"\bpart\s*{number}\b|(?m:^\s*{number}[.)])", reply):
+            continue
+        words = {w[:5] for w in re.findall(r"[a-z]{5,}", part.lower()) if w not in _PART_STOP}
+        if words and sum(w in reply for w in words) * 2 < len(words):
+            missing.append(number)
+    return missing
+
+
+_OUTPUT_PATH_RE = re.compile(
+    r"(?<![\w/.\\-])[\w.-]+(?:[\\/][\w.-]+)*\.(?:md|txt|py|json|csv|html|js|ts|yaml|yml|"
+    r"sh|sql|xml|docx|xlsx|pptx|pdf)\b", re.IGNORECASE)
+_OUTPUT_VERB_RE = re.compile(r"\b(?:save|create|write|make|generate|output|produce|export)\b",
+                             re.IGNORECASE)
+
+
+def _requested_output_paths(text: str) -> list[str]:
+    """File names the request asks to create or save, e.g. "save to report.md"."""
+    if not _OUTPUT_VERB_RE.search(text or ""):
+        return []
+    return list(dict.fromkeys(m.group(0) for m in _OUTPUT_PATH_RE.finditer(text)))[:5]
+
+
+def _missing_outputs(paths: list[str], trajectory) -> list[str]:
+    """Requested files that are not on disk and were not written this run. Paths go
+    through resolve_write_path, so anything outside the allowed roots is skipped."""
+    written = {Path(p).name for p in (trajectory.written_paths() if trajectory is not None else [])}
+    missing = []
+    for raw in paths:
+        if Path(raw).name in written:
+            continue
+        try:
+            target = resolve_write_path(raw)
+        except (ValueError, OSError):
+            continue
+        if not target.exists():
+            missing.append(raw)
+    return missing
+
+
+_CONTINUE_NOTE = ("Continue; do not stop until the result works. Finish the remaining work, "
+                  "then give the final answer.")
+
+
+def _completion_nudge(request: str, answer: str, trajectory, parts_held: bool):
+    """(kind, harness message) when a final text reply should not end the run yet,
+    else None. Questions and blockers the person must clear are never pushed on."""
+    if _announces_unfinished(answer):
+        return "unfinished", _CONTINUE_NOTE
+    if _hands_back_to_user(answer):
+        return None
+    if missing := _missing_outputs(_requested_output_paths(request), trajectory):
+        return "output", f"{_CONTINUE_NOTE} Not found yet: {', '.join(missing)}."
+    parts = _request_parts(request)
+    if parts and not parts_held and (gaps := _missing_parts(parts, answer)):
+        listing = " ".join(f"{i}) {p}." for i, p in enumerate(parts, 1))
+        return "parts", (f"Parts of the request: {listing} Not mentioned in your reply: "
+                         f"{', '.join(map(str, gaps))}. Confirm each is done with evidence "
+                         "(file made, command run) or finish it.")
+    return None
+
+
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
@@ -15925,6 +16056,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
+    completion_gate_used = 0  # completion-gate continuations this run, capped
+    parts_held = False        # the multi-part check has held a reply back once
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     plan_mutation_retries = 0
@@ -16558,6 +16691,20 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 )))
                 post_check_rounds = 0
                 continue
+            if (COMPLETION_GATE_MAX and completion_gate_used < COMPLETION_GATE_MAX
+                    and seen_signatures and PERMISSION_MODE != "plan-only"):
+                turns = _genuine_user_turns(messages)
+                nudge = _completion_nudge(_message_text(turns[-1]) if turns else "",
+                                          answer, trajectory, parts_held)
+                if nudge:
+                    kind, text = nudge
+                    completion_gate_used += 1
+                    parts_held = parts_held or kind == "parts"
+                    messages.append(_harness_turn(text))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "completion_gate", "kind": kind,
+                                      "count": completion_gate_used})
+                    continue
             answer = _with_task_notes(_guard_answer(answer), trajectory)
             if on_answer:
                 on_answer(answer)
