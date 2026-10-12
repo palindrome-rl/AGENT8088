@@ -2820,6 +2820,18 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             "model": selected_model, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
+        if thinking == "length_retry" and not _skip_optional:
+            # LiteLLM translates the native reasoning dial for its adapters.
+            # Provider-specific wire fields remain in extra_body instead.
+            retry_options = dict(_length_retry_extra_body(provider_name))
+            if "reasoning_effort" in retry_options:
+                kwargs["reasoning_effort"] = retry_options.pop("reasoning_effort")
+                # Custom OpenAI-compatible model names are absent from
+                # LiteLLM's capability catalog. Try the configured dial on
+                # the wire, with the same clean 400 fallback as the SDK lane.
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
+            if retry_options:
+                kwargs["extra_body"] = retry_options
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
         if timeout is not None:
@@ -2829,7 +2841,17 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
         _raise_if_interrupted(interrupt_check)
-        response = completion(**kwargs)
+        try:
+            response = completion(**kwargs)
+        except Exception as exc:
+            if (not _skip_optional and thinking == "length_retry"
+                    and _extras_rejected(exc, thinking=thinking)):
+                return _create_completion(
+                    client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+                    temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+                    model_name=model_name, provider_name=provider_name, _skip_optional=True,
+                    thinking=thinking, timeout=timeout)
+            raise
         if on_token is None:
             return response
         collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
@@ -3094,6 +3116,8 @@ def _retryable_model_error(error: Exception) -> bool:
         # A definite client error: the body text (an HTML page for a wrong
         # base_url mentions "connection" and "timeout") must not override it.
         return False
+    if _is_provider_repetition_stop(error):
+        return True
     name = type(error).__name__.lower()
     text = str(error).lower()
     retryable = (
