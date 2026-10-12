@@ -337,6 +337,21 @@ export function PromptBar() {
     setPlusOpen(false)
   }
 
+  // Ctrl+V of a screenshot or a copied file becomes the same attachment chip
+  // as the attach button. Clipboard text (even when an app also puts an image
+  // of it alongside, as Office does) pastes as text.
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (e.clipboardData.files.length === 0 || e.clipboardData.getData('text/plain')) return
+    e.preventDefault()
+    addFiles(e.clipboardData.files)
+  }
+
+  const handleDrop = (e: React.DragEvent) => {
+    if (e.dataTransfer.files.length === 0) return
+    e.preventDefault()
+    addFiles(e.dataTransfer.files)
+  }
+
   const canSend = text.trim().length > 0 || attachments.some((attachment) => attachment.state === 'ready')
 
   return (
@@ -536,6 +551,8 @@ export function PromptBar() {
           </div>)}
         </div>}
         <div
+          onDragOver={(e) => { if (e.dataTransfer.types.includes('Files')) e.preventDefault() }}
+          onDrop={handleDrop}
           className={cn(
             'relative flex flex-col overflow-visible border bg-white dark:bg-zinc-900/50 transition-[border-color] duration-150',
             'border-zinc-300 dark:border-zinc-800 focus-within:border-brand-primary/40',
@@ -594,6 +611,7 @@ export function PromptBar() {
               value={text}
               onChange={handleChange}
               onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
               placeholder={listening ? 'Listening…' : 'Send a message…'}
               aria-label="Prompt"
               className={cn(
