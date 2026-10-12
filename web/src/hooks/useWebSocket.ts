@@ -193,6 +193,10 @@ function wireSocket(ws: WebSocket) {
         void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
         break
       case 'command_result':
+        {
+        const commandName = data.command.toLowerCase()
+        const sessionOps = ['new', 'resume', 'reset', 'compact']
+        if (!visible && !sessionOps.includes(commandName)) break
         if (data.command.toLowerCase() === 'raw') {
           // Parse the raw model call result (content, reasoning, tool_calls)
           let parsed: { content: string; reasoning?: string; tool_calls?: unknown } | null = null
@@ -222,8 +226,7 @@ function wireSocket(ws: WebSocket) {
         // (parity with CLI — every /command prints to console; the web UI
         // should show that output in the chat). Skip 'raw' (handled above
         // with structured parsing) and session ops (handled with notifications).
-        const cmd = data.command.toLowerCase()
-        const sessionOps = ['new', 'resume', 'reset', 'compact']
+        const cmd = commandName
         if (sessionOps.includes(cmd)) {
           void syncSession(true).then(() => {
             void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
@@ -242,6 +245,7 @@ function wireSocket(ws: WebSocket) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         break
+        }
     }
   }
 
@@ -363,7 +367,7 @@ function sendFrame(msg: WSClientMessage): boolean {
   if (msg.type === 'chat' || msg.type === 'command') {
     interruptRequested = false
     const store = useSessionStore.getState()
-    const target = (msg.type === 'chat' && msg.session_id) || store.sessionId
+    const target = ((msg.type === 'chat' || msg.type === 'command') && msg.session_id) || store.sessionId
     store.setRunningSession({ id: target, name: target === store.sessionId ? store.sessionName : '' })
     // Only the chat being viewed shows the turn streaming.
     if (target === store.sessionId) {
@@ -415,10 +419,12 @@ export function drainPromptQueue() {
   if (!next) return
   store.removeQueuedPrompt(next.id)
   if (next.kind === 'command') {
-    // Commands act on the chat being viewed.
     const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
-    if (planTaskOf(next.text)) store.addMessage({ role: 'user', content: next.text })
-    sendFrame({ type: 'command', command, args: rest.join(' ') })
+    const target = next.sessionId || store.sessionId
+    if (target === store.sessionId) {
+      store.addMessage({ role: 'user', content: next.text })
+    }
+    sendFrame({ type: 'command', command, args: rest.join(' '), session_id: target || undefined })
     return
   }
   // The transcript echo happens here rather than at enqueue time, so a queued
