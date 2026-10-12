@@ -191,6 +191,21 @@ With `native_tools` enabled the full tool schemas go on the wire; with it off
 load one schema on demand. `tool_selection=hybrid` narrows the native schema set
 to the most relevant tools per request.
 
+Hybrid selection ranks tools with BM25 keyword matching and, when an embedding
+model is reachable, with embeddings, then offers the top 10 plus the always-on
+and pinned tools. It never falls back to the full catalog by itself:
+
+| Situation | What is offered |
+| --- | --- |
+| No embedder, or the embedding call fails | BM25 top 10 plus the always-on and pinned tools |
+| The two rankers share no candidate | The union of both top-10 lists plus the always-on and pinned tools |
+| No BM25 hit at all (for example a greeting) | Only the always-on and pinned tools |
+
+The model still sees every tool name in the names-only index and can load any
+schema with `search_tools`, so a keyword miss costs a turn rather than the tool.
+Each fallback reason is logged once per process at INFO. To always send every
+schema, set `tool_selection=full` (`/tool-selection full`).
+
 ## Fusion — cross-provider panel + judge
 
 `/fusion <query>` is a one-shot consultation command that runs a blind panel

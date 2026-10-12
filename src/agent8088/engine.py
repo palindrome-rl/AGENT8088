@@ -3801,14 +3801,46 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+_TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
+
+
+def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
+                            allowed: set[str], reason: str,
+                            semantic: list[int] | None = None) -> set[str]:
+    """Narrow the schema set without the embedding leg.
+
+    Used whenever hybrid ranking cannot run or its two rankers disagree. The old
+    behaviour was to offer the full catalog, which on a small model costs tens of
+    thousands of prompt tokens and offers many wrong tools, so the feature
+    failed silently in exactly the situation (no embedder) it was added for.
+    BM25 alone, plus the always-on and pinned tools, is the fallback; when a
+    semantic ranking exists but shares nothing with BM25 the union of both top
+    lists is used instead.
+    """
+    if reason not in _TOOL_SELECTION_FALLBACK_LOGGED:
+        _TOOL_SELECTION_FALLBACK_LOGGED.add(reason)
+        _log.info("tool selection: %s; ranking by keyword match instead of offering "
+                  "the full tool catalog", reason)
+    top_k = TOOL_SELECTION_TOP_K
+    ranked = _bm25_tool_ranking(query, texts)[:top_k]
+    if semantic:
+        ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
+    picked = {names[index] for index in ranked}
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    return _apply_tool_intent_guards(query, selected, set(allowed))
+
+
 def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
                                   provider: str = "", model: str = "") -> set[str]:
-    """Choose direct schemas before the model sees a request, or fail open.
+    """Choose direct schemas before the model sees a request.
 
     This is deliberately not a chat-model router. BM25 handles literal tool
     language and the existing embedding endpoint handles paraphrases; RRF keeps
-    either signal from dominating. If the semantic leg is unavailable or the two
-    rankers have no shared candidate, retain the old full catalog.
+    either signal from dominating. If the semantic leg is unavailable, BM25 alone
+    chooses the schemas; if the two rankers have no shared candidate, the union
+    of both top lists is offered. The full catalog is only offered when
+    selection is off ("full" mode, an unmeasured model in "auto" mode, or a
+    catalog no larger than the top-k).
     """
     selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
     if selected_mode == "auto":
@@ -3818,21 +3850,23 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         return set(allowed)
     names, texts, vectors = _tool_selection_index(set(allowed))
     if len(vectors) != len(names):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "no embedder available")
     try:
         active_embedder = memory.embedder()
         query_vector = active_embedder.embed_one(query) if active_embedder else []
     except Exception as exc:  # noqa: BLE001 - optional performance path
         _log.debug("tool selection query embedding unavailable: %s", exc)
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     if not query_vector:
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
     semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed,
+                                       "the keyword and semantic rankings share no candidate",
+                                       semantic=semantic)
     scores = Counter()
     for ranking in (lexical, semantic):
         for position, index in enumerate(ranking, 1):
