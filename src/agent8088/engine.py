@@ -4565,7 +4565,7 @@ _TASK_SKILL_RULES = (
 def select_task_skills(messages: list[dict], available_tools=None) -> list[str]:
     """Return the small set of workflows that apply to the current user task."""
     user_text = "\n".join(
-        str(message.get("content") or "")
+        _message_text(message)
         for message in _genuine_user_turns(messages)
     ).casefold()
     if not user_text:
@@ -13212,7 +13212,7 @@ def _preflight_refusal(messages) -> str:
     user_msg = ""
     for m in reversed(messages):
         if m.get("role") == "user":
-            user_msg = m.get("content") or ""
+            user_msg = _message_text(m)
             break
     if user_msg and _PROTECTED_TARGET_RE.search(user_msg):
         return ("I can't share my internal instructions, system prompt, or configuration "
@@ -14590,7 +14590,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         # was described, the model must not keep being told the old one.
         refresh_shell_grounding()
     user_turns = _genuine_user_turns(messages)
-    goal = str(user_turns[-1].get("content") or "") if user_turns else ""
+    goal = _message_text(user_turns[-1]) if user_turns else ""
     run_trajectory = trajectory.TrajectoryState(
         trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
     )
@@ -15070,7 +15070,7 @@ def _delegated_turns(messages) -> list:
     label = _HARNESS_PREFIX + _DELEGATED_LABEL
     return [m for m in messages
             if m.get("role") == "user"
-            and str(m.get("content", "")).startswith(label)]
+            and _message_text(m).startswith(label)]
 
 
 # Output that is a stream of events — a command's stdout, a page's text — is
@@ -15158,7 +15158,7 @@ def _genuine_user_turns(messages) -> list:
     """
     return [m for m in messages
             if m.get("role") == "user"
-            and not str(m.get("content", "")).startswith(_LOOP_PREFIXES)]
+            and not _message_text(m).startswith(_LOOP_PREFIXES)]
 
 
 def _user_supplied_url(messages, url: object) -> bool:
@@ -15210,10 +15210,10 @@ def _browser_request_text(messages) -> str:
     turns = _authorising_turns(messages)
     if not turns:
         return ""
-    latest = str(turns[-1].get("content") or "")
+    latest = _message_text(turns[-1])
     if latest.startswith("Continue this durable task"):
-        original = next((str(turn.get("content") or "") for turn in turns
-                         if str(turn.get("content") or "").startswith(
+        original = next((_message_text(turn) for turn in turns
+                         if _message_text(turn).startswith(
                              "This is a durable task.")), "")
         return original.split("\n\n", 1)[-1] if original else latest
     return latest
@@ -15225,7 +15225,7 @@ def _browser_request_is_explicit(messages, url: object = None) -> bool:
     inherited = not _genuine_user_turns(messages)
     if not request or _restricts(_BROWSER_REFUSAL, request, inherited=inherited):
         return False
-    if any(_BROWSER_REFUSAL.search(str(m.get("content") or ""))
+    if any(_BROWSER_REFUSAL.search(_message_text(m))
            for m in _delegated_turns(messages)):
         return False
     if _EXPLICIT_BROWSER_REQUEST.search(request):
@@ -15254,7 +15254,7 @@ def _user_requested_tool(messages, name: str) -> bool:
     """
     phrases = (name, *_EXPLICIT_TOOL_PHRASES.get(name, ()))
     for message in _authorising_turns(messages):
-        text = str(message.get("content", "")).lower()
+        text = _message_text(message).lower()
         if any(phrase in text for phrase in phrases):
             return True
     return False
@@ -15499,7 +15499,7 @@ def _retry_after_context_overflow(messages, error, *, call, spin, trace, turn, b
 
 def _cli_anything_requested(messages: list[dict]) -> bool:
     return any(
-        "cli-anything" in str(message.get("content") or "").casefold()
+        "cli-anything" in _message_text(message).casefold()
         for message in messages
         if message.get("role") == "user"
     )
@@ -15512,12 +15512,12 @@ _EXECUTE_SHELL_BAN = re.compile(
 def _execute_shell_forbidden(messages: list[dict]) -> bool:
     inherited = not _genuine_user_turns(messages)
     return any(
-        _restricts(_EXECUTE_SHELL_BAN, str(message.get("content") or ""),
+        _restricts(_EXECUTE_SHELL_BAN, _message_text(message),
                    inherited=inherited)
         for message in _authorising_turns(messages)
     ) or any(
         # The delegated task speaks to the child, so "yourself" there is it.
-        _restricts(_EXECUTE_SHELL_BAN, str(message.get("content") or ""),
+        _restricts(_EXECUTE_SHELL_BAN, _message_text(message),
                    inherited=False)
         for message in _delegated_turns(messages)
     )
@@ -15847,16 +15847,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
-    durable_browser_goal = next((str(message.get("content") or "")
+    durable_browser_goal = next((_message_text(message)
                                  for message in user_turns
-                                 if str(message.get("content") or "").startswith(
+                                 if _message_text(message).startswith(
                                      "This is a durable task.")), "")
     browser_goal = ((durable_browser_goal.split("\n\n", 1)[-1]
                      if durable_browser_goal else "")
-                    or (str(user_turns[-1].get("content") or "")
+                    or (_message_text(user_turns[-1])
                         if user_turns else ""))
     if len(user_turns) >= 2 and len(browser_goal.split()) <= 6:
-        prev_goal = str(user_turns[-2].get("content") or "").strip()
+        prev_goal = _message_text(user_turns[-2]).strip()
         if prev_goal and not prev_goal.startswith("This is a durable task."):
             browser_goal = f"{prev_goal}\nUser selection / follow-up: {browser_goal}"
     durable_start = (re.search(r"https?://[^\s<>\]\)]+", durable_browser_goal)
