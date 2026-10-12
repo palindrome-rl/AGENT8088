@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -99,7 +98,7 @@ def _cl():
         from agent8088 import cli as _c
         _cli = _c
         # Session files this process creates through cli helpers say "web".
-        _cli.SESSION_SOURCE = "web"
+        _cli.S.source = "web"
     return _cli
 
 
@@ -1094,19 +1093,9 @@ RUNNING_SESSION_BUSY = ("“{name}” is running a task. Stop it or wait for it 
 
 
 def _save_session_file(path, data: dict) -> None:
-    """Write a session file atomically: temp file in the same directory, then
-    os.replace, so an interrupted save leaves the last valid file.
-    ponytail: swap for cli.save_session_file when the CLI autosave change lands."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    """Use the CLI's atomic writer, including private-file permissions."""
+    from .cli import save_session_file
+    save_session_file(Path(path), data)
 
 
 def _read_session_file(path) -> dict:
@@ -2886,7 +2875,10 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
         # The web runner owns the equivalent streamed path.
         A.enter_plan_mode()
         if str(args).strip():
-            await _handle_chat(ws, {"text": str(args)}, A, C)
+            # Keep the original frame: the socket's completion callback reads
+            # the owning session id that _handle_chat assigns to it.
+            msg["text"] = str(args)
+            await _handle_chat(ws, msg, A, C)
         else:
             await ws.send_json({"type": "command_result", "command": command,
                                 "result": "plan mode — reads only. Agent8088 will research, propose a "

@@ -9000,8 +9000,7 @@ def _native_sandbox_argv():
     if sys.platform == "win32":
         # The same Node setup installed with: PATH can hold an older one
         # (conda base env, old system install) the runtime won't run on.
-        managed = _managed_node_path()
-        node = str(managed) if managed.is_file() else _which_executable("node")
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
         runner = _dsh_runner_path()
         if not node or not runner.exists():
             return None
@@ -10063,23 +10062,26 @@ def _install_managed_node() -> str | None:
                 return f"Downloaded {name}.zip failed its checksum; not installing it."
             with zipfile.ZipFile(archive) as zf:
                 zf.extractall(tmp)
+            extracted = Path(tmp) / name
+            if not all((extracted / part).is_file() for part in ("node.exe", "npm.cmd")):
+                return f"Downloaded {name}.zip does not contain Node.js and npm; not installing it."
             if dest.exists():
                 shutil.rmtree(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(Path(tmp) / name), str(dest))
+            shutil.move(str(extracted), str(dest))
     except (OSError, urllib.error.URLError, zipfile.BadZipFile) as exc:
         return f"Could not download Node.js {_MANAGED_NODE_VERSION}: {exc}"
     return None
 
 
-def _native_sandbox_node_toolchain() -> tuple[str | None, str | None, str | None]:
+def _native_sandbox_node_toolchain(*, require_npm=True) -> tuple[str | None, str | None, str | None]:
     """Find a matching Node/npm pair, preferring Agent8088's managed Node on Windows."""
     candidates = []
     if sys.platform == "win32":
         managed_node = _managed_node_path()
         managed_npm = managed_node.with_name("npm.cmd")
-        if managed_node.is_file() and managed_npm.is_file():
-            candidates.append((str(managed_node), str(managed_npm)))
+        if managed_node.is_file() and (managed_npm.is_file() or not require_npm):
+            candidates.append((str(managed_node), str(managed_npm) if managed_npm.is_file() else None))
 
     path_node = _which_executable("node")
     if path_node:
@@ -10087,7 +10089,7 @@ def _native_sandbox_node_toolchain() -> tuple[str | None, str | None, str | None
             "npm.cmd" if sys.platform == "win32" else "npm"
         ))
         path_npm = adjacent_npm if Path(adjacent_npm).is_file() else _which_executable("npm")
-        if path_npm:
+        if path_npm or not require_npm:
             pair = (path_node, path_npm)
             if pair not in candidates:
                 candidates.append(pair)
@@ -10098,6 +10100,8 @@ def _native_sandbox_node_toolchain() -> tuple[str | None, str | None, str | None
             result = subprocess.run(
                 [node, "--version"], capture_output=True, text=True, timeout=10
             )
+            if getattr(result, "returncode", 0) != 0:
+                continue
             version = (result.stdout or "").strip().lstrip("v")
             major, minor = (int(part) for part in version.split(".")[:2])
         except (OSError, ValueError, subprocess.TimeoutExpired):

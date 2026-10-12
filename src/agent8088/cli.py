@@ -304,6 +304,7 @@ class Session:
         self.live_turn = None
         self.live_turn_started = 0.0
         self.name = ""
+        self.source = "cli"
         # Set by the interactive REPL only: its first chat turn creates a saved
         # session. One-shot/--prompt-file runs stay ephemeral.
         self.autosave = False
@@ -451,7 +452,7 @@ def _session_path(name):
     return SESSIONS_DIR / f"{_session_name(name)}.json"
 
 
-# Which interface creates new session files; web_server sets "web".
+# Default for older Session adapters without a source attribute.
 SESSION_SOURCE = "cli"
 _SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
 
@@ -488,7 +489,7 @@ def build_session_data(name, previous=None):
         "version": 2,
         "id": session_id,
         "name": name,
-        "source": source if source in ("cli", "web") else SESSION_SOURCE,
+        "source": source if source in ("cli", "web") else getattr(S, "source", SESSION_SOURCE),
         "model": f"{_active_provider_name()}:{A.MODEL_NAME}",
         "created_at": previous.get("created_at") or now,
         "updated_at": now,

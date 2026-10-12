@@ -288,7 +288,7 @@ def test_session_file_writes_are_atomic(env, monkeypatch):
     def broken_dump(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(W.json, "dump", broken_dump)
+    monkeypatch.setattr(cli.A.os, "replace", broken_dump)
     with pytest.raises(OSError):
         W._save_session_file(cli._session_path("chat-b"), {"version": 2})
     assert cli._session_path("chat-b").read_bytes() == before

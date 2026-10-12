@@ -174,12 +174,14 @@ function wireSocket(ws: WebSocket) {
           const wasInterrupted = interruptRequested
           interruptRequested = false
           if (wasInterrupted) pauseQueueIfPending()
-          else drainPromptQueue()
         }
         if (visible) {
           setStreaming(false)
           resetStreaming()
         }
+        // Clear the finished turn before starting the queued one. Otherwise
+        // that cleanup also clears the next turn's streaming/Stop state.
+        drainPromptQueue()
         // A turn can change the permission mode itself (/plan enters plan-only,
         // an approved plan switches to the mode it runs in, a declined one stays
         // in plan-only), and the mode picker kept showing the old one.
