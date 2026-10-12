@@ -300,14 +300,15 @@ export function PromptBar() {
           setSessionError(error instanceof Error ? error.message : 'Could not create a session')
           return
         }
-        addMessage({ role: 'user', content: trimmed })
       }
+      addMessage({ role: 'user', content: trimmed })
       if (cmd.toLowerCase() === 'raw') {
         setRawResult(null)
         setRawLoading(true)
         setRawPanelOpen(true)
       }
-      wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
+      wsSend({ type: 'command', command: cmd, args: rest.join(' '),
+        session_id: useSessionStore.getState().sessionId || undefined })
     } else {
       const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       try {

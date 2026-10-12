@@ -75,4 +75,16 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
     type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
   })
   await expect(page.getByRole('button', { name: 'Stop generating', exact: true })).toBeVisible()
+
+  // A queued slash command keeps the chat where it was entered after a switch.
+  await page.getByRole('button', { name: /chat-a/ }).first().click()
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('/plan audit chat A')
+  await page.getByRole('button', { name: 'Add to queue', exact: true }).click()
+  await emit({ type: 'turn_complete', session_id: ids['chat-b'] })
+  await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'command', command: 'plan', args: 'audit chat A', session_id: ids['chat-a'],
+  })
+  await expect(page.getByText('/plan audit chat A', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'chat-b', exact: true }).click()
+  await expect(page.getByText('/plan audit chat A', { exact: true })).toHaveCount(0)
 })
