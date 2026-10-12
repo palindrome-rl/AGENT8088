@@ -138,6 +138,8 @@ def test_windows_runtime_prefers_managed_node_over_old_path_node(tmp_path, monke
     runner.write_text("")
     monkeypatch.setattr(engine, "_dsh_runner_path", lambda: runner)
     monkeypatch.setattr(engine, "_which_executable", lambda name: "C:/conda/node.exe")
+    monkeypatch.setattr(engine.subprocess, "run", lambda *a, **k: type(
+        "Result", (), {"stdout": "v22.11.0", "returncode": 0})())
     assert engine._native_sandbox_argv() == [str(managed), str(runner)]
 
 
