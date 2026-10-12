@@ -13,7 +13,11 @@ def _reset_cache():
     """Every test gets a clean cache and clean path overrides."""
     model_catalog.reload_catalog()
     yield
-    model_catalog.reload_catalog()
+    # Do not reload while a test's monkeypatched path may still be active:
+    # that leaks its temporary override into the next test module.
+    model_catalog._catalog_cache = None
+    model_catalog._user_cache = None
+    model_catalog._normalized_cache = None
 
 
 def test_lookup_hits_the_bundled_catalog():

@@ -12,6 +12,11 @@ already live-probes that per session, and `providers.model_token_limits()`'s
 own docstring records that a hardcoded version was removed on purpose.
 Duplicating it here would recreate the exact staleness problem this catalog
 exists to fix, for a field that already has a working live answer.
+
+Capabilities describe the agent's chat-completions path, not every API a
+provider offers. Dedicated OCR, embedding, speech and media-generation
+endpoints are not vision chat or tool-calling models here; their entries
+use rank zero and false flags. This does not disable the separate OCR tool.
 """
 from __future__ import annotations
 
