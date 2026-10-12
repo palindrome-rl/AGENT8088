@@ -969,6 +969,12 @@ _outer_turn_budget = None
 # the telemetry line attribute spend to whichever role incurred it.
 _active_role = "main"
 _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+# Chunked writes (write_file mode=append). A file written in several parts is one
+# write for max_writes_per_turn, with its bytes summed for max_write_bytes, one
+# byte-exact snapshot taken before the first part, and one audit after the last.
+_turn_chunked: dict = {}         # resolved path -> bytes written to it in this series
+_chunk_snapshots: dict = {}      # resolved path -> snapshot taken before the series began
+_pending_chunk_audits: dict = {}  # resolved path -> {"chunks", "bytes", "args"} awaiting audit
 _consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
 
 
@@ -1032,6 +1038,9 @@ def reset_turn_counters() -> None:
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     global _failure_streak, _diagnostic_shown
     _turn_writes = 0
+    _turn_chunked.clear()
+    _chunk_snapshots.clear()
+    _pending_chunk_audits.clear()
     _plan_tool_ran = False
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
@@ -10007,9 +10016,11 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
     Distinct from "the argument is missing" on purpose: telling the model an
     argument is absent when it did send one sends it chasing the wrong problem.
     """
+    hint = (" For a long file, send the first part (about 4-6 KB) with write_file and "
+            'each further part with mode="append".' if name == "write_file" else "")
     return (f"Error: could not parse the arguments for '{name}'. Send valid "
             f"JSON with newlines escaped as \\n, e.g. "
-            f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
+            f'{{"code": "a = 1\\nprint(a)"}}.{hint} Received: {raw[:200]}')
 
 
 # Every shape a "you left the argument out" refusal takes: the generic one below,
@@ -10017,7 +10028,7 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
 # 'url'", "sandboxed execution requires 'code'"). Matching only the first meant
 # the search loop — eight identical argument-less calls — went uncorrected.
 _MISSING_ARG_RE = re.compile(
-    r"^Error: .*?(was called with no arguments|requires '\w+')")
+    r"^Error: .*?(was called with no arguments|requires '\w+'|called with invalid arguments)")
 
 
 def _is_missing_argument_error(result: str) -> bool:
@@ -10070,6 +10081,122 @@ def _tool_arg_missing_error(name: str, missing: str) -> str:
     return (f"Error: '{name}' was called with no arguments. Send an ✿ARGS✿ "
             f"block containing '{missing}', e.g. "
             f'✿ARGS✿: {json.dumps({missing: "..."})}')
+
+
+# Fields a model adds to explain a call rather than to configure it. They carry
+# no meaning for any tool, so they are dropped instead of refused: a refusal
+# would cost a round trip to remove a sentence of prose.
+_IGNORED_META_ARGS = frozenset(
+    ["description", "reason", "explanation", "rationale", "comment", "thought", "thoughts"])
+# Spellings individual tools have always accepted besides their declared
+# arguments (the path aliases are handled in _tool_path, the others where the
+# tool reads its arguments). Listed so validation does not refuse them.
+_PATH_ARG_ALIASES = ("filename", "file", "file_path", "filepath", "path")
+_TOLERATED_ARGS = {
+    "spawn_subagent": {"type", "prompt", "instruction", "model"},
+    "execute_shell": {"timeout"},
+    "present_plan": {"plan", "text", "steps"},
+    "execute_plan": {"plan", "text", "steps"},
+}
+# What a model reaches for when it half-remembers a name: a wrong spelling is
+# looked up here before falling back to the closest declared name.
+_ARG_SYNONYMS = {
+    "content": ("text", "body", "data", "contents", "file_content", "file_contents"),
+    "filename": ("path", "file", "file_path", "filepath", "name", "target"),
+    "command": ("cmd", "script", "shell", "bash"),
+    "query": ("q", "search", "search_query", "text", "keywords"),
+    "url": ("link", "uri", "href", "address"),
+    "old_string": ("old", "find", "search", "old_text", "original"),
+    "new_string": ("new", "replace", "replacement", "new_text"),
+    "mode": ("append", "write_mode", "overwrite", "method"),
+}
+
+
+def _tolerated_args(name: str, spec: dict) -> set:
+    declared = set(spec.get("args") or [])
+    allowed = declared | _TOLERATED_ARGS.get(name, set())
+    if spec.get("path_arg") and spec["path_arg"] in declared:
+        allowed |= set(_PATH_ARG_ALIASES)
+    if spec.get("mode") == "docker":
+        allowed |= set(_CODE_ARG_ALIASES) | {"image", "images"}
+    return allowed
+
+
+def _suggest_arg(unknown: str, declared: list) -> str:
+    """The declared argument a wrong name was most likely meant to be, or ""."""
+    lowered = unknown.lower()
+    for real in declared:
+        if lowered in _ARG_SYNONYMS.get(real, ()):
+            return real
+    import difflib
+    close = difflib.get_close_matches(lowered, [d.lower() for d in declared], n=1, cutoff=0.6)
+    return next((d for d in declared if d.lower() == close[0]), "") if close else ""
+
+
+def _arg_type_problem(param: str, value, expected: str) -> str:
+    """Why `value` cannot be a(n) `expected`, or "" when it can.
+
+    Refuses only a value of the wrong *kind* (a list for an integer, true/false
+    for a number). Text that merely does not parse as a number is let through:
+    the tools fall back to their default for it, and a read with a garbled
+    offset has always started from the top rather than failed. A JSON string
+    standing in for an array or object has always worked, so it still does.
+    """
+    if expected in ("integer", "number"):
+        if isinstance(value, (bool, list, dict)):
+            return f"must be a{'n integer' if expected == 'integer' else ' number'}, got {_short_repr(value)}"
+        return ""
+    if expected == "boolean":
+        if isinstance(value, (list, dict)):
+            return f"must be true or false, got {_short_repr(value)}"
+        return ""
+    if expected == "array" and not isinstance(value, (list, str)):
+        return f"must be a list, got {_short_repr(value)}"
+    if expected == "object" and not isinstance(value, (dict, str)):
+        return f"must be an object, got {_short_repr(value)}"
+    return ""
+
+
+def _short_repr(value) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _validate_tool_args(name: str, spec: dict, args: dict) -> str:
+    """Check a built-in tool call against its declared arguments.
+
+    Returns an error message, or "" when the call is fine. Unknown names and
+    mistyped values used to pass straight through: an invented name was ignored
+    and the model believed it had taken effect (`append=true` on a write that
+    overwrote), and a wrong-typed value failed somewhere deeper with a message
+    about the symptom. Missing required arguments keep their own, per-tool
+    messages; this adds the unknown and mistyped cases.
+
+    Skipped for MCP tools (they carry their own JSON schema), for tools that
+    declare no arguments, and for the internal keys the harness itself passes.
+    """
+    declared = list(spec.get("args") or [])
+    if not declared or "parameters" in spec or spec.get("mode") == "mcp":
+        return ""
+    allowed = _tolerated_args(name, spec)
+    problems = []
+    for key in args:
+        if (key in allowed or str(key).startswith("_")
+                or str(key).lower() in _IGNORED_META_ARGS):
+            continue
+        hint = _suggest_arg(str(key), declared)
+        problems.append(f"'{key}' is not an argument of this tool"
+                        + (f" (did you mean '{hint}'?)" if hint else ""))
+    for param, expected in (spec.get("arg_types") or {}).items():
+        if param in args and args[param] is not None:
+            problem = _arg_type_problem(param, args[param], expected)
+            if problem:
+                problems.append(f"'{param}' {problem}")
+    if not problems:
+        return ""
+    return (f"Error: '{name}' called with invalid arguments: {'; '.join(problems)}. "
+            f"Its arguments are: {', '.join(declared)}. Correct the call and send it "
+            "again; do not repeat it unchanged.")
 
 
 _CODE_ARG_ALIASES = ("code", "script", "python", "source", "snippet", "command")
@@ -10898,6 +11025,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     timeout = _budget_capped_timeout(min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS))
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
+    invalid = _validate_tool_args(name, spec, args)
+    if invalid:
+        return invalid
     approval_key = _tool_call_key(name, args)
 
     if mode == "skill":
@@ -11330,6 +11460,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     # check and the recording that follows it agree on one spelling.
     ledger_command = ""
     write_path = ""
+    write_mode = "overwrite"
+    continues_series = False  # an append to a file already written in this series
     target = None
     path_zone = "default"
     shadowed = None
@@ -11359,7 +11491,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         command = "write_file"
         write_path = _tool_path(spec, args)
         if not write_path:
-            return "Error: write tool requires a file path."
+            return _tool_arg_missing_error(name, spec.get("path_arg") or "filename")
         try:
             target = resolve_write_path(write_path)
         except ValueError as exc:
@@ -11384,10 +11516,23 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
+        if name == "write_file":
+            write_mode = str(args.get("mode") or "overwrite").strip().lower()
+            if write_mode not in ("overwrite", "append"):
+                return (f"Error: '{name}' called with invalid arguments: 'mode' must be "
+                        f"'overwrite' or 'append', got {_short_repr(args.get('mode'))}. "
+                        "Correct the call and send it again; do not repeat it unchanged.")
+            if write_mode == "append" and args.get("source_url"):
+                return (f"Error: '{name}' called with invalid arguments: mode='append' adds "
+                        "text and cannot be combined with source_url. Correct the call and "
+                        "send it again; do not repeat it unchanged.")
+            continues_series = write_mode == "append" and str(target) in _turn_chunked
         # Blast radius. Checked here — before the permission gate — so an
         # approved turn cannot be talked into writing 500 files, and so the
-        # refusal is not something the user can wave through by mistake.
-        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN:
+        # refusal is not something the user can wave through by mistake. The
+        # parts of one file written in pieces are one write, but every byte of
+        # them counts toward the byte limit.
+        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN and not continues_series:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_writes_per_turn")
             return (f"Error: this turn has already written {_turn_writes} files, "
@@ -11396,9 +11541,15 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         write_size = len(_structured_text_argument(
             args.get(spec.get("content_arg") or "content", "")
         ).encode("utf-8"))
-        if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
+        series_bytes = _turn_chunked.get(str(target), 0) if continues_series else 0
+        if MAX_WRITE_BYTES and series_bytes + write_size > MAX_WRITE_BYTES:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_write_bytes")
+            if series_bytes:
+                return (f"Error: refusing to append {write_size} bytes to {target} — it "
+                        f"would hold {series_bytes + write_size} bytes written this turn, "
+                        f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Raise "
+                        f"max_write_bytes in config.txt or write a smaller file.")
             return (f"Error: refusing to write {write_size} bytes to {target} — "
                     f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Write a "
                     f"smaller file or raise max_write_bytes in config.txt.")
@@ -11717,7 +11868,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                            f"edit the project's own file.")
             return result
         content = _structured_text_argument(args.get(content_arg, ""))
-        _turn_writes += 1
+        if not continues_series:
+            _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             old_content = _read_text_limited(target) if target.exists() else ""
@@ -11785,6 +11937,27 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if hunk:
                 result += f"\n{hunk}"
             return result
+        if write_mode == "append":
+            if content_arg not in args:
+                if not continues_series:
+                    _turn_writes -= 1  # refused before writing; must not spend the budget
+                return (f"Error: {name} mode='append' needs content, and none was given, "
+                        f"so {target} was left unchanged.")
+            with open(target, "a", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+            written = len(content.encode("utf-8"))
+            _turn_chunked[str(target)] = _turn_chunked.get(str(target), 0) + written
+            _last_write_diff = _make_diff(old_content, old_content + content, str(target))
+            try:
+                total = target.stat().st_size
+            except OSError:
+                total = len(old_content.encode("utf-8")) + written
+            result = f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path if you meant to "
+                           f"edit the project's own file.")
+            return result
         # Everything above returned; reaching here is a whole-file overwrite.
         # write_file marks both content and source_url optional so either can
         # carry the bytes, which makes a call supplying NEITHER schema-valid.
@@ -11803,6 +11976,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         else:
             target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
+        if name == "write_file":
+            # A later append continues from here; an older series on this path is over.
+            _turn_chunked[str(target)] = len(content.encode("utf-8"))
         result = f"Wrote {len(content)} bytes to {target}"
         if shadowed is not None:
             result += (f" — NOT {shadowed}. A bare filename is stored in "
@@ -12001,6 +12177,52 @@ def _environment_diagnostic() -> str:
     return "\n".join(lines)
 
 
+_WRITE_FILE_PARTS_HINT = (
+    " For a long file, write the first part (about 4-6 KB) with write_file, then add "
+    "each further part with mode=\"append\".")
+
+
+def _chunk_key(name: str, args: dict) -> str:
+    """The resolved path a write_file call targets, or "" for anything else."""
+    if name != "write_file":
+        return ""
+    try:
+        return str(resolve_write_path(_tool_path(TOOL_SPECS.get(name, {}), args)))
+    except Exception:  # noqa: BLE001 -- an unresolvable path is refused by the tool itself
+        return ""
+
+
+def _appended_bytes(result: str) -> int:
+    match = re.match(r"Appended (\d+) bytes", result)
+    return int(match.group(1)) if match else 0
+
+
+def _flush_chunk_audits(depth: int, keep: str = "") -> str:
+    """Audit every file written in parts whose last part has now been seen.
+
+    Returns the text to show the model (an auditor's note, a failed verdict and
+    the revert), or "" when there is nothing to say. `keep` is a path still
+    being written, which stays pending.
+    """
+    notes = []
+    for key in [k for k in _pending_chunk_audits if k != keep]:
+        entry = _pending_chunk_audits.pop(key)
+        try:
+            size = Path(key).stat().st_size
+        except OSError:
+            size = entry["bytes"]
+        summary = (f"Appended {entry['chunks']} parts ({entry['bytes']} bytes) to {key}; "
+                   f"the file is now {size} bytes")
+        audited = _audit_tool_call(
+            "write_file", {"filename": key,
+                           "content": f"<{entry['bytes']} bytes appended in {entry['chunks']} parts>"},
+            summary, depth, entry["snapshot"])
+        extra = audited[len(summary):].strip() if audited.startswith(summary) else audited
+        if extra:
+            notes.append(f"Audit of {key} after its last part:\n{extra}")
+    return "\n".join(notes)
+
+
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     global _last_tool_output, _last_tool_name, _last_write_diff
     # Clear before validation too: rejected arguments must not inherit a
@@ -12026,7 +12248,22 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
     will_audit = _audit_applies(name, args, depth)
-    snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
+    # The parts of a file written in pieces are audited once, after the last
+    # part: at the next call that is not another part of it, or when the model
+    # finishes. A series' snapshot is taken before its first part, so a failed
+    # audit restores the original file, not the previous part.
+    chunk_key = _chunk_key(name, args)
+    appending = bool(chunk_key) and str(args.get("mode") or "").strip().lower() == "append"
+    flush_note = _flush_chunk_audits(depth, keep=chunk_key if appending else "")
+    defer_audit = will_audit and appending
+    if defer_audit:
+        will_audit = False
+    snapshot = None
+    if (will_audit or defer_audit) and PLAN_AUDIT_REVERT:
+        snapshot = (_chunk_snapshots.get(chunk_key) if appending and chunk_key in _chunk_snapshots
+                    else _capture_write_state(name, args))
+        if chunk_key and snapshot is not None:
+            _chunk_snapshots[chunk_key] = snapshot
 
     try:
         result = run_tool(name, args, depth=depth)
@@ -12055,6 +12292,12 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
             'Inspect the reported cause and tool schema. Resolve the prerequisite before retrying; do not bypass permissions.',
             recoverable=validation)
 
+    if defer_audit and result.startswith("Appended "):
+        entry = _pending_chunk_audits.setdefault(
+            chunk_key, {"chunks": 0, "bytes": 0, "snapshot": snapshot})
+        entry["chunks"] += 1
+        entry["bytes"] += _appended_bytes(result)
+
     # A blocked call has not done anything yet, so there is nothing to verify —
     # it gets audited on the retry that follows approval. The prefix is
     # \x1f-delimited (a Windows path splits on ':'); matching ':' here meant the
@@ -12064,6 +12307,9 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
         result = _audit_tool_call(name, args, result, depth, snapshot)
+
+    if flush_note:
+        result = f"{result}\n{flush_note}"
 
     _remember_escalation(name, args, result)
 
@@ -16293,6 +16539,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     f"{warning} Retry with one complete, concise tool call; "
                     "split large work across calls if needed."
                 )
+                if "write_file" in content:
+                    retry_instruction += _WRITE_FILE_PARTS_HINT
             else:
                 # The whole budget was spent on reasoning before any answer or
                 # tool call appeared — "split work into calls" doesn't address
@@ -16378,6 +16626,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 retry_instruction = (
                     f"{warning} The previous attempt was cut off and discarded. "
                     + ("Make one short, complete tool call; split large work across calls."
+                       + (_WRITE_FILE_PARTS_HINT if "write_file" in content else "")
                        if content else
                        "That budget went entirely to reasoning: stop reasoning and "
                        "reply in plain text or call one tool."))
@@ -16558,6 +16807,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 )))
                 post_check_rounds = 0
                 continue
+            if gates_open and _pending_chunk_audits and depth == 0:
+                chunk_note = _flush_chunk_audits(depth)
+                if chunk_note:
+                    messages.append(_harness_turn(chunk_note))
+                    post_check_rounds = 0
+                    continue
             answer = _with_task_notes(_guard_answer(answer), trajectory)
             if on_answer:
                 on_answer(answer)
@@ -16839,8 +17094,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "inside a string value that is not escaped as \\\" (code "
                     "with \"\"\"docstrings\"\"\" or f\"...\" strings). Escape every "
                     "quote and newline inside values. For long file content, "
-                    "write a shorter first part and add the rest with further "
-                    "calls; otherwise send only the required arguments."
+                    "write the first part (about 4-6 KB) with write_file and add "
+                    "each further part with write_file mode=\"append\", in order; "
+                    "otherwise send only the required arguments."
                 )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",

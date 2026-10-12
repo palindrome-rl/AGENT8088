@@ -300,8 +300,8 @@ is a plausible accident that the permission gate does not catch. Both default to
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_writes_per_turn` | `0` | Files one request may write. |
-| `max_write_bytes` | `0` | Bytes a single write may contain. |
+| `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
