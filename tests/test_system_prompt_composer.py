@@ -53,8 +53,8 @@ def test_cli_and_engine_use_the_same_composer(engine, monkeypatch):
 
     specs = {"read_text": engine.TOOL_SPECS["read_text"]}
     skills = {"example": {"description": "Example skill."}}
-    monkeypatch.setattr(cli, "_active_tool_specs", lambda: specs)
-    monkeypatch.setattr(cli, "_active_skills", lambda: skills)
+    monkeypatch.setattr(cli, "_active_tool_specs", lambda session=None: specs)
+    monkeypatch.setattr(cli, "_active_skills", lambda session=None: skills)
     monkeypatch.setattr(engine, "_native_tools_enabled", lambda *_a, **_k: True)
     assert cli._session_system_prompt() == engine.compose_system_prompt(
         specs=specs, skills=skills,
