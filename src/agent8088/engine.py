@@ -3106,7 +3106,8 @@ def _model_error_context(provider_name: str, model_name: str) -> dict:
             "base_url": active_endpoint_url(provider_name) if provider_name else active_endpoint_url(),
             "model": model_name or MODEL_NAME,
             "api_key_env": profile.get("api_key_env") or None,
-            "timeout_seconds": TIMEOUT_SECONDS}
+            "timeout_seconds": TIMEOUT_SECONDS,
+            "env_file": str(ENV_FILE_PATH)}
 
 
 def explain_model_error(error, provider_name: str = "", model_name: str = ""):
@@ -13144,7 +13145,8 @@ def _model_failure_reason(error, provider_name: str = "", model_name: str = "") 
     if friendly.kind in ("unknown", "bad_request"):
         # Nothing more specific to say: keep the long-standing wording.
         message = f"the model backend errored ({detail})."
-    elif (detail and detail not in message and len(detail) <= 120
+    elif (friendly.kind != "auth"  # a provider's 401 text can echo part of the key
+          and detail and detail not in message and len(detail) <= 120
           and not any(ch in detail for ch in "{}<>")):
         message = f"{message.rstrip('.')} ({detail})."
     if not message.endswith((".", "!", "?", "…", ")")):
