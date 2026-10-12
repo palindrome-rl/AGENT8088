@@ -6,14 +6,14 @@ import { apiFetch } from '@/lib/api'
 import { ErrorCard } from '@/components/ErrorCard'
 
 async function request<T>(url: string, body?: unknown): Promise<T> {
-  const data = await apiFetch<T & { error?: string }>(
+  // apiFetch handles failed HTTP responses. A successful task record's
+  // `error` is checkpoint/status information, not an API failure.
+  return apiFetch<T>(
     url,
     body === undefined
       ? { action: 'load durable tasks' }
       : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), action: 'update that task' },
   )
-  if (data?.error) throw new Error(data.error)
-  return data
 }
 
 const stateColor: Record<string, string> = { running: 'text-brand-cyan bg-brand-primary/10', cancelling: 'text-orange-400 bg-orange-500/10', queued: 'text-yellow-400 bg-yellow-500/10', paused: 'text-orange-400 bg-orange-500/10', completed: 'text-emerald-400 bg-emerald-500/10', cancelled: 'text-zinc-400 bg-zinc-800' }
