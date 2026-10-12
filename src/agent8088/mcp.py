@@ -51,6 +51,40 @@ def _matches(name, patterns):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
+def _drop_unset(value):
+    """Remove ``None`` values and the SDK's ``_meta`` envelope, recursively."""
+    if isinstance(value, dict):
+        return {key: _drop_unset(item) for key, item in value.items()
+                if item is not None and key != "_meta"}
+    if isinstance(value, list):
+        return [_drop_unset(item) for item in value]
+    return value
+
+
+def format_result(result):
+    """Render an MCP tool result for the model.
+
+    The model used to receive the serialised result object, for example
+    ``{"_meta": null, "content": [{"type": "text", "text": "..."}], ...}``, with
+    every quote escaped and the unused fields spelled out. That costs tokens and
+    makes the value harder for a small model to read. A result made only of text
+    blocks now reaches the model as that text; anything else keeps its structure
+    without the null fields and ``_meta``. A server-reported error is prefixed
+    "MCP tool error:". A result that is not an SDK result object (a plain dict)
+    is serialised as before.
+    """
+    if not hasattr(result, "model_dump"):
+        return json.dumps(result, default=str, ensure_ascii=False)
+    data = result.model_dump(by_alias=True)
+    prefix = "MCP tool error: " if data.get("isError") else ""
+    blocks = data.get("content") or []
+    if blocks and all(isinstance(block, dict) and block.get("type") == "text" for block in blocks):
+        text = "\n".join(str(block.get("text", "")) for block in blocks)
+        if text.strip():
+            return prefix + text
+    return prefix + json.dumps(_drop_unset(data), default=str, ensure_ascii=False)
+
+
 class MCPRuntime:
     """Own MCP sessions for this Agent8088 process and expose normal tool specs."""
 
@@ -446,9 +480,8 @@ class MCPRuntime:
                 # Reopen just this server, here, when the breaker lets a probe through.
                 self._reconnect(server)
             result = self._run(self._call(registered, arguments), self._tools[registered].get("timeout", 30))
-            data = result.model_dump(by_alias=True) if hasattr(result, "model_dump") else result
             self._note_success(server)
-            return json.dumps(data, default=str, ensure_ascii=False)
+            return format_result(result)
         except Exception as exc:
             self._note_failure(server)
             detail = _describe(exc)
