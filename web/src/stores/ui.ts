@@ -37,15 +37,18 @@ interface UIState {
   codeFont: CodeFont
   sidebarTranslucent: boolean
   contrast: number
+  /** sessionId: the chat whose task asked. The card shows only in that chat. */
   approvalPending: {
     id: string
     toolName: string
     changeType: string
     description: string
+    sessionId?: string
   } | null
   planApprovalPending: {
     id: string
     plan: string
+    sessionId?: string
   } | null
   rawPanelOpen: boolean
 

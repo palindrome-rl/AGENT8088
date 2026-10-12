@@ -9,10 +9,23 @@ export interface QueuedPrompt {
   text: string
   attachmentIds: string[]
   attachments?: ChatAttachment[]
+  /** The chat it was typed in; it runs there even if the user moves on. */
+  sessionId?: string
+  sessionName?: string
 }
+
+/** What a background chat needs the user to see. */
+export type ChatAttention = 'done' | 'failed' | 'approval'
 
 interface SessionState {
   sessionName: string
+  /** Stable id of the chat being viewed. */
+  sessionId: string
+  /** The chat that owns the running task (one at a time), which may not be
+   *  the one being viewed. `isStreaming` is only about the viewed chat. */
+  runningSession: { id: string; name: string } | null
+  /** Background chats that finished, failed or wait for approval, by id. */
+  attention: Record<string, ChatAttention>
   messages: ChatMessage[]
   status: StatusInfo | null
   isStreaming: boolean
@@ -52,6 +65,9 @@ interface SessionState {
   setRawResult: (result: SessionState['rawResult']) => void
   setRawLoading: (loading: boolean) => void
   setSessionName: (name: string) => void
+  setSessionId: (id: string) => void
+  setRunningSession: (running: SessionState['runningSession']) => void
+  setAttention: (id: string, attention: ChatAttention | null) => void
   clearChat: () => void
   addMessage: (message: ChatMessage) => void
   setStatus: (status: StatusInfo) => void
@@ -75,6 +91,9 @@ interface SessionState {
 
 export const useSessionStore = create<SessionState>((set) => ({
   sessionName: '',
+  sessionId: '',
+  runningSession: null,
+  attention: {},
   messages: [],
   status: null,
   isStreaming: false,
@@ -95,6 +114,16 @@ export const useSessionStore = create<SessionState>((set) => ({
   setRawLoading: (rawLoading) => set({ rawLoading }),
   setSessionName: (sessionName) => set(s => ({ sessionName,
     status: s.status ? { ...s.status, session_name: sessionName } : null })),
+  setSessionId: (sessionId) => set({ sessionId }),
+  setRunningSession: (runningSession) => set({ runningSession }),
+  setAttention: (id, kind) => set((s) => {
+    const attention = { ...s.attention }
+    if (kind) attention[id] = kind
+    else delete attention[id]
+    return { attention }
+  }),
+  // Clears the view only. Queued prompts stay: each one names its own chat,
+  // and switching chats while a task runs must not drop them.
   clearChat: () => set({
     messages: [],
     isStreaming: false,
@@ -102,9 +131,6 @@ export const useSessionStore = create<SessionState>((set) => ({
     streamingReasoning: [],
     toolEvents: [],
     planSteps: [],
-    // Queued prompts were written for the conversation being cleared.
-    promptQueue: [],
-    queuePaused: false,
   }),
   addMessage: (message) => set((s) => ({ messages: [...s.messages, message] })),
   setStatus: (status) => set({ status }),
