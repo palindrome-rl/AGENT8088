@@ -38,6 +38,9 @@ def test_failed_private_write_preserves_previous_web_session(tmp_path, monkeypat
 
 
 def test_web_plan_completion_keeps_owning_session_id(monkeypatch):
+    session = cli.Session()
+    session.id = "a" * 32
+    monkeypatch.setattr(cli, "S", session)
     async def fake_chat(ws, frame, A, C):
         frame["_session_id"] = "a" * 32
         assert frame["session_id"] == "a" * 32

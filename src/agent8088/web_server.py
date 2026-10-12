@@ -2945,7 +2945,8 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
 
 
 async def _send_command_event(ws, msg, event):
-    event.setdefault("session_id", msg.get("_session_id", ""))
+    if msg.get("_session_id"):
+        event.setdefault("session_id", msg["_session_id"])
     await ws.send_json(event)
 
 
