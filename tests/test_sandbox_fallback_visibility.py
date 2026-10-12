@@ -16,6 +16,8 @@ def sandbox(engine, monkeypatch):
     monkeypatch.setattr(engine, "_native_sandbox_missing_requirements",
                         lambda: list(state["native_missing"]))
     monkeypatch.setattr(engine, "_docker_available", lambda: state["docker"])
+    # These tests are about the backend fallback; pin the platform-dependent network report.
+    monkeypatch.setattr(engine, "_native_enforces_network", lambda: True)
     monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *a, **k: not engine._native_sandbox_broken)
     monkeypatch.setattr(engine, "_docker_sandbox_ready", lambda *a, **k: state["docker"])
     return engine, state

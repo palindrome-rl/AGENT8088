@@ -1578,8 +1578,104 @@ def _lex_command(command: str):
         return None
 
 
+# --- Process-stop floor (always-on, every mode) ---
+# A command that stops processes by name (pkill python, taskkill /IM node.exe,
+# Stop-Process -Name ...) stops every process of that name on the machine:
+# unrelated user jobs and Agent8088's own interpreter included. On the Windows
+# native sandbox the process list is the host's, so "inside the sandbox" does
+# not help. Stopping a process by a literal PID stays allowed, except
+# Agent8088 itself and its parent. Checked per command segment from
+# _hard_blocked_shell, so wrappers (bash -c, powershell -Command) and command
+# substitutions are covered by its recursion. A script file that does the
+# stopping is not inspected.
+_KILL_BY_NAME_COMMANDS = frozenset(["pkill", "killall", "killall5", "skill", "snice"])
+_KILL_PIDS_COMMANDS = frozenset(["kill", "stop-process", "spps", "tskill", "pskill"])
+_COMMAND_PREFIXES = frozenset([
+    "sudo", "doas", "nohup", "time", "nice", "ionice", "env", "command", "exec",
+    "builtin", "stdbuf", "setsid", "timeout",
+])
+_STOP_BY_NAME_FLAGS = frozenset(["-name", "-n", "-processname", "-inputobject", "-input"])
+_PID_TARGET = re.compile(r"\d+|%\w+|\$!")
+_PROCESS_ENUMERATION = re.compile(
+    r"get-process|\bgps\b|\[system\.diagnostics\.process\]|process_iter", re.IGNORECASE)
+_PROCESS_KILL_CALL = re.compile(r"\.(?:kill|terminate)\s*\(", re.IGNORECASE)
+_WMI_KILL_BY_NAME = re.compile(
+    r"(?:wmic\s+process|win32_process)[\s\S]*?\bname\b[\s\S]*?\b(?:delete|terminate)\b",
+    re.IGNORECASE)
+_process_refusal = threading.local()
+
+PROCESS_STOP_REFUSAL = (
+    "Error: Stopping processes by name, or every process, is blocked: it can stop "
+    "unrelated programs and Agent8088's own interpreter. Stop a process you started "
+    "by its PID instead.")
+
+
+def _own_pids() -> set:
+    pids = {str(os.getpid())}
+    try:
+        pids.add(str(os.getppid()))
+    except OSError:
+        pass
+    return pids
+
+
+def _segment_stops_processes_unsafely(segment: list) -> bool:
+    """True if one command segment stops processes by name, all of them, or Agent8088."""
+    words = [str(part).strip("'\"") for part in segment]
+    while words and (Path(words[0]).stem.lower() in _COMMAND_PREFIXES
+                     or re.fullmatch(r"[A-Za-z_]\w*=\S*", words[0])
+                     or re.fullmatch(r"\d+[smhd]?", words[0])):
+        words = words[1:]
+    if not words:
+        return False
+    exe = Path(words[0]).stem.lower()
+    args = [word.lower() for word in words[1:]]
+    if exe in _KILL_BY_NAME_COMMANDS:
+        return True
+    if exe == "xargs":
+        # The targets arrive on a pipe and cannot be checked.
+        return any(Path(word).stem.lower() in _KILL_BY_NAME_COMMANDS | _KILL_PIDS_COMMANDS | {"taskkill"}
+                   for word in args)
+    if exe == "wmic":
+        return bool(_WMI_KILL_BY_NAME.search(" ".join(words)))
+    if exe == "taskkill":
+        if any(arg.split(":", 1)[0] in ("/im", "-im", "/fi", "-fi") for arg in args):
+            return True
+        pids = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ("/pid", "-pid")]
+        return not pids or bool(_own_pids() & set(pids))
+    if exe in _KILL_PIDS_COMMANDS:
+        if any(arg.split(":", 1)[0] in _STOP_BY_NAME_FLAGS for arg in args):
+            return True
+        if any(arg in ("-l", "-L") for arg in words[1:]):
+            return False  # kill -l: list signal names
+        if len(args) >= 2 and args[-1] == "-1" or "0" in args:
+            return True  # kill -9 -1 / kill 0: every process the user can signal
+        targets = [arg for arg in args if _PID_TARGET.fullmatch(arg)]
+        # No literal PID means the target comes from a pipe, a name or a
+        # substitution (`... | Stop-Process`, `kill $(pgrep x)`), which cannot be checked.
+        return not targets or bool(_own_pids() & set(targets))
+    return False
+
+
+def _command_text_stops_processes(command: str) -> bool:
+    """Whole-command patterns the per-segment check cannot see (PowerShell/Python loops)."""
+    if _PROCESS_ENUMERATION.search(command) and _PROCESS_KILL_CALL.search(command):
+        return True
+    return bool(_WMI_KILL_BY_NAME.search(command))
+
+
+def last_refusal_was_process_stop() -> bool:
+    """True if the most recent _hard_blocked_shell call in this thread refused for the process-stop floor."""
+    return bool(getattr(_process_refusal, "hit", False))
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+    if _depth == 0:
+        _process_refusal.hit = False
     if _is_unrecoverable_command(command):
+        return True
+    if _command_text_stops_processes(command):
+        _process_refusal.hit = True
         return True
     if _matches_user_deny(command):
         return True
@@ -1642,6 +1738,9 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         first = Path(segment[0]).stem.lower()
         if first in _NON_EXEC_GIT_TEXT_COMMANDS:
             continue
+        if _segment_stops_processes_unsafely(segment):
+            _process_refusal.hit = True
+            return True
         for index, part in enumerate(segment):
             if Path(part).stem.lower() == "git" and _dangerous_git_args(segment[index + 1:]):
                 return True
@@ -9011,6 +9110,20 @@ def _resolve_sandbox_backend() -> str:
     return "docker" if _docker_usable() else "unavailable"
 
 
+NETWORK_NOT_ENFORCED = "not enforced on this backend (write restriction only)"
+
+
+def _native_enforces_network() -> bool:
+    """Whether the native backend on this OS applies the network allowlist.
+
+    The Windows backend is an ACL runner: it restricts where a command can
+    write, and a sandboxed command still reaches any host and sees the host's
+    process list. macOS (sandbox-exec) and Linux (bubblewrap + proxy) apply
+    sandbox_allowed_domains. Docker runs with no network regardless of OS.
+    """
+    return sys.platform != "win32"
+
+
 def sandbox_status() -> dict:
     resolved = _resolve_sandbox_backend()
     detail = {
@@ -9057,11 +9170,21 @@ def sandbox_status() -> dict:
         detail += " (candidate; not yet verified by a sandboxed command)"
     if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure):
         failure = _native_sandbox_failure or _docker_sandbox_failure
+    unenforced = resolved == "native" and not _native_enforces_network()
+    if unenforced:
+        network = NETWORK_NOT_ENFORCED
+        if SANDBOX_ALLOWED_DOMAINS:
+            network += (f"; sandbox_allowed_domains ({', '.join(SANDBOX_ALLOWED_DOMAINS)}) "
+                        "is not applied")
+    else:
+        network = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked"
     return {
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
-        "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
+        "network": network,
+        "network_enforced": None if resolved == "unavailable" else not unenforced,
+        "host_processes_shared": unenforced,
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
         "failure": (failure or "")[:300],
@@ -9450,6 +9573,25 @@ def _report_sandbox(status: dict | None = None) -> None:
         status = status or sandbox_status()
         resolved = status.get("resolved")
         requested = str(status.get("requested") or "auto")
+        # Reported apart from the backend itself: a switch from native to docker
+        # is announced only on a state change, and a native backend that is
+        # degraded for its network would hide that switch.
+        if status.get("network_enforced") is False:
+            applied = ("; sandbox_allowed_domains is not applied"
+                       if SANDBOX_ALLOWED_DOMAINS else "")
+            capabilities.report(
+                capabilities.SANDBOX_NETWORK, active="file-writes-only", preferred="enforced",
+                state=capabilities.DEGRADED,
+                reason=f"network policy {NETWORK_NOT_ENFORCED}",
+                impact=("sandboxed commands can reach any host and see the host's "
+                        f"processes{applied}"),
+                fix="sandbox_backend=docker for network isolation")
+        elif status.get("network_enforced") and resolved == "native":
+            capabilities.report(capabilities.SANDBOX_NETWORK, active="enforced",
+                                preferred="enforced", state=capabilities.OK)
+        else:
+            # Docker has no network at all, which its own notice already says.
+            capabilities.clear(capabilities.SANDBOX_NETWORK)
         if resolved == "native":
             capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
                                 state=capabilities.OK)
@@ -11445,6 +11587,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",
                detail=command[:200], reason="hard_blocked_shell")
+        if last_refusal_was_process_stop():
+            return PROCESS_STOP_REFUSAL
         return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
     if mode == "shell":

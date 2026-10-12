@@ -46,6 +46,14 @@ container images, low overhead.
 The Windows prompt provisions a low-privilege local account that sandboxed
 commands run as — that's why it's a one-time elevation.
 
+**The Windows native backend restricts file writes only.** It does not apply
+`sandbox_allowed_domains`, and a sandboxed command sees the host's process list.
+`/sandbox`, `/doctor` and the start-up notice say so ("network policy not
+enforced on this backend (write restriction only)"), and `/doctor` warns when
+`sandbox_allowed_domains` is set there. For network isolation on Windows use
+`sandbox_backend=docker`. Stopping processes by name is refused in every mode
+for the same reason (see [permissions](03-permissions-and-security.md)).
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run:
@@ -65,7 +73,9 @@ Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
 ## Network egress
 
-Sandboxed commands have no network unless you allow specific domains:
+Sandboxed commands have no network unless you allow specific domains
+(**macOS, Linux and Docker** -- the Windows native backend does not enforce this,
+see above):
 
 ```ini
 sandbox_allowed_domains=api.example.com,pypi.org
