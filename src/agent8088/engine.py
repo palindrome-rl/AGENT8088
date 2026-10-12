@@ -9852,20 +9852,52 @@ def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
                                 workspace=workspace)
 
 
+def _native_sandbox_node_toolchain() -> tuple[str | None, str | None, str | None]:
+    """Find a matching Node/npm pair, preferring Agent8088's managed Node on Windows."""
+    candidates = []
+    if sys.platform == "win32":
+        managed_node = _agent_data_dir() / "node" / "node.exe"
+        managed_npm = managed_node.with_name("npm.cmd")
+        if managed_node.is_file() and managed_npm.is_file():
+            candidates.append((str(managed_node), str(managed_npm)))
+
+    path_node = _which_executable("node")
+    if path_node:
+        adjacent_npm = str(Path(path_node).with_name(
+            "npm.cmd" if sys.platform == "win32" else "npm"
+        ))
+        path_npm = adjacent_npm if Path(adjacent_npm).is_file() else _which_executable("npm")
+        if path_npm:
+            pair = (path_node, path_npm)
+            if pair not in candidates:
+                candidates.append(pair)
+
+    first_version = None
+    for node, npm in candidates:
+        try:
+            result = subprocess.run(
+                [node, "--version"], capture_output=True, text=True, timeout=10
+            )
+            version = (result.stdout or "").strip().lstrip("v")
+            major, minor = (int(part) for part in version.split(".")[:2])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+        if first_version is None:
+            first_version = version
+        if result.returncode == 0 and (major, minor) >= (20, 11):
+            return node, npm, version
+    return None, None, first_version
+
+
 def install_native_sandbox() -> str:
-    node = _which_executable("node")
-    npm = _which_executable("npm")
+    node, npm, version = _native_sandbox_node_toolchain()
     if not node or not npm:
-        return "Node.js 20.11 or newer is required to install the native sandbox runtime."
-    try:
-        version = subprocess.run(
-            [node, "--version"], capture_output=True, text=True, timeout=10
-        ).stdout.strip().lstrip("v")
-        major, minor = (int(part) for part in version.split(".")[:2])
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return "Could not determine the installed Node.js version."
-    if (major, minor) < (20, 11):
-        return f"Node.js 20.11 or newer is required (found {version})."
+        if version:
+            return f"Node.js 20.11 or newer is required (found {version})."
+        return (
+            "Node.js 20.11 or newer is required to install the native sandbox runtime. "
+            "Install it, then rerun `agent8088 --sandbox-setup`."
+        )
 
     runtime_dir = _agent_data_dir() / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
