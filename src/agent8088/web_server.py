@@ -815,6 +815,21 @@ async def end_task(task_id: str):
         store.close()
 
 
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    store = _task_store()
+    try:
+        try:
+            task = store.resolve(task_id)
+        except KeyError:
+            return _error(f"task not found: {task_id}", 404)
+        if not store.delete(task["id"]):
+            return _error("task is running or queued; end the task first", 409)
+        return {"ok": True}
+    finally:
+        store.close()
+
+
 @app.get("/api/fusion/config")
 async def get_fusion_config():
     A = _eng()
