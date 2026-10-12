@@ -18,6 +18,7 @@ Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
 import subprocess
+import uuid
 import shutil
 import textwrap
 try:
@@ -25,7 +26,7 @@ try:
 except ImportError:
     pass
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -273,6 +274,11 @@ class Session:
         self.live_turn = None
         self.live_turn_started = 0.0
         self.name = ""
+        self.source = "cli"
+        # Set by the interactive REPL only: its first chat turn creates a saved
+        # session. One-shot/--prompt-file runs stay ephemeral.
+        self.autosave = False
+        self.save_warning = ""  # last save failure shown, so a retry loop warns once
         self.disabled_skills = {
             name.strip() for name in config.get("disabled_skills", "").split(",")
             if name.strip() in A.SKILL_PACKAGES
@@ -416,14 +422,47 @@ def _session_path(name):
     return SESSIONS_DIR / f"{_session_name(name)}.json"
 
 
-def _save_active_session():
-    """Persist named sessions automatically; unnamed chats remain ephemeral."""
-    if not S.name:
-        return
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _write_private_text(_session_path(S.name), json.dumps({
+# Default for older Session adapters without a source attribute.
+SESSION_SOURCE = "cli"
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _read_session_file(path):
+    """A session file's JSON object, or {} when missing or unreadable."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_session_file(path, data):
+    """Write session JSON atomically (temp file + os.replace) with private
+    permissions. A failed write raises and leaves the previous file intact."""
+    return _write_private_text(path, json.dumps(data, indent=2))
+
+
+def build_session_data(name, previous=None):
+    """Version-2 session JSON for the active conversation S.
+
+    `previous` is the file's current content: its id, source and created_at
+    are kept, so a session's identity survives every later save. A file
+    without them (written before they existed) gets them now.
+    """
+    previous = previous or {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    session_id = previous.get("id")
+    if not (isinstance(session_id, str) and _SESSION_ID_RE.fullmatch(session_id)):
+        session_id = uuid.uuid4().hex
+    source = previous.get("source")
+    return {
         "version": 2,
-        "name": S.name,
+        "id": session_id,
+        "name": name,
+        "source": source if source in ("cli", "web") else getattr(S, "source", SESSION_SOURCE),
+        "model": f"{_active_provider_name()}:{A.MODEL_NAME}",
+        "created_at": previous.get("created_at") or now,
+        "updated_at": now,
         "messages": S.messages,
         "trajectory_state": S.trajectory_state,
         "temperature": S.temperature,
@@ -436,7 +475,63 @@ def _save_active_session():
         "last_trace": S.last_trace,
         "conversation_trace": S.conversation_trace,
         "trace_path": S.trace_path,
-    }, indent=2))
+    }
+
+
+def _save_active_session():
+    """Persist the active session; a chat with no name yet stays ephemeral."""
+    if not S.name:
+        return
+    path = _session_path(S.name)
+    save_session_file(path, build_session_data(S.name, _read_session_file(path)))
+
+
+def _save_session_safely():
+    """Save for the CLI's own turn/exit paths: a failure is one visible warning
+    line, never an exception that ends the turn. The atomic write means the
+    last good file is still on disk."""
+    try:
+        _save_active_session()
+    except Exception as exc:  # noqa: BLE001 -- a save must never break the chat
+        message = f"could not save session {S.name!r}: {exc}"
+        if message != S.save_warning:
+            console.print(f"[red]{message}[/red]")
+        S.save_warning = message
+        return False
+    S.save_warning = ""
+    return True
+
+
+def _autosave_name(prompt):
+    """A readable session name from the first prompt (or the time), unique
+    among existing files. Each candidate is claimed with an exclusive create,
+    so an existing session — even one made a moment ago by the web UI or
+    another terminal — is never overwritten."""
+    words = re.findall(r"[a-z0-9]+", (prompt or "").lower())[:6]
+    base = "-".join(words)[:40].strip("-") or time.strftime("chat-%Y%m%d-%H%M%S")
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 10_000):
+        name = base if n == 1 else f"{base}-{n}"
+        try:
+            with open(_session_path(name), "x", encoding="utf-8"):
+                return name
+        except FileExistsError:
+            continue
+    raise OSError(f"no free session name for {base!r}")
+
+
+def _ensure_autosave_session(prompt):
+    """Give an unnamed REPL chat a saved session before its first turn."""
+    if S.name or not S.autosave:
+        return
+    try:
+        name = _autosave_name(prompt)
+    except OSError as exc:
+        console.print(f"[red]could not create a saved session:[/red] {exc}")
+        return
+    S.name = name
+    if _save_session_safely():
+        console.print(f"[dim]chat saved as {name} · /resume {name} after a restart[/dim]")
 
 
 def _save_preferences():
@@ -455,16 +550,17 @@ def _save_preferences():
     _save_active_session()
 
 
-def _active_skills():
-    A.set_disabled_skills(S.disabled_skills)
+def _active_skills(session=None):
+    disabled = (session or S).disabled_skills
+    A.set_disabled_skills(disabled)
     return {name: skill for name, skill in A.SKILL_PACKAGES.items()
-            if name not in S.disabled_skills}
+            if name not in disabled}
 
 
-def _active_tool_specs():
+def _active_tool_specs(session=None):
     skill_tools = {tool for skill in A.SKILL_PACKAGES.values()
                    for tool in skill.get("tools", {})}
-    active_skill_tools = {tool for skill in _active_skills().values()
+    active_skill_tools = {tool for skill in _active_skills(session).values()
                           for tool in skill.get("tools", {})}
     allowed = (set(A.TOOL_NAMES) - skill_tools) | active_skill_tools
     if A.PERMISSION_MODE == "plan-only":
@@ -480,9 +576,9 @@ def _active_provider_name():
     return A.ACTIVE_PROVIDER or A.DEFAULT_PROVIDER or "default"
 
 
-def _session_system_prompt():
-    specs = _active_tool_specs()
-    return A.compose_system_prompt(specs=specs, skills=_active_skills())
+def _session_system_prompt(session=None):
+    specs = _active_tool_specs(session)
+    return A.compose_system_prompt(specs=specs, skills=_active_skills(session))
 
 
 # ---------------------------------------------------------------------------
@@ -2270,19 +2366,21 @@ def _await_memory_capture(stored_ref, query=""):
     _report_memory_capture(list(stored_ref))
 
 
-def _turn_max_turns(mode):
+def _turn_max_turns(mode, session=None):
     """Round budget for this turn. A plan-mode turn does three things in one turn —
     research, propose, then execute everything the user approved — so it needs more
     rounds than a normal exchange. The alternative, raising the cap mid-turn when
     the approval lands, means reaching into the agent loop; this stays outside it."""
+    max_turns = (session or S).max_turns
     if mode == "plan-only":
-        return max(S.max_turns, PLAN_MODE_MIN_TURNS)
-    return S.max_turns
+        return max(max_turns, PLAN_MODE_MIN_TURNS)
+    return max_turns
 
 
 def do_chat(query):
     # Anything last turn's capture stored after its report budget ran out.
     _report_pending_capture()
+    _ensure_autosave_session(query)
     S.messages.append({"role": "user", "content": query})
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
@@ -2459,7 +2557,7 @@ def do_chat(query):
                 tools_def=lambda: A.build_tools_def(_active_tool_specs()),
                 allowed_tools=lambda: set(_active_tool_specs()),
                 trajectory_state=S.trajectory_state,
-                on_trajectory_state=lambda _state: _save_active_session(),
+                on_trajectory_state=lambda _state: _save_session_safely(),
             )
         except A.AgentInterrupted:
             answer = None
@@ -2481,7 +2579,7 @@ def do_chat(query):
         S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "interrupted": True}
         _record_trace(query, trace, elapsed, interrupted=True)
         _after_turn_plan_state()
-        _save_active_session()
+        _save_session_safely()
         return
 
     render_answer(answer)
@@ -2501,7 +2599,7 @@ def do_chat(query):
         console.print(Panel(Text(json.dumps(_trace_for_display(trace), indent=2)), title="[#237dd7]trace[/#237dd7]",
                             box=box.MINIMAL, border_style="#0077B6"))
     _after_turn_plan_state()
-    _save_active_session()
+    _save_session_safely()
 
 
 # ---------------------------------------------------------------------------
@@ -5964,26 +6062,29 @@ def cmd_new(rest):
 
 def cmd_sessions(_):
     if not SESSIONS_DIR.exists():
-        console.print("[dim](no named sessions yet — use /new <name>)[/dim]")
+        console.print("[dim](no saved sessions yet)[/dim]")
         return
     rows = []
     for path in sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             rows.append((path.stem, len(data.get("messages", [])),
-                         time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))))
+                         time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime)),
+                         str(data.get("source") or ""), str(data.get("model") or "")))
         except (OSError, json.JSONDecodeError):
             continue
     if not rows:
-        console.print("[dim](no readable named sessions)[/dim]")
+        console.print("[dim](no readable saved sessions)[/dim]")
         return
     t = Table(title="Sessions", box=box.SIMPLE, title_style="bold #00edff",
               header_style="bold #00edff", border_style="#0077B6")
     t.add_column("Name", style="#237dd7")
     t.add_column("Messages", style="#237dd7")
     t.add_column("Updated", style="#237dd7")
-    for name, messages, updated in rows:
-        t.add_row(("● " if name == S.name else "  ") + name, str(messages), updated)
+    t.add_column("Source", style="dim")
+    t.add_column("Model", style="dim")
+    for name, messages, updated, source, model in rows:
+        t.add_row(("● " if name == S.name else "  ") + name, str(messages), updated, source, model)
     console.print(t)
 
 
@@ -7168,7 +7269,7 @@ _COMPLETABLE_COMMANDS = tuple(sorted((*COMMANDS, "exit")))
 # ---------------------------------------------------------------------------
 # Main REPL
 # ---------------------------------------------------------------------------
-def _estimate_context_pct():
+def _estimate_context_pct(session=None):
     """Prompt-token estimate against the active model's context window — a
     progress hint. Anchored on the server's last real usage.prompt_tokens for
     this conversation when there is one, else CHARS_PER_TOKEN (see
@@ -7178,7 +7279,8 @@ def _estimate_context_pct():
     # is the module-level build from import time and no longer matches it (it
     # still carries the prose tool catalogue this session omits), so the meter
     # was reporting a prompt that is not sent.
-    tokens = A.estimate_prompt_tokens(S.messages, _session_system_prompt())
+    session = session or S
+    tokens = A.estimate_prompt_tokens(session.messages, _session_system_prompt(session))
     ctx_window, _ = A._active_model_token_limits()
     if not ctx_window:
         return 0
@@ -9780,15 +9882,8 @@ def main():
         # unexpected exception — lands here, which is why the save and the
         # flush are after the loop rather than beside each `break`. Saving a
         # session do_chat already saved rewrites the same content.
-        _save_session_on_exit()
+        _save_session_safely()
         _flush_memory_capture()
-
-
-def _save_session_on_exit():
-    try:
-        _save_active_session()
-    except Exception as exc:  # noqa: BLE001 -- never mask why the REPL is ending
-        console.print(f"[red]could not save session {S.name!r}:[/red] {exc}")
 
 
 def _first_run_check():
@@ -9840,6 +9935,14 @@ def _run_repl_command(handler, rest, name=""):
 
 
 def _repl_loop():
+    S.autosave = True
+    try:
+        _repl_turns()
+    finally:
+        S.autosave = False
+
+
+def _repl_turns():
     while True:
         _print_notices(_mcp_failure_notice())
         _print_capability_changes()
@@ -9885,6 +9988,7 @@ def _repl_loop():
             break
         except Exception as e:
             console.print(f"[red]error:[/red] {e}")
+            _save_session_safely()  # keep the turn's progress (its question, any tool results)
 
 
 if __name__ == "__main__":

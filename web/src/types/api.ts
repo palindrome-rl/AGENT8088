@@ -76,6 +76,10 @@ export interface MemoryStatus {
 }
 
 export interface SessionInfo {
+  /** Stable id from the session file; null for an old file not yet re-saved. */
+  id: string | null
+  /** True while this chat owns the running agent task. */
+  running?: boolean
   name: string
   message_count: number
   updated: string
@@ -124,6 +128,10 @@ export interface StatusInfo {
   context_pct: number
   permission_mode: 'readonly' | 'full-auto' | 'plan-only'
   session_name: string
+  /** The chat being viewed. */
+  session_id?: string
+  /** The chat whose task is running, which may not be the one being viewed. */
+  running_session?: { id: string; name: string } | null
   last_usage: {
     seconds: number
     tokens: number
@@ -323,13 +331,17 @@ export type ToolEvent = {
 }
 
 export type WSClientMessage =
-  | { type: 'chat'; text: string; attachments?: string[] }
+  /** session_id: the chat this prompt belongs to (a queued prompt can be sent
+   *  after the user has moved to another chat). Omitted = the viewed chat. */
+  | { type: 'chat'; text: string; attachments?: string[]; session_id?: string }
   | { type: 'command'; command: string; args?: string }
   | { type: 'interrupt' }
   | { type: 'approval'; approved: boolean; session_scope: boolean; id: string }
   | { type: 'plan_approval'; mode: string; id: string }
 
-export type WSEvent =
+/** Turn events carry session_id: the chat that owns the turn. The UI applies
+ *  them to the visible chat only when it is that chat. */
+export type WSEvent = (
   | { type: 'status'; data: StatusInfo }
   | { type: 'capabilities'; data: CapabilityRow[] }
   | { type: 'token'; kind: 'reasoning' | 'content'; delta: string }
@@ -348,3 +360,9 @@ export type WSEvent =
   | { type: 'session_saved'; name: string }
   | { type: 'memory_captured'; facts: string[] }
   | { type: 'command_result'; command: string; result: string; structured?: unknown }
+) & { session_id?: string }
+
+/** A pending approval re-offered by GET /api/history for the viewed chat. */
+export type PendingApprovalFrame =
+  | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string; session_id: string }
+  | { type: 'plan_approval'; plan: string; id: string; session_id: string }

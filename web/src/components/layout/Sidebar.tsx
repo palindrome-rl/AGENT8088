@@ -6,10 +6,11 @@ import {
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useUIStore, type Theme } from '@/stores/ui'
-import { useSessionStore } from '@/stores/session'
+import { useSessionStore, type ChatAttention } from '@/stores/session'
+import { syncSession } from '@/hooks/useWebSocket'
 import { cn } from '@/lib/utils'
 import { useState, useEffect, useRef } from 'react'
-import type { ChatMessage, SessionInfo } from '@/types/api'
+import type { SessionInfo } from '@/types/api'
 import { apiFetch } from '@/lib/api'
 
 /* ─────────────────────────────────────────────────────────
@@ -34,6 +35,12 @@ const settingsItems = [
   { to: '/doctor', label: 'Doctor', icon: Stethoscope },
 ]
 
+const attentionLabels: Record<ChatAttention, string> = {
+  done: 'Done',
+  failed: 'Failed',
+  approval: 'Needs approval',
+}
+
 const SIDEBAR_EXPANDED = 224
 const SIDEBAR_COLLAPSED = 52
 
@@ -46,7 +53,9 @@ const appearanceThemes: { value: Theme; label: string; Icon: typeof Sun }[] = [
 
 export function Sidebar() {
   const { sidebarCollapsed, toggleSidebar, theme, setTheme } = useUIStore()
-  const { clearChat, setMessages, setSessionName, isStreaming } = useSessionStore()
+  // New chat and Resume stay available while a task runs: the task keeps
+  // its own chat on the server, and only that chat is protected below.
+  const { clearChat, setSessionName, runningSession, attention } = useSessionStore()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -116,8 +125,10 @@ export function Sidebar() {
     }
   }, [sessionMenu])
 
+  const ownsRunningTask = (session: SessionInfo) =>
+    Boolean(session.running || (runningSession?.id && runningSession.id === session.id))
+
   const handleNewChat = async () => {
-    if (isStreaming) return
     setSessionError('')
     try {
       await apiFetch('/api/sessions/new', {
@@ -133,6 +144,7 @@ export function Sidebar() {
     clearChat()
     setSessionName('')
     setSettingsOpen(false)
+    await syncSession(true)
     await sessionsQuery.refetch()
     navigate('/')
   }
@@ -147,11 +159,11 @@ export function Sidebar() {
         body: JSON.stringify({ name }),
         action: `resume ${name}`,
       })
-      const history = await apiFetch<{ messages: ChatMessage[] }>(
-        '/api/history', { action: 'load that session\'s history' })
+      // Reads the chat's saved history, its id, whether its task is still
+      // running, and any approval that task is waiting on.
       clearChat()
-      setMessages(history.messages)
       setSessionName(name)
+      await syncSession(true)
       await sessionsQuery.refetch()
       navigate('/')
     } catch (error) {
@@ -198,6 +210,7 @@ export function Sidebar() {
       if (result.active) {
         clearChat()
         setSessionName('')
+        await syncSession(true)
         navigate('/')
       }
       await sessionsQuery.refetch()
@@ -280,8 +293,7 @@ export function Sidebar() {
           <button
             type="button"
             onClick={handleNewChat}
-            disabled={isStreaming}
-            title={isStreaming ? 'Finish the current turn before starting a new chat' : 'Start a new chat'}
+            title={runningSession ? 'Start a new chat (the running task keeps going in its own chat)' : 'Start a new chat'}
             className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/40 active:scale-[0.98]"
           >
             <Plus className="h-4 w-4 shrink-0 text-zinc-500 dark:text-zinc-400" />
@@ -389,13 +401,29 @@ export function Sidebar() {
                   >
                     <button
                       type="button"
-                      disabled={session.active || isStreaming || resuming !== null || sessionAction !== null}
+                      disabled={session.active || resuming !== null || sessionAction !== null}
                       onClick={() => handleResume(session.name)}
                       className="flex min-w-0 flex-1 items-center gap-2 truncate text-left disabled:cursor-default"
                       title={session.active ? 'Active session' : `Resume ${session.name}`}
                     >
-                      <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', session.active ? 'bg-brand-cyan' : 'bg-zinc-400 dark:bg-zinc-600')} />
+                      <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full',
+                        ownsRunningTask(session) ? 'animate-pulse bg-amber-400'
+                          : session.active ? 'bg-brand-cyan' : 'bg-zinc-400 dark:bg-zinc-600')} />
                       <span className="min-w-0 flex-1 truncate">{session.name}</span>
+                      {ownsRunningTask(session) && !(session.id && attention[session.id]) && (
+                        <span className="shrink-0 text-[10px] text-amber-500" title="A task is running in this chat">running</span>
+                      )}
+                      {session.id && attention[session.id] && !session.active && (
+                        <span
+                          role="status"
+                          className={cn('shrink-0 rounded px-1 text-[10px]',
+                            attention[session.id] === 'failed' ? 'bg-red-500/15 text-red-500'
+                              : attention[session.id] === 'approval' ? 'bg-amber-500/15 text-amber-500'
+                                : 'bg-emerald-500/15 text-emerald-500')}
+                        >
+                          {attentionLabels[attention[session.id]]}
+                        </span>
+                      )}
                       {resuming === session.name && <span className="text-[10px] text-brand-cyan">…</span>}
                     </button>
                     <button
@@ -413,7 +441,8 @@ export function Sidebar() {
                         <button
                           type="button"
                           role="menuitem"
-                          disabled={isStreaming || resuming !== null || sessionAction !== null}
+                          disabled={ownsRunningTask(session) || resuming !== null || sessionAction !== null}
+                          title={ownsRunningTask(session) ? 'Stop or finish the running task in this chat first' : undefined}
                           onClick={() => void handleRename(session.name)}
                           className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-zinc-600 hover:bg-zinc-100 hover:text-brand-cyan dark:text-zinc-300 dark:hover:bg-zinc-800"
                         >
@@ -422,7 +451,8 @@ export function Sidebar() {
                         <button
                           type="button"
                           role="menuitem"
-                          disabled={isStreaming || resuming !== null || sessionAction !== null}
+                          disabled={ownsRunningTask(session) || resuming !== null || sessionAction !== null}
+                          title={ownsRunningTask(session) ? 'Stop or finish the running task in this chat first' : undefined}
                           onClick={() => void handleDelete(session.name)}
                           className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs text-zinc-600 hover:bg-zinc-100 hover:text-red-400 dark:text-zinc-300 dark:hover:bg-zinc-800"
                         >

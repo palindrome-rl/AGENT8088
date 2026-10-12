@@ -6,7 +6,7 @@ A single shared agent loop (run_agent) drives both modes:
   - interactive REPL          (no args)
   - one-shot / headless mode (query as args, optional --trace)
 """
-import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request  # readline enables input history
+import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
@@ -8950,7 +8950,9 @@ def _native_sandbox_argv():
                     else part for part in argv]
         return argv
     if sys.platform == "win32":
-        node = _which_executable("node")
+        # The same Node setup installed with: PATH can hold an older one
+        # (conda base env, old system install) the runtime won't run on.
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
         runner = _dsh_runner_path()
         if not node or not runner.exists():
             return None
@@ -9863,20 +9865,112 @@ def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
                                 workspace=workspace)
 
 
-def install_native_sandbox() -> str:
-    node = _which_executable("node")
-    npm = _which_executable("npm")
-    if not node or not npm:
-        return "Node.js 20.11 or newer is required to install the native sandbox runtime."
+# Keep in step with $NodeVersion in install.ps1.
+_MANAGED_NODE_VERSION = "22.11.0"
+
+
+def _managed_node_path() -> Path:
+    """The portable Node install.ps1 (or --sandbox-setup) puts under the data dir."""
+    return _agent_data_dir() / "node" / "node.exe"
+
+
+def _install_managed_node() -> str | None:
+    """Download portable Node into the managed dir on Windows; returns an error or None.
+
+    A conda/base env or an old system install can put Node < 20.11 first on
+    PATH, so setup provisions its own copy instead of failing on it.
+    """
+    machine = platform.machine().lower()
+    arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
+    if not arch:
+        return f"Node.js publishes no Windows build for this machine ({machine or 'unknown'})."
+    name = f"node-v{_MANAGED_NODE_VERSION}-win-{arch}"
+    base = f"https://nodejs.org/dist/v{_MANAGED_NODE_VERSION}/"
+    dest = _managed_node_path().parent
     try:
-        version = subprocess.run(
-            [node, "--version"], capture_output=True, text=True, timeout=10
-        ).stdout.strip().lstrip("v")
-        major, minor = (int(part) for part in version.split(".")[:2])
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return "Could not determine the installed Node.js version."
-    if (major, minor) < (20, 11):
-        return f"Node.js 20.11 or newer is required (found {version})."
+        with urllib.request.urlopen(base + "SHASUMS256.txt", timeout=60) as resp:
+            sums = resp.read().decode("utf-8", "replace")
+        expected = next((line.split()[0] for line in sums.splitlines()
+                         if line.endswith(f"  {name}.zip")), None)
+        if not expected:
+            return f"Could not find a checksum for {name}.zip on nodejs.org."
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / f"{name}.zip"
+            with urllib.request.urlopen(base + f"{name}.zip", timeout=300) as resp, \
+                    open(archive, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+                return f"Downloaded {name}.zip failed its checksum; not installing it."
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(tmp)
+            extracted = Path(tmp) / name
+            if not all((extracted / part).is_file() for part in ("node.exe", "npm.cmd")):
+                return f"Downloaded {name}.zip does not contain Node.js and npm; not installing it."
+            if dest.exists():
+                shutil.rmtree(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(extracted), str(dest))
+    except (OSError, urllib.error.URLError, zipfile.BadZipFile) as exc:
+        return f"Could not download Node.js {_MANAGED_NODE_VERSION}: {exc}"
+    return None
+
+
+def _native_sandbox_node_toolchain(*, require_npm=True) -> tuple[str | None, str | None, str | None]:
+    """Find a matching Node/npm pair, preferring Agent8088's managed Node on Windows."""
+    candidates = []
+    if sys.platform == "win32":
+        managed_node = _managed_node_path()
+        managed_npm = managed_node.with_name("npm.cmd")
+        if managed_node.is_file() and (managed_npm.is_file() or not require_npm):
+            candidates.append((str(managed_node), str(managed_npm) if managed_npm.is_file() else None))
+
+    path_node = _which_executable("node")
+    if path_node:
+        adjacent_npm = str(Path(path_node).with_name(
+            "npm.cmd" if sys.platform == "win32" else "npm"
+        ))
+        path_npm = adjacent_npm if Path(adjacent_npm).is_file() else _which_executable("npm")
+        if path_npm or not require_npm:
+            pair = (path_node, path_npm)
+            if pair not in candidates:
+                candidates.append(pair)
+
+    first_version = None
+    for node, npm in candidates:
+        try:
+            result = subprocess.run(
+                [node, "--version"], capture_output=True, text=True, timeout=10
+            )
+            if getattr(result, "returncode", 0) != 0:
+                continue
+            version = (result.stdout or "").strip().lstrip("v")
+            major, minor = (int(part) for part in version.split(".")[:2])
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+        if first_version is None:
+            first_version = version
+        if (major, minor) >= (20, 11):
+            return node, npm, version
+    return None, None, first_version
+
+
+def install_native_sandbox() -> str:
+    node, npm, version = _native_sandbox_node_toolchain()
+    if (not node or not npm) and sys.platform == "win32":
+        found = f" (found {version})" if version else ""
+        print(f"Node.js 20.11 or newer is required{found}; "
+              f"installing Node.js {_MANAGED_NODE_VERSION} for Agent8088...", flush=True)
+        error = _install_managed_node()
+        if error:
+            return error
+        node, npm, version = _native_sandbox_node_toolchain()
+    if not node or not npm:
+        if version:
+            return f"Node.js 20.11 or newer is required (found {version})."
+        return (
+            "Node.js 20.11 or newer is required to install the native sandbox runtime. "
+            "Install it, then rerun `agent8088 --sandbox-setup`."
+        )
 
     runtime_dir = _agent_data_dir() / "runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)

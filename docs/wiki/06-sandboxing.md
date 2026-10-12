@@ -32,8 +32,9 @@ on `PATH` is not treated as proof that it works.
 agent8088 --sandbox-setup
 ```
 
-Installs the open-source Anthropic sandbox runtime — no Docker daemon, no
-container images, low overhead.
+Installs the native sandbox runtime: Anthropic's sandbox runtime on macOS/Linux
+or the DSH Windows ACL runtime on Windows. No Docker daemon or container images
+are needed.
 
 **Prerequisites:**
 
@@ -41,7 +42,13 @@ container images, low overhead.
 |---|---|
 | macOS | Node.js 20.11+, `ripgrep` |
 | Linux | Node.js 20.11+, `bubblewrap`, `socat`, `ripgrep` |
-| Windows | Node.js 20.11+, one UAC prompt to create a restricted sandbox account |
+| Windows | Supported Node.js (managed automatically if needed), one UAC prompt to create a restricted sandbox account |
+
+On Windows, setup and runtime both prefer Agent8088's managed Node when it
+meets the Node.js 20.11+ requirement. An older managed installation is skipped
+in favor of a supported PATH version. If neither is suitable, sandbox setup
+downloads the pinned Node.js 22.11.0 build and verifies its SHA-256 checksum.
+Setup requires npm; running an already-installed sandbox only requires Node.
 
 The Windows prompt provisions a low-privilege local account that sandboxed
 commands run as — that's why it's a one-time elevation.

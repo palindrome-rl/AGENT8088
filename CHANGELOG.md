@@ -4,6 +4,25 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.2 branch maintenance - 2026-10-12
+
+### Improved
+
+- Interactive CLI conversations automatically get a saved name after the
+  first message, with source/model metadata and restart/resume support.
+- The Web UI can start or resume another chat while a task runs. Transcripts,
+  answers and approvals stay with their owning chat; queued messages retain
+  their destination. Running chats are protected from rename, delete and reset.
+- Session writes share the atomic, private file writer. Plan completion and
+  queued-turn streaming state retain the correct session identity.
+- Windows sandbox setup and execution consistently choose a supported Node.js
+  runtime, preferring the managed installation. Setup can download checksummed
+  Node.js 22.11.0 when needed without replacing an existing installation with an
+  incomplete download.
+
+Public installation commands, update channel, version 1.2.0, MIT license and
+existing public-specific diagnostics and UI fixes are preserved.
+
 ## v1.2 branch maintenance - 2026-10-09
 
 ### Fixed

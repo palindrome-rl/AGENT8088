@@ -74,6 +74,19 @@ agent8088 --web
 
 Open `http://127.0.0.1:8180`.
 
+### Switching chats while a task runs
+
+**New chat** and saved chats remain available during a task. The running task
+keeps its own transcript, answers and approval requests; switching chats does
+not move them into the chat you are viewing. Return to the running chat to
+approve its action. Session-scoped grants are cleared when switching chats,
+so an action may ask for approval again.
+
+Messages entered while a task runs wait in a queue for the chat where you
+entered them. Only one task runs at a time. Stop or failure pauses the queue
+for your review. The sidebar identifies the running chat. You cannot rename,
+delete, reset or compact that chat while its task is running.
+
 ### Images and attachments in Agent8088 v1.2
 
 Use **+ → Image analysis** to choose images, paste a screenshot into the
@@ -172,7 +185,7 @@ sensitive-file floor still applies unconditionally.
 |---|---|
 | `/help` | List all commands |
 | `/new [name]` | Start a fresh session, optionally named |
-| `/sessions` | List saved named sessions |
+| `/sessions` | List saved chats, including their CLI/web source and model |
 | `/resume <name>` | Reload a named session (restores skill state too) |
 | `/reset` | Clear the current conversation |
 | `/history` | Show conversation history |
@@ -181,6 +194,13 @@ sensitive-file floor still applies unconditionally.
 | `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
+
+The first ordinary message in the interactive CLI automatically names and
+saves the chat. You do not need to run `/new` first. After restarting, use
+`/sessions` to find its name, then `/resume <name>` to continue. Saved progress
+also survives a failed or interrupted turn when the session write succeeds;
+a save failure is reported. One-shot and `--prompt-file` runs do not enable
+this interactive autosave behavior. `/save` remains a separate JSON export.
 
 ### Model
 

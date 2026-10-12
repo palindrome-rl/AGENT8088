@@ -218,7 +218,7 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 
 | Command | Purpose |
 | --- | --- |
-| `agent8088` | Start an interactive session. |
+| `agent8088` | Start an interactive session. The first message automatically creates a saved chat; use `/sessions` and `/resume <name>` after restarting. |
 | `agent8088 --memory-setup` | Add the mem0 memory engine to an existing install (installs the backend deps and makes mem0 the default engine). The installers offer the same choice up front: `-WithMem0`/`-SkipMem0` (PowerShell) or `--memory mem0`/`--memory native` (bash), plus an interactive prompt. Switch engines any time with `/memory engine native\|mem0` — both stores are kept. |
 | `agent8088 --uninstall` | Remove the install dir, config, env vars, and cron/scheduled-task entries. Add `--workspace` to also remove trace logs + WhatsApp session data, or `--dry-run` to preview first. |
 | `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
@@ -231,6 +231,11 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 | `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
 | `/dump` | Write a redacted diagnostic bundle (`dump-<date>-<time>.txt` in the data folder) for sharing in a bug report. |
 | `/save [file]` | Export the conversation and trace to JSON. Without a name it writes a new date-stamped file, so earlier saves are kept. |
+
+In the web UI, you can start or resume another chat while a task runs. Its
+answers and approval requests stay in the original chat. Messages sent while
+a task runs are queued for the chat where you entered them; only one task
+runs at a time. A running chat cannot be renamed, deleted, reset, or compacted.
 
 ---
 

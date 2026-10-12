@@ -53,7 +53,12 @@ export function PromptBar() {
   const imageInputRef = useRef<HTMLInputElement>(null)
   const { isStreaming, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
     promptQueue, queuePaused, enqueuePrompt, updateQueuedPrompt, removeQueuedPrompt, clearQueue,
-    setQueuePaused } = useSessionStore()
+    setQueuePaused, runningSession, sessionId, setSessionId } = useSessionStore()
+  // One agent task runs at a time, in whichever chat started it. While it
+  // runs, anything sent from any chat waits in the queue.
+  const taskRunning = isStreaming || runningSession !== null
+  const runningElsewhere = runningSession !== null && runningSession.id !== sessionId
+  const runningChatLabel = runningSession?.name ? `“${runningSession.name}”` : 'another chat'
   const { send: wsSend } = useWebSocket()
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingText, setEditingText] = useState('')
@@ -114,9 +119,10 @@ export function PromptBar() {
 
     const statusResponse = await fetch('/api/status')
     if (!statusResponse.ok) throw new Error(`Could not read session status (${statusResponse.status})`)
-    const status = await statusResponse.json() as { session_name?: string }
+    const status = await statusResponse.json() as { session_name?: string; session_id?: string }
     if (status.session_name) {
       setSessionName(status.session_name)
+      if (status.session_id) setSessionId(status.session_id)
       return
     }
 
@@ -128,10 +134,11 @@ export function PromptBar() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       })
-      const result = await response.json().catch(() => ({})) as { error?: string; name?: string }
+      const result = await response.json().catch(() => ({})) as { error?: string; name?: string; id?: string }
       if (response.status === 409 || result.error?.startsWith('session exists:')) continue
       if (!response.ok || result.error) throw new Error(result.error ?? `Could not create session (${response.status})`)
       setSessionName(result.name || name)
+      if (result.id) setSessionId(result.id)
       void queryClient.invalidateQueries({ queryKey: ['sessions'] })
       return
     }
@@ -240,7 +247,7 @@ export function PromptBar() {
     // prompt waits in the queue instead of being dropped. The session is
     // created now rather than at dispatch time, which keeps the dispatcher
     // (in the socket handler) free of async work.
-    if (isStreaming) {
+    if (taskRunning) {
       const queuedText = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       const queuedPlanTask = planTaskOf(queuedText)
       if (!queuedText.startsWith('/') || queuedPlanTask) {
@@ -257,8 +264,11 @@ export function PromptBar() {
           `or send a message instead of a /command.`)
         return
       }
+      const { sessionId: queuedFor, sessionName: queuedName } = useSessionStore.getState()
       enqueuePrompt({
         kind: queuedText.startsWith('/') ? 'command' : 'chat',
+        sessionId: queuedFor,
+        sessionName: queuedName,
         text: queuedText,
         attachmentIds: readyAttachments.flatMap((attachment) => attachment.id ? [attachment.id] : []),
         attachments: readyAttachments.map(({ id, file }) => ({ id, name: file.name, type: file.type, size: file.size })),
@@ -381,6 +391,24 @@ export function PromptBar() {
         </div>
       )}
 
+      {/* ── a task running in another chat ─────────────── */}
+      {runningElsewhere && (
+        <div role="status" className="mx-auto mb-2 flex max-w-2xl items-center gap-2 px-4 text-[11px] text-zinc-500 dark:text-zinc-400">
+          <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+          <span className="flex-1">
+            A task is running in {runningChatLabel}. Messages you send here wait until it finishes.
+          </span>
+          <button
+            type="button"
+            aria-label={`Stop the task running in ${runningSession?.name || 'another chat'}`}
+            onClick={() => wsSend({ type: 'interrupt' })}
+            className="rounded-md px-2 py-0.5 text-red-400 transition-colors hover:bg-red-600/15"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+
       {/* ── prompt queue ───────────────────────────────── */}
       {promptQueue.length > 0 && (
         <div className="mx-auto mb-2 max-w-2xl px-4">
@@ -389,6 +417,11 @@ export function PromptBar() {
               <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
                 Queued · {promptQueue.length}
                 {queuePaused && ' · paused'}
+                {!queuePaused && runningSession && (
+                  runningSession.id === sessionId
+                    ? ' · waiting for the task in this chat to finish'
+                    : ` · waiting for the task in ${runningChatLabel} to finish`
+                )}
               </span>
               <div className="flex items-center gap-1">
                 {queuePaused && (
@@ -453,6 +486,11 @@ export function PromptBar() {
                           : 'text-zinc-700 dark:text-zinc-200')}
                     >
                       {queued.text}
+                      {queued.sessionId && queued.sessionId !== sessionId && (
+                        <span className="ml-1.5 text-[11px] text-zinc-400 dark:text-zinc-500">
+                          · for {queued.sessionName ? `“${queued.sessionName}”` : 'another chat'}
+                        </span>
+                      )}
                     </span>
                   )}
                   {editingId !== queued.id && (
@@ -589,7 +627,7 @@ export function PromptBar() {
                 type="button"
                 aria-label="Permission mode"
                 aria-expanded={modeOpen}
-                disabled={modeChanging || isStreaming}
+                disabled={modeChanging || taskRunning}
                 onClick={() => setModeOpen((open) => !open)}
                 className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-800 disabled:opacity-40 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-100"
               >
