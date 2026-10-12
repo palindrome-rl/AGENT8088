@@ -51,6 +51,7 @@ than a design choice.
 | `web_search.py`, `web_server.py` | `web_search` backend routing; `--web` browser-UI mode (FastAPI/uvicorn) |
 | `logging_setup.py` | Daily-rotating JSONL operational log, attached to the `agent8088` logger tree |
 | `testing_support.py` | Shared test/verification helpers |
+| `completion.py` | Completion checks: unfinished-work wording, required files, multi-part requests, the continuation budget |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |
@@ -95,6 +96,43 @@ nor writes.
 
 If the model backend errors mid-turn, the loop returns the best output it has
 rather than crashing the session.
+
+### Completion checks
+
+A reply with no tool call is not always the end. Before it is accepted, the loop
+runs an ordered set of cheap, deterministic checks (`completion.py`; no model
+call is made by any of them). The first one that fails sends a follow-up that
+says to *continue*, never to give a final answer:
+
+0. **Empty reply.** With work pending (a failed tool, an unverified change, a part
+   of the request not done) the follow-up is "Your last reply was empty. Continue
+   the task". With nothing pending it is the single legacy retry.
+1. **Admits unfinished work.** The reply says, in plain words, that it is not
+   done ("not finished yet", "still need to", "remaining steps", "I'll now",
+   `TODO` outside code) *and* the run shows open items, or the request asked for
+   changes and nothing was written.
+2. **Named files exist.** Files the request asks to create (a path whose nearest
+   cue in its sentence is a verb like write/create/save, so an input file is not
+   one), and files this run wrote that the reply names, must exist and be
+   non-empty.
+3. **Multi-part requests.** A numbered or bulleted list, or explicit "and also /
+   then" clauses (two or more), becomes a checklist in the task state. Parts whose
+   key words neither the reply nor the written file names mention are listed.
+   A single-paragraph request builds no checklist.
+4. **Verification.** Changed work with no passing check gets "Continue, and also
+   run what you changed". The tests reminder fires only when the project already
+   has a test suite and the changed file is library code: not a scratch dir, the
+   system temp dir, or an entry-point or one-off script (scrapers, downloaders).
+
+All of them draw on one budget, `max_completion_continuations` (3). A follow-up
+that makes progress (a changed file, a passing check, an addressed part) hands
+its slot back, so a long task that is still advancing is not cut off; the total
+is bounded at four times the budget. When the budget is spent the reply is
+accepted and the answer ends with a "Not completed: ..." note listing what is
+unmet. Re-planning after two failed actions stays separate and does not use the
+budget; `max_post_check_rounds` still bounds tool rounds after a follow-up. Set
+the budget to `0` to turn the checks off. In a disposable container the old
+deliverables re-check still runs, as one of these follow-ups.
 
 ## Plans stop at the first failed step
 
