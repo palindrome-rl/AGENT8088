@@ -5855,6 +5855,24 @@ def _git_tool_changed_tree(name: str, result: str) -> bool:
                 or "nothing to commit" in text or "nothing added to commit" in text)
 
 
+_SHELL_GIT_COMMAND = re.compile(r"(?:^|[\s;&|(])git\s")
+
+
+def _git_tools_hint(command: str) -> str:
+    """Where a git command the shell refused can still go, or "".
+
+    `git push` is hard-blocked in the shell and the sandbox refuses writes under
+    .git, so a commit-and-push through execute_shell always fails. Told only
+    "forbidden by safety policy", small models reported a security block and
+    stopped until the user wrote "you have full permission". The git tools run
+    git on this computer, and git_push asks the user for its own approval."""
+    if not _SHELL_GIT_COMMAND.search(command or ""):
+        return ""
+    return ("Use the git tools instead: git_commit, git_push, git_branch, git_checkout. "
+            "They run git on this computer, and git_push shows the user an approval "
+            "prompt itself, so call it rather than asking for permission first.")
+
+
 # --- what a shell command after a finishing check is -------------------------
 # Used only to decide whether a round after a finishing nudge changed anything
 # (MAX_POST_CHECK_ROUNDS), never for permission. Errs towards "change": an
@@ -9779,7 +9797,7 @@ _SANDBOX_DENIED_RE = re.compile(
     r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
 
 
-def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> str:
     """Say where the sandbox lets a command write when it was refused access.
 
     "Access is denied" alone does not tell the model the boundary is deliberate,
@@ -9788,6 +9806,8 @@ def _explain_sandbox_denial(result: str, workspace: Path) -> str:
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    if hint := _git_tools_hint(command):
+        return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
             "the sandbox temp folder; everything else is read-only, and programs "
             "outside the agent's own runtime may be refused. Creating virtual "
@@ -9825,7 +9845,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
         return _explain_sandbox_denial(
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
-            ARTIFACTS_ROOT if temporary is None else workspace)
+            ARTIFACTS_ROOT if temporary is None else workspace, command)
     finally:
         if temporary:
             temporary.cleanup()
@@ -11352,7 +11372,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",
                detail=command[:200], reason="hard_blocked_shell")
-        return "Error: This shell operation is forbidden by Agent8088's safety policy."
+        refusal = "This shell operation is forbidden by Agent8088's safety policy."
+        if hint := _git_tools_hint(command):
+            # Its own suggested_action: the generic one ("do not bypass
+            # permissions") read as "do not use another route" to small models.
+            return efficiency.tool_error("blocked_shell_git", refusal, hint, recoverable=True)
+        return f"Error: {refusal}"
 
     if mode == "shell":
         web_urls = _shell_web_urls(command)
@@ -16814,8 +16839,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         trace.append({"turn": turn, "type": "denial_breaker",
                                       "content": answer})
                     return answer
-                messages.append(_harness_turn("Permission denied by the user. You remain in readonly mode. "
-                    "Tell the user what you could not do and why the task cannot be completed."))
+                # No mode claim: a denial does not change the mode, and "you
+                # remain in readonly mode" was false after a declined git_push
+                # in edit or full-auto, telling the model writes were now off.
+                messages.append(_harness_turn(f"Permission denied by the user, so {name} did not run. "
+                    "Do not retry it. Tell the user what you could not do and why."))
                 continue
 
             usable = (not _plan_step_failed(result)

@@ -1,5 +1,7 @@
 """Harness-side fixes for the small-model QA sheet (gemma-4-26b, Qwen 3.8 27B,
 Gemma 4 31B): what the model is told, and when the harness stops it."""
+import json
+
 import httpx
 import openai
 
@@ -46,3 +48,57 @@ def test_the_chat_answer_is_clear_and_never_echoes_the_key(engine, monkeypatch):
     leaky = engine._model_failure_reason(
         ShortAuthError("Incorrect API key provided: sk-or-v1-abcd****wxyz"), "openrouter", "m")
     assert "sk-or" not in leaky and "wxyz" not in leaky
+
+
+# --- git commit/push: a pointer to the git tools, never a bare "blocked" -------
+
+def _model(engine, monkeypatch, replies):
+    calls = []
+
+    def fake_model(messages, tools, **kwargs):
+        calls.append([m.get("content") for m in messages])
+        content = replies[min(len(calls) - 1, len(replies) - 1)]
+        message = type("M", (), {"content": content, "tool_calls": None})()
+        return type("R", (), {"choices": [type("C", (), {"message": message,
+                                                         "finish_reason": "stop"})()]})()
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", fake_model)
+    return calls
+
+
+def test_shell_git_push_is_still_refused_but_points_at_the_git_tools(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    result = engine.run_tool("execute_shell",
+                             {"command": "git add . && git commit -m 'wip' && git push"})
+    assert result.startswith("Error: This shell operation is forbidden by Agent8088's safety policy.")
+    action = json.loads(result.split("\n", 1)[1])["suggested_action"]
+    assert "git_commit" in action and "git_push" in action and "approval prompt" in action
+    assert (engine.run_tool("execute_shell", {"command": "rm -rf /"})
+            == "Error: This shell operation is forbidden by Agent8088's safety policy.")
+
+
+def test_git_push_still_needs_the_users_approval(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    assert engine.run_tool("git_push", {}).startswith("ESCALATION_REQUEST\x1f")
+
+
+def test_a_sandbox_refused_git_write_names_the_git_tools(engine, tmp_path):
+    denied = ("fatal: Unable to create 'C:/p/.git/index.lock': Permission denied\n"
+              "Command exited with status 128.")
+    note = engine._explain_sandbox_denial(denied, tmp_path, "git add -A && git commit -m wip")
+    assert "git_commit" in note and "ask the user" not in note
+    assert "git_commit" not in engine._explain_sandbox_denial(denied, tmp_path, "pip install x")
+
+
+def test_a_declined_push_does_not_claim_readonly_mode(engine, monkeypatch):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    calls = _model(engine, monkeypatch, ["✿FUNCTION✿: git_push ✿ARGS✿: {}",
+                                         "Committed, but the push was declined."])
+    monkeypatch.setattr(engine, "exec_tool", lambda name, arguments, depth=0:
+                        engine.run_tool(name, json.loads(arguments)))
+    answer = engine.run_agent([{"role": "user", "content": "push my branch"}], max_turns=5,
+                              on_escalation=lambda name, result: False, dynamic_turns=False)
+    told = str(calls[-1][-1])
+    assert "Permission denied by the user, so git_push did not run" in told
+    assert "readonly" not in told
+    assert answer.startswith("Committed, but the push was declined.")
