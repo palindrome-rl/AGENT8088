@@ -102,3 +102,27 @@ def test_a_declined_push_does_not_claim_readonly_mode(engine, monkeypatch):
     assert "Permission denied by the user, so git_push did not run" in told
     assert "readonly" not in told
     assert answer.startswith("Committed, but the push was declined.")
+
+
+# --- file tools act on this computer; only shell and code are sandboxed --------
+
+def test_permission_context_does_not_confine_file_tools_to_the_sandbox(engine):
+    for mode in ("full-auto", "edit", "readonly"):
+        text = engine.render_permission_context(mode)
+        assert "allowed when sandboxed" not in text
+        assert "File tools work on this computer's files in the allowed paths" in text
+
+
+def test_a_sandbox_denial_points_at_the_file_tools(engine, tmp_path):
+    note = engine._explain_sandbox_denial("touch: /p/x: Permission denied", tmp_path, "touch /p/x")
+    assert "write_file or edit_file" in note and "this computer's files" in note
+
+
+def test_a_refused_path_names_the_real_boundary(engine, monkeypatch, tmp_path):
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    outside = tmp_path.parent / "elsewhere.txt"
+    result = engine.exec_tool("write_file", json.dumps({"filename": str(outside), "content": "x"}))
+    action = json.loads(result.split("\n", 1)[1])["suggested_action"]
+    assert str(tmp_path) in action and "allowed_paths" in action
+    assert not outside.exists()

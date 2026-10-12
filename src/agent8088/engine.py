@@ -4676,6 +4676,10 @@ def render_permission_context(mode: str | None = None) -> str:
     """State the live permission boundary once for every front end."""
     mode = mode or PERMISSION_MODE
     lines = [f"\n\n## Current Permission Mode: {mode}"]
+    # Not "allowed when sandboxed": file tools never run in the sandbox, and a
+    # 26B model read that as "I can only write inside the sandbox, not on the PC".
+    where = ("File tools work on this computer's files in the allowed paths; "
+             "only shell and code run sandboxed.")
     if mode == "plan-only":
         lines.append(
             # Restored from the "## Plan Mode" section that the layered-prompt
@@ -4690,18 +4694,17 @@ def render_permission_context(mode: str | None = None) -> str:
         )
     elif mode == "full-auto":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Catastrophic commands and "
-            "credential-path writes remain blocked."
+            f"{where} Catastrophic commands and credential-path writes remain blocked."
         )
     elif mode == "edit":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Use only the actions needed; "
+            f"{where} Use only the actions needed; "
             "catastrophic commands and credential-path writes remain blocked."
         )
     else:
         lines.append(
             "Reads and safe shell commands are allowed. Writes and mutations require user "
-            "approval; rely on the tool result for the actual decision."
+            f"approval; rely on the tool result for the actual decision. {where}"
         )
     return "\n".join(lines) + "\n"
 
@@ -9809,7 +9812,9 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only, and programs "
+            "the sandbox temp folder; everything else is read-only to them. To create "
+            "or change a file elsewhere in the allowed paths, use write_file or "
+            "edit_file: they act on this computer's files, not the sandbox. Programs "
             "outside the agent's own runtime may be refused. Creating virtual "
             "environments or installing packages from the shell will not work "
             "here: keep outputs under that folder, use the packages the agent's "
@@ -11979,6 +11984,12 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception as e:
         result = f"Error: {e}" if str(e) else f"Error: {type(e).__name__}"
 
+    if result.startswith('Error: Path not allowed'):
+        # The real boundary, so the model does not report "sandbox only".
+        allowed = ", ".join(str(path) for path in ALLOWED_PATHS) or "none"
+        result = efficiency.tool_error('path_not_allowed', result.removeprefix('Error:').strip(),
+            f"File tools work on this computer's files, but only inside: {allowed}. Use a path "
+            f"there; only the user can allow another folder, via allowed_paths in {_config_file()}.")
     if result.startswith('Error:') and '"suggested_action"' not in result:
         validation = _is_missing_argument_error(result) or _is_parse_error_result(result)
         result = efficiency.tool_error('invalid_arguments' if validation else 'tool_failure',
@@ -14414,6 +14425,8 @@ def describe_capabilities() -> str:
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
         f"- New generated files: {ARTIFACTS_ROOT}",
+        f"- File tools (this computer, not the sandbox) reach: "
+        f"{', '.join(str(path) for path in ALLOWED_PATHS) or 'everywhere'}",
         f"- Web search: {_search_chain_summary()}{_limited_suffix(capabilities.SEARCH)}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
