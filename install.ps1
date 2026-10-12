@@ -3518,8 +3518,8 @@ function Verify-Install {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
         Write-Host "  Sandbox:  Docker is used when available"
-        Write-Host "            Native is not set up on Windows yet (optional, may fail):"
-        Write-Host "            elevated agent8088 --sandbox-setup"
+        Write-Host "            Native setup did not finish; retry (no admin needed):"
+        Write-Host "            agent8088 --sandbox-setup"
     }
     Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://agent8088-installer.pages.dev/install.ps1)"
     if ($script:InstallLog) { Write-Host "  Log:    $($script:InstallLog)" }
