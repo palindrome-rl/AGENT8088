@@ -104,6 +104,11 @@ export interface ChatMessage {
   /** CLI/Rich output is terminal text, not Markdown. */
   format?: 'markdown' | 'terminal'
   attachments?: ChatAttachment[]
+  /** The turn's thinking, one entry per model step. Live-only: /api/history
+   *  does not carry it, so a reload drops it. */
+  reasoning?: string[]
+  /** The turn's tool rows (and their diffs), snapshotted when it finished. */
+  tools?: ToolEvent[]
 }
 
 export interface ChatAttachment {
@@ -168,6 +173,10 @@ export interface ConfigInfo {
   tool_selection: 'full' | 'hybrid' | 'auto'
   max_turns: number
   temperature: number
+  verbose?: 'on' | 'off' | 'full'
+  usage_mode?: 'off' | 'tokens' | 'full'
+  show_trace?: boolean
+  show_reasoning?: boolean
   tools_file: string
   system_file: string
   skills_dir: string
@@ -304,6 +313,13 @@ export type ToolDiffPayload = {
   removed: number
   lines: ToolDiffLine[]
   truncated: boolean
+}
+
+export type ToolEvent = {
+  name: string
+  status: 'running' | 'done' | 'failed'
+  result?: string
+  diff?: ToolDiffPayload
 }
 
 export type WSClientMessage =

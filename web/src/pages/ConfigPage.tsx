@@ -227,16 +227,19 @@ function ModelSwitcher({ providers, config, onSwitch, switching }: {
 
 // ---- Preferences Panel ----
 
-function PreferencesPanel({ onSet, setting }: {
+function PreferencesPanel({ initial, onSet, setting }: {
+  /** Seeds the form once. Not re-synced on refetch: react-query refetches on
+   *  window focus, which would wipe unsaved edits. */
+  initial: ConfigInfo
   onSet: (prefs: Record<string, unknown>) => void
   setting: boolean
 }) {
-  const [temperature, setTemperature] = useState(0.1)
-  const [maxTurns, setMaxTurns] = useState(10)
-  const [verbose, setVerbose] = useState('on')
-  const [usageMode, setUsageMode] = useState('tokens')
-  const [showTrace, setShowTrace] = useState(false)
-  const [showReasoning, setShowReasoning] = useState(false)
+  const [temperature, setTemperature] = useState(initial.temperature ?? 0.1)
+  const [maxTurns, setMaxTurns] = useState(initial.max_turns ?? 10)
+  const [verbose, setVerbose] = useState<string>(initial.verbose ?? 'on')
+  const [usageMode, setUsageMode] = useState<string>(initial.usage_mode ?? 'tokens')
+  const [showTrace, setShowTrace] = useState(initial.show_trace ?? false)
+  const [showReasoning, setShowReasoning] = useState(initial.show_reasoning ?? false)
 
   const save = () => {
     onSet({
@@ -335,7 +338,7 @@ function PreferencesPanel({ onSet, setting }: {
             )}
           >
             <span className={cn(
-              'absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
+              'absolute left-0 top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
               showTrace ? 'translate-x-5' : 'translate-x-0.5',
             )} />
           </button>
@@ -350,7 +353,7 @@ function PreferencesPanel({ onSet, setting }: {
             )}
           >
             <span className={cn(
-              'absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
+              'absolute left-0 top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
               showReasoning ? 'translate-x-5' : 'translate-x-0.5',
             )} />
           </button>
@@ -518,7 +521,7 @@ function AuditToggle({ onToggle, toggling }: { onToggle: (enable: boolean) => vo
           <Loader2 className="absolute left-2 top-0.5 h-5 w-5 animate-spin text-white" />
         ) : (
           <span className={cn(
-            'absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
+            'absolute left-0 top-0.5 h-5 w-5 rounded-full bg-white transition-transform',
             enabled ? 'translate-x-5' : 'translate-x-0.5',
           )} />
         )}
@@ -658,6 +661,7 @@ export default function ConfigPage() {
   // Preferences
   const prefMutation = useMutation({
     mutationFn: (prefs: Record<string, unknown>) => postJSON<ActionResponse>('/api/preferences', prefs),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config'] }),
   })
 
   // Limits
@@ -834,10 +838,17 @@ export default function ConfigPage() {
         <div className="space-y-6">
           {/* Preferences */}
           <Section icon={Sliders} title="Preferences" subtitle="Session-level settings">
-            <PreferencesPanel
-              onSet={(prefs) => prefMutation.mutate(prefs)}
-              setting={prefMutation.isPending}
-            />
+            {configQuery.data ? (
+              <PreferencesPanel
+                initial={configQuery.data}
+                onSet={(prefs) => prefMutation.mutate(prefs)}
+                setting={prefMutation.isPending}
+              />
+            ) : configQuery.isLoading ? (
+              <div className="flex items-center gap-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" /> Loading preferences…
+              </div>
+            ) : null}
           </Section>
 
           {/* Limits */}
