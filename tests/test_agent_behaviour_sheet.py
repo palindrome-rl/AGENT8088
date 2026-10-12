@@ -148,3 +148,14 @@ def test_harness_notes_try_another_way_before_the_user(engine, monkeypatch, tmp_
     action = json.loads(engine.exec_tool("read_text", json.dumps({"filename": "a"}))
                         .split("\n", 1)[1])["suggested_action"]
     assert action.startswith("Choose an accessible path or another way")
+
+
+# --- subagents: say when explore and coder are the right call -----------------
+
+def test_subagent_guidance_names_explore_and_coder(engine):
+    guidance = engine.render_capability_guidance(
+        {"spawn_subagent": engine.TOOL_SPECS["spawn_subagent"]}, native_tools=True)
+    assert "explore for a broad search" in guidance and "coder for a change" in guidance
+    description = engine.TOOL_SPECS["spawn_subagent"]["description"]
+    for agent in ("explore", "coder", "researcher", "general-purpose"):
+        assert agent in description

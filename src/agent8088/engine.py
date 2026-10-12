@@ -4633,9 +4633,10 @@ def render_capability_guidance(specs: dict, *, native_tools: bool) -> str:
     if "spawn_subagent" in specs:
         sections.append(
             "## Subagents\n"
-            "Delegate only an independent task that needs several steps. Give it a complete "
-            "goal, expected deliverable, and authority boundary. Do not delegate a one-tool "
-            "action, and synthesize the final answer yourself."
+            "Delegate independent multi-step work: explore for a broad search across many "
+            "files, coder for a change spanning several files. Give a complete goal, "
+            "deliverable and limits; never delegate a one-tool action; write the final "
+            "answer yourself."
         )
     mcp_tools = [spec for spec in specs.values() if spec.get("mode") == "mcp"]
     if mcp_tools:
