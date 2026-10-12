@@ -228,6 +228,23 @@ class Mem0MemoryStore:
                     "dims": embed_dims,
                 }
 
+            # Mem0's constructor validates its configuration but does not
+            # contact the embedding service. In particular, an unpulled local
+            # Ollama model used to look healthy until the first recall, where
+            # Mem0 swallowed the failure and returned an empty list. The native
+            # embedder uses the same provider/model configuration, so probe it
+            # once before claiming Mem0 is available. Falling back to SQLite
+            # preserves local keyword recall and status explains the split.
+            if (self.embedder is not None
+                    and embed_provider == "ollama"
+                    and not self.embedder.available()):
+                detail = getattr(self.embedder, "last_error", "")
+                self.last_error = (f"embedding service unavailable for "
+                                   f"{embed_provider}/{self.embedder.model}"
+                                   + (f": {detail}" if detail else ""))[:300]
+                self._memory = None
+                self._available = False
+                return None
             if hasattr(memory_cls, "from_config"):
                 self._memory = memory_cls.from_config(cfg)
             else:
