@@ -3,15 +3,23 @@ import { useUIStore } from '@/stores/ui'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { useEffect, useState } from 'react'
 
 export function PlanApprovalCard() {
   const { planApprovalPending, setPlanApprovalPending } = useUIStore()
   const { send } = useWebSocket()
+  const [error, setError] = useState('')
+
+  useEffect(() => { setError('') }, [planApprovalPending?.id])
 
   if (!planApprovalPending) return null
 
   const handleResponse = (mode: string) => {
-    send({ type: 'plan_approval', mode, id: planApprovalPending.id })
+    const delivered = send({ type: 'plan_approval', mode, id: planApprovalPending.id })
+    if (!delivered) {
+      setError('Approval could not be sent. Keep this card open and try again when connected.')
+      return
+    }
     setPlanApprovalPending(null)
   }
 
@@ -32,6 +40,7 @@ export function PlanApprovalCard() {
             </ReactMarkdown>
           </div>
         </div>
+        {error && <p role="alert" className="mb-3 text-xs text-red-600 dark:text-red-400">{error}</p>}
         <div className="flex flex-wrap gap-2">
           <button
             onClick={() => handleResponse('readonly')}

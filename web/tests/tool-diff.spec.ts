@@ -42,7 +42,7 @@ async function push(page: any, event: unknown) {
 /** Get the app into its streaming state, which is when tool activity renders. */
 async function streaming(page: any) {
   await page.addInitScript(STUB)
-  await page.goto('/', { waitUntil: 'domcontentloaded' })
+  await page.goto('/', { waitUntil: 'networkidle' })
   await page.waitForFunction(() => !!(window as any).__fake)
   await push(page, { type: 'spin', message: 'running edit_file...', elapsed: 1, tokens: 0 })
 }
