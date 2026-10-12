@@ -1,14 +1,18 @@
 import { Check, X, FileText } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
+import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 export function PlanApprovalCard() {
   const { planApprovalPending, setPlanApprovalPending } = useUIStore()
+  const sessionId = useSessionStore((s) => s.sessionId)
   const { send } = useWebSocket()
 
-  if (!planApprovalPending) return null
+  // Shown in the chat whose task asked; it waits there while another is viewed.
+  if (!planApprovalPending
+      || (planApprovalPending.sessionId && planApprovalPending.sessionId !== sessionId)) return null
 
   const handleResponse = (mode: string) => {
     send({ type: 'plan_approval', mode, id: planApprovalPending.id })

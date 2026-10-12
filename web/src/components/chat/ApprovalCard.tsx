@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
 import { ChevronDown, ChevronUp, Clock, ShieldCheck, ShieldX } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
+import { useSessionStore } from '@/stores/session'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { Button } from '@/components/atoms/Button'
 
 /** One approval card; the arrow exposes the less common approval scopes. */
 export function ApprovalCard() {
   const { approvalPending, setApprovalPending } = useUIStore()
+  const sessionId = useSessionStore((s) => s.sessionId)
   const { send } = useWebSocket()
   const [menuOpen, setMenuOpen] = useState(false)
   const [error, setError] = useState('')
@@ -16,7 +18,8 @@ export function ApprovalCard() {
     setError('')
   }, [approvalPending?.id])
 
-  if (!approvalPending) return null
+  // Shown in the chat whose task asked; it waits there while another is viewed.
+  if (!approvalPending || (approvalPending.sessionId && approvalPending.sessionId !== sessionId)) return null
 
   const respond = (approved: boolean, sessionScope: boolean) => {
     const delivered = send({ type: 'approval', approved, session_scope: sessionScope, id: approvalPending.id })
