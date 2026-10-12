@@ -3128,7 +3128,8 @@ def _model_error_context(provider_name: str, model_name: str) -> dict:
             "base_url": active_endpoint_url(provider_name) if provider_name else active_endpoint_url(),
             "model": model_name or MODEL_NAME,
             "api_key_env": profile.get("api_key_env") or None,
-            "timeout_seconds": TIMEOUT_SECONDS}
+            "timeout_seconds": TIMEOUT_SECONDS,
+            "env_file": str(ENV_FILE_PATH)}
 
 
 def explain_model_error(error, provider_name: str = "", model_name: str = ""):
@@ -4373,8 +4374,8 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     ]
     lines.append("Mandatory routing — call the matching tool before writing an answer:")
     lines.append(
-        "- When a tool error has suggested_action, relay it exactly; never invent admin rights, "
-        "paths, executables, or setup commands.")
+        "- Act on a tool error's suggested_action yourself; ask the user only for what only "
+        "they can do; never invent admin rights, paths, executables, or setup commands.")
     if "read_text" in specs:
         lines.append("- A direct request to read a file MUST call read_text.")
     if "execute_shell" in specs:
@@ -4654,9 +4655,10 @@ def render_capability_guidance(specs: dict, *, native_tools: bool) -> str:
     if "spawn_subagent" in specs:
         sections.append(
             "## Subagents\n"
-            "Delegate only an independent task that needs several steps. Give it a complete "
-            "goal, expected deliverable, and authority boundary. Do not delegate a one-tool "
-            "action, and synthesize the final answer yourself."
+            "Delegate independent multi-step work: explore for a broad search across many "
+            "files, coder for a change spanning several files. Give a complete goal, "
+            "deliverable and limits; never delegate a one-tool action; write the final "
+            "answer yourself."
         )
     mcp_tools = [spec for spec in specs.values() if spec.get("mode") == "mcp"]
     if mcp_tools:
@@ -4697,6 +4699,10 @@ def render_permission_context(mode: str | None = None) -> str:
     """State the live permission boundary once for every front end."""
     mode = mode or PERMISSION_MODE
     lines = [f"\n\n## Current Permission Mode: {mode}"]
+    # Not "allowed when sandboxed": file tools never run in the sandbox, and a
+    # 26B model read that as "I can only write inside the sandbox, not on the PC".
+    where = ("File tools work on this computer's files in the allowed paths; "
+             "only shell and code run sandboxed.")
     if mode == "plan-only":
         lines.append(
             # Restored from the "## Plan Mode" section that the layered-prompt
@@ -4711,18 +4717,17 @@ def render_permission_context(mode: str | None = None) -> str:
         )
     elif mode == "full-auto":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Catastrophic commands and "
-            "credential-path writes remain blocked."
+            f"{where} Catastrophic commands and credential-path writes remain blocked."
         )
     elif mode == "edit":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Use only the actions needed; "
+            f"{where} Use only the actions needed; "
             "catastrophic commands and credential-path writes remain blocked."
         )
     else:
         lines.append(
             "Reads and safe shell commands are allowed. Writes and mutations require user "
-            "approval; rely on the tool result for the actual decision."
+            f"approval; rely on the tool result for the actual decision. {where}"
         )
     return "\n".join(lines) + "\n"
 
@@ -5881,6 +5886,24 @@ def _git_tool_changed_tree(name: str, result: str) -> bool:
     text = str(result or "")
     return not (text.lstrip().startswith("Error") or "exited with status" in text
                 or "nothing to commit" in text or "nothing added to commit" in text)
+
+
+_SHELL_GIT_COMMAND = re.compile(r"(?:^|[\s;&|(])git\s")
+
+
+def _git_tools_hint(command: str) -> str:
+    """Where a git command the shell refused can still go, or "".
+
+    `git push` is hard-blocked in the shell and the sandbox refuses writes under
+    .git, so a commit-and-push through execute_shell always fails. Told only
+    "forbidden by safety policy", small models reported a security block and
+    stopped until the user wrote "you have full permission". The git tools run
+    git on this computer, and git_push asks the user for its own approval."""
+    if not _SHELL_GIT_COMMAND.search(command or ""):
+        return ""
+    return ("Use the git tools instead: git_commit, git_push, git_branch, git_checkout. "
+            "They run git on this computer, and git_push shows the user an approval "
+            "prompt itself, so call it rather than asking for permission first.")
 
 
 # --- what a shell command after a finishing check is -------------------------
@@ -9923,7 +9946,7 @@ _SANDBOX_DENIED_RE = re.compile(
     r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
 
 
-def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> str:
     """Say where the sandbox lets a command write when it was refused access.
 
     "Access is denied" alone does not tell the model the boundary is deliberate,
@@ -9932,12 +9955,17 @@ def _explain_sandbox_denial(result: str, workspace: Path) -> str:
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    if hint := _git_tools_hint(command):
+        return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only, and programs "
+            "the sandbox temp folder; everything else is read-only to them. To create "
+            "or change a file elsewhere in the allowed paths, use write_file or "
+            "edit_file: they act on this computer's files, not the sandbox. Programs "
             "outside the agent's own runtime may be refused. Creating virtual "
             "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder, use the packages the agent's "
-            "Python already has, or ask the user to install what is missing.")
+            "here: keep outputs under that folder and use the packages the agent's "
+            "Python already has or another tool; ask the user to install something "
+            "only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
@@ -9969,7 +9997,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
         return _explain_sandbox_denial(
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
-            ARTIFACTS_ROOT if temporary is None else workspace)
+            ARTIFACTS_ROOT if temporary is None else workspace, command)
     finally:
         if temporary:
             temporary.cleanup()
@@ -11583,7 +11611,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",
                detail=command[:200], reason="hard_blocked_shell")
-        return "Error: This shell operation is forbidden by Agent8088's safety policy."
+        refusal = "This shell operation is forbidden by Agent8088's safety policy."
+        if hint := _git_tools_hint(command):
+            # Its own suggested_action: the generic one ("do not bypass
+            # permissions") read as "do not use another route" to small models.
+            return efficiency.tool_error("blocked_shell_git", refusal, hint, recoverable=True)
+        return f"Error: {refusal}"
 
     if mode == "shell":
         web_urls = _shell_web_urls(command)
@@ -12050,7 +12083,8 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
     stem = program[:-4] if program.lower().endswith(".exe") else program
     hint = _INSTALL_HINTS.get(stem.lower())
     if hint or (os.sep not in str(missing) and "/" not in str(missing) and "." not in stem):
-        action = (f"`{stem}` is not installed or not on PATH: {hint}. Tell the user; do not try to install it yourself."
+        action = (f"`{stem}` is not installed or not on PATH. Do the job another way with the tools you "
+                  f"have if you can; otherwise tell the user ({hint}). Do not try to install it yourself."
                   if hint else f"`{stem}` is not installed or not on PATH. Use another tool, or tell the user it is missing.")
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
@@ -12177,7 +12211,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except PermissionError as e:
         target = f": {e.filename}" if getattr(e, "filename", None) else ""
         result = efficiency.tool_error('permission_denied', f'The operating system denied access{target}.',
-            'Ask the user to resolve access or choose an accessible path. Do not bypass permissions.')
+            'Choose an accessible path or another way to do this; ask the user only if this exact '
+            'path is required. Do not bypass permissions.')
     except (ValueError, TypeError) as e:
         result = efficiency.tool_error('invalid_input', str(e),
             'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)
@@ -12186,6 +12221,12 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception as e:
         result = f"Error: {e}" if str(e) else f"Error: {type(e).__name__}"
 
+    if result.startswith('Error: Path not allowed'):
+        # The real boundary, so the model does not report "sandbox only".
+        allowed = ", ".join(str(path) for path in ALLOWED_PATHS) or "none"
+        result = efficiency.tool_error('path_not_allowed', result.removeprefix('Error:').strip(),
+            f"File tools work on this computer's files, but only inside: {allowed}. Use a path "
+            f"there; only the user can allow another folder, via allowed_paths in {_config_file()}.")
     if result.startswith('Error:') and '"suggested_action"' not in result:
         validation = _is_missing_argument_error(result) or _is_parse_error_result(result)
         result = efficiency.tool_error('invalid_arguments' if validation else 'tool_failure',
@@ -13377,7 +13418,8 @@ def _model_failure_reason(error, provider_name: str = "", model_name: str = "") 
     if friendly.kind in ("unknown", "bad_request"):
         # Nothing more specific to say: keep the long-standing wording.
         message = f"the model backend errored ({detail})."
-    elif (detail and detail not in message and len(detail) <= 120
+    elif (friendly.kind != "auth"  # a provider's 401 text can echo part of the key
+          and detail and detail not in message and len(detail) <= 120
           and not any(ch in detail for ch in "{}<>")):
         message = f"{message.rstrip('.')} ({detail})."
     if not message.endswith((".", "!", "?", "…", ")")):
@@ -14620,6 +14662,8 @@ def describe_capabilities() -> str:
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
         f"- New generated files: {ARTIFACTS_ROOT}",
+        f"- File tools (this computer, not the sandbox) reach: "
+        f"{', '.join(str(path) for path in ALLOWED_PATHS) or 'everywhere'}",
         f"- Web search: {_search_chain_summary()}{_limited_suffix(capabilities.SEARCH)}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
@@ -17045,8 +17089,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         trace.append({"turn": turn, "type": "denial_breaker",
                                       "content": answer})
                     return answer
-                messages.append(_harness_turn("Permission denied by the user. You remain in readonly mode. "
-                    "Tell the user what you could not do and why the task cannot be completed."))
+                # No mode claim: a denial does not change the mode, and "you
+                # remain in readonly mode" was false after a declined git_push
+                # in edit or full-auto, telling the model writes were now off.
+                messages.append(_harness_turn(f"Permission denied by the user, so {name} did not run. "
+                    "Do not retry it. Tell the user what you could not do and why."))
                 continue
 
             usable = (not _plan_step_failed(result)
