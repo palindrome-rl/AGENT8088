@@ -461,8 +461,50 @@ def test_searxng_ordinary_queries_stay_general(monkeypatch):
 
     monkeypatch.setattr(web_search, "_http_get_json", fake_get_json)
     ctx = FakeCtx(config={"search_base_url": "http://127.0.0.1:8899/search?q="})
-    SearxngProvider().search("ferrari 488 specs", 5, ctx)
+    out = SearxngProvider().search("ferrari 488 specs", 5, ctx)
     assert "categories=images" not in seen["url"]
+    assert isinstance(out, SearchSuccess) and not out.results
+
+
+def test_searxng_reports_unresponsive_engines_when_empty(monkeypatch):
+    monkeypatch.setattr(web_search, "_http_get_json", lambda *a, **k: {
+        "results": [], "unresponsive_engines": [["brave", "timeout"], ["bing", "403"]]})
+    ctx = FakeCtx(config={"search_base_url": "http://127.0.0.1:8899/search?q="})
+
+    out = SearxngProvider().search("ferrari 488 specs", 5, ctx)
+
+    assert isinstance(out, SearchFailure)
+    assert "brave, bing" in out.error
+    assert "container logs" in out.error
+
+
+def test_searxng_empty_results_never_triggers_a_public_fallback(monkeypatch):
+    """A pinned local-only provider surfaces its failure without routing the
+    query to another provider."""
+    monkeypatch.setattr(web_search, "_http_get_json", lambda *a, **k: {
+        "results": [], "unresponsive_engines": [["brave", "timeout"]]})
+
+    class OtherProvider:
+        name = "other"
+        calls = 0
+
+        def is_available(self, ctx):
+            return True
+
+        def search(self, *args, **kwargs):
+            self.calls += 1
+            return SearchSuccess([], "other")
+
+    other = OtherProvider()
+    searxng = SearxngProvider()
+    ctx = FakeCtx(config={"search_base_url": "http://127.0.0.1:8899/search?q="})
+    report = web_search.run_search(
+        "private query", 5, web_search.Registry([searxng, other]),
+        {"web_search_provider": "searxng"}, ctx, return_report=True)
+
+    assert report.provider == ""
+    assert other.calls == 0
+    assert "SearXNG returned no results and reported unresponsive engines" in report.text
 
 
 def test_run_search_passes_images_flag_to_provider(monkeypatch):
