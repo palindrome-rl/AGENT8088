@@ -50,6 +50,52 @@ def test_inline_plan_uses_web_chat_runner(monkeypatch):
     assert socket.events == []
 
 
+def test_queued_plan_runs_in_its_originating_chat_and_restores_the_view(monkeypatch):
+    viewed = type("Session", (), {"name": "", "messages": []})()
+    origin = type("Session", (), {"name": "", "messages": []})()
+    cli = type("Cli", (), {"S": viewed})()
+    engine, socket = _Engine(), _Socket()
+    seen = []
+
+    monkeypatch.setattr(web_server, "_turn_session", lambda _cli, sid: origin if sid == "origin" else None)
+
+    async def fake_handle_chat(ws, frame, agent, context):
+        seen.append((ws, frame, agent, context.S))
+
+    monkeypatch.setattr(web_server, "_handle_chat", fake_handle_chat)
+    frame = {"type": "command", "command": "plan", "args": "write a report",
+             "session_id": "origin"}
+    asyncio.run(web_server._handle_command(socket, frame, engine, cli))
+
+    assert seen == [(socket, {"type": "command", "command": "plan", "args": "write a report",
+                              "session_id": "origin", "_session_id": "origin",
+                              "text": "write a report"}, engine, origin)]
+    assert cli.S is viewed
+
+
+def test_queued_context_command_runs_in_origin_and_persists_its_echo(monkeypatch):
+    import io
+    from rich.console import Console
+
+    viewed = type("Session", (), {"name": "", "messages": []})()
+    origin = type("Session", (), {"name": "", "messages": []})()
+    cli = type("Cli", (), {"S": viewed, "console": Console(file=io.StringIO()),
+                            "COMMANDS": {"status": lambda _args: seen.append(cli.S)},
+                            "WEB_CONFIRM": None})()
+    seen = []
+    engine, socket = object(), _Socket()
+    monkeypatch.setattr(web_server, "_turn_session", lambda _cli, sid: origin if sid == "origin" else None)
+
+    asyncio.run(web_server._handle_command(
+        socket, {"type": "command", "command": "status", "args": "", "session_id": "origin"},
+        engine, cli))
+
+    assert seen == [origin]
+    assert cli.S is viewed
+    assert origin.messages == [{"role": "user", "content": "/status"}]
+    assert socket.events[0]["type"] == "command_result"
+
+
 class _PlanEngine(_Engine):
     """Engine stub whose run_agent exercises the plan-approval callback.
 

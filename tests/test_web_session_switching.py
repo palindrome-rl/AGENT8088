@@ -175,6 +175,44 @@ def test_approval_identifies_its_chat_and_can_be_answered_after_switching_back(e
     assert escalation["session_id"] == env.a_id
 
 
+def test_approval_after_switch_stays_with_the_running_session(env):
+    request = "ESCALATION_REQUEST\x1fworkspace-write\x1fwrite\x1freport.md\x1fwrite report.md"
+    answers = []
+
+    def body(messages, kwargs, engine):
+        answers.append(kwargs["on_escalation"]("write_file", request))
+        return "ok"
+
+    thread, _ws, _ = _start(env, body)
+    _wait_for(lambda: any(e.get("session_id") == env.a_id
+                          for e in W._pending_approvals.values()))
+    first = next(e for e in W._pending_approvals.values() if e["session_id"] == env.a_id)
+    env.client.post("/api/sessions/resume", json={"name": "chat-b"})
+    first["approved"] = True
+    first["session_scope"] = True
+    first["event"].set()
+    thread.join(5)
+    assert not thread.is_alive() and answers == [True]
+
+    # B asks for its own grant after A's approval was accepted off-screen.
+    thread, _ws, _ = _start(env, body)
+    _wait_for(lambda: any(e.get("session_id") == env.b_id
+                          for e in W._pending_approvals.values()))
+    second = next(e for e in W._pending_approvals.values() if e["session_id"] == env.b_id)
+    second["approved"] = True
+    second["event"].set()
+    thread.join(5)
+    assert not thread.is_alive() and answers == [True, True]
+
+    # Returning to A reuses only A's grant; it does not inherit B's one-time approval.
+    env.client.post("/api/sessions/resume", json={"name": "chat-a"})
+    thread, _ws, _ = _start(env, body)
+    thread.join(5)
+    assert not thread.is_alive() and answers == [True, True, True]
+    assert W._session_allowlist[env.a_id] == {"write"}
+    assert W._session_allowlist[env.b_id] == set()
+
+
 def test_stop_ends_the_running_task_and_keeps_its_progress_in_its_chat(env):
     def body(messages, kwargs, engine):
         messages.append({"role": "assistant", "content": "step 1 done"})
@@ -229,6 +267,65 @@ def test_the_running_chat_cannot_be_deleted_renamed_or_reset_but_others_can(env)
         gate.set()
         thread.join(5)
     assert env.client.delete("/api/sessions/chat-a").status_code == 200
+
+
+def test_deleted_and_reset_sessions_release_their_grants(env):
+    W._session_allowlist[env.b_id] = {"network_request"}
+    assert env.client.delete("/api/sessions/chat-b").status_code == 200
+    assert env.b_id not in W._session_allowlist
+
+    W._session_allowlist[env.a_id] = {"write"}
+    assert env.client.post("/api/sessions/reset").status_code == 200
+    assert env.a_id not in W._session_allowlist
+
+
+def test_session_switch_waits_for_a_context_command_worker(env, monkeypatch):
+    env.client.post("/api/sessions/resume", json={"name": "chat-b"})
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def command(_args):
+        entered.set()
+        assert release.wait(5)
+        seen.append(cli.S.name)
+
+    monkeypatch.setattr(cli, "COMMANDS", {"probe": command})
+    command_thread = threading.Thread(target=lambda: asyncio.run(W._handle_command(
+        _Socket(), {"command": "probe", "session_id": env.a_id}, _Engine(env.tmp, lambda *a: None), cli)),
+        daemon=True)
+    command_thread.start()
+    assert entered.wait(5)
+
+    switch_result = []
+    switch_thread = threading.Thread(target=lambda: switch_result.append(
+        env.client.post("/api/sessions/new", json={"name": ""})), daemon=True)
+    switch_thread.start()
+    time.sleep(0.05)
+    release.set()
+    command_thread.join(5)
+    switch_thread.join(5)
+
+    assert not command_thread.is_alive() and not switch_thread.is_alive()
+    assert seen == ["chat-a"]
+    assert switch_result[0].status_code == 200
+    assert cli.S.name == ""
+
+
+def test_cancelled_session_switch_wait_does_not_orphan_the_view_lock(env):
+    async def exercise():
+        W._SESSION_VIEW_LOCK.acquire()
+        try:
+            waiting = asyncio.create_task(W.new_session(W.SessionActionBody(name="")))
+            await asyncio.sleep(0.03)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+        finally:
+            W._SESSION_VIEW_LOCK.release()
+        result = await W.new_session(W.SessionActionBody(name=""))
+        assert result["ok"] is True
+
+    asyncio.run(exercise())
 
 
 def test_a_second_task_waits_and_a_queued_prompt_runs_in_its_own_chat(env):
