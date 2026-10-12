@@ -12,5 +12,5 @@ def test_command_catalog_covers_cli_commands_and_aliases():
     assert not {"think", "clear"} & set(catalog)
     assert catalog["agents"]["usage"] == "/agents [new|edit|delete|models]"
     assert catalog["fusion"]["usage"].startswith("/fusion [setup|")
-    assert catalog["task"]["usage"] == "/task [start|resume|end|output|list] <value>"
+    assert catalog["task"]["usage"] == "/task [start|resume|end|delete|output|list] <value>"
     assert catalog["exit"]["aliases"] == []
