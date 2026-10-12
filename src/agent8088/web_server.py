@@ -98,7 +98,7 @@ def _cl():
         from agent8088 import cli as _c
         _cli = _c
         # Session files this process creates through cli helpers say "web".
-        _cli.SESSION_SOURCE = "web"
+        _cli.S.source = "web"
     return _cli
 
 

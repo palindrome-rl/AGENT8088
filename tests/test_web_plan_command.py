@@ -45,7 +45,8 @@ def test_inline_plan_uses_web_chat_runner(monkeypatch):
     asyncio.run(web_server._handle_command(socket, {"command": "plan", "args": "audit the app"}, engine, cli))
 
     assert engine.entered_plan_mode
-    assert seen == [(socket, {"text": "audit the app"}, engine, cli)]
+    assert seen == [(socket, {"command": "plan", "args": "audit the app",
+                              "text": "audit the app"}, engine, cli)]
     assert socket.events == []
 
 
