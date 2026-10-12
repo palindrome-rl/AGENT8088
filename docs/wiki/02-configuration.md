@@ -355,6 +355,7 @@ where a silently half-done plan does damage.
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `subagent_max_seconds.<profile>` | Wall clock, in seconds, for one sub-agent profile. **Overrides the profile's `max_seconds`.** Without either, `subagent_timeout_seconds` (300) applies. |
 | `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
 
 ### Changing a limit without editing this file
