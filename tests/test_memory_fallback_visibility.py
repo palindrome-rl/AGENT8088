@@ -43,6 +43,35 @@ def test_mem0_fallback_reports_memory_degraded(monkeypatch, tmp_path):
     assert "--memory-setup" in entry.fix
 
 
+def test_missing_ollama_embeddings_falls_back_with_specific_diagnosis(monkeypatch, tmp_path):
+    import agent8088.memory.mem0_store as mem0_store
+
+    class _Mem0:
+        @classmethod
+        def from_config(cls, _config):
+            return cls()
+
+    class _Embedder:
+        model = "nomic-embed-text"
+        last_error = "connection refused"
+
+        def available(self):
+            return False
+
+    monkeypatch.setattr(mem0_store, "_import_mem0", lambda: _Mem0)
+    monkeypatch.setattr(memory, "embedder", lambda: _Embedder())
+    memory.configure(config={"memory": "1", "memory_engine": "mem0",
+                             "memory_mem0_embed_provider": "ollama"},
+                     db_path=str(tmp_path / "m.db"))
+
+    status = memory.memory_status()
+
+    assert status["engine"] == "native" and status["ok"] is True
+    assert "embedding service unavailable for ollama/nomic-embed-text" in status["error"]
+    assert "connection refused" in status["error"]
+    assert "mem0's memories are not recalled" in capabilities.get(capabilities.MEMORY).impact
+
+
 def test_native_by_choice_is_ok(tmp_path):
     memory.configure(config={"memory": "1"}, db_path=str(tmp_path / "m.db"))
     memory.store()
@@ -93,7 +122,7 @@ class _Client:
     def embeddings(self):
         return self
 
-    def create(self, model, input):
+    def create(self, model, input, timeout=None):
         if not self.ok[0]:
             raise ConnectionError("connection refused")
         item = type("E", (), {"embedding": [1.0, 0.0]})()
