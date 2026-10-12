@@ -51,6 +51,39 @@ def _matches(name, patterns):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
+def format_result(result):
+    """Render an MCP tool result for the model.
+
+    The model used to receive the serialised result object, for example
+    ``{"_meta": null, "content": [{"type": "text", "text": "..."}], ...}``, with
+    every quote escaped and the unused fields spelled out. That costs tokens and
+    makes the value harder for a small model to read. A result made only of text
+    blocks, without structured content, now reaches the model as that text.
+    Other results keep their structure. Only absent SDK fields and protocol
+    ``_meta`` envelopes are omitted; application payloads remain intact.
+    A server-reported error is prefixed
+    "MCP tool error:". A result that is not an SDK result object (a plain dict)
+    is serialised as before.
+    """
+    if not hasattr(result, "model_dump"):
+        return json.dumps(result, default=str, ensure_ascii=False)
+    # Pydantic excludes absent SDK fields without recursively deleting JSON
+    # nulls inside arbitrary application dictionaries (structuredContent).
+    data = result.model_dump(by_alias=True, exclude_none=True)
+    data.pop("_meta", None)
+    prefix = "MCP tool error: " if data.get("isError") else ""
+    blocks = data.get("content") or []
+    for block in blocks:
+        if isinstance(block, dict):
+            block.pop("_meta", None)
+    if ("structuredContent" not in data and blocks
+            and all(isinstance(block, dict) and block.get("type") == "text" for block in blocks)):
+        text = "\n".join(str(block.get("text", "")) for block in blocks)
+        if text.strip():
+            return prefix + text
+    return prefix + json.dumps(data, default=str, ensure_ascii=False)
+
+
 class MCPRuntime:
     """Own MCP sessions for this Agent8088 process and expose normal tool specs."""
 
@@ -446,9 +479,8 @@ class MCPRuntime:
                 # Reopen just this server, here, when the breaker lets a probe through.
                 self._reconnect(server)
             result = self._run(self._call(registered, arguments), self._tools[registered].get("timeout", 30))
-            data = result.model_dump(by_alias=True) if hasattr(result, "model_dump") else result
             self._note_success(server)
-            return json.dumps(data, default=str, ensure_ascii=False)
+            return format_result(result)
         except Exception as exc:
             self._note_failure(server)
             detail = _describe(exc)
