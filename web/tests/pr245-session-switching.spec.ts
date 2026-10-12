@@ -57,6 +57,7 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
   await expect(page.getByText('Approval Required', { exact: true })).toBeVisible()
   await page.screenshot({ path: 'test-results/pr245-background-approval.png', fullPage: true })
   await page.getByRole('button', { name: 'chat-b', exact: true }).click()
+  await expect(page.getByText('B original question', { exact: true })).toBeVisible()
   running = false
   pending = false
   await emit({ type: 'answer', text: 'Only A result', session_id: ids['chat-a'] })
@@ -65,4 +66,13 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
   await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
     type: 'chat', text: 'Follow up in B', session_id: ids['chat-b'],
   })
+  // Queue another prompt in the now-visible running chat. Completion of the
+  // previous turn must not erase the new turn's Stop button/streaming state.
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('One more in B')
+  await page.getByRole('button', { name: 'Add to queue', exact: true }).click()
+  await emit({ type: 'turn_complete', session_id: ids['chat-b'] })
+  await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
+  })
+  await expect(page.getByRole('button', { name: 'Stop generating', exact: true })).toBeVisible()
 })
