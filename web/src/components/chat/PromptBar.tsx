@@ -1,8 +1,8 @@
 import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Send, Square, Plus, Mic, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield, Pencil, X, ListPlus } from 'lucide-react'
+import { Send, Square, Plus, Clipboard, ImagePlus, Terminal, Paperclip, Trash2, AlertCircle, Loader2, ChevronDown, Shield, Pencil, X, ListPlus } from 'lucide-react'
 import { useSessionStore } from '@/stores/session'
-import { useWebSocket, drainPromptQueue } from '@/hooks/useWebSocket'
+import { useWebSocket, drainPromptQueue, planTaskOf } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
@@ -11,7 +11,7 @@ import { Otto } from './Otto'
 /* ─────────────────────────────────────────────────────────
  * PROMPT BAR — Beautiful UI style
  * Composer with @ sources, / commands, model picker,
- * dictation, and send. Pop-in menus, gliding highlight.
+ * and send. Pop-in menus, gliding highlight.
  * ───────────────────────────────────────────────────────── */
 
 const sessionStopWords = new Set(['a', 'an', 'and', 'are', 'for', 'from', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'please', 'the', 'to', 'with'])
@@ -44,7 +44,6 @@ export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
   const [plusOpen, setPlusOpen] = useState(false)
-  const [listening, setListening] = useState(false)
   const [sessionError, setSessionError] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [modeOpen, setModeOpen] = useState(false)
@@ -70,6 +69,10 @@ export function PromptBar() {
     ? commands.flatMap(command => [command.name, ...command.aliases])
       .filter(command => command && command.startsWith(query)).slice(0, 8)
     : [], [commands, menu, query])
+  // The highlighted row of the / menu; arrows move it, Enter/Tab take it.
+  const [selected, setSelected] = useState(0)
+  useEffect(() => setSelected(0), [menu, query])
+  const selectedRow = Math.min(selected, Math.max(rows.length - 1, 0))
 
   useEffect(() => {
     const insertCommand = (event: Event) => {
@@ -239,9 +242,10 @@ export function PromptBar() {
     // (in the socket handler) free of async work.
     if (isStreaming) {
       const queuedText = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
-      if (!queuedText.startsWith('/')) {
+      const queuedPlanTask = planTaskOf(queuedText)
+      if (!queuedText.startsWith('/') || queuedPlanTask) {
         try {
-          await ensureSession(queuedText)
+          await ensureSession(queuedPlanTask || queuedText)
         } catch (error) {
           setSessionError(error instanceof Error ? error.message : 'Could not create a session')
           return
@@ -275,6 +279,19 @@ export function PromptBar() {
       }
       setSessionError('')
       const [cmd, ...rest] = trimmed.slice(1).split(' ')
+      const planTask = planTaskOf(trimmed)
+      if (planTask) {
+        // `/plan <task>` runs as a chat turn on the server, so it is a message
+        // the user sent: show it and name the session after it, as a chat
+        // message does. It used to vanish from the transcript.
+        try {
+          await ensureSession(planTask)
+        } catch (error) {
+          setSessionError(error instanceof Error ? error.message : 'Could not create a session')
+          return
+        }
+        addMessage({ role: 'user', content: trimmed })
+      }
       if (cmd.toLowerCase() === 'raw') {
         setRawResult(null)
         setRawLoading(true)
@@ -302,12 +319,15 @@ export function PromptBar() {
     if (menu && rows.length > 0) {
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault()
+        const step = e.key === 'ArrowDown' ? 1 : -1
+        setSelected((selectedRow + step + rows.length) % rows.length)
         return
       }
       const exactCommand = rows.includes(text.trim().slice(1).toLowerCase())
-      if (((e.key === 'Enter' && !e.shiftKey && !exactCommand) || e.key === 'Tab')) {
+      // A typed exact command sends on Enter, unless a row was picked with the arrows.
+      if ((e.key === 'Enter' && !e.shiftKey && (!exactCommand || selectedRow > 0)) || e.key === 'Tab') {
         e.preventDefault()
-        const cmd = rows[0]
+        const cmd = rows[selectedRow]
         setText(`/${cmd} `)
         setDismissed(true)
         setPlusOpen(false)
@@ -475,7 +495,10 @@ export function PromptBar() {
               key={cmd}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => { setText(`/${cmd} `); setDismissed(true); setPlusOpen(false); inputRef.current?.focus() }}
-              className="block w-full px-3 py-1.5 text-left text-[13px] transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50"
+              onMouseEnter={() => setSelected(i)}
+              aria-selected={i === selectedRow}
+              className={cn('block w-full px-3 py-1.5 text-left text-[13px] transition-colors',
+                i === selectedRow ? 'bg-zinc-100 dark:bg-zinc-800/60' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800/50')}
               style={{ animation: `fade-up 200ms cubic-bezier(0.23,1,0.32,1) ${i * 40}ms both` }}
             >
               <span className="font-mono text-brand-cyan">/{cmd}</span>
@@ -602,7 +625,7 @@ export function PromptBar() {
               onChange={handleChange}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={listening ? 'Listening…' : 'Send a message…'}
+              placeholder="Send a message…"
               aria-label="Prompt"
               className={cn(
                 'prompt-textarea min-w-0 flex-1 resize-none bg-transparent text-[14px] text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:outline-none',
@@ -658,33 +681,6 @@ export function PromptBar() {
                 className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-400 transition-all hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200 active:scale-95"
               >
                 <Clipboard className="h-4 w-4" />
-              </button>
-
-              {/* Dictation */}
-              <button
-                type="button"
-                aria-label={listening ? 'Stop dictation' : 'Start dictation'}
-                onClick={() => setListening(!listening)}
-                className={cn(
-                  'flex h-7 w-7 items-center justify-center rounded-lg transition-all active:scale-95',
-                  listening
-                    ? 'bg-brand-primary/15 text-brand-cyan'
-                    : 'text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200',
-                )}
-              >
-                {listening ? (
-                  <span className="flex h-3 items-center gap-[2px]">
-                    {[0, 1, 2].map(i => (
-                      <span
-                        key={i}
-                        className="w-[2px] rounded-full bg-current"
-                        style={{ height: '100%', animation: `eq-bounce 900ms ease-in-out ${i * 150}ms infinite` }}
-                      />
-                    ))}
-                  </span>
-                ) : (
-                  <Mic className="h-4 w-4" />
-                )}
               </button>
 
               {/* Queue — only while a turn is running, where Send is Stop and

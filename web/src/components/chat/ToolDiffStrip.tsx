@@ -75,7 +75,9 @@ export function ToolDiffStrip({ diffs }: { diffs: ToolDiffPayload[] }) {
             font-mono text-[11.5px] text-ink shadow-btn transition-colors duration-100 hover:bg-hover"
           style={{ animation: `pop-in 250ms cubic-bezier(0.23,1,0.32,1) ${index * 80}ms both` }}
         >
-          <span className="min-w-0 truncate">{diff.file}</span>
+          {/* Cut from the left so the file name stays visible: an end-cut
+              absolute path made plan_a.txt and plan_b.txt look the same. */}
+          <span className="min-w-0 truncate [direction:rtl]" title={diff.file}><bdi>{diff.file}</bdi></span>
           <span className="shrink-0 text-green tabular-nums">+{diff.added}</span>
           {diff.removed > 0 && (
             <span className="shrink-0 text-red tabular-nums">−{diff.removed}</span>
@@ -96,7 +98,7 @@ export function ToolDiffStrip({ diffs }: { diffs: ToolDiffPayload[] }) {
           }}
         >
           <div className="flex items-center justify-between border-b border-line px-2.5 py-1.5 font-mono text-[11px]">
-            <span className="min-w-0 truncate text-ink-2">{shown.file}</span>
+            <span className="min-w-0 truncate text-ink-2 [direction:rtl]" title={shown.file}><bdi>{shown.file}</bdi></span>
             <span className="shrink-0 tabular-nums">
               <span className="text-green">+{shown.added}</span>
               {shown.removed > 0 && <span className="text-red"> −{shown.removed}</span>}

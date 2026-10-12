@@ -1,4 +1,7 @@
 import { useRef, useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { apiFetch } from '@/lib/api'
+import type { ToolSpec } from '@/types/api'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { MessageBubble } from './MessageBubble'
@@ -6,12 +9,13 @@ import { ToolChip } from './ToolChip'
 import { ToolDiffStrip } from './ToolDiffStrip'
 import { ThinkingTrace } from './ThinkingTrace'
 import { ApprovalCard } from './ApprovalCard'
+import { PlanApprovalCard } from '@/components/plan/PlanApprovalCard'
 import { PromptBar } from './PromptBar'
 import { RawPanel } from './RawPanel'
 import { scrubMarkup, displayMessages } from '@/lib/scrub'
 
 export function ChatPanel() {
-  const { messages, toolEvents, isStreaming, streamingText } = useSessionStore()
+  const { messages, toolEvents, isStreaming, streamingText, streamingReasoning } = useSessionStore()
   const { theme, rawPanelOpen } = useUIStore()
   const paletteShortcut = navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl+K'
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -22,6 +26,16 @@ export function ChatPanel() {
 
 
   const isEmpty = messages.length === 0 && !isStreaming
+  // Counted from the server (same query as the Tools page); it was a
+  // hard-coded "32 tools across 14 modes" long after both numbers grew.
+  const { data: tools } = useQuery({
+    queryKey: ['tools'],
+    queryFn: () => apiFetch<ToolSpec[]>('/api/tools', { action: 'load the tool list' }),
+    enabled: isEmpty,
+  })
+  const toolsSubtitle = tools
+    ? `${tools.length} tools across ${new Set(tools.map((tool) => tool.mode)).size} modes`
+    : 'See what the agent can use'
 
   return (
     <div className="flex h-full flex-col">
@@ -42,7 +56,7 @@ export function ChatPanel() {
               <SuggestionCard title="Ask anything" subtitle="Research, write code, analyze" />
               <SuggestionCard title="Run a command" subtitle="Type / for all commands" />
               <SuggestionCard title="Plan a task" subtitle="Use /plan to propose & execute" />
-              <SuggestionCard title="Browse tools" subtitle="32 tools across 14 modes" />
+              <SuggestionCard title="Browse tools" subtitle={toolsSubtitle} />
             </div>
 
             <div className="mt-5 flex items-center gap-1.5 text-[11px] text-zinc-400 dark:text-zinc-600">
@@ -61,7 +75,7 @@ export function ChatPanel() {
         {/* Tool activity is visible even before answer text arrives. */}
         {isStreaming && (
           <div className="msg-enter mx-auto max-w-3xl px-6 py-4">
-            <ThinkingTrace />
+            <ThinkingTrace reasoning={streamingReasoning} live={isStreaming} />
             <div data-testid="tool-rows">
               {toolEvents.map((tool, i) => (
                 <ToolChip key={i} name={tool.name} status={tool.status} result={tool.result} />
@@ -78,6 +92,7 @@ export function ChatPanel() {
           </div>
         )}
         <ApprovalCard />
+        <PlanApprovalCard />
       </div>
       {isStreaming && (
         <div className="mx-auto w-full max-w-3xl px-6 py-2">

@@ -1,5 +1,8 @@
 import { create } from 'zustand'
-import type { ChatAttachment, ChatMessage, StatusInfo, ToolDiffPayload } from '@/types/api'
+import type { ChatAttachment, ChatMessage, StatusInfo, ToolDiffPayload, ToolEvent } from '@/types/api'
+import { parseEscalation } from '@/lib/scrub'
+
+export type { ToolEvent }
 
 export interface QueuedPrompt {
   id: string
@@ -18,13 +21,9 @@ interface SessionState {
   isStreaming: boolean
   activity: string
   streamingText: string
+  /** Reasoning sections, one per model step; deltas append to the last. */
   streamingReasoning: string[]
-  toolEvents: Array<{
-    name: string
-    status: 'running' | 'done' | 'failed'
-    result?: string
-    diff?: ToolDiffPayload
-  }>
+  toolEvents: ToolEvent[]
   planSteps: Array<{
     index: number
     stepText: string
@@ -65,7 +64,7 @@ interface SessionState {
   setStreaming: (streaming: boolean) => void
   setActivity: (activity: string) => void
   appendStreamingText: (delta: string) => void
-  appendStreamingReasoning: (delta: string) => void
+  appendStreamingReasoning: (delta: string, newSection?: boolean) => void
   resetStreaming: () => void
   addToolEvent: (name: string) => void
   updateToolEvent: (name: string, result: string, diff?: ToolDiffPayload) => void
@@ -95,7 +94,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   setRawLoading: (rawLoading) => set({ rawLoading }),
   setSessionName: (sessionName) => set(s => ({ sessionName,
     status: s.status ? { ...s.status, session_name: sessionName } : null })),
-  clearChat: () => set({
+  clearChat: () => set((s) => ({
     messages: [],
     isStreaming: false,
     streamingText: '',
@@ -105,7 +104,10 @@ export const useSessionStore = create<SessionState>((set) => ({
     // Queued prompts were written for the conversation being cleared.
     promptQueue: [],
     queuePaused: false,
-  }),
+    // The status bar's "last turn" belonged to the old conversation (every
+    // New chat / resume / delete path clears the chat through here).
+    status: s.status ? { ...s.status, last_usage: null } : s.status,
+  })),
   addMessage: (message) => set((s) => ({ messages: [...s.messages, message] })),
   setStatus: (status) => set({ status }),
   setConnection: (connection) => set({ connection }),
@@ -124,20 +126,32 @@ export const useSessionStore = create<SessionState>((set) => ({
   setStreaming: (streaming) => set({ isStreaming: streaming }),
   setActivity: (activity) => set({ activity }),
   appendStreamingText: (delta) => set((s) => ({ streamingText: s.streamingText + delta })),
-  appendStreamingReasoning: (delta) => set((s) => ({
-    streamingReasoning: [...s.streamingReasoning, delta],
-  })),
+  appendStreamingReasoning: (delta, newSection) => set((s) => {
+    const sections = s.streamingReasoning
+    return {
+      streamingReasoning: newSection || !sections.length
+        ? [...sections, delta]
+        : [...sections.slice(0, -1), sections[sections.length - 1] + delta],
+    }
+  }),
   resetStreaming: () => set({ streamingText: '', streamingReasoning: [], toolEvents: [], planSteps: [] }),
   addToolEvent: (name) => set((s) => ({
     toolEvents: [...s.toolEvents, { name, status: 'running' }],
   })),
-  updateToolEvent: (name, result, diff) => set((s) => ({
-    toolEvents: s.toolEvents.map((e) =>
+  updateToolEvent: (name, result, diff) => set((s) => {
+    // A blocked call's result is the approval request, which the approval card
+    // shows; the approved retry gets its own row. Drop the row rather than
+    // leave the raw request code in the transcript.
+    if (parseEscalation(result)) {
+      const blocked = s.toolEvents.findIndex((e) => e.name === name && e.status === 'running')
+      return blocked < 0 ? {} : { toolEvents: s.toolEvents.filter((_, i) => i !== blocked) }
+    }
+    return { toolEvents: s.toolEvents.map((e) =>
       e.name === name && e.status === 'running'
         ? { ...e, status: /^(Error:|Invalid JSON|Command timed out)/i.test(result) ? 'failed' : 'done', result, diff }
         : e
-    ),
-  })),
+    ) }
+  }),
   updatePlanStep: (step) => set((s) => ({
     planSteps: s.planSteps.some((p) => p.index === step.index)
       ? s.planSteps.map((p) => p.index === step.index ? { ...p, ...step } : p)

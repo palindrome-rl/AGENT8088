@@ -11908,7 +11908,10 @@ def _environment_diagnostic() -> str:
 
 
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
-    global _last_tool_output, _last_tool_name
+    global _last_tool_output, _last_tool_name, _last_write_diff
+    # Clear before validation too: rejected arguments must not inherit a
+    # previous successful write's diff.
+    _last_write_diff = None
     try:
         args = json.loads(arguments)
     except Exception:
