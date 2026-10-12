@@ -12439,6 +12439,20 @@ def strip_tool_json(text: str) -> str:
     return text.strip()
 
 
+def _unknown_tool_call_instruction(native_tools: bool) -> str:
+    """How the unknown-tool correction tells the model to retry.
+
+    A model on a native tool-calling backend sees its tools as schemas, not as
+    text. Teaching it the text-marker syntax in the correction invites it to
+    write ✿FUNCTION✿ lines into its reply, which the marker salvage then has to
+    recover. Name the format the model is actually using.
+    """
+    if native_tools:
+        return "Either call one of those through the tool-calling interface, using its schema"
+    return ("Either call one of those with the exact format "
+            '`✿FUNCTION✿: name ✿ARGS✿: {"arg": "value"}`')
+
+
 def _attempted_tool_names(text: str) -> list:
     """Tool names the model *tried* to call, valid or not — used for error handling
     when find_tool_calls() finds nothing runnable (e.g. a hallucinated tool)."""
@@ -16460,9 +16474,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                      if gated else
                      f"Error: the tool '{name}' does not exist. ") +
                     f"Available tools are: {available}. "
-                    "Either call one of those with the exact format "
-                    '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
-                    "or, if no tool fits, answer the user directly in plain text "
+                    + _unknown_tool_call_instruction(_native_tools_enabled(
+                        round_tools_def, loop_provider or "")) +
+                    ", or, if no tool fits, answer the user directly in plain text "
                     "without mentioning tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
