@@ -137,7 +137,7 @@ Tried in order when the primary fails with a **retryable** error — HTTP 429,
 5xx, or a timeout/connection error. Deterministic failures (401, 400) do not
 trigger fallback, because retrying a bad key on a different provider just wastes
 a call. Before moving on, the same provider is retried with exponential backoff
-(`api_max_retries`, default 3; `0` means immediate failover).
+(`api_max_retries`, default 5; `0` means immediate failover).
 
 ## API keys
 

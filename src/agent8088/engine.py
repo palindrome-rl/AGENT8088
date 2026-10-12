@@ -575,9 +575,12 @@ DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
-API_MAX_RETRIES = max(0, _config_int("api_max_retries", 3))
-API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 500))
-API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 10000))
+# The defaults wait about 31 s in total (1+2+4+8+16 s): a gateway or provider
+# hiccup usually lasts 30-60 s, and the old 3.5 s window ended runs that a
+# slightly longer wait would have survived. The turn budget still caps it.
+API_MAX_RETRIES = max(0, _config_int("api_max_retries", 5))
+API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 1000))
+API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 30000))
 API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio", 0.1)))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
@@ -2817,6 +2820,18 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             "model": selected_model, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
+        if thinking == "length_retry" and not _skip_optional:
+            # LiteLLM translates the native reasoning dial for its adapters.
+            # Provider-specific wire fields remain in extra_body instead.
+            retry_options = dict(_length_retry_extra_body(provider_name))
+            if "reasoning_effort" in retry_options:
+                kwargs["reasoning_effort"] = retry_options.pop("reasoning_effort")
+                # Custom OpenAI-compatible model names are absent from
+                # LiteLLM's capability catalog. Try the configured dial on
+                # the wire, with the same clean 400 fallback as the SDK lane.
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
+            if retry_options:
+                kwargs["extra_body"] = retry_options
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
         if timeout is not None:
@@ -2826,7 +2841,17 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
         _raise_if_interrupted(interrupt_check)
-        response = completion(**kwargs)
+        try:
+            response = completion(**kwargs)
+        except Exception as exc:
+            if (not _skip_optional and thinking == "length_retry"
+                    and _extras_rejected(exc, thinking=thinking)):
+                return _create_completion(
+                    client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+                    temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+                    model_name=model_name, provider_name=provider_name, _skip_optional=True,
+                    thinking=thinking, timeout=timeout)
+            raise
         if on_token is None:
             return response
         collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
@@ -2834,6 +2859,9 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
+                if not getattr(chunk, "choices", None):
+                    _raise_for_error_chunk(chunk)
+                    continue
                 choice = chunk.choices[0]
                 delta = choice.delta
                 finish_reason = getattr(choice, "finish_reason", None) or finish_reason
@@ -2963,6 +2991,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             if getattr(chunk, 'usage', None) is not None:
                 stream_usage = chunk.usage
             if not chunk.choices:
+                _raise_for_error_chunk(chunk)
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
@@ -3016,14 +3045,79 @@ def _fallback_targets() -> list:
 _fallback_targets()  # report invalid targets at startup, before a call fails
 
 
+class ProviderStreamError(RuntimeError):
+    """An error the provider reported inside a streamed reply.
+
+    Some gateways answer HTTP 200 and then send an error chunk (with an empty
+    ``choices`` list) when the upstream model times out or stops a looping
+    reply. The OpenAI client raises on such a chunk itself; other clients, and
+    the LiteLLM path here, would otherwise read it as an empty reply or fail on
+    ``choices[0]``. ``status_code`` carries the error's own code (for example
+    504) so the ordinary retry rules apply.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raise_for_error_chunk(chunk) -> None:
+    """Raise ProviderStreamError when a streamed chunk is an error, not data."""
+    if getattr(chunk, "choices", None):
+        return
+    error = getattr(chunk, "error", None)
+    if error is None:
+        extra = getattr(chunk, "model_extra", None)
+        error = extra.get("error") if isinstance(extra, dict) else None
+    if not error:
+        return
+    if isinstance(error, dict):
+        message, code = error.get("message"), error.get("code")
+    else:
+        message, code = getattr(error, "message", None), getattr(error, "code", None)
+    try:
+        status = int(code) if code is not None and not isinstance(code, bool) else None
+    except (TypeError, ValueError):
+        status = None
+    raise ProviderStreamError(str(message or "The provider reported an error mid-stream"), status)
+
+
+_REPETITION_GUARD_MARKERS = ("repeating the same chunk", "repeating the same", "repetition detected")
+
+
+def _is_provider_repetition_stop(error: Exception) -> bool:
+    """The provider cut off a looping reply (reported as an error, often a 502)."""
+    text = str(error).lower()
+    return any(marker in text for marker in _REPETITION_GUARD_MARKERS)
+
+
+def _is_provider_stall(error: Exception) -> bool:
+    """A gateway/upstream failure that retrying the identical request may repeat.
+
+    Idle timeouts, 5xx from the upstream and a looping-reply stop are all cases
+    where the same request has already failed once for a reason that depends on
+    that request, so the retry changes it (see _create_completion_with_fallback).
+    """
+    from agent8088.errors import status_code as _status_code
+    status = _status_code(error)
+    text = str(error).lower()
+    return (isinstance(status, int) and 500 <= status < 600
+            or "idle timeout" in text or _is_provider_repetition_stop(error))
+
+
 def _retryable_model_error(error: Exception) -> bool:
-    status = getattr(error, "status_code", None)
+    from agent8088.errors import status_code as _status_code
+    # The SDK's streamed-error exception carries the error's code in .code, not
+    # .status_code, so read it the same way the rest of the harness does.
+    status = _status_code(error)
     if status in (408, 429) or isinstance(status, int) and status >= 500:
         return True
     if isinstance(status, int) and 400 <= status < 500:
         # A definite client error: the body text (an HTML page for a wrong
         # base_url mentions "connection" and "timeout") must not override it.
         return False
+    if _is_provider_repetition_stop(error):
+        return True
     name = type(error).__name__.lower()
     text = str(error).lower()
     retryable = (
@@ -3252,6 +3346,14 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
         except Exception as error:
             primary_error = primary_error or error
             last_error = error
+            if thinking is None and _is_provider_stall(error):
+                # The same request just failed for a reason that depends on the
+                # request (an upstream idle timeout, a 5xx, a looping reply cut
+                # off by the provider). Repeating it unchanged tends to repeat
+                # the failure, so the retry is sent with thinking reduced, the
+                # same switch the output-limit retry uses. One change per call.
+                thinking = "length_retry"
+                notify("Provider stopped the reply; retrying with reduced thinking.")
             if emitted:
                 # The reply broke off mid-stream. Redoing it once is safe:
                 # tool calls only run after a complete response, so any
@@ -15989,6 +16091,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     last_call_tokens = 0  # completion tokens of the last call that finished normally
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
+    last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     tool_failed = False  # any tool call this run returned an error
@@ -16212,9 +16315,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
-        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
-        # thinking off; the next ordinary turn is back to normal thinking.
-        retry_kwargs = {"thinking": "length_retry"} if length_retries >= 2 else {}
+        # A3.2/A3.4: this one call runs with thinking off after an empty
+        # cut-off (the whole allowance went to reasoning, or to an unclosed tool
+        # call the runtime hides) and, for any other kind, from the 2nd
+        # consecutive cut-off; the next ordinary turn is back to normal thinking.
+        # Retrying an empty cut-off with thinking still on mostly cuts off again
+        # and costs a full call each time.
+        retry_kwargs = ({"thinking": "length_retry"}
+                        if length_retries >= 2 or length_retries and last_cutoff_kind == "empty"
+                        else {})
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",
@@ -16392,6 +16501,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             else:
                 cutoff_kind, cap_hint = "empty", 0
                 prose_cutoffs = 0
+            last_cutoff_kind = cutoff_kind
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
@@ -16469,6 +16579,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
         cap_hint = prose_cutoffs = 0
+        last_cutoff_kind = ""
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])

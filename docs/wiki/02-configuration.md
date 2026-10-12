@@ -57,9 +57,9 @@ takes over:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `api_max_retries` | `3` | Attempts per call on retryable errors (429/503/connection). `0` disables. |
-| `api_retry_initial_delay_ms` | `500` | First backoff delay. |
-| `api_retry_max_delay_ms` | `10000` | Ceiling for the exponential backoff. |
+| `api_max_retries` | `5` | Retries per call on retryable errors (408/429/5xx, connection, errors the provider reports inside a stream). `0` disables. With the default delays the retries span about 30 s. |
+| `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
+| `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
 
 ### Fusion
