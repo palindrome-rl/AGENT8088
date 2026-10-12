@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   Search, MessageSquare, Wrench, BookOpen, Bot, Network, Brain,
   FolderClock, FolderOpen, Settings, Stethoscope, Sparkles, ClipboardList,
-  Terminal, ArrowRight, CornerDownLeft,
+  Terminal, ArrowRight, CornerDownLeft, Palette,
 } from 'lucide-react'
 import { useUIStore } from '@/stores/ui'
 import { useWebSocket } from '@/hooks/useWebSocket'
@@ -38,6 +38,10 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Sessions', path: '/sessions', icon: FolderClock, keywords: 'sessions history save resume' },
   { label: 'Config', path: '/config', icon: Settings, keywords: 'config settings model providers limits' },
   { label: 'Doctor', path: '/doctor', icon: Stethoscope, keywords: 'doctor health check diagnostics' },
+  // Same pages and icons as the sidebar's settings menu.
+  { label: 'Web Search', path: '/search', icon: Search, keywords: 'web search backends searxng ddgs tavily exa' },
+  { label: 'Schedules', path: '/schedules', icon: FolderClock, keywords: 'schedules schedule cron recurring jobs' },
+  { label: 'Appearance', path: '/appearance', icon: Palette, keywords: 'appearance theme dark light colors' },
 ]
 
 type ResultEntry =

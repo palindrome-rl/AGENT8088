@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp, Clock, ShieldCheck, ShieldX } from 'lucide-reac
 import { useUIStore } from '@/stores/ui'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { Button } from '@/components/atoms/Button'
+import { parseEscalation } from '@/lib/scrub'
 
 /** One approval card; the arrow exposes the less common approval scopes. */
 export function ApprovalCard() {
@@ -17,6 +18,8 @@ export function ApprovalCard() {
   }, [approvalPending?.id])
 
   if (!approvalPending) return null
+  // The description is the engine's raw request code; show its parts as words.
+  const request = parseEscalation(approvalPending.description)
 
   const respond = (approved: boolean, sessionScope: boolean) => {
     const delivered = send({ type: 'approval', approved, session_scope: sessionScope, id: approvalPending.id })
@@ -35,7 +38,14 @@ export function ApprovalCard() {
             <div className="mb-2 flex items-center gap-2"><Clock className="h-4 w-4 text-brand-cyan" /><span className="text-[13px] font-semibold text-zinc-900 dark:text-zinc-100">Approval Required</span></div>
             <div className="text-[14px] font-medium text-zinc-900 dark:text-zinc-100">Allow {approvalPending.toolName}?</div>
             <div className="mt-1 text-[12px] font-mono text-brand-primary">{approvalPending.changeType}</div>
-            <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-zinc-100 p-2 font-mono text-[11px] text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">{approvalPending.description}</pre>
+            {request ? (
+              <div className="mt-2 space-y-1.5 rounded-lg bg-zinc-100 p-2 text-[12px] text-zinc-700 dark:bg-zinc-950 dark:text-zinc-300">
+                <p className="break-words">{request.reason}</p>
+                {request.paths && <p className="max-h-20 overflow-auto break-all font-mono text-[11px] text-zinc-500 dark:text-zinc-400">{request.paths}</p>}
+              </div>
+            ) : (
+              <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-zinc-100 p-2 font-mono text-[11px] text-zinc-600 dark:bg-zinc-950 dark:text-zinc-400">{approvalPending.description}</pre>
+            )}
             {error && <p role="alert" className="mt-2 text-[11px] text-red-500 dark:text-red-400">{error}</p>}
           </div>
           <div className="primitive-card-footer flex items-center justify-between gap-3 border-t border-zinc-200 dark:border-zinc-800/60">

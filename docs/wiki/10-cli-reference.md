@@ -74,6 +74,26 @@ agent8088 --web
 
 Open `http://127.0.0.1:8180`.
 
+### Images and attachments in Agent8088 v1.2
+
+Use **+ → Image analysis** to choose images, paste a screenshot into the
+message box, or drop a file onto the composer. The clipboard button also
+attaches an image when browser permissions allow it; otherwise use Ctrl+V
+(Cmd+V on macOS). Wait for **Ready**, add your question, then send a normal
+message. Slash commands do not accept attachments.
+
+Vision-capable chat models receive the images themselves. Models without
+vision use the installed local OCR engine; OCR extracts text, not a complete
+visual interpretation. An unknown model's image support is initially shown
+as unconfirmed and checked when sending. If neither vision nor OCR is
+available, the attachment warns that the image cannot be read. Dedicated
+provider OCR, embedding and speech APIs are not vision chat models.
+
+History shows your question and attachment chips without displaying base64
+image data. Saved session files can still contain the image data. Completed
+answers retain their thinking and tool activity in the active browser page;
+reloading may not restore those live-only traces.
+
 Use the web flags to change the server settings:
 
 ```sh

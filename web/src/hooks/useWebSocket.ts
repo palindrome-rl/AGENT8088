@@ -24,6 +24,10 @@ let reconnectAttempts = 0
 let outbox: WSClientMessage[] = []
 /** Once Stop is pressed, late stream frames must not turn the composer red again. */
 let interruptRequested = false
+/** A model step began (spin 'thinking...' / tool_start) and has not streamed
+ *  reasoning yet: its first delta opens a new section. Pending rather than an
+ *  eager '' push, so a step without reasoning leaves no empty section. */
+let reasoningBreak = false
 
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 15_000
@@ -59,6 +63,7 @@ function wireSocket(ws: WebSocket) {
       case 'spin':
         if (interruptRequested) break
         setStreaming(true)
+        if (data.message === 'thinking...') reasoningBreak = true
         useSessionStore.getState().setActivity(data.message === 'thinking...'
           ? (useSessionStore.getState().toolEvents.length ? 'Reviewing results' : 'Preparing request')
           : data.message)
@@ -66,7 +71,10 @@ function wireSocket(ws: WebSocket) {
       case 'token':
         if (interruptRequested) break
         if (data.kind === 'reasoning') {
-          appendStreamingReasoning(data.delta)
+          if (data.delta) {
+            appendStreamingReasoning(data.delta, reasoningBreak)
+            reasoningBreak = false
+          }
         } else {
           appendStreamingText(data.delta)
           if (scrubMarkup(useSessionStore.getState().streamingText).trim()) {
@@ -76,13 +84,19 @@ function wireSocket(ws: WebSocket) {
         break
       case 'stream_reset':
         // The reply broke off mid-stream and is being retried: drop the
-        // fragment already shown so the retry doesn't append to it.
-        useSessionStore.setState({ streamingText: '', streamingReasoning: [] })
+        // fragment already shown so the retry doesn't append to it. Only the
+        // current step's reasoning is the fragment; earlier steps stay.
+        useSessionStore.setState((s) => ({
+          streamingText: '',
+          streamingReasoning: reasoningBreak ? s.streamingReasoning : s.streamingReasoning.slice(0, -1),
+        }))
+        reasoningBreak = true
         break
       case 'tool_calls':
         break
       case 'tool_start':
         if (interruptRequested) break
+        reasoningBreak = true
         addToolEvent(data.name)
         useSessionStore.getState().setActivity(data.name === 'web_search' ? 'Searching the web' : `Running ${data.name}`)
         break
@@ -110,6 +124,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'plan_approval':
         setPlanApprovalPending({ id: data.id, plan: data.plan })
+        void syncSession()  // the engine is in plan-only now; show it while the card waits
         break
       case 'answer':
         if (interruptRequested) break
@@ -119,7 +134,10 @@ function wireSocket(ws: WebSocket) {
             setStatus({ ...current, last_usage: data.usage, rate_limit_status: data.rate_limit_status ?? current.rate_limit_status })
           }
         }
-        addMessage({ role: 'assistant', content: scrubMarkup(data.text) })
+        addMessage({ role: 'assistant', content: scrubMarkup(data.text), ...turnTrace() })
+        // Reset now, not at turn_complete: in between, the live block and the
+        // finished bubble would both show the same thinking and tool rows.
+        resetStreaming()
         break
       case 'interrupted':
         stopLocally()
@@ -128,7 +146,8 @@ function wireSocket(ws: WebSocket) {
         console.error('Agent error:', data.message)
         setApprovalPending(null)
         setPlanApprovalPending(null)
-        addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}` })
+        addMessage({ role: 'assistant', content: `Error: ${scrubMarkup(data.message)}`, ...turnTrace() })
+        resetStreaming()
         pauseQueueIfPending()
         break
       case 'turn_complete':
@@ -140,6 +159,10 @@ function wireSocket(ws: WebSocket) {
         }
         setStreaming(false)
         resetStreaming()
+        // A turn can change the permission mode itself (/plan enters plan-only,
+        // an approved plan switches to the mode it runs in, a declined one stays
+        // in plan-only), and the mode picker kept showing the old one.
+        void syncSession()
         break
       case 'session_saved':
         if (data.name) setSessionName(data.name)
@@ -307,6 +330,13 @@ function sendFrame(msg: WSClientMessage): boolean {
 
 /** Dispatch the head of the prompt queue. Called when a turn ends, and by
  *  Resume. One prompt per turn: the backend refuses concurrent turns. */
+/** The task of a `/plan <task>` command, else ''. The server runs that task as
+ *  a chat turn, so the composer shows it as a message the user sent. */
+export function planTaskOf(text: string): string {
+  const match = /^\/plan\s+(\S[\s\S]*)$/i.exec(text.trim())
+  return match ? match[1].trim() : ''
+}
+
 export function drainPromptQueue() {
   const store = useSessionStore.getState()
   if (store.queuePaused) return
@@ -315,6 +345,7 @@ export function drainPromptQueue() {
   store.removeQueuedPrompt(next.id)
   if (next.kind === 'command') {
     const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
+    if (planTaskOf(next.text)) store.addMessage({ role: 'user', content: next.text })
     sendFrame({ type: 'command', command, args: rest.join(' ') })
     return
   }
@@ -330,10 +361,27 @@ function pauseQueueIfPending() {
   if (store.promptQueue.length) store.setQueuePaused(true)
 }
 
+/** The turn's thinking and tool rows, to carry onto its finished message so
+ *  they outlive resetStreaming. A tool still running when the turn ended never
+ *  finished, so it is shown as failed rather than spinning forever. */
+function turnTrace(): Pick<ChatMessage, 'reasoning' | 'tools'> {
+  const { streamingReasoning, toolEvents } = useSessionStore.getState()
+  return {
+    reasoning: streamingReasoning.length ? streamingReasoning : undefined,
+    tools: toolEvents.length
+      ? toolEvents.map((t) => t.status === 'running' ? { ...t, status: 'failed' as const } : t)
+      : undefined,
+  }
+}
+
 function stopLocally() {
   const store = useSessionStore.getState()
   const partial = scrubMarkup(store.streamingText).trim()
-  if (partial) store.addMessage({ role: 'assistant', content: partial })
+  // A second call finds the state already reset, so nothing attaches twice.
+  const trace = turnTrace()
+  if (partial || trace.reasoning || trace.tools) {
+    store.addMessage({ role: 'assistant', content: partial, ...trace })
+  }
   store.setStreaming(false)
   store.resetStreaming()
   store.setActivity('Stopped')

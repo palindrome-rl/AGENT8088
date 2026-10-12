@@ -241,16 +241,25 @@ export function Sidebar() {
               <img src="/logo.png" alt="Agent8088" className="h-9 w-auto" style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal', filter: theme === 'light' ? 'invert(1)' : undefined }} />
             </button>
           ) : (
-            <div className="absolute left-2 top-1 flex h-8 w-8 items-center justify-center">
-              <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10">
+            // The logo IS the expand button: it turns into the expand icon on
+            // hover/focus. Two elements in the same spot drew the icon over it.
+            <button
+              type="button"
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+              onClick={toggleSidebar}
+              className="group absolute left-2 top-1 flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200"
+            >
+              <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-brand-border/20 bg-brand-primary/10 group-hover:hidden group-focus-visible:hidden">
                 <img
                   src="/palindrome-logo.png"
-                  alt="Palindrome"
+                  alt=""
                   className="h-5 w-6 object-contain"
                   style={{ mixBlendMode: theme === 'dark' ? 'screen' : 'normal', filter: theme === 'light' ? 'invert(1)' : undefined }}
                 />
               </div>
-            </div>
+              <PanelLeftOpen className="hidden h-4 w-4 group-hover:block group-focus-visible:block" />
+            </button>
           )}
 
           {/* Collapse button */}
@@ -262,16 +271,6 @@ export function Sidebar() {
               className="absolute right-2 top-1 flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200"
             >
               <PanelLeftClose className="h-4 w-4" />
-            </button>
-          )}
-          {sidebarCollapsed && (
-            <button
-              type="button"
-              aria-label="Expand sidebar"
-              onClick={toggleSidebar}
-              className="absolute left-2 top-0.5 flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200"
-            >
-              <PanelLeftOpen className="h-4 w-4" />
             </button>
           )}
         </div>

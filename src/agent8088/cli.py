@@ -19,6 +19,7 @@ Run:  python agent8088_cli.py
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
 import subprocess
 import shutil
+import textwrap
 try:
     import readline  # enables input history/editing; Unix-only
 except ImportError:
@@ -263,6 +264,7 @@ class Session:
         self.show_trace = config.get("show_trace", "0").lower() in {"1", "true", "on", "yes"}
         self.show_reasoning = config.get("show_reasoning", "0").lower() in {"1", "true", "on", "yes"}
         A.SHOW_REASONING = self.show_reasoning
+        self.reasoning_full = False  # /reasoning full|collapse: print every line of each thought
         self.last_trace = None
         self.conversation_trace = []
         self.trace_path = ""
@@ -2291,6 +2293,7 @@ def do_chat(query):
     else:
         trace = [] if S.show_trace else None
     reasoning_parts = []
+    _last_thoughts.clear()  # /thoughts shows the latest turn's
     stream = _StreamFilter()
     tokens_ref = [0]
     turn_start = time.time()
@@ -2299,11 +2302,38 @@ def do_chat(query):
     # the region is only repainted when something actually changed.
     with esc, Live(console=console, auto_refresh=False, transient=True) as _rich_live, \
             _ThrottledLive(_rich_live) as live:
+        def flush_reasoning():
+            # The live region only shows the tail of the reasoning and is erased
+            # when the turn ends. A finished round's reasoning is printed once
+            # above it instead, so it stays in the scrollback. Only ever filled
+            # when S.show_reasoning is on (see on_token); masked like the live view.
+            if not reasoning_parts:
+                return
+            text = A._mask_system_content("".join(reasoning_parts)).strip()
+            reasoning_parts.clear()
+            if text:
+                # The first lines of each thought, wrapped to the terminal.
+                # Printed scrollback cannot be unfolded later, so the full
+                # text is kept for /thoughts.
+                _last_thoughts.append(text)
+                n = len(_last_thoughts)
+                # Blank lines are dropped so every preview line carries text.
+                lines = [row for line in text.splitlines() if line.strip()
+                         for row in textwrap.wrap(line, max(30, console.width - 6))]
+                body = Text("\n".join(lines if S.reasoning_full else lines[:_THOUGHT_PREVIEW_LINES]),
+                            style="dim italic")
+                if not S.reasoning_full and len(lines) > _THOUGHT_PREVIEW_LINES:
+                    body.append(f"\n... ({len(lines) - _THOUGHT_PREVIEW_LINES} more lines — /thoughts {n})",
+                                style="dim")
+                console.print(Panel(body, title=f"[dim]thought {n}[/dim]", title_align="left",
+                                    box=box.MINIMAL, border_style="grey50"))
+
         def spin(msg):
             # Each round starts with "thinking..."; that is the boundary at which a
             # finished tool call stops being the thing on screen, so the filter is
             # cleared here and prose after a tool result streams normally again.
             if msg.startswith("thinking"):
+                flush_reasoning()
                 stream.reset()
             live.update(_StatusLine(msg, turn_start, tokens_ref, interruptible=msg.startswith("thinking")))
             return nullcontext()
@@ -2344,6 +2374,11 @@ def do_chat(query):
 
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
+
+        def _on_calls(calls):
+            # The round's reasoning belongs above the tool rows it led to.
+            flush_reasoning()
+            on_calls(calls)
 
         def _on_result(name, result):
             on_result(name, result)
@@ -2415,7 +2450,7 @@ def do_chat(query):
                 # extraction call runs, so it goes on a background thread and the
                 # user never waits for it. The gateway and cron stay synchronous.
                 memory_background=True,
-                spin=spin, on_calls=on_calls, on_tool=on_tool,
+                spin=spin, on_calls=_on_calls, on_tool=on_tool,
                 on_result=_on_result, on_escalation=_on_escalation,
                 on_answer=None, on_token=on_token,
                 on_status=on_status, on_stream_reset=on_stream_reset,
@@ -2436,6 +2471,7 @@ def do_chat(query):
             A._plan_on_escalation = None
             A._plan_on_approval = None
 
+    flush_reasoning()  # the last round's, above the answer (or the interrupt note)
     elapsed = time.time() - turn_start
     if answer is None:
         partial = stream.prose_text().strip()
@@ -2524,7 +2560,8 @@ COMMAND_SPECS = (
     ("trace", "/trace [on|off]", "Toggle capturing/printing the step-by-step JSON trace", ()),
     ("verbose", "/verbose [on|off|full]", "Control tool activity detail", ()),
     ("usage", "/usage [off|tokens|full]", "Control post-turn usage summaries", ()),
-    ("reasoning", "/reasoning [on|off]", "Show/hide the model's thinking (hidden by default; masked when shown)", ()),
+    ("reasoning", "/reasoning [on|off|full|collapse]", "Show/hide the model's thinking (hidden by default; masked when shown); full/collapse sets whole thoughts or the first lines", ()),
+    ("thoughts", "/thoughts [N]", "Expand the last turn's thinking (all steps, or step N)", ()),
     ("temp", "/temp <float>", "Set sampling temperature (current: {temperature})", ()),
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
     ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
@@ -2628,7 +2665,10 @@ COMMAND_DETAILS = {
                "the trace.",
     "usage": "/usage shows the setting; /usage off|tokens|full sets the summary printed after "
              "each turn.",
-    "reasoning": "/reasoning on|off shows or hides the model's thinking (hidden by default).",
+    "reasoning": "/reasoning on|off shows or hides the model's thinking (hidden by default); "
+                 "/reasoning full shows every line of each thought, /reasoning collapse the first lines.",
+    "thoughts": "/thoughts prints the last turn's thinking in full (each step is shown cut to its "
+                "first lines); /thoughts <n> prints just step n.",
     "temp": "/temp <0.0-2.0> sets the sampling temperature for this session.",
     "maxturns": "/maxturns <n> sets how many rounds the agent may take per request (at least 1).",
     "tool-selection": "/tool-selection shows the mode; /tool-selection hybrid|full|auto sets how "
@@ -6113,12 +6153,38 @@ def _show_toggle(label, value, options, detail=""):
     console.print(f"{label}: [{color}]{state}[/] · set with {escape(options)}{tail}")
 
 
+_last_thoughts: list[str] = []  # the latest turn's reasoning, one entry per step
+_THOUGHT_PREVIEW_LINES = 5  # lines of each thought shown before "... more lines"
+
+
+def cmd_thoughts(rest):
+    """Expand the reasoning do_chat printed collapsed: all steps, or step N."""
+    if not _last_thoughts:
+        console.print("[dim]No thoughts from the last turn (turn reasoning on with /reasoning on).[/dim]")
+        return
+    arg = rest.strip()
+    if arg and not (arg.isdigit() and 1 <= int(arg) <= len(_last_thoughts)):
+        console.print(f"[red]usage:[/red] /thoughts [1-{len(_last_thoughts)}]")
+        return
+    steps = [int(arg)] if arg else range(1, len(_last_thoughts) + 1)
+    for n in steps:
+        console.print(Panel(Text(_last_thoughts[n - 1], style="dim italic"), title=f"[dim]thought {n}[/dim]",
+                            title_align="left", box=box.MINIMAL, border_style="grey50"))
+
+
 def cmd_reasoning(rest):
     arg = rest.strip().lower()
+    if arg in ("full", "collapse"):
+        # /reasoning full|collapse: whole thoughts, or just their first lines.
+        S.reasoning_full = arg == "full"
+        shown = "every line" if S.reasoning_full else f"the first {_THOUGHT_PREVIEW_LINES} lines"
+        console.print(f"thoughts will show {shown}"
+                      + ("" if S.show_reasoning else "  [dim](reasoning is off: /reasoning on)[/dim]"))
+        return
     if arg not in ("on", "off"):
         _show_toggle("reasoning display", S.show_reasoning, "/reasoning on|off")
         if arg:
-            console.print("[red]usage:[/red] /reasoning on|off")
+            console.print("[red]usage:[/red] /reasoning on|off|full|collapse")
         return
     S.show_reasoning = arg == "on"
     A.SHOW_REASONING = S.show_reasoning
@@ -7088,7 +7154,7 @@ COMMANDS = {
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
     "compact": cmd_compact,
-    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning,
+    "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "thoughts": cmd_thoughts,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
     "maxturns": cmd_maxturns, "tool-selection": cmd_tool_selection, "limits": cmd_limits, "save": cmd_save,
     "memory": cmd_memory,

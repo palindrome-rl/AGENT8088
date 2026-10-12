@@ -75,6 +75,13 @@ Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
 
 ## 1:1 CLI Surface Mapping
 
+On `AGENT8088-v1.2`, **+ → Image analysis**, image paste/drop, and the clipboard
+button all use session attachments. Wait for the **Ready** chip, type a
+question, and send it as normal chat (not a slash command). Vision chat models
+receive real image parts; other models use local OCR when installed. Unknown
+image support is marked unconfirmed until the send-time capability check.
+The browser history hides base64, although saved sessions can contain it.
+
 | CLI Command | Web UI Page/Component | API Endpoint |
 |---|---|---|
 | `<text>` (free chat) | Chat Panel | `WS /ws {type:chat}` |
@@ -88,8 +95,8 @@ Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
 | `/cli-anything [task]` | Chat command | `WS {type:command}` |
 | `/plan [task]` | Plan Steps + Approval Card | `WS {type:command}` + plan events |
 | `/audit [on\|off]` | Config Page | `POST /api/audit` |
-| `/image <path> [q]` | Image Upload | `WS / REST` |
-| `/paste [q]` | Image Upload (paste) | `WS / REST` |
+| `/image <path> [q]` | Image analysis picker / image paste / drop | `POST /api/attachments`, then `WS {type:chat}` |
+| `/paste [q]` | Browser clipboard button (browser clipboard, not the server's) | `POST /api/attachments`, then `WS {type:chat}` |
 | `/raw <text>` | Raw Panel | `WS {type:command}` |
 | `/model [provider[:model]]` | Config Page switcher | `POST /api/model/switch` |
 | `/models [provider]` | Config Page picker | `GET /api/models/{provider}` |
@@ -116,7 +123,6 @@ Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
 | `/temp <float>` | Config Page | `POST /api/preferences` |
 | `/maxturns <int>` | Config Page | `POST /api/preferences` |
 | `/save <file>` | Chat export | Client-side download |
-| `/clear` | Chat reset | `POST /api/sessions/reset` |
 | `/exit` `/quit` | Session end | WS close |
 | **Gateway** `/new` | Sessions Page | `POST /api/sessions/new` |
 | **Gateway** `/stop` | Prompt Bar interrupt | `WS {type:interrupt}` |

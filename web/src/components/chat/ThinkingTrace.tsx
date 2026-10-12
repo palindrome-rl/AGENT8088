@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from 'react'
-import { useSessionStore } from '@/stores/session'
+import { memo, useState, useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { scrubMarkup } from '@/lib/scrub'
 
 /* ─────────────────────────────────────────────────────────
@@ -7,44 +8,49 @@ import { scrubMarkup } from '@/lib/scrub'
  *
  * Shows shimmering "Thinking..." while streaming, then settles
  * to "Thought for N seconds" with expandable reasoning.
+ * One section per model step: finished steps render as Markdown,
+ * the step still streaming as plain text (no half-open fences).
+ * Live in ChatPanel; collapsed and static on a finished message.
  * ───────────────────────────────────────────────────────── */
 
-export function ThinkingTrace() {
-  const { streamingReasoning, isStreaming } = useSessionStore()
-  const [expanded, setExpanded] = useState(true)
+export function ThinkingTrace({ reasoning, live = false }: { reasoning: string[]; live?: boolean }) {
+  const [expanded, setExpanded] = useState(live)
   const [settled, setSettled] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const startTime = useRef<number>(0)
 
   // Track elapsed time while streaming
   useEffect(() => {
-    if (isStreaming && streamingReasoning.length > 0) {
+    if (live && reasoning.length > 0) {
       if (startTime.current === 0) startTime.current = Date.now()
       const t = setInterval(() => {
         setElapsed((Date.now() - startTime.current) / 1000)
       }, 100)
       return () => clearInterval(t)
     }
-    if (!isStreaming && startTime.current > 0) {
+    if (!live && startTime.current > 0) {
       setSettled(true)
     }
-  }, [isStreaming, streamingReasoning.length])
+  }, [live, reasoning.length])
 
   // Reset when new turn starts
   useEffect(() => {
-    if (isStreaming && streamingReasoning.length === 0) {
+    if (live && reasoning.length === 0) {
       startTime.current = 0
       setElapsed(0)
       setSettled(false)
       setExpanded(true)
     }
-  }, [isStreaming, streamingReasoning.length])
+  }, [live, reasoning.length])
 
-  if (!streamingReasoning.length) return null
+  if (!reasoning.length) return null
 
   const timeStr = elapsed < 60 ? `${elapsed.toFixed(1)}s` : `${Math.floor(elapsed / 60)}m ${(elapsed % 60).toFixed(1)}s`
-  const working = isStreaming && !settled
-  const labelText = working ? 'Thinking' : `Thought for ${timeStr}`
+  const working = live && !settled
+  // A finished message has no timer, so it reports steps instead.
+  const labelText = working ? 'Thinking'
+    : startTime.current > 0 ? `Thought for ${timeStr}`
+    : reasoning.length > 1 ? `Thinking · ${reasoning.length} steps` : 'Thinking'
 
   return (
     <div
@@ -111,25 +117,39 @@ export function ThinkingTrace() {
               className="absolute left-[3px] w-px bg-zinc-200 dark:bg-zinc-800"
               style={{ top: -8, height: '100%', transition: 'height 500ms cubic-bezier(0.23,1,0.32,1)' }}
             />
-            <div className="flex flex-col gap-1 py-1">
-              <div
-                className="flex min-h-7 items-center gap-2 rounded-md px-1.5 py-0.5"
-                style={{ animation: 'fade-up 320ms cubic-bezier(0.23,1,0.32,1) both' }}
-              >
-                {working ? (
-                  <span
-                    className="size-3 shrink-0 rounded-full border-[1.5px] border-zinc-300 dark:border-zinc-700 border-t-brand-cyan"
-                    style={{ animation: 'spin 700ms linear infinite' }}
-                  />
-                ) : (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
-                    <path d="M20 6L9 17l-5-5" />
-                  </svg>
-                )}
-                <span className="min-w-0 text-[12.5px] leading-relaxed text-zinc-600 dark:text-zinc-400 font-mono">
-                  {scrubMarkup(streamingReasoning.join(''))}
-                </span>
-              </div>
+            <div className="flex flex-col gap-2 py-1">
+              {reasoning.map((text, i) => {
+                const current = working && i === reasoning.length - 1
+                return (
+                  <div
+                    key={i}
+                    className="rounded-md px-1.5 py-0.5"
+                    style={{ animation: 'fade-up 320ms cubic-bezier(0.23,1,0.32,1) both' }}
+                  >
+                    {/* Step label */}
+                    <div className="flex min-h-6 items-center gap-2 text-[11px] font-medium text-zinc-400 dark:text-zinc-500">
+                      {current ? (
+                        <span
+                          className="size-3 shrink-0 rounded-full border-[1.5px] border-zinc-300 dark:border-zinc-700 border-t-brand-cyan"
+                          style={{ animation: 'spin 700ms linear infinite' }}
+                        />
+                      ) : (
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#a1a1aa" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                          <path d="M20 6L9 17l-5-5" />
+                        </svg>
+                      )}
+                      Step {i + 1}
+                    </div>
+                    {current ? (
+                      <div className="min-w-0 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-zinc-600 dark:text-zinc-400">
+                        {scrubMarkup(text)}
+                      </div>
+                    ) : (
+                      <ReasoningMarkdown text={text} />
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </div>
         </div>
@@ -137,3 +157,13 @@ export function ThinkingTrace() {
     </div>
   )
 }
+
+/** A finished step never changes, so memo keeps the live stream from
+ *  re-parsing every earlier step on each delta. Raw HTML stays escaped. */
+const ReasoningMarkdown = memo(function ReasoningMarkdown({ text }: { text: string }) {
+  return (
+    <div className="chat-markdown min-w-0 max-w-full overflow-hidden text-[12.5px] leading-relaxed text-zinc-600 dark:text-zinc-400 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_pre]:rounded [&_pre]:bg-zinc-100 [&_pre]:p-2 dark:[&_pre]:bg-zinc-800/60 [&_code]:font-mono">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{scrubMarkup(text)}</ReactMarkdown>
+    </div>
+  )
+})

@@ -42,7 +42,7 @@ async function push(page: any, event: unknown) {
 /** Get the app into its streaming state, which is when tool activity renders. */
 async function streaming(page: any) {
   await page.addInitScript(STUB)
-  await page.goto('/', { waitUntil: 'domcontentloaded' })
+  await page.goto('/', { waitUntil: 'networkidle' })
   await page.waitForFunction(() => !!(window as any).__fake)
   await push(page, { type: 'spin', message: 'running edit_file...', elapsed: 1, tokens: 0 })
 }
@@ -132,4 +132,25 @@ test('two writes to the same file collapse into one chip with combined counts', 
   await expect(chips).toHaveCount(1)
   await expect(page.getByTestId('tool-diff-strip')).toContainText('+4')
   await expect(page.getByTestId('tool-diff-strip')).toContainText('−3')
+})
+
+test('thinking and tool rows stay on the answer after the turn ends', async ({ page }) => {
+  await streaming(page)
+  await push(page, { type: 'spin', message: 'thinking...', elapsed: 1, tokens: 0 })
+  await push(page, { type: 'token', kind: 'reasoning', delta: 'first **step**' })
+  await push(page, { type: 'tool_start', name: 'edit_file' })
+  await push(page, { type: 'tool_result', name: 'edit_file', result: 'Updated src/app.py', diff: DIFF })
+  await push(page, { type: 'spin', message: 'thinking...', elapsed: 2, tokens: 0 })
+  await push(page, { type: 'token', kind: 'reasoning', delta: 'second step' })
+  await push(page, { type: 'answer', text: 'all done' })
+  await push(page, { type: 'turn_complete' })
+
+  // One copy only: the live block was reset when the answer landed.
+  await expect(page.getByTestId('message-tool-rows')).toHaveCount(1)
+  await expect(page.getByTestId('message-tool-rows')).toContainText('edit_file')
+  await expect(page.getByTestId('tool-diff-strip')).toHaveCount(1)
+  const trace = page.getByRole('button', { name: /Thinking · 2 steps/ })
+  await expect(trace).toHaveAttribute('aria-expanded', 'false')
+  await trace.click()
+  await expect(page.locator('strong', { hasText: 'step' })).toBeVisible()
 })
