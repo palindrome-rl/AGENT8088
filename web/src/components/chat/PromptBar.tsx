@@ -6,7 +6,6 @@ import { useWebSocket, drainPromptQueue } from '@/hooks/useWebSocket'
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
-import { ImageUpload } from './ImageUpload'
 import { Otto } from './Otto'
 
 /* ─────────────────────────────────────────────────────────
@@ -45,8 +44,6 @@ export function PromptBar() {
   const [text, setText] = useState('')
   const [dismissed, setDismissed] = useState(false)
   const [plusOpen, setPlusOpen] = useState(false)
-  const [showImageUpload, setShowImageUpload] = useState(false)
-  const [pasteImage, setPasteImage] = useState<string | null>(null)
   const [listening, setListening] = useState(false)
   const [sessionError, setSessionError] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
@@ -54,6 +51,7 @@ export function PromptBar() {
   const [modeChanging, setModeChanging] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
   const { isStreaming, status, addMessage, setSessionName, setStatus, setRawLoading, setRawResult,
     promptQueue, queuePaused, enqueuePrompt, updateQueuedPrompt, removeQueuedPrompt, clearQueue,
     setQueuePaused } = useSessionStore()
@@ -160,7 +158,7 @@ export function PromptBar() {
     }
   }
 
-  const addFiles = (files: FileList | null) => {
+  const addFiles = (files: FileList | File[] | null) => {
     if (!files) return
     const selected = Array.from(files).slice(0, Math.max(0, 5 - attachments.length))
     for (const file of selected) {
@@ -226,8 +224,6 @@ export function PromptBar() {
     setText('')
     setDismissed(false)
     setPlusOpen(false)
-    setShowImageUpload(false)
-    setPasteImage(null)
     setAttachments((items) => items.filter((attachment) => attachment.state === 'error'))
   }
 
@@ -508,7 +504,7 @@ export function PromptBar() {
               { label: 'Web search', Icon: Plus, action: () => { setText('Search the web for '); inputRef.current?.focus() } },
               { label: 'Memory recall', Icon: Plus, action: () => { setText('What do you remember about '); inputRef.current?.focus() } },
               { label: 'Attach files', Icon: Paperclip, action: () => fileInputRef.current?.click() },
-              { label: 'Image analysis', Icon: ImagePlus, action: () => { setShowImageUpload(true) } },
+              { label: 'Image analysis', Icon: ImagePlus, action: () => imageInputRef.current?.click() },
             ].map(({ label, Icon, action }, i) => (
               <button
                 key={label}
@@ -533,13 +529,7 @@ export function PromptBar() {
       {/* ── composer ───────────────────────────────────── */}
       <div className="mx-auto w-full max-w-2xl">
         <input ref={fileInputRef} type="file" multiple className="hidden" accept=".txt,.md,.csv,.json,.pdf,.docx,.xlsx,.pptx,image/png,image/jpeg,image/gif,image/webp" onChange={(event) => { addFiles(event.target.files); event.currentTarget.value = '' }} />
-        {/* ── image upload panel ──────────────────────── */}
-        {showImageUpload && (
-          <ImageUpload
-            initialImage={pasteImage}
-            onClose={() => { setShowImageUpload(false); setPasteImage(null) }}
-          />
-        )}
+        <input ref={imageInputRef} type="file" multiple className="hidden" accept="image/png,image/jpeg,image/gif,image/webp" onChange={(event) => { addFiles(event.target.files); event.currentTarget.value = '' }} />
         {attachments.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5 px-1">
           {attachments.map((attachment) => <div key={attachment.localId} className="flex max-w-full items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-300">
             {attachment.state === 'uploading' ? <Loader2 className="h-3 w-3 animate-spin text-brand-cyan" /> : attachment.state === 'error' ? <AlertCircle className="h-3 w-3 text-red-400" /> : <Paperclip className="h-3 w-3 text-brand-cyan" />}
@@ -649,27 +639,20 @@ export function PromptBar() {
                 type="button"
                 aria-label="Paste image from clipboard"
                 onClick={async () => {
+                  // Same path as Ctrl+V: the clipboard image becomes an
+                  // attachment chip, and the model receives the image itself.
                   try {
-                    const items = await navigator.clipboard.read()
-                    for (const item of items) {
-                      for (const type of item.types) {
-                        if (type.startsWith('image/')) {
-                          const blob = await item.getType(type)
-                          const reader = new FileReader()
-                          reader.onload = () => {
-                            setPasteImage(reader.result as string)
-                            setShowImageUpload(true)
-                          }
-                          reader.readAsDataURL(blob)
-                          return
-                        }
-                      }
+                    for (const item of await navigator.clipboard.read()) {
+                      const type = item.types.find((t) => t.startsWith('image/'))
+                      if (!type) continue
+                      const blob = await item.getType(type)
+                      const ext = type.split('/')[1].replace('jpeg', 'jpg')
+                      addFiles([new File([blob], `clipboard-${Date.now()}.${ext}`, { type })])
+                      return
                     }
-                    // No image in clipboard — open panel for manual paste
-                    setShowImageUpload(true)
+                    setSessionError('No image on the clipboard. Copy one, or press Ctrl+V in the message box.')
                   } catch {
-                    // Clipboard API unavailable — open panel for manual paste
-                    setShowImageUpload(true)
+                    setSessionError('The browser blocked clipboard access. Press Ctrl+V in the message box instead.')
                   }
                 }}
                 className="flex h-7 w-7 items-center justify-center rounded-lg text-zinc-400 transition-all hover:bg-zinc-100 dark:hover:bg-zinc-800/50 hover:text-zinc-700 dark:hover:text-zinc-200 active:scale-95"
