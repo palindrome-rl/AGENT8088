@@ -1,4 +1,5 @@
 import json
+import threading
 
 from agent8088.task_runtime import TaskStore, run_task
 
@@ -42,6 +43,124 @@ def test_cancelled_task_does_not_resume(tmp_path):
     row = run_task("ignored", lambda *_args, **_kwargs: "should not run",
                    store=store, workspace=tmp_path, task_id=task_id)
     assert row["state"] == "cancelled"
+
+
+def test_end_during_worker_keeps_task_until_final_checkpoint(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    task_id = store.create("review", tmp_path, [{"role": "user", "content": "review"}])
+
+    def agent(_messages, **_kwargs):
+        assert store.cancel(task_id)["state"] == "cancelling"
+        assert not store.delete(task_id)
+        return "done"
+
+    row = run_task("review", agent, store=store, workspace=tmp_path, task_id=task_id)
+    assert row["state"] == "cancelled"
+    assert store.get(task_id)["last_answer"] == "done"
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0] > 0
+    assert store.delete(task_id)
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+
+
+def test_concurrent_resume_claims_only_one_worker(tmp_path):
+    path = tmp_path / "tasks.db"
+    first_store = TaskStore(path)
+    task_id = first_store.create("resume", tmp_path, [{"role": "user", "content": "resume"}])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def agent(_messages, **_kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+        return "TASK_COMPLETE"
+
+    def run_first_worker():
+        worker_store = TaskStore(path)
+        try:
+            run_task("resume", agent, store=worker_store,
+                     workspace=tmp_path, task_id=task_id)
+        finally:
+            worker_store.close()
+
+    worker = threading.Thread(target=run_first_worker)
+    worker.start()
+    assert entered.wait(5)
+    second_store = TaskStore(path)
+    try:
+        row = run_task("resume", agent, store=second_store, workspace=tmp_path,
+                       task_id=task_id)
+        assert row["state"] == "running"
+        assert calls == [1]
+    finally:
+        release.set()
+        worker.join(5)
+        second_store.close()
+        first_store.close()
+    assert not worker.is_alive()
+    assert calls == [1]
+
+
+def test_concurrent_resume_cannot_claim_between_slices(tmp_path):
+    path = tmp_path / "tasks.db"
+    initial_store = TaskStore(path)
+    task_id = initial_store.create("resume", tmp_path, [{"role": "user", "content": "resume"}])
+    checkpointed = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def agent(_messages, **_kwargs):
+        calls.append(1)
+        return "TASK_PROGRESS"
+
+    def run_first_worker():
+        worker_store = TaskStore(path)
+        try:
+            original_update = worker_store.update
+
+            def hold_queued(task, **fields):
+                original_update(task, **fields)
+                if fields.get("state") == "queued":
+                    checkpointed.set()
+                    release.wait(5)
+
+            worker_store.update = hold_queued
+            run_task("resume", agent, store=worker_store, workspace=tmp_path,
+                     task_id=task_id, max_slices=1)
+        finally:
+            worker_store.close()
+
+    worker = threading.Thread(target=run_first_worker)
+    worker.start()
+    assert checkpointed.wait(5)
+    second_store = TaskStore(path)
+    try:
+        row = run_task("resume", agent, store=second_store, workspace=tmp_path,
+                       task_id=task_id)
+        assert row["state"] == "queued"
+        assert calls == [1]
+    finally:
+        release.set()
+        worker.join(5)
+        second_store.close()
+        initial_store.close()
+    assert not worker.is_alive()
+    assert calls == [1]
+
+
+def test_windows_worker_liveness_uses_process_query_not_kill_zero(monkeypatch):
+    import os
+    import pytest
+    from agent8088.task_runtime import TaskStore
+
+    if os.name != "nt":
+        pytest.skip("Windows process query semantics")
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("os.kill must not probe Windows PIDs"))
+    assert TaskStore.process_is_alive(os.getpid())
+    assert not TaskStore.process_is_alive(0x7FFFFFFF)
 
 
 def test_resuming_a_task_does_not_pause_another_running_task(tmp_path):

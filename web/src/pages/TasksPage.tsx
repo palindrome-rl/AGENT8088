@@ -16,7 +16,7 @@ async function request<T>(url: string, body?: unknown): Promise<T> {
   return data
 }
 
-const stateColor: Record<string, string> = { running: 'text-brand-cyan bg-brand-primary/10', queued: 'text-yellow-400 bg-yellow-500/10', paused: 'text-orange-400 bg-orange-500/10', completed: 'text-emerald-400 bg-emerald-500/10', cancelled: 'text-zinc-400 bg-zinc-800' }
+const stateColor: Record<string, string> = { running: 'text-brand-cyan bg-brand-primary/10', cancelling: 'text-orange-400 bg-orange-500/10', queued: 'text-yellow-400 bg-yellow-500/10', paused: 'text-orange-400 bg-orange-500/10', completed: 'text-emerald-400 bg-emerald-500/10', cancelled: 'text-zinc-400 bg-zinc-800' }
 
 export default function TasksPage() {
   const client = useQueryClient()
@@ -24,9 +24,9 @@ export default function TasksPage() {
   const [selected, setSelected] = useState<string | null>(null)
   const tasks = useQuery({
     queryKey: ['tasks'], queryFn: () => request<DurableTask[]>('/api/tasks?include_cancelled=true'),
-    refetchInterval: (query) => query.state.data?.some((task) => task.state === 'running' || task.state === 'queued') ? 1500 : false,
+    refetchInterval: (query) => query.state.data?.some((task) => task.worker_active || task.state === 'running' || task.state === 'cancelling' || task.state === 'queued') ? 1500 : false,
   })
-  const detail = useQuery({ queryKey: ['task', selected], queryFn: () => request<DurableTask>(`/api/tasks/${selected}`), enabled: Boolean(selected), refetchInterval: () => tasks.data?.some((task) => task.id === selected && (task.state === 'running' || task.state === 'queued')) ? 1500 : false })
+  const detail = useQuery({ queryKey: ['task', selected], queryFn: () => request<DurableTask>(`/api/tasks/${selected}`), enabled: Boolean(selected), refetchInterval: () => tasks.data?.some((task) => task.id === selected && (task.worker_active || task.state === 'running' || task.state === 'cancelling' || task.state === 'queued')) ? 1500 : false })
   const refresh = () => { void client.invalidateQueries({ queryKey: ['tasks'] }); void client.invalidateQueries({ queryKey: ['task', selected] }) }
   const start = useMutation({ mutationFn: () => request<DurableTask>('/api/tasks', { goal }), onSuccess: (task) => { setGoal(''); setSelected(task.id); refresh() } })
   const resume = useMutation({ mutationFn: (id: string) => request<DurableTask>(`/api/tasks/${id}/resume`, {}), onSuccess: refresh })
@@ -35,7 +35,7 @@ export default function TasksPage() {
   const error = tasks.error ?? detail.error ?? start.error ?? resume.error ?? end.error ?? remove.error
   const active = detail.data
   // Read from the list: it polls until the run stops, while the detail can stop one poll early.
-  const live = tasks.data?.some((task) => task.id === selected && (task.state === 'running' || task.state === 'queued'))
+  const live = tasks.data?.some((task) => task.id === selected && (task.worker_active || task.state === 'running' || task.state === 'cancelling' || task.state === 'queued'))
 
   return <div className="mx-auto max-w-5xl space-y-5 p-4 sm:p-6">
     <div className="flex items-center gap-2.5"><ClipboardList className="h-5 w-5 text-brand-cyan" /><div><h1 className="text-lg font-semibold text-zinc-100">Durable Tasks</h1><p className="text-xs text-zinc-500">Checkpointed work that can be resumed after interruption.</p></div></div>
