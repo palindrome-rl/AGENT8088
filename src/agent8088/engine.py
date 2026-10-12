@@ -5979,6 +5979,8 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
 
 def _standalone_test_command(command: str) -> bool:
     """Recognise explicit test runners, without assuming scripts are tests."""
+    if not isinstance(command, str):
+        return False
     if re.search(r"[;&|\n><`]|\$\(", command):
         return False
     try:
