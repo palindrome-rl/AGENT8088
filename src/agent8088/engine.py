@@ -16759,12 +16759,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     and trajectory.request_tests()):
                 if on_trajectory_state:
                     on_trajectory_state()
-                messages.append(_harness_turn((
-                    "Controller state says these code files changed this run with no "
-                    f"tests written: {', '.join(trajectory.untested_paths())}. "
-                    "Before your final answer, call generate_tests on each one, or "
-                    "state plainly why tests do not apply to this change."
-                )))
+                messages.append(_harness_turn(trajectory.nudge_text()))
                 post_check_rounds = 0
                 continue
             answer = _with_task_notes(_guard_answer(answer), trajectory)
@@ -16985,6 +16980,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    command=str(args.get("command") or ""),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
