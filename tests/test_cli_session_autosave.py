@@ -37,6 +37,7 @@ def sessions(tmp_path, monkeypatch):
 class _Esc:
     def __init__(self):
         self.triggered = threading.Event()
+        self._active = False
 
     def __enter__(self):
         return self

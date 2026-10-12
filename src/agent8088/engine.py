@@ -523,8 +523,8 @@ DEFAULT_MAX_TURNS = 50
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
-# Tool rounds allowed after a finishing nudge (deliverables re-check,
-# verification, re-plan, tests) with no state change before the model is told to
+# Tool rounds allowed after a finishing nudge or successful verification of
+# changed work, with no state change before the model is told to
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
@@ -5975,6 +5975,23 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
     if name == "run_tests":
         return False
     return True
+
+
+def _standalone_test_command(command: str) -> bool:
+    """Recognise explicit test runners, without assuming scripts are tests."""
+    if not isinstance(command, str):
+        return False
+    if re.search(r"[;&|\n><`]|\$\(", command):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return (bool(words) and words[0] in {"pytest", "py.test"}
+            or any(tuple(words[:len(prefix)]) == prefix
+                   for prefix in _TEST_RUNNER_COMMANDS)
+            or len(words) > 2 and words[0] in {"python", "python3"}
+            and words[1] == "-m" and words[2] in {"pytest", "unittest", "doctest"})
 
 
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
@@ -12095,7 +12112,14 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
+    # A passing test command already supplies verification evidence. Auditing
+    # that evidence with another agent repeats the check and can dominate the
+    # task budget. Writes bundled with a test still need their usual audit.
+    test_evidence = (name == "execute_shell"
+                     and _standalone_test_command(args.get("command", ""))
+                     and tool_output.detect_verdict(result).status == "passed")
+    if (will_audit and not test_evidence
+            and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
         result = _audit_tool_call(name, args, result, depth, snapshot)
 
@@ -17034,6 +17058,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+
+        # A successful test of changed work starts the same bounded check phase
+        # even when the model has not attempted a final answer yet. Mere reads
+        # or research do not start it. Further writes still reset the counter.
+        if (executed and post_check_rounds is None and trajectory is not None
+                and trajectory.mutation_count()
+                and trajectory.data.get("verification") == "verified"
+                and not round_changed):
+            post_check_rounds = 0
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
