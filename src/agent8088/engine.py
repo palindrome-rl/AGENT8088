@@ -9884,7 +9884,7 @@ def _native_sandbox_node_toolchain() -> tuple[str | None, str | None, str | None
             continue
         if first_version is None:
             first_version = version
-        if result.returncode == 0 and (major, minor) >= (20, 11):
+        if (major, minor) >= (20, 11):
             return node, npm, version
     return None, None, first_version
 
