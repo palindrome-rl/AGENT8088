@@ -9626,6 +9626,23 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     if sys.platform == "win32":
+        # The runner creates a private temp child under --temp and injects it
+        # as TMP/TEMP in the restricted child process. Keep installer caches
+        # below that runner-owned path so their writes use the same ACL grant.
+        selected_node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
+        path_prefix = (f'set "PATH={Path(selected_node).parent};%PATH%"'
+                       if selected_node else "")
+        env_prefix = path_prefix
+        if not readonly:
+            python_compat = APP_DIR / "sandbox_python"
+            env_prefix += ((' && ' if env_prefix else '') +
+                           f'set "PYTHONPATH={python_compat};%PYTHONPATH%" && '
+                           'set "AGENT8088_SANDBOX_TEMP=%TEMP%" && '
+                           'set "TMPDIR=%TEMP%" && '
+                           'set "npm_config_cache=%TEMP%\\npm-cache" && '
+                           'set "PIP_CACHE_DIR=%TEMP%\\pip-cache"')
+        if env_prefix:
+            command = f"{env_prefix} && {command}"
         mode = "read-only" if readonly else "workspace-write"
         wrapped = _native_sandbox_shell_argv(command)
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),

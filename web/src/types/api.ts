@@ -207,12 +207,13 @@ export interface ConfigInfo {
 export interface DurableTask {
   id: string
   goal: string
-  state: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled'
+  state: 'queued' | 'running' | 'cancelling' | 'paused' | 'completed' | 'cancelled'
   slice_no: number
   last_answer: string
   error: string
   created_at: number
   updated_at: number
+  worker_active?: boolean
   operations?: Array<{ id: string; tool: string; state: string; result: string; started_at: number; finished_at: number | null }>
 }
 

@@ -739,10 +739,16 @@ def _task_store():
 
 def _task_view(task: dict, operations: list[dict] | None = None) -> dict:
     """Return task state without its checkpointed model messages."""
-    view = {key: value for key, value in task.items() if key != "messages_json"}
+    view = {key: value for key, value in task.items()
+            if key not in {"messages_json", "worker_pid"}}
+    view["worker_active"] = bool(task.get("worker_pid"))
     if operations is not None:
         view["operations"] = operations
     return view
+
+
+_durable_task_workers: set[str] = set()
+_durable_task_workers_lock = threading.Lock()
 
 
 def _run_durable_task(task_id: str) -> None:
@@ -764,10 +770,21 @@ def _run_durable_task(task_id: str) -> None:
         log.exception("durable task %s failed to start", task_id)
     finally:
         store.close()
+        with _durable_task_workers_lock:
+            _durable_task_workers.discard(task_id)
 
 
 def _start_durable_task(task_id: str) -> None:
-    threading.Thread(target=_run_durable_task, args=(task_id,), daemon=True).start()
+    with _durable_task_workers_lock:
+        if task_id in _durable_task_workers:
+            return
+        _durable_task_workers.add(task_id)
+    try:
+        threading.Thread(target=_run_durable_task, args=(task_id,), daemon=True).start()
+    except Exception:
+        with _durable_task_workers_lock:
+            _durable_task_workers.discard(task_id)
+        raise
 
 
 @app.get("/api/tasks")
@@ -815,8 +832,17 @@ async def resume_task(task_id: str):
             task = store.resolve(task_id)
         except KeyError:
             return _error(f"task not found: {task_id}", 404)
-        if task["state"] == "running":
-            return _error("task is already running", 409)
+        if task["state"] in {"running", "queued", "cancelling"}:
+            with _durable_task_workers_lock:
+                worker_active = task["id"] in _durable_task_workers
+            if worker_active or store.worker_is_alive(task["id"]):
+                message = "task is still stopping" if task["state"] == "cancelling" else "task is already running"
+                return _error(message, 409)
+            if task["state"] in {"running", "cancelling"} or int(task.get("worker_pid") or 0):
+                # A process restart can leave an owned task running or queued.
+                # Recover only after confirming the recorded worker is gone.
+                store.recover(task["id"])
+            task = store.get(task["id"])
         if task["state"] in {"completed", "cancelled"}:
             return _error(f"task is {task['state']} and cannot resume", 409)
     finally:
@@ -847,7 +873,10 @@ async def delete_task(task_id: str):
         except KeyError:
             return _error(f"task not found: {task_id}", 404)
         if not store.delete(task["id"]):
-            return _error("task is running or queued; end the task first", 409)
+            message = ("task is running or queued; end the task first" if
+                       task["state"] in {"running", "queued", "cancelling"} else
+                       "task worker is still finishing; try again in a moment")
+            return _error(message, 409)
         return {"ok": True}
     finally:
         store.close()

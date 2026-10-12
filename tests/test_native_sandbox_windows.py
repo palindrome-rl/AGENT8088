@@ -103,7 +103,13 @@ def test_exec_native_sandbox_builds_dsh_argv_on_windows(tmp_path, monkeypatch):
     child = argv[argv.index("--") + 1:]
     assert child[0] == spaced_python
     assert child[1] == "-c"
-    assert base64.b64decode(child[3]).decode("utf-8") == "echo hi"
+    command = base64.b64decode(child[3]).decode("utf-8")
+    assert 'set "PATH=C:\\node;%PATH%"' in command
+    assert 'set "npm_config_cache=%TEMP%\\npm-cache"' in command
+    assert 'set "PIP_CACHE_DIR=%TEMP%\\pip-cache"' in command
+    assert 'set "AGENT8088_SANDBOX_TEMP=%TEMP%"' in command
+    assert 'sandbox_python' in command
+    assert 'set "TMPDIR=%TEMP%"' in command and command.endswith("echo hi")
 
 
 def test_exec_native_sandbox_readonly_uses_read_only_mode_on_windows(tmp_path, monkeypatch):
