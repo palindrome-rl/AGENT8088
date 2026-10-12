@@ -124,3 +124,51 @@ def test_windows_install_reports_failure_after_retry_also_fails(tmp_path, monkey
 
     assert len(attempts) == 2
     assert "could not" in result
+
+
+def test_windows_runtime_prefers_managed_node_over_old_path_node(tmp_path, monkeypatch):
+    """A conda/old Node 18 first on PATH must not be the one that runs the sandbox."""
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    monkeypatch.delenv("AGENT8088_SRT", raising=False)
+    managed = tmp_path / "node" / "node.exe"
+    managed.parent.mkdir()
+    managed.write_text("")
+    runner = tmp_path / "runner.js"
+    runner.write_text("")
+    monkeypatch.setattr(engine, "_dsh_runner_path", lambda: runner)
+    monkeypatch.setattr(engine, "_which_executable", lambda name: "C:/conda/node.exe")
+    assert engine._native_sandbox_argv() == [str(managed), str(runner)]
+
+
+def test_windows_install_provisions_managed_node_when_path_node_is_old(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    managed = tmp_path / "node" / "node.exe"
+    monkeypatch.setattr(engine, "_which_executable",
+                        lambda name: {"node": "C:/conda/node.exe",
+                                      "npm": "C:/conda/npm.cmd"}.get(name))
+
+    def fake_install():
+        managed.parent.mkdir()
+        managed.write_text("")
+        managed.with_name("npm.cmd").write_text("")
+
+    monkeypatch.setattr(engine, "_install_managed_node", fake_install)
+    monkeypatch.setattr(engine.subprocess, "run", lambda argv, **k: type(
+        "R", (), {"stdout": "v22.11.0\n" if argv[0] == str(managed) else "v18.12.1\n"})())
+    calls = []
+    monkeypatch.setattr(engine, "_exec_process", lambda argv, timeout: calls.append(argv) or "ok")
+    monkeypatch.setattr(engine, "_native_sandbox_missing_requirements", lambda: [])
+    monkeypatch.setattr(engine, "_native_sandbox_ready", lambda *a, **k: True)
+
+    assert engine.install_native_sandbox() == "Native sandbox runtime installed and verified."
+    assert calls[0][0] == str(managed.with_name("npm.cmd"))
+
+
+def test_windows_install_reports_node_download_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine.sys, "platform", "win32")
+    monkeypatch.setenv("AGENT8088_HOME", str(tmp_path))
+    monkeypatch.setattr(engine, "_which_executable", lambda name: None)
+    monkeypatch.setattr(engine, "_install_managed_node", lambda: "Could not download Node.js 22.11.0: offline")
+    assert engine.install_native_sandbox() == "Could not download Node.js 22.11.0: offline"
