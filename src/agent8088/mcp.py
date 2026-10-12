@@ -51,16 +51,6 @@ def _matches(name, patterns):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
-def _drop_unset(value):
-    """Remove ``None`` values and the SDK's ``_meta`` envelope, recursively."""
-    if isinstance(value, dict):
-        return {key: _drop_unset(item) for key, item in value.items()
-                if item is not None and key != "_meta"}
-    if isinstance(value, list):
-        return [_drop_unset(item) for item in value]
-    return value
-
-
 def format_result(result):
     """Render an MCP tool result for the model.
 
@@ -68,21 +58,30 @@ def format_result(result):
     ``{"_meta": null, "content": [{"type": "text", "text": "..."}], ...}``, with
     every quote escaped and the unused fields spelled out. That costs tokens and
     makes the value harder for a small model to read. A result made only of text
-    blocks now reaches the model as that text; anything else keeps its structure
-    without the null fields and ``_meta``. A server-reported error is prefixed
+    blocks, without structured content, now reaches the model as that text.
+    Other results keep their structure. Only absent SDK fields and protocol
+    ``_meta`` envelopes are omitted; application payloads remain intact.
+    A server-reported error is prefixed
     "MCP tool error:". A result that is not an SDK result object (a plain dict)
     is serialised as before.
     """
     if not hasattr(result, "model_dump"):
         return json.dumps(result, default=str, ensure_ascii=False)
-    data = result.model_dump(by_alias=True)
+    # Pydantic excludes absent SDK fields without recursively deleting JSON
+    # nulls inside arbitrary application dictionaries (structuredContent).
+    data = result.model_dump(by_alias=True, exclude_none=True)
+    data.pop("_meta", None)
     prefix = "MCP tool error: " if data.get("isError") else ""
     blocks = data.get("content") or []
-    if blocks and all(isinstance(block, dict) and block.get("type") == "text" for block in blocks):
+    for block in blocks:
+        if isinstance(block, dict):
+            block.pop("_meta", None)
+    if ("structuredContent" not in data and blocks
+            and all(isinstance(block, dict) and block.get("type") == "text" for block in blocks)):
         text = "\n".join(str(block.get("text", "")) for block in blocks)
         if text.strip():
             return prefix + text
-    return prefix + json.dumps(_drop_unset(data), default=str, ensure_ascii=False)
+    return prefix + json.dumps(data, default=str, ensure_ascii=False)
 
 
 class MCPRuntime:

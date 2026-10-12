@@ -193,13 +193,15 @@ to the most relevant tools per request.
 
 Hybrid selection ranks tools with BM25 keyword matching and, when an embedding
 model is reachable, with embeddings, then offers the top 10 plus the always-on
-and pinned tools. It never falls back to the full catalog by itself:
+and pinned tools. An unavailable embedder does not trigger a full-catalog
+fallback (catalogs of 10 tools or fewer are already small enough to send whole):
 
 | Situation | What is offered |
 | --- | --- |
 | No embedder, or the embedding call fails | BM25 top 10 plus the always-on and pinned tools |
 | The two rankers share no candidate | The union of both top-10 lists plus the always-on and pinned tools |
-| No BM25 hit at all (for example a greeting) | Only the always-on and pinned tools |
+| No keyword matches, but usable semantic candidates | Semantic top 10 plus the always-on and pinned tools |
+| Neither ranker has candidates (for example a greeting with no embedder) | Only the always-on and pinned tools |
 
 The model still sees every tool name in the names-only index and can load any
 schema with `search_tools`, so a keyword miss costs a turn rather than the tool.

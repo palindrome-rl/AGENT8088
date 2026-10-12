@@ -1,6 +1,5 @@
-"""Hybrid tool selection stays before the model call and fails open."""
+"""Hybrid tool selection stays before the model call and degrades to keywords."""
 import json
-
 from types import SimpleNamespace as NS
 
 
@@ -86,6 +85,20 @@ def test_the_keyword_fallback_is_logged_once_per_reason(engine, monkeypatch, cap
     assert len(notes) == 1
 
 
+def test_no_keyword_matches_keeps_semantic_candidates(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: _Embedder())
+    monkeypatch.setattr(engine, "_bm25_tool_ranking", lambda *_args: [])
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "what local models can my machine run?", allowed, mode="hybrid")
+
+    assert "check_local_hardware" in chosen
+    assert len(chosen) < len(allowed)
+    assert chosen <= allowed
+
+
 def test_full_mode_still_offers_the_whole_catalog(engine, monkeypatch):
     monkeypatch.setattr(engine.memory, "embedder", lambda: None)
     engine._TOOL_INDEX_CACHE.clear()
@@ -97,7 +110,7 @@ def test_full_mode_still_offers_the_whole_catalog(engine, monkeypatch):
 def test_novice_branch_review_does_not_expose_worktree_diff(engine, monkeypatch):
     """The two tools inspect different scopes; offering both caused a live
     model to review the branch and then contaminate that result with git diff.
-    The guard must also work when embeddings fail and selection fails open.
+    The guard must also work when embeddings fail and selection uses keywords.
     """
     monkeypatch.setattr(engine.memory, "embedder", lambda: None)
     engine._TOOL_INDEX_CACHE.clear()

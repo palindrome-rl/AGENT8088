@@ -3692,7 +3692,7 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
 
     A catalog changes rarely; embed all of it once rather than making every user
     turn pay for 48 tool descriptions. The existing embedder has its own circuit
-    breaker, so a missing embedding model degrades to full tool exposure.
+    breaker, so a missing embedding model degrades to keyword-only ranking.
     """
     entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
                for name in sorted(names) if name in TOOL_SPECS]

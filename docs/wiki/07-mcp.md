@@ -78,10 +78,12 @@ are enforced the same as for built-ins.
 
 ### What the model sees as a result
 
-A result made only of text blocks reaches the model as that text (several blocks
-are joined by newlines), with no JSON envelope and no escaping. A result with
-other content, such as images or structured content, keeps its structure with
-the null fields and `_meta` removed. When the server reports an error the result
+A result made only of text blocks, with no structured content, reaches the model
+as that text (several blocks are joined by newlines), with no JSON envelope and
+no escaping. A result with images or structured content keeps its structure,
+including text summaries alongside structured data. Absent SDK fields and
+protocol `_meta` envelopes are omitted; `null` values and fields named `_meta`
+inside application payloads are preserved. When the server reports an error the result
 starts with `MCP tool error:`. The untrusted-content wrapper below is applied
 after this step, to every result.
 
