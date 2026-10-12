@@ -119,7 +119,7 @@ are in:
 
 ```powershell
 $env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
-$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+$env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
 ```
 
 Or answer `c` ("continue in this window") at the Windows Terminal prompt. Agent8088

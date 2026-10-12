@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -44,7 +45,7 @@ class TaskStore:
           state TEXT NOT NULL, slice_no INTEGER NOT NULL DEFAULT 0,
           messages_json TEXT NOT NULL, last_answer TEXT NOT NULL DEFAULT '',
           error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
-          trajectory_json TEXT NOT NULL DEFAULT '{}'
+          trajectory_json TEXT NOT NULL DEFAULT '{}', worker_pid INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS task_events (
           id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
@@ -61,6 +62,8 @@ class TaskStore:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
         if "trajectory_json" not in columns:
             self.db.execute("ALTER TABLE tasks ADD COLUMN trajectory_json TEXT NOT NULL DEFAULT '{}'")
+        if "worker_pid" not in columns:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN worker_pid INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def create(self, goal: str, workspace: str | Path, messages: list[dict]) -> str:
@@ -113,18 +116,48 @@ class TaskStore:
         return [dict(row) for row in reversed(rows)]
 
     def cancel(self, task_id: str) -> dict:
+        self.db.execute("BEGIN IMMEDIATE")
         task = self.get(task_id)
         if not task:
+            self.db.rollback()
             raise KeyError(task_id)
         if task["state"] == "completed":
+            self.db.rollback()
             return task
-        self.db.execute(
-            "UPDATE tasks SET state='cancelled', error='ended by user', updated_at=? WHERE id=?",
-            (_now(), task_id),
-        )
-        self.event(task_id, "cancelled", {})
+        # Keep an active worker protected from deletion until it has left its
+        # current model/tool call and completed its final checkpoint.
+        self.db.execute("UPDATE tasks SET state=CASE WHEN state IN ('running','cancelling') "
+                        "OR worker_pid!=0 "
+                        "THEN 'cancelling' ELSE 'cancelled' END, error='ended by user', "
+                        "updated_at=? WHERE id=?", (_now(), task_id))
+        active = self.get(task_id)["state"] == "cancelling"
+        self.event(task_id, "cancellation_requested" if active else "cancelled", {})
         self.db.commit()
         return self.get(task_id)
+
+    def delete(self, task_id: str) -> bool:
+        """Remove a task with its event and operation ledger; False if it is live.
+
+        A running or queued task has a worker checkpointing into these rows, so
+        it must be ended first. The state check and delete are one statement.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        task = self.get(task_id)
+        if (task and task["state"] == "cancelling" and
+                not self.process_is_alive(int(task.get("worker_pid") or 0))):
+            self.db.execute("UPDATE tasks SET state='cancelled', worker_pid=0, updated_at=? "
+                            "WHERE id=? AND state='cancelling' AND worker_pid=?",
+                            (_now(), task_id, int(task.get("worker_pid") or 0)))
+            self.event(task_id, "cancelled", {})
+        cur = self.db.execute(
+            "DELETE FROM tasks WHERE id=? AND worker_pid=0 "
+            "AND state NOT IN ('running', 'queued', 'cancelling')",
+            (task_id,))
+        if cur.rowcount:
+            self.db.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+            self.db.execute("DELETE FROM task_operations WHERE task_id=?", (task_id,))
+        self.db.commit()
+        return bool(cur.rowcount)
 
     def update(self, task_id: str, **fields) -> None:
         allowed = {"state", "slice_no", "messages_json", "last_answer", "error", "trajectory_json"}
@@ -132,9 +165,73 @@ class TaskStore:
         if not fields:
             return
         fields["updated_at"] = _now()
-        sql = ", ".join(f"{k}=?" for k in fields)
-        self.db.execute(f"UPDATE tasks SET {sql} WHERE id=?", (*fields.values(), task_id))
+        assignments = []
+        values = []
+        for key, value in fields.items():
+            if key == "state":
+                assignments.append("state=CASE WHEN state='cancelling' AND ?!='cancelled' "
+                                   "THEN state ELSE ? END")
+                values.extend((value, value))
+            else:
+                assignments.append(f"{key}=?")
+                values.append(value)
+        self.db.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id=?",
+                        (*values, task_id))
         self.db.commit()
+
+    def claim(self, task_id: str) -> bool:
+        """Atomically claim a queued or paused task for exactly one worker."""
+        cur = self.db.execute(
+            "UPDATE tasks SET state='running', worker_pid=?, updated_at=? "
+            "WHERE id=? AND state IN ('queued','paused') AND worker_pid=0",
+            (os.getpid(), _now(), task_id))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    def finish_cancellation(self, task_id: str) -> None:
+        cur = self.db.execute("UPDATE tasks SET state='cancelled', worker_pid=0, updated_at=? "
+                              "WHERE id=? AND state='cancelling'", (_now(), task_id))
+        if cur.rowcount:
+            self.event(task_id, "cancelled", {})
+        self.db.execute("UPDATE tasks SET worker_pid=0 WHERE id=?", (task_id,))
+        self.db.commit()
+
+    @staticmethod
+    def process_is_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return ctypes.get_last_error() == 5  # access denied means the process exists
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return True
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def worker_is_alive(self, task_id: str) -> bool:
+        task = self.get(task_id)
+        return bool(task and self.process_is_alive(int(task.get("worker_pid") or 0)))
 
     def checkpoint(self, task_id: str, *, messages=None, answer=None, state=None, error=None,
                    trajectory=None):
@@ -184,14 +281,32 @@ class TaskStore:
 
     def recover(self, task_id: str) -> int:
         """Mark one task interrupted by a process death as resumable."""
+        self.db.execute("BEGIN IMMEDIATE")
+        task = self.get(task_id)
+        if (not task or task["state"] not in {"running", "queued", "cancelling"} or
+                (task["state"] == "queued" and not int(task.get("worker_pid") or 0))):
+            self.db.rollback()
+            return 0
+        worker_pid = int(task.get("worker_pid") or 0)
+        if self.process_is_alive(worker_pid):
+            self.db.rollback()
+            return 0
         cur = self.db.execute(
             "UPDATE task_operations SET state='unknown', finished_at=? "
             "WHERE task_id=? AND state='started'", (_now(), task_id),
         )
         self.db.execute(
-            "UPDATE tasks SET state='paused', error='process interrupted', updated_at=? "
-            "WHERE id=? AND state='running'", (_now(), task_id),
+            "UPDATE tasks SET state='paused', worker_pid=0, error='process interrupted', updated_at=? "
+            "WHERE id=? AND state IN ('running','queued') AND worker_pid=?",
+            (_now(), task_id, worker_pid),
         )
+        cancelled = self.db.execute(
+            "UPDATE tasks SET state='cancelled', worker_pid=0, updated_at=? "
+            "WHERE id=? AND state='cancelling' AND worker_pid=?",
+            (_now(), task_id, worker_pid),
+        )
+        if cancelled.rowcount:
+            self.event(task_id, "cancelled", {})
         self.db.commit()
         return cur.rowcount
 
@@ -260,7 +375,20 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
             raise KeyError(task_id)
         if task["state"] in {"completed", "cancelled"}:
             return task
-        store.recover(task_id)
+        if task["state"] == "cancelling":
+            if store.worker_is_alive(task_id):
+                return task
+            store.recover(task_id)
+            return store.get(task_id)
+        # Pre-ownership checkpoints migrate with worker_pid=0. Recover a
+        # running legacy checkpoint too, rather than silently failing claim().
+        if (task["state"] == "running" or
+                task["state"] == "queued" and int(task.get("worker_pid") or 0)):
+            if store.worker_is_alive(task_id):
+                return task
+            store.recover(task_id)
+        if not store.claim(task_id):
+            return store.get(task_id) or task
         task = store.get(task_id)
         # The model API receives its system prompt separately. Drop any stale
         # in-band system messages from an interrupted pre-runtime run.
@@ -274,6 +402,20 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                      "final answer with TASK_COMPLETE; otherwise end it with TASK_PROGRESS.\n\n"
                      + goal}]
         task_id = store.create(goal, workspace, messages)
+        if not store.claim(task_id):
+            return store.get(task_id)
+    task = store.get(task_id)
+    try:
+        _run_claimed_task(agent, store, task_id, messages, max_slices=max_slices,
+                          slice_turns=slice_turns, verify=verify, on_slice=on_slice,
+                          agent_kwargs=agent_kwargs)
+    finally:
+        store.finish_cancellation(task_id)
+    return store.get(task_id)
+
+
+def _run_claimed_task(agent, store, task_id, messages, *, max_slices, slice_turns,
+                      verify, on_slice, agent_kwargs):
     task = store.get(task_id)
     runtime = TaskRuntime(store, task_id)
     try:
@@ -282,9 +424,9 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
         runtime.trajectory_state = {}
     for _ in range(max_slices):
         task = store.get(task_id)
-        if task["state"] == "cancelled":
+        if task["state"] in {"cancelled", "cancelling"}:
             break
-        store.update(task_id, state="running", slice_no=int(task["slice_no"]) + 1, error="")
+        store.update(task_id, slice_no=int(task["slice_no"]) + 1, error="")
         task = store.get(task_id)
         if on_slice:
             on_slice(task, "running")
@@ -306,13 +448,15 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                                dynamic_turns=False, trajectory_state=runtime.trajectory_state,
                                on_trajectory_state=checkpoint_trajectory, **agent_kwargs)
         except Exception as exc:
-            store.checkpoint(task_id, messages=_compact(messages), state="paused", error=str(exc),
+            current = store.get(task_id)
+            state = "cancelled" if current["state"] == "cancelling" else "paused"
+            store.checkpoint(task_id, messages=_compact(messages), state=state, error=str(exc),
                              trajectory=runtime.trajectory_state)
             break
         store.checkpoint(task_id, messages=_compact(messages), answer=answer,
                          trajectory=runtime.trajectory_state)
         task = store.get(task_id)
-        if task["state"] == "cancelled":
+        if task["state"] in {"cancelled", "cancelling"}:
             break
         if on_slice:
             on_slice(task, "checkpointed")

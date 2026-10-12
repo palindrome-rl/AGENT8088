@@ -2664,7 +2664,7 @@ COMMAND_SPECS = (
     ("maxturns", "/maxturns <int>", "Set max agent turns (current: {max_turns})", ()),
     ("tool-selection", "/tool-selection [hybrid|full|auto]", "Set native tool schemas sent to the model (persists)", ()),
     ("save", "/save <file>", "Save conversation + last trace to a JSON file", ()),
-    ("task", "/task [start|resume|end|output|list] <value>", "Manage durable long-running tasks", ()),
+    ("task", "/task [start|resume|end|delete|output|list] <value>", "Manage durable long-running tasks", ()),
     ("schedule", "/schedule [list|add <cron> <task>|remove <index-or-task>]", "Add/list/remove a recurring run of this agent (cron/Task Scheduler)", ()),
     ("browser", "/browser [status|close|reset]", "Inspect or close the active reusable browser session", ()),
     ("help", "/help", "Show this list", ()),
@@ -2773,7 +2773,8 @@ COMMAND_DETAILS = {
                       "many tool schemas are sent to the model each turn. Saved.",
     "save": "/save <file> saves the conversation and the last trace to a JSON file.",
     "task": "/task start <goal> starts a durable task that survives restarts; /task resume <id>; "
-            "/task end <id>; /task output <id> shows its latest answer; /task list.",
+            "/task end <id>; /task delete <id> removes a task that is not running; "
+            "/task output <id> shows its latest answer; /task list.",
     "schedule": "/schedule list; /schedule add <cron> <task> runs the task on a schedule (5-field "
                 "cron, e.g. \"0 9 * * *\" is daily at 9am; uses cron or Task Scheduler); "
                 "/schedule remove <number-or-task>.",
@@ -3105,21 +3106,21 @@ def cmd_task(rest):
             console.print(f"{row['id'][:12]}  {row['state']:<10}  {row['goal'][:100]}")
         store.close()
         return
-    if action not in {"start", "resume", "end", "output"}:
-        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task end <id> | /task output <id> | /task list[/dim]")
+    if action not in {"start", "resume", "end", "delete", "output"}:
+        console.print("[dim]usage: /task start <goal> | /task resume <id> | /task end <id> | /task delete <id> | /task output <id> | /task list[/dim]")
         store.close()
         return
-    task_ref = parts[1].strip() if action in {"resume", "end", "output"} and len(parts) > 1 else ""
+    task_ref = parts[1].strip() if action in {"resume", "end", "delete", "output"} and len(parts) > 1 else ""
     goal = parts[1].strip() if action == "start" and len(parts) > 1 else ""
     if action == "start" and not goal:
         console.print("[red]A task goal is required.[/red]")
         store.close()
         return
-    if action in {"resume", "end", "output"} and not task_ref:
+    if action in {"resume", "end", "delete", "output"} and not task_ref:
         console.print(f"[red]A task id is required for /task {action}.[/red]")
         store.close()
         return
-    if action in {"resume", "end", "output"}:
+    if action in {"resume", "end", "delete", "output"}:
         try:
             task = store.resolve(task_ref)
         except KeyError:
@@ -3131,6 +3132,13 @@ def cmd_task(rest):
     if action == "end":
         row = store.cancel(task["id"])
         console.print(f"[bold]task {row['id']}[/bold] → {row['state']}")
+        store.close()
+        return
+    if action == "delete":
+        if store.delete(task["id"]):
+            console.print(f"[bold]task {task['id']}[/bold] deleted")
+        else:
+            console.print(f"[red]Task {task['id'][:12]} is {task['state']}; end it first with /task end.[/red]")
         store.close()
         return
     if action == "output":

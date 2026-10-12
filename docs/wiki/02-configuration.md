@@ -64,9 +64,9 @@ takes over:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `api_max_retries` | `3` | Attempts per call on retryable errors (429/503/connection). `0` disables. |
-| `api_retry_initial_delay_ms` | `500` | First backoff delay. |
-| `api_retry_max_delay_ms` | `10000` | Ceiling for the exponential backoff. |
+| `api_max_retries` | `5` | Retries per call on retryable errors (408/429/5xx, connection, errors the provider reports inside a stream). `0` disables. With the default delays the retries span about 30 s. |
+| `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
+| `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
 
 ### Fusion
@@ -289,7 +289,7 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
-| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
+| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check or a successful test of changed work before the model is told to answer; a fresh summary is requested 2 rounds later. A write resets the count. Research and failed tests do not start it. `0` disables it. |
 | `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
 | `main_llm_min_tokens` | `4096` | Floor for the completion cap after a length cut-off: the retry gets about twice what the last normal reply used, never less than this and never more than the provider's limit. Resets after a normal reply. |
 | `length_retry_max_tokens` | `0` | Ceiling for the cap a cut-off retry earns. `0` = only the provider's limit. |
