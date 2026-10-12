@@ -126,6 +126,20 @@ class TaskStore:
         self.db.commit()
         return self.get(task_id)
 
+    def delete(self, task_id: str) -> bool:
+        """Remove a task with its event and operation ledger; False if it is live.
+
+        A running or queued task has a worker checkpointing into these rows, so
+        it must be ended first. The state check and delete are one statement.
+        """
+        cur = self.db.execute(
+            "DELETE FROM tasks WHERE id=? AND state NOT IN ('running', 'queued')", (task_id,))
+        if cur.rowcount:
+            self.db.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+            self.db.execute("DELETE FROM task_operations WHERE task_id=?", (task_id,))
+        self.db.commit()
+        return bool(cur.rowcount)
+
     def update(self, task_id: str, **fields) -> None:
         allowed = {"state", "slice_no", "messages_json", "last_answer", "error", "trajectory_json"}
         fields = {k: v for k, v in fields.items() if k in allowed}
