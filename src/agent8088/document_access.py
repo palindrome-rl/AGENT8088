@@ -4,6 +4,7 @@ Authorization remains with the caller. This cache is process-local, bounded,
 and keyed by resolved file identity; it is never an authorization mechanism.
 """
 from collections import OrderedDict
+import heapq
 from pathlib import Path
 from threading import RLock
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -313,6 +314,8 @@ def load(path):
 _SEARCH_STOPWORDS = frozenset(
     "the a an and or of to in on for with that this it is are be as at by from into".split())
 _SEARCH_BEFORE, _SEARCH_AFTER, _SEARCH_MAX_PASSAGES = 300, 700, 8
+_SEARCH_MAX_CANDIDATES = 4096
+_SEARCH_BUCKET_CHARS = _SEARCH_BEFORE + _SEARCH_AFTER
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 
@@ -360,21 +363,49 @@ def _search(text, query):
         anchors = phrase_starts
         needed = len(terms)
     else:
-        anchors = sorted({pos for t in terms for pos in spots[t]})[:20000]
+        # Rank the whole document while keeping candidate memory bounded. A
+        # prefix slice can hide a stronger passage after many early keyword hits.
+        anchors = heapq.merge(*(spots[t] for t in terms))
         needed = 1 if len(terms) == 1 else (len(terms) + 1) // 2
     scored = []
+
+    def retain(item):
+        rank = item[0]
+        if len(scored) < _SEARCH_MAX_CANDIDATES:
+            heapq.heappush(scored, item)
+        elif rank > scored[0][0]:
+            heapq.heapreplace(scored, item)
+
+    previous = None
+    bucket = None
+    bucket_best = None
     for pos in anchors:
+        if pos == previous:
+            continue
+        previous = pos
+        current_bucket = pos // _SEARCH_BUCKET_CHARS
+        if bucket is not None and current_bucket != bucket:
+            if bucket_best is not None:
+                retain(bucket_best)
+            bucket_best = None
+        bucket = current_bucket
         lo, hi = max(0, pos - _SEARCH_BEFORE), pos + _SEARCH_AFTER
         found = covered(lo, hi)
         if len(found) < needed:
             continue
-        exact = any(lo <= start <= hi for start in phrase_starts)
+        first_phrase = bisect_left(phrase_starts, lo)
+        exact = first_phrase < len(phrase_starts) and phrase_starts[first_phrase] <= hi
         hits = sum(bisect_right(spots[t], hi) - bisect_left(spots[t], lo) for t in terms)
-        scored.append((len(found), exact, hits, -pos, pos, lo, hi, found))
-    scored.sort(reverse=True)
+        rank = (len(found), exact, hits, -pos)
+        item = (rank, pos, lo, hi, found)
+        if bucket_best is None or rank > bucket_best[0]:
+            bucket_best = item
+    if bucket_best is not None:
+        retain(bucket_best)
+    scored.sort(key=lambda item: item[0], reverse=True)
     markers = [(m.start(), m.group()[3:].strip()) for m in re.finditer(r"(?m)^## .+$", text)]
     passages, taken = [], []
-    for coverage, exact, _hits, _neg, pos, lo, hi, found in scored:
+    for (coverage, exact, _hits, _neg), pos, lo, hi, found in scored:
         if any(abs(pos - other) < _SEARCH_BEFORE + _SEARCH_AFTER for other in taken):
             continue
         taken.append(pos)

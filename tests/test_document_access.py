@@ -254,3 +254,27 @@ def test_unrelated_text_is_not_returned_as_a_match(tmp_path):
 def test_plural_and_case_variants_match(tmp_path):
     result = _search(tmp_path, 'Kernels are chosen. A kernel matters.', 'KERNEL')
     assert result['match_count'] == 1
+
+
+def test_search_ranks_matching_passages_after_many_early_keyword_hits(tmp_path):
+    text = ('alpha ' * 21000) + ('gap ' * 1000) + 'alpha beta gamma'
+    result = _search(tmp_path, text, 'alpha beta gamma')
+    assert result['match_count'] >= 1
+    assert result['matches'][0]['match'] == 'all_terms'
+    assert 'alpha beta gamma' in result['matches'][0]['text']
+
+
+def test_search_keeps_separate_relevant_passages_within_heap_candidate_range(tmp_path):
+    text = ('alpha beta gamma' + (' filler' * 430)) + '\nMiddle: alpha beta gamma\n' + (' gap' * 430) + '\nLater: alpha beta gamma'
+    result = _search(tmp_path, text, 'alpha beta gamma')
+    assert result['match_count'] == 3
+    assert any('Middle: alpha beta gamma' in match['text'] for match in result['matches'])
+    assert any('Later: alpha beta gamma' in match['text'] for match in result['matches'])
+
+
+def test_dense_anchor_cluster_cannot_fill_the_candidate_heap(tmp_path, monkeypatch):
+    monkeypatch.setattr(access, '_SEARCH_MAX_CANDIDATES', 2)
+    text = ('x y ' * 40) + ('gap ' * 750) + 'later: x y'
+    result = _search(tmp_path, text, 'x y')
+    assert result['match_count'] == 2
+    assert any('later: x y' in match['text'] for match in result['matches'])

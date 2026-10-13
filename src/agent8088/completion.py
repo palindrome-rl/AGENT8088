@@ -151,10 +151,6 @@ def _has_content(path: Path) -> bool:
         return False
 
 
-def _under(path: Path, roots: Iterable[Path]) -> bool:
-    return any(root == path or root in path.parents for root in roots)
-
-
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = ()) -> list[str]:
     """Named or claimed deliverables that do not exist, are empty, or sit in the
@@ -172,16 +168,7 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     written = list(written)
     missing: list[str] = []
     for path in named_output_paths(request):
-        wanted = PurePath(path.replace("\\", "/"))
         satisfied = any(_nonempty_file(c) for c in _candidates(path, roots))
-        if not satisfied:
-            tail = [part.lower() for part in wanted.parts if part not in ("", ".", "..", "/")]
-            for w in written:
-                parts = [part.lower() for part in PurePath(w.replace("\\", "/")).parts]
-                if (tail and parts[-len(tail):] == tail and _exists_somewhere(w, roots + mirrors)
-                        and not _under(Path(w), mirrors)):
-                    satisfied = True
-                    break
         if not satisfied:
             elsewhere = any(_nonempty_file(c) for c in _candidates(path, mirrors))
             missing.append(f"{path} (found only in {mirrors[0]}; create it at the requested path)"

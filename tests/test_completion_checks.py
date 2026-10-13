@@ -73,11 +73,19 @@ def test_missing_and_empty_outputs_are_found(tmp_path):
     assert missing == ["empty.txt", "absent.txt"]
 
 
-def test_a_written_file_satisfies_a_bare_name_wherever_it_landed(tmp_path):
+def test_a_written_file_in_the_wrong_folder_does_not_satisfy_a_bare_name(tmp_path):
     landed = tmp_path / "elsewhere" / "report.md"
     landed.parent.mkdir()
     landed.write_text("content", encoding="utf-8")
-    assert c.missing_outputs("Write report.md", "done", [str(landed)], [tmp_path]) == []
+    assert c.missing_outputs("Write report.md", "done", [str(landed)], [tmp_path]) == ["report.md"]
+
+
+@pytest.mark.parametrize("requested", ["report.md", "./report.md"])
+def test_relative_and_absolute_requested_paths_resolve_at_the_target(tmp_path, requested):
+    target = tmp_path / "report.md"
+    target.write_text("content", encoding="utf-8")
+    assert c.missing_outputs(f"Write {requested}", "done", [], [tmp_path]) == []
+    assert c.missing_outputs(f"Write {target}", "done", [], [tmp_path]) == []
 
 
 def test_a_claimed_deliverable_that_is_now_empty_is_reported(tmp_path):
