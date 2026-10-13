@@ -5,6 +5,14 @@ import json
 import pytest
 
 
+@pytest.mark.parametrize("command", [None, 123, {"unexpected": "object"}, []])
+def test_malformed_shell_command_remains_a_tool_error(engine, monkeypatch, command):
+    monkeypatch.setattr(engine, "run_tool", lambda *a, **k: "Error: command must be a string")
+    assert not engine._standalone_test_command(command)
+    result = engine.exec_tool("execute_shell", json.dumps({"command": command}))
+    assert "Error: command must be a string" in result
+
+
 @pytest.mark.parametrize("command,output,audited", [
     ("python -m pytest -q", "3 passed", False),
     ("python verify.py", "1 passed", True),

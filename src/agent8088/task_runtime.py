@@ -380,7 +380,10 @@ def run_task(goal: str, agent: Callable, *, store: TaskStore, workspace: str | P
                 return task
             store.recover(task_id)
             return store.get(task_id)
-        if task["state"] in {"running", "queued"} and int(task.get("worker_pid") or 0):
+        # Pre-ownership checkpoints migrate with worker_pid=0. Recover a
+        # running legacy checkpoint too, rather than silently failing claim().
+        if (task["state"] == "running" or
+                task["state"] == "queued" and int(task.get("worker_pid") or 0)):
             if store.worker_is_alive(task_id):
                 return task
             store.recover(task_id)
