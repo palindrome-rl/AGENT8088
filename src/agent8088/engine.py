@@ -580,6 +580,10 @@ WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
 # Tokens a model may spend reasoning on an ordinary turn, where the provider can
 # be told (see _reasoning_budget_extra_body). 0 = leave the provider's default.
 REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
+# Completion cap for a call that runs with thinking off (the retry after an empty or
+# reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
+# tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
+THINKING_OFF_MAX_TOKENS = 4096
 # Consecutive prose-only cut-offs (no tool call in progress: the model is looping
 # in plain text) tolerated before the final no-tools round.
 PROSE_CUTOFF_MAX = 2
@@ -17160,7 +17164,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     recent_call_tokens = []  # the last few, for the adaptive first-call cap
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
-    last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
+    thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
+    last_cutoff_kind = ""       # kind of the last cut-off
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -17389,15 +17394,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
-        # A3.2/A3.4: this one call runs with thinking off after an empty
-        # cut-off (the whole allowance went to reasoning, or to an unclosed tool
-        # call the runtime hides) and, for any other kind, from the 2nd
-        # consecutive cut-off; the next ordinary turn is back to normal thinking.
-        # Retrying an empty cut-off with thinking still on mostly cuts off again
-        # and costs a full call each time.
+        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
+        # thinking off; the next ordinary turn is back to normal thinking.
         retry_kwargs = ({"thinking": "length_retry"}
-                        if length_retries >= 2 or length_retries and last_cutoff_kind == "empty"
-                        else {})
+                        if length_retries >= 2 or thinking_off_retry else {})
+        if retry_kwargs and last_cutoff_kind != "tool_call":
+            # Thinking is off for this call, so it only has to write a short answer
+            # or one call: cap it at 4096 (or a lower initial_completion_cap).
+            turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
+                                  INITIAL_COMPLETION_CAP or THINKING_OFF_MAX_TOKENS)
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",
@@ -17577,6 +17582,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             else:
                 cutoff_kind, cap_hint = "empty", 0
                 prose_cutoffs = 0
+            # Thinking ate the budget (empty, or reasoning near the cap): the next call
+            # runs with thinking off, before the cap changes. A tool call being written
+            # keeps thinking on, since it needs room rather than less reasoning.
+            reasoning_chars = len(_extract_reasoning(message))
+            thinking_off_retry = cutoff_kind != "tool_call" and (
+                cutoff_kind == "empty" or reasoning_chars >= 0.9 * 4 * turn_max_tokens)
             last_cutoff_kind = cutoff_kind
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
@@ -17645,6 +17656,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "Your last responses reached the output limit and were discarded. "
                     "Reply within 200 tokens with exactly one complete tool call or a "
                     "final answer. Do not include analysis or thinking.")
+            if thinking_off_retry and length_retries == 1:
+                retry_instruction += " Call one tool or answer right away."
             messages.append(_harness_turn(retry_instruction))
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
@@ -17662,7 +17675,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
         cap_hint = prose_cutoffs = 0
-        last_cutoff_kind = ""
+        thinking_off_retry, last_cutoff_kind = False, ""
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -18083,6 +18096,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    command=str(args.get("command") or ""),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
