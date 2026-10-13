@@ -128,7 +128,9 @@ def _run_with_script(e, monkeypatch, replies):
 
     monkeypatch.setattr(e, "_create_completion_with_fallback", fake)
     e.TOOL_SPECS["execute_shell"]["host"] = "1"
-    answer = e.run_agent([{"role": "user", "content": "write /tmp/x.txt"}], max_turns=6)
+    # No file is named: a request that names one gets the missing-output check
+    # first (see test_completion_pipeline), which is not what these tests are about.
+    answer = e.run_agent([{"role": "user", "content": "say hi from the shell"}], max_turns=6)
     return answer, seen
 
 

@@ -19,7 +19,8 @@ from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
-from agent8088 import (cli_anything, diffview, documents, efficiency, local_models,
+from agent8088 import (cli_anything, completion as completion_checks, diffview,
+                       documents, efficiency, local_models,
                        memory, patching, providers, routing, testing_support,
                        tool_output,
                        trajectory, web_search)
@@ -528,6 +529,12 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
+# Follow-ups the completion checks may send in one request when a reply is empty,
+# admits unfinished work, leaves a named file missing, skips a part of a
+# multi-part request, or leaves changed work unverified. One budget for all of
+# them; a follow-up that makes progress hands its slot back. 0 turns the checks off.
+MAX_COMPLETION_CONTINUATIONS = max(0, _config_int(
+    "max_completion_continuations", completion_checks.DEFAULT_CONTINUATIONS))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
@@ -606,6 +613,8 @@ LIMIT_SPECS = {
     "max_turn_seconds":          ("MAX_TURN_SECONDS", int, "Wall-clock seconds per request"),
     "max_turn_cost_usd":         ("MAX_TURN_COST_USD", float, "Spend per request (USD)"),
     "max_writes_per_turn":       ("MAX_WRITES_PER_TURN", int, "Files written per request"),
+    "max_completion_continuations": ("MAX_COMPLETION_CONTINUATIONS", int,
+                                     "Completion follow-ups per request (0 = off)"),
     "max_write_bytes":           ("MAX_WRITE_BYTES", int, "Bytes per single write"),
     "max_subagent_answer_chars": ("MAX_SUBAGENT_ANSWER_CHARS", int, "Sub-agent answer cap"),
     "subagent_max_depth":        ("SUBAGENT_MAX_DEPTH", int, "Nested sub-agent depth"),
@@ -16359,7 +16368,7 @@ DELIVERABLES_CHECK_NUDGE = (
     "(file path, format, service or port), run a check now that confirms it exists "
     "and behaves exactly as specified. Remove scratch files, test users and other "
     "leftovers you created that the task did not ask for. Check each item once with "
-    "a single command, then give your final answer. Do not keep exploring."
+    "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
 POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
 
@@ -16407,6 +16416,72 @@ def _workspace_note(trajectory) -> str:
     return ""
 
 
+_CHANGE_REQUEST = re.compile(
+    r"\b(?:build|create|write|implement|fix|make|generate|add|change|update|refactor|set\s+up|"
+    r"install|develop|code|produce)\b", re.IGNORECASE)
+
+
+def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
+                           deliverables_due: bool = False):
+    """The first completion check a text reply fails, or None to accept it.
+
+    Order: unfinished work admitted, named files missing, (benchmark) deliverables
+    re-check, parts of a multi-part request, verification, tests. Each nudge draws
+    on the one budget; when it is spent the reply is accepted and the unmet
+    checks are recorded for the end-of-run note. No model call is made here.
+    """
+    if trajectory is None or not budget.enabled:
+        return None
+    mark = trajectory.progress_mark()
+    budget.observe(mark)
+    written = trajectory.written_paths()
+    nudge = None
+    if depth == 0 and completion_checks.admits_unfinished_work(reply):
+        promised = bool(_CHANGE_REQUEST.search(request)) and not trajectory.mutation_count()
+        if trajectory.has_open_items() or promised:
+            nudge = completion_checks.Nudge(
+                "unfinished",
+                completion_checks.continue_text(
+                    "Your reply says the work is not finished.", completion_checks.UNFINISHED_ASK),
+                unmet="the reply says the work is unfinished")
+    if nudge is None and depth == 0:
+        missing = completion_checks.missing_outputs(
+            request, reply, written, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()])
+        if missing:
+            nudge = completion_checks.outputs_nudge(missing)
+    if nudge is None and deliverables_due:
+        nudge = completion_checks.Nudge("deliverables", DELIVERABLES_CHECK_NUDGE,
+                                        unmet="the deliverables re-check was not completed")
+    if nudge is None and depth == 0:
+        if not trajectory.subgoals_built():
+            trajectory.set_subgoals(completion_checks.extract_subgoals(request))
+        pending = trajectory.open_subgoals()
+        if pending:
+            open_items = completion_checks.unaddressed_subgoals(pending, reply, written)
+            trajectory.mark_subgoals(open_items)
+            if open_items:
+                nudge = completion_checks.subgoals_nudge(open_items)
+    if nudge is None and trajectory.request_verification():
+        nudge = completion_checks.Nudge(
+            "verify",
+            completion_checks.continue_text(
+                "Changed work has no fresh verification evidence.", completion_checks.VERIFY_ASK),
+            unmet="changed work has no passing check")
+    if nudge is None and not DISPOSABLE_CONTAINER:
+        temp_dir, project = tempfile.gettempdir(), str(PROJECT_ROOT)
+        # The system temp dir is scratch space, unless the project itself lives there.
+        relevant = lambda path: completion_checks.is_library_code(path, temp_dir, project)
+        if (completion_checks.project_has_tests(PROJECT_ROOT)
+                and trajectory.request_tests(relevant)):
+            nudge = completion_checks.tests_nudge(trajectory.relevant_untested(relevant))
+    if nudge is None:
+        return None
+    if budget.spend(mark, nudge.unmet):
+        return nudge
+    trajectory.note_unmet(budget.unmet)
+    return None
+
+
 def _with_task_notes(answer: str, trajectory) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
@@ -16416,6 +16491,9 @@ def _with_task_notes(answer: str, trajectory) -> str:
                      "verification evidence was recorded.")
     elif trajectory is not None and (review := trajectory.review()):
         notes.append(f"Task-state note: {review}")
+    if (trajectory is not None and trajectory.needs_verification()
+            and (unmet := trajectory.unmet_review())):
+        notes.append(f"Task-state note: {unmet}")
     if location_note := _workspace_note(trajectory):
         notes.append(location_note)
     for note in notes:
@@ -16517,6 +16595,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
+    completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
     tool_failed = False  # any tool call this run returned an error
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
@@ -16542,6 +16621,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
     user_turns = _genuine_user_turns(messages)
+    request_text = _message_text(user_turns[-1]) if user_turns else ""
     durable_browser_goal = next((_message_text(message)
                                  for message in user_turns
                                  if _message_text(message).startswith(
@@ -17080,14 +17160,29 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             answer = strip_tool_json(content)
 
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
-            if not answer and empty_retries < 1 and not forcing and not unknown:
+            work_pending = (trajectory is not None and completion_budget.enabled
+                            and trajectory.has_open_items())
+            retry_empty = False
+            if not answer and not forcing and not unknown:
+                if work_pending:
+                    # Counts against the shared budget; mid-task it is a stall to
+                    # push through, so it may repeat while the budget lasts.
+                    retry_empty = completion_budget.spend(
+                        trajectory.progress_mark(), "the model returned an empty reply")
+                else:
+                    retry_empty = empty_retries < 1
+            if retry_empty:
                 empty_retries += 1
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
-                messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "
-                    "plain text. Do not think out loud and do not call any tools."))
+                if work_pending:
+                    # Mid-task an empty reply is a stall, not a finish: ask to carry on.
+                    messages.append(_harness_turn(completion_checks.EMPTY_REPLY_ASK))
+                else:
+                    messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "
+                        "plain text. Do not think out loud and do not call any tools."))
                 if trace is not None:
-                    trace.append({"turn": turn, "type": "empty_answer"})
+                    trace.append({"turn": turn, "type": "empty_answer", "pending": work_pending})
                 continue
 
             if not answer:
@@ -17121,16 +17216,6 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # Once told to answer, take this reply: a gate firing again here is
             # exactly the open-ended checking the cap exists to end.
             gates_open = not post_check_told
-            if gates_open and DISPOSABLE_CONTAINER and not deliverables_checked and seen_signatures:
-                # Graded on exact outputs with nobody to ask: before the one
-                # final answer, re-check every deliverable against the task.
-                deliverables_checked = True
-                messages.append(_harness_turn(DELIVERABLES_CHECK_NUDGE))
-                if trace is not None:
-                    trace.append({"turn": turn, "type": "deliverables_check"})
-                post_check_rounds = 0
-                continue
-
             if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -17143,34 +17228,28 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # back to working, so the cap must not cut that short.
                 post_check_rounds, post_check_told = None, False
                 continue
-            if gates_open and trajectory is not None and trajectory.request_verification():
-                if on_trajectory_state:
-                    on_trajectory_state()
-                messages.append(_harness_turn((
-                    "Controller state says a changed result has no fresh verification evidence. "
-                    "Before your final answer, inspect or test the changed result if a suitable "
-                    "tool is available. If verification is not possible, say that plainly. "
-                    "Check each item once with a single command, then give your final "
-                    "answer. Do not keep exploring."
-                )))
-                post_check_rounds = 0
-                continue
-            if (gates_open and trajectory is not None and not DISPOSABLE_CONTAINER
-                    and trajectory.request_tests()):
-                if on_trajectory_state:
-                    on_trajectory_state()
-                messages.append(_harness_turn((
-                    "Controller state says these code files changed this run with no "
-                    f"tests written: {', '.join(trajectory.untested_paths())}. "
-                    "Before your final answer, call generate_tests on each one, or "
-                    "state plainly why tests do not apply to this change."
-                )))
-                post_check_rounds = 0
-                continue
             if gates_open and _pending_chunk_audits and depth == 0:
                 chunk_note = _flush_chunk_audits(depth)
                 if chunk_note:
                     messages.append(_harness_turn(chunk_note))
+                    post_check_rounds = 0
+                    continue
+            if gates_open:
+                nudge = _next_completion_nudge(
+                    completion_budget, trajectory, reply=answer, request=request_text,
+                    depth=depth,
+                    deliverables_due=(DISPOSABLE_CONTAINER and not deliverables_checked
+                                      and bool(seen_signatures)))
+                if nudge is not None:
+                    if on_trajectory_state:
+                        on_trajectory_state()
+                    if nudge.kind == "deliverables":
+                        deliverables_checked = True
+                    messages.append(_harness_turn(nudge.text))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "completion_check",
+                                      "kind": nudge.kind,
+                                      "spent": completion_budget.spent})
                     post_check_rounds = 0
                     continue
             answer = _with_task_notes(_guard_answer(answer), trajectory)

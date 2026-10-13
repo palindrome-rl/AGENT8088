@@ -5,7 +5,7 @@ buggy.py, the model ran `python fib.py` to check it. Running code can change
 anything, so that run counted as a new change, re-armed "a changed result has
 no fresh verification evidence", and the model re-ran the same check twice.
 """
-NUDGE = "Controller state says a changed result"
+NUDGE = "Changed work has no fresh verification evidence"
 
 
 def _response(content):
