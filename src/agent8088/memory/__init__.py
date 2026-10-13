@@ -112,6 +112,18 @@ def _clear_error(operation):
         _RUNTIME.pop("last_error_op", None)
 
 
+def _store_error(active_store, operation):
+    """An adapter's non-raising failure is still a failed recall/save."""
+    error = getattr(active_store, "operation_error", "")
+    failed = getattr(active_store, "failed_operation", "")
+    relevant = {"search"} if operation == "recall" else {"add", "get_all"}
+    if isinstance(error, str) and error and failed in relevant:
+        redact = _RUNTIME.get("redact") or (lambda text: text)
+        _note_error(operation, RuntimeError(redact(error)))
+        return True
+    return False
+
+
 def configure(*, config=None, client_factory=None, completion=None, redact=None,
               db_path=None, project=None, user_id=None, embed_provider="", repo="",
               author=""):
@@ -130,11 +142,17 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             return cast(default)
 
     with _LOCK:
-        previous_path = _RUNTIME.get("db_path")
-        previous_model = _RUNTIME.get("embed_model")
-        previous_engine = _RUNTIME.get("engine_name")
         embed_model = str(config.get("memory_embed_model") or "nomic-embed-text").strip()
         engine_name, mem0_cfg = parse_memory_engine_config(config)
+        resolved_path = db_path or os.path.expanduser("~/.agent8088/memory.db")
+        client_settings = {key: value for key, value in config.items()
+                           if key.startswith("provider.") or key == "default_provider"}
+        embed_inputs = (embed_model, str(embed_provider or ""), client_factory, client_settings)
+        store_inputs = (resolved_path, engine_name,
+                        dict(mem0_cfg) if engine_name == "mem0" else None,
+                        embed_inputs if engine_name == "mem0" else None)
+        rebuild_store = _RUNTIME.get("store_inputs") != store_inputs
+        rebuild_embedder = _RUNTIME.get("embed_inputs") != embed_inputs
 
         _RUNTIME.update(
             # On for every install, off for a bare import with no config at all.
@@ -148,7 +166,9 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             engine_name=engine_name,
             mem0_cfg=mem0_cfg,
             capture_enabled=_flag("memory_capture", "1"),
-            db_path=db_path or os.path.expanduser("~/.agent8088/memory.db"),
+            db_path=resolved_path,
+            store_inputs=store_inputs,
+            embed_inputs=embed_inputs,
             user_id=user_id or str(config.get("memory_user_id") or "owner").strip(),
             scope_by_identity=_flag("memory_scope_by_identity"),
             embed_model=embed_model,
@@ -172,14 +192,17 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             redact=redact or (lambda text: text),
             client_factory=client_factory,
         )
-        if previous_path != db_path or previous_engine != engine_name:
+        if rebuild_store:
+            _RUNTIME.pop("last_error", None)
+            _RUNTIME.pop("last_error_op", None)
+            _RUNTIME.pop("mem0_error", None)
             existing = _RUNTIME.pop("store", None)
             if existing is not None:
                 try:
                     existing.close()
                 except Exception as exc:
                     log.debug("closing the previous memory store failed: %s", exc)
-        if previous_model != embed_model:
+        if rebuild_embedder:
             _RUNTIME.pop("embedder", None)
 
 
@@ -327,7 +350,8 @@ def recall(query, *, identity=None, limit=None):
             rrf_k=_RUNTIME.get("rrf_k", 60),
             min_score=_RUNTIME.get("min_score", 0.0),
         )
-        _clear_error("recall")
+        if not _store_error(active_store, "recall"):
+            _clear_error("recall")
         return found
     except Exception as exc:
         _note_error("recall", exc)
@@ -424,10 +448,11 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
                      source_channel="", files_touched=None, on_stored=None,
                      close_connection=False):
     try:
+        _clear_error("capture")
         stored = _capture(user_turns, answer, identity=identity, run_id=run_id,
                           agent_id=agent_id, source_channel=source_channel,
                           files_touched=files_touched, on_stored=on_stored)
-        _clear_error("capture")
+        _store_error(_RUNTIME.get("store"), "capture")
         return stored
     except Exception as exc:
         _note_error("capture", exc)
@@ -437,7 +462,9 @@ def _capture_guarded(user_turns, answer, *, identity=None, run_id=None, agent_id
         # would otherwise outlive the thread that can use it.
         if close_connection:
             existing = _RUNTIME.get("store")
-            if existing is not None:
+            if isinstance(existing, MemoryStore):
+                # SQLite connections are thread-local. Mem0's Qdrant client is
+                # shared with recall and must stay open until reset/reconfigure.
                 try:
                     existing.close()
                 except Exception as exc:
@@ -525,6 +552,8 @@ def _capture(user_turns, answer, *, identity=None, run_id=None, agent_id=None,
             stored += 1
             stored_rows.append({"id": memory_id, "text": text,
                                 "categories": item.get("categories") or []})
+        else:
+            _store_error(active_store, "capture")
     _LAST_CAPTURE["stored"] = stored
     if stored and _RUNTIME.get("engine_name") == "mem0" and type(active_store).__name__ != "Mem0MemoryStore":
         # Split brain: these facts live in the native store, which mem0 never
@@ -578,6 +607,9 @@ def status() -> dict:
                 log.debug("memory store status failed: %s", exc)
         report["engine"] = store_status.get("engine", "native")
         report["embedder_info"] = store_status.get("embedder")
+        operation_error = store_status.get("operation_error")
+        if isinstance(operation_error, str) and operation_error:
+            report["error"] = operation_error
         # Why the requested engine is not the live one. Only meaningful when
         # those two disagree; a healthy native-by-choice setup has no error.
         if report["engine"] != report["engine_configured"]:
@@ -617,6 +649,7 @@ def memory_status() -> dict:
                 "fix": "Check that memory_db_path (default ~/.agent8088/memory.db) is writable "
                        "and not locked by another process, or set memory=0 in config.txt."}
     engine = "mem0" if type(active).__name__ == "Mem0MemoryStore" else "native"
+    _store_error(active, "recall" if getattr(active, "failed_operation", "") == "search" else "capture")
     error = _RUNTIME.get("last_error", "")
     op = _RUNTIME.get("last_error_op", "")
     if error and op in ("recall", "capture"):

@@ -126,7 +126,8 @@ def test_commands_hold_and_release_the_turn_lock(monkeypatch):
         raise RuntimeError("failed command")
 
     c = SimpleNamespace(COMMANDS={"new": command}, console=Console(),
-                        A=SimpleNamespace(PROVIDERS={}), WEB_CONFIRM=None)
+                        A=SimpleNamespace(PROVIDERS={}), WEB_CONFIRM=None,
+                        S=cli.Session())
     asyncio.run(W._handle_command(SimpleNamespace(send_json=send_json),
                                 {"command": "new", "args": "other"}, object(), c))
     assert held == [True]

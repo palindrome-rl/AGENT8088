@@ -335,7 +335,9 @@ export type WSClientMessage =
   /** session_id: the chat this prompt belongs to (a queued prompt can be sent
    *  after the user has moved to another chat). Omitted = the viewed chat. */
   | { type: 'chat'; text: string; attachments?: string[]; session_id?: string }
-  | { type: 'command'; command: string; args?: string }
+  /** Contextual commands stay with the chat where they were typed. Navigation
+   * commands such as /new and /resume deliberately act on the current view. */
+  | { type: 'command'; command: string; args?: string; session_id?: string }
   | { type: 'interrupt' }
   | { type: 'approval'; approved: boolean; session_scope: boolean; id: string }
   | { type: 'plan_approval'; mode: string; id: string }
@@ -360,7 +362,7 @@ export type WSEvent = (
   | { type: 'error'; message: string }
   | { type: 'session_saved'; name: string }
   | { type: 'memory_captured'; facts: string[] }
-  | { type: 'command_result'; command: string; result: string; structured?: unknown }
+  | { type: 'command_result'; command: string; result: string; structured?: unknown; session_id?: string }
 ) & { session_id?: string }
 
 /** A pending approval re-offered by GET /api/history for the viewed chat. */

@@ -116,7 +116,10 @@ class Embedder:
                     "set memory_embed_provider to one that does"))
                 return []
             try:
-                response = client.embeddings.create(model=self.model, input=cleaned)
+                # Embeddings are a best-effort recall aid. A missing local
+                # Ollama service must not hold a turn indefinitely.
+                response = client.embeddings.create(model=self.model, input=cleaned,
+                                                    timeout=5)
                 vectors = [list(item.embedding) for item in response.data]
             except Exception as exc:
                 self._note_failure(exc)

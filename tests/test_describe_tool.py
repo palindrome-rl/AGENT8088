@@ -48,7 +48,7 @@ def test_cli_aliases_never_execute(engine, monkeypatch):
     from agent8088 import cli
     output = StringIO()
     monkeypatch.setattr(cli, "A", engine)
-    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    monkeypatch.setattr(cli, "console", Console(file=output, width=4000))
     monkeypatch.setattr(cli, "_active_tool_specs", lambda: engine.TOOL_SPECS)
     def forbidden(*args, **kwargs):
         pytest.fail("CLI description invoked a tool")

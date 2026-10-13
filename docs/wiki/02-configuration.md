@@ -272,6 +272,10 @@ number of rounds. All default to `0`, meaning disabled.
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
 | `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check or a successful test of changed work before the model is told to answer; a fresh summary is requested 2 rounds later. A write resets the count. Research and failed tests do not start it. `0` disables it. |
+| `max_completion_continuations` | `3` | Follow-ups the completion checks may send in one request (empty reply, reply admitting unfinished work, a named file missing, a part of a multi-part request skipped, changed work unverified). A follow-up that makes progress hands its slot back. When spent the answer is accepted with a "Not completed" note. `0` turns the checks off. See [architecture](11-architecture.md#completion-checks). |
+| `completion_smoke_test` | `report` | What to do with a failed [`check_app`](04-tools.md#check_app) smoke test of a page or script the run wrote: `report` shows it in the answer and never blocks, `enforce` also asks the model to fix it, `off` skips it. |
+| `completion_smoke_timeout_seconds` | `20` | Time allowed for one page check. |
+| `completion_smoke_max_failures` | `2` | Failed smoke tests per request that `enforce` sends back to the model before accepting the answer with a note. |
 | `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
@@ -300,8 +304,8 @@ is a plausible accident that the permission gate does not catch. Both default to
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_writes_per_turn` | `0` | Files one request may write. |
-| `max_write_bytes` | `0` | Bytes a single write may contain. |
+| `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
@@ -355,6 +359,7 @@ where a silently half-done plan does damage.
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `subagent_max_seconds.<profile>` | Wall clock, in seconds, for one sub-agent profile. **Overrides the profile's `max_seconds`.** Without either, `subagent_timeout_seconds` (300) applies. |
 | `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
 
 ### Changing a limit without editing this file

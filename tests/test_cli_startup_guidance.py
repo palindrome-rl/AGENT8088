@@ -211,6 +211,8 @@ def test_could_not_answer_renders_as_an_error(out):
 
 
 class _Esc:
+    _active = False
+
     def __init__(self):
         import threading
         self.triggered = threading.Event()
