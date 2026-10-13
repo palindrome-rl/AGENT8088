@@ -46,6 +46,8 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
+| `provider.<name>.reasoning_budget_tokens` | Thinking-token budget for that provider, overriding `reasoning_budget_tokens`; `0` turns it off for the provider. |
+| `provider.<name>.reasoning_budget_extra_body` | JSON object that tells that provider the budget, with `{budget}` standing for the number, e.g. `{"thinking": {"budget_tokens": {budget}}}`. Without it only OpenRouter is configured (`{"reasoning": {"max_tokens": N}}`); other providers are left alone. |
 | `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
 | `fallback_models` | Comma-separated `provider:model` chain for transient errors, missing models, capacity failures, and independent-provider authentication failures. |
 | `context_window` | Token budget for history trimming. |
@@ -276,7 +278,10 @@ number of rounds. All default to `0`, meaning disabled.
 | `completion_smoke_test` | `report` | What to do with a failed [`check_app`](04-tools.md#check_app) smoke test of a page or script the run wrote: `report` shows it in the answer and never blocks, `enforce` also asks the model to fix it, `off` skips it. |
 | `completion_smoke_timeout_seconds` | `20` | Time allowed for one page check. |
 | `completion_smoke_max_failures` | `2` | Failed smoke tests per request that `enforce` sends back to the model before accepting the answer with a note. |
-| `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
+| `initial_completion_cap` | `8192` | Ceiling for the completion-token cap of an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry (up to `write_output_cap`); plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
+| `adaptive_completion_cap` | `1` | With the ceiling above, cap an ordinary call at twice the median size of the last five normal replies (reasoning included), never below `main_llm_min_tokens` (4096). A runaway call then stops after a few minutes instead of the full ceiling. `0` keeps the fixed ceiling. |
+| `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
+| `reasoning_budget_tokens` | `0` | Tokens a model may spend thinking on an ordinary turn, where the provider can be told (see `provider.<name>.reasoning_budget_extra_body`). `0` leaves the provider's default. Prefer this to raising the output cap: a larger cap makes every runaway call proportionally longer without making an answer more likely. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |

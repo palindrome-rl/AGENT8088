@@ -561,6 +561,21 @@ MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
 # writing a tool call earns a larger cap on its retry (see cap_hint). 0 = always
 # use the provider's full completion limit.
 INITIAL_COMPLETION_CAP = max(0, _config_int("initial_completion_cap", 8192))
+# The cap above is a ceiling. With this on, an ordinary call is capped at twice
+# the median size of the last few normal replies, never below main_llm_min_tokens
+# and never above initial_completion_cap, so a runaway call stops after a few
+# minutes' worth of tokens rather than the full ceiling. A call that is cut off
+# while writing a tool call still earns a larger cap on its retry.
+ADAPTIVE_COMPLETION_CAP = str(APP_CONFIG.get("adaptive_completion_cap", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+ADAPTIVE_CAP_MIN_SAMPLES = 3
+ADAPTIVE_CAP_WINDOW = 5
+# The largest cap a cut-off tool call (a file being written) may earn on its retry.
+# Doubling alone would climb to the provider's whole limit; 0 = no ceiling beyond it.
+WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
+# Tokens a model may spend reasoning on an ordinary turn, where the provider can
+# be told (see _reasoning_budget_extra_body). 0 = leave the provider's default.
+REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
 # Consecutive prose-only cut-offs (no tool call in progress: the model is looping
 # in plain text) tolerated before the final no-tools round.
 PROSE_CUTOFF_MAX = 2
@@ -2700,7 +2715,7 @@ def _is_unknown_param_error(exc: Exception) -> bool:
     lowered = text.lower()
     return ("unknown" in lowered or "unexpected" in lowered
             or "unrecognized" in lowered or "unsupported" in lowered) and (
-        "reasoning_effort" in lowered or "extra_body" in lowered
+        "reasoning_effort" in lowered or "extra_body" in lowered or "reasoning" in lowered
         or "argument" in lowered or "parameter" in lowered or "field" in lowered
     )
 
@@ -2801,6 +2816,67 @@ def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
                 "balance": None}
     except (TypeError, ValueError):
         return None
+
+
+def _adaptive_first_cap(recent: list, ceiling: int, floor: int) -> int:
+    """The completion cap for an ordinary call, from how large this model's replies are.
+
+    Twice the median of the last few normal replies (their completion tokens,
+    reasoning included), clamped to [floor, ceiling]. Until there are a few
+    samples, or with the feature off, the ceiling stands.
+    """
+    if not ADAPTIVE_COMPLETION_CAP or len(recent) < ADAPTIVE_CAP_MIN_SAMPLES or ceiling <= 0:
+        return ceiling
+    import statistics
+    return min(ceiling, max(floor, int(2 * statistics.median(recent))))
+
+
+def _write_retry_cap(failed_cap: int, provider_limit: int) -> int:
+    """The cap a cut-off tool call (a file being written) earns for its retry.
+
+    Double the cap that just failed, but no higher than write_output_cap, and never
+    lower than the failed cap. Past that, a long file belongs in chunks
+    (write_file mode=append), not in one ever-larger call.
+    """
+    wanted = 2 * failed_cap
+    if WRITE_OUTPUT_CAP:
+        wanted = min(wanted, max(WRITE_OUTPUT_CAP, failed_cap))
+    return min(provider_limit, wanted)
+
+
+def _reasoning_budget_extra_body(provider_name: str) -> dict:
+    """Request fields that cap thinking tokens on an ordinary turn, or {}.
+
+    reasoning_budget_tokens sets the budget (provider.<name>.reasoning_budget_tokens
+    overrides it, 0 turning it off for that provider). How a provider is told is
+    provider.<name>.reasoning_budget_extra_body, a JSON object in which the text
+    {budget} stands for the number, for example {"thinking": {"budget_tokens": {budget}}}.
+    Without that, OpenRouter gets its documented {"reasoning": {"max_tokens": N}}
+    and every other provider is left alone: a field a provider does not know is a
+    rejected request, and which control each one exposes is not guessable.
+    """
+    profile = (PROVIDERS.get(provider_name) or {}) if provider_name else {}
+    if "reasoning_budget_tokens" in profile:
+        budget = _positive_int(profile.get("reasoning_budget_tokens"), 0)
+    else:
+        budget = REASONING_BUDGET_TOKENS
+    if budget <= 0:
+        return {}
+    template = str(profile.get("reasoning_budget_extra_body") or "").strip()
+    if template:
+        try:
+            parsed = json.loads(template.replace("{budget}", str(budget)))
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        logging.getLogger(__name__).warning(
+            "Ignoring provider.%s.reasoning_budget_extra_body: not a JSON object.", provider_name)
+        return {}
+    host = str(profile.get("base_url") or "").lower()
+    if "openrouter" in (provider_name or "").lower() or "openrouter.ai" in host:
+        return {"reasoning": {"max_tokens": budget}}
+    return {}
 
 
 def _provider_extra_body(provider_name: str) -> dict:
@@ -3029,6 +3105,10 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         template_kwargs["enable_thinking"] = False
         extra_body["chat_template_kwargs"] = template_kwargs
         extra_body.pop("reasoning_effort", None)
+    elif thinking is None and (budget_fields := _reasoning_budget_extra_body(provider_name)):
+        # An ordinary turn with a reasoning budget configured. The provider's own
+        # extra_body wins on any key it already sets.
+        extra_body = {**budget_fields, **(extra_body or {})}
     elif thinking == "length_retry":
         # The retry after a cut-off: the model just spent a whole allowance
         # reasoning, so force thinking down for THIS call only. Restored on the
@@ -16682,6 +16762,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
     length_retries = 0   # consecutive token-limited calls; incomplete, never executed
     last_call_tokens = 0  # completion tokens of the last call that finished normally
+    recent_call_tokens = []  # the last few, for the adaptive first-call cap
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
     last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
@@ -16903,6 +16984,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         # never below the floor); any normal finish resets to the full limit.
         normal_cap = (min(turn_completion_limit, INITIAL_COMPLETION_CAP)
                       if INITIAL_COMPLETION_CAP else turn_completion_limit)
+        if INITIAL_COMPLETION_CAP:
+            normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, MAIN_LLM_MIN_TOKENS)
         turn_max_tokens = (
             normal_cap if not length_retries else
             min(turn_completion_limit,
@@ -17090,7 +17173,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # and more room only repeats it. Empty output is a hidden runaway
             # (e.g. an unclosed native tool call); it keeps the small retry cap.
             if content and "✿FUNCTION✿" in content:
-                cutoff_kind, cap_hint = "tool_call", min(turn_completion_limit, 2 * turn_max_tokens)
+                cutoff_kind, cap_hint = "tool_call", _write_retry_cap(turn_max_tokens, turn_completion_limit)
                 prose_cutoffs = 0
             elif content:
                 cutoff_kind, cap_hint = "prose", 0
@@ -17170,8 +17253,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
         messages.append({"role": "assistant", "content": content})
+        # Without a usage report the size is estimated from the text, reasoning
+        # included: counting only the answer would teach the adaptive cap that a
+        # model which thinks at length writes short replies.
         last_call_tokens = int(getattr(getattr(response, "usage", None),
-                                       "completion_tokens", 0) or 0) or _estimate_tokens(len(content))
+                                       "completion_tokens", 0) or 0) or _estimate_tokens(
+            len(content) + len(_extract_reasoning(message)))
+        recent_call_tokens.append(last_call_tokens)
+        del recent_call_tokens[:-ADAPTIVE_CAP_WINDOW]
         if length_retries:
             if trace is not None:
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
