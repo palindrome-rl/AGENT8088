@@ -29,6 +29,29 @@ def test_compact_messages_preserves_recent_messages_and_active_model(monkeypatch
     assert seen["kwargs"]["model_name"] == "model-y"
 
 
+def test_manual_compaction_resolves_auto_to_a_concrete_model(monkeypatch, engine):
+    messages = [{"role": "user", "content": f"message {index}"} for index in range(8)]
+    seen = {}
+    selected_client = object()
+    monkeypatch.setattr(engine, "MODEL_NAME", "auto:fast")
+    monkeypatch.setattr(engine, "_auto_chain", [("provider-x", "model-y")])
+    monkeypatch.setattr(engine, "_last_auto_rung", None)
+    monkeypatch.setattr(engine, "get_client", lambda provider: (selected_client, "model-y"))
+    monkeypatch.setattr(engine, "_active_model_token_limits", lambda *args: (32768, 8192))
+
+    def fake_completion(client, request, tools, **kwargs):
+        seen.update(client=client, kwargs=kwargs)
+        return _response("summary")
+
+    monkeypatch.setattr(engine, "create_completion", fake_completion)
+
+    assert engine.compact_messages(messages, keep=3)
+    assert seen["client"] is selected_client
+    assert seen["kwargs"]["provider_name"] == "provider-x"
+    assert seen["kwargs"]["model_name"] == "model-y"
+    assert seen["kwargs"]["model_name"] != "auto:fast"
+
+
 def test_agent_auto_compacts_before_the_next_completion(monkeypatch, engine):
     messages = [{"role": "user", "content": "x"} for _ in range(8)]
     selected_client = object()
