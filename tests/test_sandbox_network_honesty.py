@@ -111,3 +111,11 @@ def test_doctor_row_is_unchanged_where_enforced(engine, status_for):
 def test_only_the_windows_backend_lacks_network_enforcement(engine, monkeypatch, platform, expected):
     monkeypatch.setattr(engine.sys, "platform", platform)
     assert engine._native_enforces_network() is expected
+
+
+def test_unfiltered_docker_network_is_not_claimed_as_enforced(status_for, engine, monkeypatch):
+    monkeypatch.setattr(engine, "DOCKER_NETWORK", "bridge")
+    status = status_for("docker")
+    assert status["network_enforced"] is False
+    assert "not filtered" in status["network"]
+    assert status["host_processes_shared"] is False

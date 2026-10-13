@@ -9599,8 +9599,10 @@ def sandbox_status() -> dict:
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
-        "network": network,
-        "network_enforced": None if resolved == "unavailable" else not unenforced,
+        "network": _sandbox_network_summary(resolved) if resolved == "docker" else network,
+        "network_enforced": (None if resolved == "unavailable" else
+                             not unenforced and (resolved != "docker" or
+                                                 DOCKER_NETWORK in ("allowlist", "none"))),
         "host_processes_shared": unenforced,
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
