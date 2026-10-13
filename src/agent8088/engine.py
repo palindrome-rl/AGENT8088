@@ -5054,6 +5054,11 @@ def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
                 # timeouts above.
                 "max_turns": (_config_int(f"subagent_max_turns.{name}", 0)
                               or _positive_int(meta.get("max_turns", "8"), 8)),
+                # Wall clock for this profile alone; 0 means "use
+                # subagent_timeout_seconds". max_turns bounds rounds, and a
+                # round can take minutes, so it does not bound time.
+                "max_seconds": (_config_int(f"subagent_max_seconds.{name}", 0)
+                                or _positive_int(meta.get("max_seconds", "0"), 0)),
                 # Optional permission floor for the sub-run. Only "readonly" is
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
@@ -6853,6 +6858,9 @@ def _subagent_ceiling(type_name: str) -> tuple:
     """
     if type_name == "auditor":
         return PLAN_AUDIT_TIMEOUT_SECONDS, "plan_audit_timeout_seconds"
+    own = (SUBAGENT_SPECS.get(type_name) or {}).get("max_seconds") or 0
+    if own > 0:
+        return own, f"subagent_max_seconds.{type_name}"
     return SUBAGENT_TIMEOUT_SECONDS, "subagent_timeout_seconds"
 
 
@@ -7472,6 +7480,25 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     return report
 
 
+def _subagent_time_limit_report(type_name: str, limit: int, answer: str, written: list) -> str:
+    """What the parent is told when a sub-agent hit its own wall clock.
+
+    The sub-run's loop already ends with the exception text and its last tool
+    output. That reads as a failure, and it hides the one fact the parent needs
+    to carry on: what the sub-agent had already put on disk. So say that first,
+    and say plainly that the rest is partial work to build on, not a crash.
+    """
+    lines = [f"Sub-agent '{type_name}' reached its {limit}s time limit and was stopped. "
+             "What follows is partial work, not a failure of the task."]
+    if written:
+        shown = ", ".join(written[:10]) + (f" (+{len(written) - 10} more)" if len(written) > 10 else "")
+        lines.append(f"Files it wrote or changed: {shown}")
+    else:
+        lines.append("It had not written any file.")
+    lines.append(answer)
+    return "\n".join(lines)
+
+
 def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
                    from_user: bool = False) -> str:
     """Run a delegated task in a tool-restricted sub-agent loop.
@@ -7596,6 +7623,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     # with `find / -maxdepth 5` and the turn sat there until it was killed.
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
+    files_before = list(_TURN_FILES_TOUCHED)
     messages = history if history is not None else []
     messages.append(_delegated_turn(task, from_user))
     # A task the person typed is its own authority. One the parent model wrote
@@ -7641,6 +7669,11 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
             _one_shot_grants.clear()
             _one_shot_grants.update(saved_grants)
 
+    reason = child_budget.exceeded()
+    if reason and reason.startswith("Time budget") and "Time budget exceeded" in str(answer):
+        answer = _subagent_time_limit_report(
+            type_name, child_budget.max_seconds, answer,
+            [path for path in _TURN_FILES_TOUCHED if path not in files_before])
     answer = _cap_subagent_answer(answer)
     if model_warning:
         answer = f"[note: {model_warning}]\n\n{answer}"

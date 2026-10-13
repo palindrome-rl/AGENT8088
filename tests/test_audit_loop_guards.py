@@ -349,7 +349,9 @@ def test_every_subagent_gets_a_wall_clock(engine, monkeypatch):
     monkeypatch.setattr(engine, "run_agent",
                         lambda *a, **k: seen.update(budget=k.get("budget")) or "done")
 
-    engine._exec_subagent({"agent_type": "test-writer", "task": "write tests"})
+    # A profile without its own max_seconds gets subagent_timeout_seconds
+    # (test-writer sets its own; see test_subagent_time_limits).
+    engine._exec_subagent({"agent_type": "coder", "task": "write code"})
 
     assert seen["budget"].max_seconds == 240
     assert seen["budget"] is not parent
