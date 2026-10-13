@@ -4,6 +4,7 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
   const ids = { 'chat-a': 'a'.repeat(32), 'chat-b': 'b'.repeat(32) }
   let viewed: keyof typeof ids = 'chat-a'
   let running = false
+  let runningChat: keyof typeof ids = 'chat-a'
   let pending = false
   await page.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname
@@ -12,13 +13,13 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
       tool_name: 'write_file', change_type: 'workspace-write', description: 'Write report.md' }
     const json = path === '/api/status' ? {
       session_name: viewed, session_id: ids[viewed], permission_mode: 'readonly',
-      running_session: running ? { id: ids['chat-a'], name: 'chat-a' } : null,
+      running_session: running ? { id: ids[runningChat], name: runningChat } : null,
     } : path === '/api/history' ? {
-      session_id: ids[viewed], running: running && viewed === 'chat-a',
+      session_id: ids[viewed], running: running && viewed === runningChat,
       messages: [{ role: 'user', content: viewed === 'chat-a' ? 'A original question' : 'B original question' }],
       pending_approvals: pending && viewed === 'chat-a' ? [approval] : [],
     } : path === '/api/sessions' ? Object.entries(ids).map(([name, id]) => ({ name, id,
-      message_count: 1, updated: '', running: running && name === 'chat-a' }))
+      message_count: 1, updated: '', running: running && name === runningChat }))
       : path === '/api/providers' ? { configured: [], builtins: [], active: '', details: {} }
       : path === '/api/sessions/resume' ? { ok: true, name: viewed, id: ids[viewed] } : []
     await route.fulfill({ json })
@@ -33,7 +34,7 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
         setTimeout(() => this.onopen?.({}), 0)
       }
       send(data: string) { ((window as any).__sent ??= []).push(JSON.parse(data)) }
-      close() { this.readyState = 3 }
+      close() { this.readyState = 3; setTimeout(() => this.onclose?.({}), 0) }
     }
     ;(window as any).WebSocket = Socket
   })
@@ -75,4 +76,34 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
     type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
   })
   await expect(page.getByRole('button', { name: 'Stop generating', exact: true })).toBeVisible()
+
+  // A queued slash command keeps the chat where it was entered after a switch.
+  running = true
+  runningChat = 'chat-b'
+  await page.getByRole('button', { name: /chat-a/ }).first().click()
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('/plan audit chat A')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  expect(await page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
+  })
+  await page.getByRole('button', { name: /^chat-b(?: running)?$/ }).click()
+  running = false
+  await emit({ type: 'turn_complete', session_id: ids['chat-b'] })
+  await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'command', command: 'plan', args: 'audit chat A', session_id: ids['chat-a'],
+  })
+  await expect(page.getByText('/plan audit chat A', { exact: true })).toHaveCount(0)
+
+  // A thrown socket send must retain the prompt and replay it on reconnect.
+  running = false
+  await emit({ type: 'turn_complete', session_id: ids['chat-a'] })
+  await expect(page.getByRole('button', { name: 'Stop generating', exact: true })).toHaveCount(0)
+  await page.evaluate(() => {
+    (window as any).__socket.send = () => { throw new Error('connection closed during send') }
+  })
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('Recover this message')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'chat', text: 'Recover this message', session_id: ids['chat-b'],
+  })
 })

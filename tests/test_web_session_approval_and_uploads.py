@@ -110,7 +110,8 @@ def test_session_approval_stops_asking_for_that_change_type(monkeypatch, tmp_pat
     request = ("web_search", _request("network_request"))
     engine = _EscalatingEngine(tmp_path, [request, request])
     socket = _ApprovingSocket(session_scope=True)
-    _turn(monkeypatch, engine, socket)
+    cli = _Cli()
+    _turn(monkeypatch, engine, socket, cli)
 
     assert len(socket.prompts()) == 1, "the second search must not ask again"
     assert engine.answers == [True, True]
@@ -119,7 +120,7 @@ def test_session_approval_stops_asking_for_that_change_type(monkeypatch, tmp_pat
     # And it outlives the turn: the next turn's search is not asked about either.
     later = _EscalatingEngine(tmp_path, [request])
     later_socket = _ApprovingSocket(session_scope=True)
-    _turn(monkeypatch, later, later_socket)
+    _turn(monkeypatch, later, later_socket, cli)
     assert later_socket.prompts() == []
     assert later.answers == [True]
 
@@ -150,7 +151,7 @@ def test_git_push_grant_names_its_target_and_is_never_session_wide(monkeypatch, 
     # A bare grant never matched the push target, so the push could not run.
     assert engine.grants[0] == ("git_remote_write", "origin main")
     assert len(socket.prompts()) == 2, "a push is approved per push"
-    assert "git_remote_write" not in web._session_allowlist
+    assert all("git_remote_write" not in grants for grants in web._session_allowlist.values())
 
 
 def test_plan_approval_is_never_session_wide(monkeypatch, tmp_path):
@@ -191,7 +192,7 @@ def test_malformed_request_fails_closed_without_asking(monkeypatch, tmp_path):
     assert socket.prompts() == []
 
 
-def test_new_and_resumed_sessions_start_with_no_session_approvals(monkeypatch, tmp_path):
+def test_switching_sessions_preserves_grants_for_each_stable_id(monkeypatch, tmp_path):
     session_file = tmp_path / "saved.json"
     session_file.write_text(json.dumps({"messages": []}), encoding="utf-8")
     cli = SimpleNamespace(
@@ -199,13 +200,13 @@ def test_new_and_resumed_sessions_start_with_no_session_approvals(monkeypatch, t
         _session_name=lambda name: name, _session_path=lambda name: tmp_path / f"{name}.json")
     monkeypatch.setattr(web, "_cl", lambda: cli)
 
-    web._session_allowlist.add("network_request")
+    old_id = web._sid(cli.S)
+    web._session_allowlist[old_id] = {"network_request"}
     asyncio.run(web.new_session(web.SessionActionBody(name="")))
-    assert not web._session_allowlist
+    assert web._session_allowlist[old_id] == {"network_request"}
 
-    web._session_allowlist.add("network_request")
     asyncio.run(web.resume_session(web.SessionActionBody(name="saved")))
-    assert not web._session_allowlist
+    assert web._session_allowlist[old_id] == {"network_request"}
 
 
 def test_resume_replaces_unknown_display_settings_with_defaults(monkeypatch, tmp_path):
