@@ -1,4 +1,5 @@
 import json
+import pytest
 
 
 def test_reasoning_cleanup_preserves_tags_inside_valid_python_string(engine, tmp_path):
@@ -51,6 +52,18 @@ def test_nested_bare_json_example_is_not_a_second_call(engine):
     calls = engine.find_tool_calls(text)
     assert len(calls) == 1
     assert calls[0]["name"] == "read_text"
+
+
+@pytest.mark.parametrize("container", [
+    {"example": {"name": "execute_shell", "arguments": {"command": "echo nested"}}},
+    {"name": "not-a-tool", "arguments": {
+        "example": {"name": "execute_shell", "arguments": {"command": "echo nested"}}}},
+])
+def test_json_data_containers_do_not_expose_nested_calls(engine, container):
+    reply = json.dumps(container) + '\n' + json.dumps({
+        "name": "read_text", "arguments": {"filename": "real.py"}})
+    assert engine.find_tool_calls(reply) == [{
+        "name": "read_text", "arguments": {"filename": "real.py"}}]
 
 
 def test_new_invalid_python_test_is_refused_even_without_cleanup(engine, monkeypatch, tmp_path):

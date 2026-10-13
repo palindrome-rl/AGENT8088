@@ -13445,14 +13445,22 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
     for header in re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text):
         end = _scan_json_object(text, header.end())
         marker_spans.append((header.start(), header.end() + len(end)))
-    bare_spans = []
+    # Find outer objects independently of tool names. Otherwise an unknown
+    # tool name (or an ordinary JSON data container) lets a nested example
+    # become a call simply because its parent did not match the call regex.
+    root_starts = set()
+    consumed_until = -1
+    for opening in re.finditer(r"\{", text):
+        if opening.start() < consumed_until:
+            continue
+        raw_object = _scan_json_object(text, opening.start())
+        root_starts.add(opening.start())
+        consumed_until = opening.start() + len(raw_object)
     for m in re.finditer(
             r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
-        if (any(start < m.start() < end for start, end in marker_spans)
-                or any(start < m.start() < end for start, end in bare_spans)):
+        if (m.start() not in root_starts
+                or any(start < m.start() < end for start, end in marker_spans)):
             continue
-        raw_call = _scan_json_object(text, m.start())
-        bare_spans.append((m.start(), m.start() + len(raw_call)))
         resolved = _resolve_tool_name(m.group(1))
         if resolved not in allowed:
             continue
