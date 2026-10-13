@@ -523,8 +523,8 @@ DEFAULT_MAX_TURNS = 50
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
-# Tool rounds allowed after a finishing nudge (deliverables re-check,
-# verification, re-plan, tests) with no state change before the model is told to
+# Tool rounds allowed after a finishing nudge or successful verification of
+# changed work, with no state change before the model is told to
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
@@ -575,9 +575,12 @@ DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
-API_MAX_RETRIES = max(0, _config_int("api_max_retries", 3))
-API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 500))
-API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 10000))
+# The defaults wait about 31 s in total (1+2+4+8+16 s): a gateway or provider
+# hiccup usually lasts 30-60 s, and the old 3.5 s window ended runs that a
+# slightly longer wait would have survived. The turn budget still caps it.
+API_MAX_RETRIES = max(0, _config_int("api_max_retries", 5))
+API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 1000))
+API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 30000))
 API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio", 0.1)))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
@@ -2817,6 +2820,18 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             "model": selected_model, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
+        if thinking == "length_retry" and not _skip_optional:
+            # LiteLLM translates the native reasoning dial for its adapters.
+            # Provider-specific wire fields remain in extra_body instead.
+            retry_options = dict(_length_retry_extra_body(provider_name))
+            if "reasoning_effort" in retry_options:
+                kwargs["reasoning_effort"] = retry_options.pop("reasoning_effort")
+                # Custom OpenAI-compatible model names are absent from
+                # LiteLLM's capability catalog. Try the configured dial on
+                # the wire, with the same clean 400 fallback as the SDK lane.
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
+            if retry_options:
+                kwargs["extra_body"] = retry_options
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
         if timeout is not None:
@@ -2826,7 +2841,17 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
         _raise_if_interrupted(interrupt_check)
-        response = completion(**kwargs)
+        try:
+            response = completion(**kwargs)
+        except Exception as exc:
+            if (not _skip_optional and thinking == "length_retry"
+                    and _extras_rejected(exc, thinking=thinking)):
+                return _create_completion(
+                    client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+                    temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+                    model_name=model_name, provider_name=provider_name, _skip_optional=True,
+                    thinking=thinking, timeout=timeout)
+            raise
         if on_token is None:
             return response
         collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
@@ -2834,6 +2859,9 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
+                if not getattr(chunk, "choices", None):
+                    _raise_for_error_chunk(chunk)
+                    continue
                 choice = chunk.choices[0]
                 delta = choice.delta
                 finish_reason = getattr(choice, "finish_reason", None) or finish_reason
@@ -2963,6 +2991,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             if getattr(chunk, 'usage', None) is not None:
                 stream_usage = chunk.usage
             if not chunk.choices:
+                _raise_for_error_chunk(chunk)
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
@@ -3016,14 +3045,79 @@ def _fallback_targets() -> list:
 _fallback_targets()  # report invalid targets at startup, before a call fails
 
 
+class ProviderStreamError(RuntimeError):
+    """An error the provider reported inside a streamed reply.
+
+    Some gateways answer HTTP 200 and then send an error chunk (with an empty
+    ``choices`` list) when the upstream model times out or stops a looping
+    reply. The OpenAI client raises on such a chunk itself; other clients, and
+    the LiteLLM path here, would otherwise read it as an empty reply or fail on
+    ``choices[0]``. ``status_code`` carries the error's own code (for example
+    504) so the ordinary retry rules apply.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raise_for_error_chunk(chunk) -> None:
+    """Raise ProviderStreamError when a streamed chunk is an error, not data."""
+    if getattr(chunk, "choices", None):
+        return
+    error = getattr(chunk, "error", None)
+    if error is None:
+        extra = getattr(chunk, "model_extra", None)
+        error = extra.get("error") if isinstance(extra, dict) else None
+    if not error:
+        return
+    if isinstance(error, dict):
+        message, code = error.get("message"), error.get("code")
+    else:
+        message, code = getattr(error, "message", None), getattr(error, "code", None)
+    try:
+        status = int(code) if code is not None and not isinstance(code, bool) else None
+    except (TypeError, ValueError):
+        status = None
+    raise ProviderStreamError(str(message or "The provider reported an error mid-stream"), status)
+
+
+_REPETITION_GUARD_MARKERS = ("repeating the same chunk", "repeating the same", "repetition detected")
+
+
+def _is_provider_repetition_stop(error: Exception) -> bool:
+    """The provider cut off a looping reply (reported as an error, often a 502)."""
+    text = str(error).lower()
+    return any(marker in text for marker in _REPETITION_GUARD_MARKERS)
+
+
+def _is_provider_stall(error: Exception) -> bool:
+    """A gateway/upstream failure that retrying the identical request may repeat.
+
+    Idle timeouts, 5xx from the upstream and a looping-reply stop are all cases
+    where the same request has already failed once for a reason that depends on
+    that request, so the retry changes it (see _create_completion_with_fallback).
+    """
+    from agent8088.errors import status_code as _status_code
+    status = _status_code(error)
+    text = str(error).lower()
+    return (isinstance(status, int) and 500 <= status < 600
+            or "idle timeout" in text or _is_provider_repetition_stop(error))
+
+
 def _retryable_model_error(error: Exception) -> bool:
-    status = getattr(error, "status_code", None)
+    from agent8088.errors import status_code as _status_code
+    # The SDK's streamed-error exception carries the error's code in .code, not
+    # .status_code, so read it the same way the rest of the harness does.
+    status = _status_code(error)
     if status in (408, 429) or isinstance(status, int) and status >= 500:
         return True
     if isinstance(status, int) and 400 <= status < 500:
         # A definite client error: the body text (an HTML page for a wrong
         # base_url mentions "connection" and "timeout") must not override it.
         return False
+    if _is_provider_repetition_stop(error):
+        return True
     name = type(error).__name__.lower()
     text = str(error).lower()
     retryable = (
@@ -3252,6 +3346,14 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
         except Exception as error:
             primary_error = primary_error or error
             last_error = error
+            if thinking is None and _is_provider_stall(error):
+                # The same request just failed for a reason that depends on the
+                # request (an upstream idle timeout, a 5xx, a looping reply cut
+                # off by the provider). Repeating it unchanged tends to repeat
+                # the failure, so the retry is sent with thinking reduced, the
+                # same switch the output-limit retry uses. One change per call.
+                thinking = "length_retry"
+                notify("Provider stopped the reply; retrying with reduced thinking.")
             if emitted:
                 # The reply broke off mid-stream. Redoing it once is safe:
                 # tool calls only run after a complete response, so any
@@ -3692,7 +3794,7 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
 
     A catalog changes rarely; embed all of it once rather than making every user
     turn pay for 48 tool descriptions. The existing embedder has its own circuit
-    breaker, so a missing embedding model degrades to full tool exposure.
+    breaker, so a missing embedding model degrades to keyword-only ranking.
     """
     entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
                for name in sorted(names) if name in TOOL_SPECS]
@@ -3801,14 +3903,46 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+_TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
+
+
+def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
+                            allowed: set[str], reason: str,
+                            semantic: list[int] | None = None) -> set[str]:
+    """Narrow the schema set without the embedding leg.
+
+    Used whenever hybrid ranking cannot run or its two rankers disagree. The old
+    behaviour was to offer the full catalog, which on a small model costs tens of
+    thousands of prompt tokens and offers many wrong tools, so the feature
+    failed silently in exactly the situation (no embedder) it was added for.
+    BM25 alone, plus the always-on and pinned tools, is the fallback; when a
+    semantic ranking exists but shares nothing with BM25 the union of both top
+    lists is used instead.
+    """
+    if reason not in _TOOL_SELECTION_FALLBACK_LOGGED:
+        _TOOL_SELECTION_FALLBACK_LOGGED.add(reason)
+        _log.info("tool selection: %s; ranking by keyword match instead of offering "
+                  "the full tool catalog", reason)
+    top_k = TOOL_SELECTION_TOP_K
+    ranked = _bm25_tool_ranking(query, texts)[:top_k]
+    if semantic:
+        ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
+    picked = {names[index] for index in ranked}
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    return _apply_tool_intent_guards(query, selected, set(allowed))
+
+
 def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
                                   provider: str = "", model: str = "") -> set[str]:
-    """Choose direct schemas before the model sees a request, or fail open.
+    """Choose direct schemas before the model sees a request.
 
     This is deliberately not a chat-model router. BM25 handles literal tool
     language and the existing embedding endpoint handles paraphrases; RRF keeps
-    either signal from dominating. If the semantic leg is unavailable or the two
-    rankers have no shared candidate, retain the old full catalog.
+    either signal from dominating. If the semantic leg is unavailable, BM25 alone
+    chooses the schemas; if the two rankers have no shared candidate, the union
+    of both top lists is offered. The full catalog is only offered when
+    selection is off ("full" mode, an unmeasured model in "auto" mode, or a
+    catalog no larger than the top-k).
     """
     selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
     if selected_mode == "auto":
@@ -3818,21 +3952,23 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         return set(allowed)
     names, texts, vectors = _tool_selection_index(set(allowed))
     if len(vectors) != len(names):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "no embedder available")
     try:
         active_embedder = memory.embedder()
         query_vector = active_embedder.embed_one(query) if active_embedder else []
     except Exception as exc:  # noqa: BLE001 - optional performance path
         _log.debug("tool selection query embedding unavailable: %s", exc)
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     if not query_vector:
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
     semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed,
+                                       "the keyword and semantic rankings share no candidate",
+                                       semantic=semantic)
     scores = Counter()
     for ranking in (lexical, semantic):
         for position, index in enumerate(ranking, 1):
@@ -5941,6 +6077,23 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
     if name == "run_tests":
         return False
     return True
+
+
+def _standalone_test_command(command: str) -> bool:
+    """Recognise explicit test runners, without assuming scripts are tests."""
+    if not isinstance(command, str):
+        return False
+    if re.search(r"[;&|\n><`]|\$\(", command):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return (bool(words) and words[0] in {"pytest", "py.test"}
+            or any(tuple(words[:len(prefix)]) == prefix
+                   for prefix in _TEST_RUNNER_COMMANDS)
+            or len(words) > 2 and words[0] in {"python", "python3"}
+            and words[1] == "-m" and words[2] in {"pytest", "unittest", "doctest"})
 
 
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
@@ -12061,7 +12214,14 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
+    # A passing test command already supplies verification evidence. Auditing
+    # that evidence with another agent repeats the check and can dominate the
+    # task budget. Writes bundled with a test still need their usual audit.
+    test_evidence = (name == "execute_shell"
+                     and _standalone_test_command(args.get("command", ""))
+                     and tool_output.detect_verdict(result).status == "passed")
+    if (will_audit and not test_evidence
+            and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
         result = _audit_tool_call(name, args, result, depth, snapshot)
 
@@ -12437,6 +12597,20 @@ def strip_tool_json(text: str) -> str:
     text = re.sub(r'[ \t]+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _unknown_tool_call_instruction(native_tools: bool) -> str:
+    """How the unknown-tool correction tells the model to retry.
+
+    A model on a native tool-calling backend sees its tools as schemas, not as
+    text. Teaching it the text-marker syntax in the correction invites it to
+    write ✿FUNCTION✿ lines into its reply, which the marker salvage then has to
+    recover. Name the format the model is actually using.
+    """
+    if native_tools:
+        return "Either call one of those through the tool-calling interface, using its schema"
+    return ("Either call one of those with the exact format "
+            '`✿FUNCTION✿: name ✿ARGS✿: {"arg": "value"}`')
 
 
 def _attempted_tool_names(text: str) -> list:
@@ -15935,6 +16109,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     last_call_tokens = 0  # completion tokens of the last call that finished normally
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
+    last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     tool_failed = False  # any tool call this run returned an error
@@ -16158,9 +16333,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
-        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
-        # thinking off; the next ordinary turn is back to normal thinking.
-        retry_kwargs = {"thinking": "length_retry"} if length_retries >= 2 else {}
+        # A3.2/A3.4: this one call runs with thinking off after an empty
+        # cut-off (the whole allowance went to reasoning, or to an unclosed tool
+        # call the runtime hides) and, for any other kind, from the 2nd
+        # consecutive cut-off; the next ordinary turn is back to normal thinking.
+        # Retrying an empty cut-off with thinking still on mostly cuts off again
+        # and costs a full call each time.
+        retry_kwargs = ({"thinking": "length_retry"}
+                        if length_retries >= 2 or length_retries and last_cutoff_kind == "empty"
+                        else {})
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",
@@ -16338,6 +16519,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             else:
                 cutoff_kind, cap_hint = "empty", 0
                 prose_cutoffs = 0
+            last_cutoff_kind = cutoff_kind
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
@@ -16415,6 +16597,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
         cap_hint = prose_cutoffs = 0
+        last_cutoff_kind = ""
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -16478,9 +16661,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                      if gated else
                      f"Error: the tool '{name}' does not exist. ") +
                     f"Available tools are: {available}. "
-                    "Either call one of those with the exact format "
-                    '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
-                    "or, if no tool fits, answer the user directly in plain text "
+                    + _unknown_tool_call_instruction(_native_tools_enabled(
+                        round_tools_def, loop_provider or "")) +
+                    ", or, if no tool fits, answer the user directly in plain text "
                     "without mentioning tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
@@ -17004,6 +17187,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+
+        # A successful test of changed work starts the same bounded check phase
+        # even when the model has not attempted a final answer yet. Mere reads
+        # or research do not start it. Further writes still reset the counter.
+        if (executed and post_check_rounds is None and trajectory is not None
+                and trajectory.mutation_count()
+                and trajectory.data.get("verification") == "verified"
+                and not round_changed):
+            post_check_rounds = 0
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:

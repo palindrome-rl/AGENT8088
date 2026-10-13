@@ -1,6 +1,5 @@
-"""Hybrid tool selection stays before the model call and fails open."""
+"""Hybrid tool selection stays before the model call and degrades to keywords."""
 import json
-
 from types import SimpleNamespace as NS
 
 
@@ -28,18 +27,90 @@ def test_hybrid_selection_puts_local_hardware_in_direct_schemas(engine, monkeypa
     assert compact < full / 2
 
 
-def test_hybrid_selection_fails_open_without_embeddings(engine, monkeypatch):
+def test_hybrid_selection_uses_keywords_without_embeddings(engine, monkeypatch):
+    """No embedder must not mean the whole catalog: the feature exists to avoid that."""
     monkeypatch.setattr(engine.memory, "embedder", lambda: None)
     engine._TOOL_INDEX_CACHE.clear()
     allowed = set(engine.TOOL_SPECS)
-    assert engine.select_tool_names_for_request(
-        "what local models can my machine run?", allowed, mode="hybrid") == allowed
+
+    chosen = engine.select_tool_names_for_request(
+        "what local models can my machine run?", allowed, mode="hybrid")
+
+    assert "check_local_hardware" in chosen
+    assert "git_push" not in chosen
+    assert len(chosen) < len(allowed) / 2
+    assert engine._TOOL_SELECTION_PINNED & allowed <= chosen
+
+
+def test_keyword_fallback_offers_only_the_pinned_tools_when_nothing_matches(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request("hello", allowed, mode="hybrid")
+
+    assert chosen == (engine._TOOL_SELECTION_PINNED | engine._TOOL_SELECTION_ALWAYS) & allowed
+
+
+def test_rankers_with_no_shared_candidate_offer_the_union_not_the_catalog(engine, monkeypatch):
+    class _Disagreeing(_Embedder):
+        def embed_one(self, _query):
+            return [0.0, 1.0]  # the "git" side, while the query's words are about local models
+
+    monkeypatch.setattr(engine.memory, "embedder", lambda: _Disagreeing())
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "what local models can my machine run?", allowed, mode="hybrid")
+
+    assert "check_local_hardware" in chosen, "the keyword side"
+    assert any(name.startswith("git_") for name in chosen), "the semantic side"
+    assert len(chosen) < len(allowed)
+
+
+def test_the_keyword_fallback_is_logged_once_per_reason(engine, monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    monkeypatch.setattr(engine, "_TOOL_SELECTION_FALLBACK_LOGGED", set())
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    with caplog.at_level(logging.INFO, logger=engine._log.name):
+        for _ in range(3):
+            engine.select_tool_names_for_request("what local models can my machine run?",
+                                                 allowed, mode="hybrid")
+
+    notes = [r for r in caplog.records if "no embedder available" in r.getMessage()]
+    assert len(notes) == 1
+
+
+def test_no_keyword_matches_keeps_semantic_candidates(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: _Embedder())
+    monkeypatch.setattr(engine, "_bm25_tool_ranking", lambda *_args: [])
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    chosen = engine.select_tool_names_for_request(
+        "what local models can my machine run?", allowed, mode="hybrid")
+
+    assert "check_local_hardware" in chosen
+    assert len(chosen) < len(allowed)
+    assert chosen <= allowed
+
+
+def test_full_mode_still_offers_the_whole_catalog(engine, monkeypatch):
+    monkeypatch.setattr(engine.memory, "embedder", lambda: None)
+    engine._TOOL_INDEX_CACHE.clear()
+    allowed = set(engine.TOOL_SPECS)
+
+    assert engine.select_tool_names_for_request("hello", allowed, mode="full") == allowed
 
 
 def test_novice_branch_review_does_not_expose_worktree_diff(engine, monkeypatch):
     """The two tools inspect different scopes; offering both caused a live
     model to review the branch and then contaminate that result with git diff.
-    The guard must also work when embeddings fail and selection fails open.
+    The guard must also work when embeddings fail and selection uses keywords.
     """
     monkeypatch.setattr(engine.memory, "embedder", lambda: None)
     engine._TOOL_INDEX_CACHE.clear()
@@ -73,11 +144,10 @@ def test_document_review_does_not_get_misrouted_to_code_review(engine, monkeypat
         "I am new here. Please review this attached PDF contract and explain it simply.",
         allowed, mode="hybrid")
 
-    # Selection fails open here, so the guard must not give review_code
-    # exclusive control of a document task or remove its ordinary tools.
-    assert chosen == allowed
-    assert "document_read" in chosen
-    assert "git_diff" in chosen
+    # The guard must not give review_code exclusive control of a document task
+    # or remove its ordinary tools: the pinned document and file tools stay.
+    assert {"convert_document", "create_document", "read_text"} <= chosen
+    assert "git_diff" in chosen, "the guard only acts on code-review wording"
 
 
 def test_auto_mode_only_enables_measured_models(engine, monkeypatch):
