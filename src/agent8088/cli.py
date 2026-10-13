@@ -8613,33 +8613,151 @@ def _find_npm(home):
 def _rebuild_web_ui(install_dir, home, runner=None):
     """Rebuild web/dist from the checked-out source so the UI matches the CLI.
 
-    Returns (ok, message). Never reports success after a failed install/build:
-    the old bundle is left in place and the message says it is stale.
+    Build into a private staging directory and publish only a complete bundle.
+    Returns (ok, message).
     """
+    import html.parser
+    import shutil
     import subprocess
+    import tempfile
+    from urllib.parse import unquote, urlsplit
+
     run = runner or (lambda argv, cwd, env: subprocess.run(
-        argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=900))
+        argv, cwd=cwd, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=900))
     web = install_dir / "web"
     if not (web / "package.json").exists():
         return True, "No web/ source in this install; nothing to rebuild."
+
+    web_root = web.resolve()
+    install_root = install_dir.resolve()
+    try:
+        web_root.relative_to(install_root)
+    except ValueError:
+        return False, f"Web UI NOT updated: web source resolves outside the install directory ({web_root})."
+
+    dist = web_root / "dist"
+    if dist.is_symlink():
+        return False, "Web UI NOT updated: refusing to replace a symlink at web/dist."
+    try:
+        dist.resolve().relative_to(web_root)
+    except ValueError:
+        return False, "Web UI NOT updated: web/dist resolves outside the web source directory."
+
     npm = _find_npm(home)
     if npm is None:
-        return False, ("Web UI NOT updated: Node.js/npm was not found, so the browser keeps "
-                       "serving the old build. Install Node.js 20+ (or re-run the installer), "
-                       f"then run `npm ci && npm run build` in {web}.")
+        return False, ("Web UI NOT updated: Node.js/npm was not found. The existing build "
+                       "was left untouched. Install Node.js 20+ (or re-run the installer), "
+                       f"then run `npm ci --include=dev --include=optional && npm run build` in {web}.")
     env = dict(os.environ)
     env["PATH"] = str(Path(npm).parent) + os.pathsep + env.get("PATH", "")
     install_cmd = "ci" if (web / "package-lock.json").exists() else "install"
-    for step in ([npm, install_cmd], [npm, "run", "build"]):
+    install_step = [npm, install_cmd, "--include=dev", "--include=optional", "--no-audit", "--no-fund"]
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=".agent8088-web-build-", dir=str(web_root)))
+    except OSError as exc:
+        return False, f"Web UI NOT updated: could not create a staging directory inside {web_root} ({exc})."
+
+    def stage_is_safe():
+        try:
+            resolved = stage.resolve()
+            resolved.relative_to(web_root)
+            return (resolved.parent == web_root and resolved == stage.absolute()
+                    and not stage.is_symlink())
+        except (OSError, ValueError):
+            return False
+
+    def clean_stage():
+        if stage_is_safe() and stage.exists():
+            shutil.rmtree(stage)
+
+    def failed(message, preserve_stage=False):
+        if preserve_stage:
+            message += f"\nBuild staging directory was retained at {stage}."
+        else:
+            try:
+                clean_stage()
+            except OSError as exc:
+                message += f"\nBuild staging directory was retained at {stage} ({exc})."
+        return False, message
+
+    for step in (install_step, [npm, "run", "build", "--", "--outDir", str(stage / "dist")]):
         try:
             result = run(step, str(web), env)
         except (OSError, subprocess.SubprocessError) as exc:
-            return False, f"Web UI NOT updated: `{' '.join(step[1:])}` could not run ({exc})."
+            return failed(f"Web UI NOT updated: `{' '.join(step[1:])}` could not run ({exc}).")
         if result.returncode != 0:
             tail = ((result.stderr or "") + (result.stdout or "")).strip().splitlines()[-8:]
-            return False, (f"Web UI NOT updated: `npm {' '.join(step[1:])}` failed; the old "
-                           "build is still being served.\n  " + "\n  ".join(tail))
-    return True, "Web UI rebuilt."
+            return failed((f"Web UI NOT updated: `npm {' '.join(step[1:])}` failed; "
+                           "the existing build was left untouched.\n  " + "\n  ".join(tail)))
+
+    staged_dist = stage / "dist"
+
+    class _LocalAssets(html.parser.HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.urls = []
+
+        def handle_starttag(self, tag, attrs):
+            for key, value in attrs:
+                if key.lower() in ("src", "href") and value:
+                    self.urls.append(value.strip())
+
+    index = staged_dist / "index.html"
+    try:
+        if not index.is_file() or index.stat().st_size == 0:
+            return failed("Web UI NOT updated: the build did not produce a non-empty dist/index.html; the existing build was left untouched.")
+        parser = _LocalAssets()
+        parser.feed(index.read_text(encoding="utf-8"))
+        missing = []
+        for raw_url in parser.urls:
+            parsed = urlsplit(raw_url)
+            if parsed.scheme or parsed.netloc or raw_url.startswith("#"):
+                continue
+            relative = unquote(parsed.path).lstrip("/")
+            if not relative:
+                continue
+            asset = (staged_dist / relative).resolve()
+            try:
+                asset.relative_to(staged_dist.resolve())
+            except ValueError:
+                missing.append(raw_url)
+                continue
+            if not asset.is_file() or asset.stat().st_size == 0:
+                missing.append(raw_url)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return failed(f"Web UI NOT updated: could not validate the staged build ({exc}); the existing build was left untouched.")
+    if missing:
+        return failed("Web UI NOT updated: staged index references missing or empty local assets: "
+                      + ", ".join(missing[:8]) + "; the existing build was left untouched.")
+
+    backup = stage / "previous-dist"
+    moved_old = False
+    try:
+        if dist.exists():
+            dist.rename(backup)
+            moved_old = True
+        staged_dist.rename(dist)
+    except OSError as exc:
+        restore_note = ""
+        if moved_old:
+            try:
+                backup.rename(dist)
+                moved_old = False
+            except OSError as restore_exc:
+                restore_note = f" The previous build is preserved at {backup}; restoration failed ({restore_exc})."
+        message = f"Web UI NOT updated: could not activate the new build ({exc})."
+        if not restore_note:
+            message += " The existing build was left untouched."
+        message += restore_note
+        return failed(message, preserve_stage=bool(restore_note))
+
+    cleanup_note = ""
+    try:
+        clean_stage()
+    except OSError as exc:
+        cleanup_note = f" Temporary build data remains at {stage} ({exc})."
+    return True, "Web UI rebuilt and verified." + cleanup_note
 
 
 def _run_update(force=False):
@@ -8706,10 +8824,9 @@ def _run_update(force=False):
     print(f"Already at the latest commit of {branch} ({after})."
           if before == after else f"Updated {branch}: {before} -> {after}")
 
-    web_ok, web_message = (
-        _rebuild_web_ui(install_dir, home)
-        if before != after or force or not (install_dir / "web" / "dist" / "index.html").exists()
-        else (True, ""))
+    # --update is also the explicit retry path after a prior build failed or
+    # Node/npm was unavailable. Always rebuild even when the checkout is current.
+    web_ok, web_message = _rebuild_web_ui(install_dir, home)
     if web_message:
         print(web_message)
 
