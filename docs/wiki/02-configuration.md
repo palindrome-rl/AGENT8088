@@ -144,8 +144,8 @@ not per call.
 |---|---|---|
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
-| `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox. |
-| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings. |
+| `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
+| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |
 | `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
 ## Gateway
