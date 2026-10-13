@@ -9,9 +9,10 @@ missing or failing own-origin asset, a first control that an overlay blocks, or 
 first control whose click changes nothing. A request to an external host
 (hotlinked fonts, images, CDN scripts) is only a warning.
 
-A script gets a static check: it must compile (Python) or parse (Node). Nothing
-is executed. Without Chromium the check reports "unavailable" instead of failing
-the task.
+A script must compile (Python) or parse (Node). When a read-only sandbox runner
+is supplied it also gets a brief startup check there. Without Chromium the page
+check reports "unavailable" instead of failing the task. Dependency errors from
+blocked external scripts are inconclusive, never proof that the page passed.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import os
 import shutil
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -222,7 +224,11 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
 
     failures, warnings, console = [], [], []
     external: list[str] = []
+    external_scripts: list[str] = []
     dialogs: list[str] = []
+    cancelled = out.setdefault("cancelled", threading.Event())
+    if cancelled.is_set():
+        return
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _handler(root, deny))
     port = server.server_address[1]
     origin = f"http://127.0.0.1:{port}"
@@ -232,15 +238,24 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
     browser = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            if cancelled.is_set():
+                return
+            # A unique command-line marker identifies only this check's browser
+            # tree, including a browser still starting when the timeout fires.
+            out["browser_marker"] = f"--agent8088-smoke-check={uuid.uuid4().hex}"
+            browser = p.chromium.launch(args=[out["browser_marker"]])
             out["browser_started"] = True
+            if cancelled.is_set():
+                return
             context = browser.new_context(accept_downloads=False, permissions=[],
                                           service_workers="block",
                                           viewport={"width": 1280, "height": 800})
             # WebSockets are not HTTP requests, so the route below cannot stop
             # them; close each one before it connects.
-            if hasattr(context, "route_web_socket"):
-                context.route_web_socket("**/*", lambda ws: ws.close())
+            block_websockets = getattr(context, "route_web_socket", None)
+            if not callable(block_websockets):
+                raise RuntimeError("Playwright lacks WebSocket interception; upgrade Playwright before checking pages")
+            block_websockets("**/*", lambda ws: ws.close())
 
             def route(request_route):
                 url = request_route.request.url
@@ -249,6 +264,8 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                 else:
                     if url not in external:
                         external.append(url)
+                    if request_route.request.resource_type == "script" and url not in external_scripts:
+                        external_scripts.append(url)
                     request_route.abort()
 
             context.route("**/*", route)
@@ -310,17 +327,21 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                             f"clicking the first control ({control['label']}"
                             + (f" \"{control['text']}\"" if control['text'] else "")
                             + ") changed nothing on the page")
-            if external:
-                # The check blocks the network on purpose. Errors that follow
-                # from a library that could not load (Chart is not defined) are
-                # the block's doing, not a bug in the page.
+            if external_scripts:
+                # A blocked script may explain a missing global, but cannot
+                # prove that the application is correct. Fonts/images alone
+                # never excuse a local JavaScript error.
                 keep = []
+                uncertain = []
                 for item in failures:
                     if item.startswith(("page error", "console error")) and _EXTERNAL_SYMPTOM.search(item):
-                        warnings.append(f"{item} (likely caused by the blocked external script)")
+                        uncertain.append(item)
+                        warnings.append(f"{item} (possibly caused by a blocked external script; not verified)")
                     else:
                         keep.append(item)
                 failures[:] = keep
+                if uncertain and not failures:
+                    out["unavailable"] = "blocked external scripts prevented verification of JavaScript behavior"
             for url in external[:MAX_ITEMS]:
                 warnings.append(f"blocked request to an external host: {url[:120]}")
             if len(external) > MAX_ITEMS:
@@ -340,6 +361,9 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
 
 def _abandon(out: dict, started: float) -> None:
     """A check that timed out must not leave its server or browser behind."""
+    cancelled = out.get("cancelled")
+    if cancelled is not None:
+        cancelled.set()
     server = out.get("server")
     if server is not None:
         try:
@@ -347,12 +371,15 @@ def _abandon(out: dict, started: float) -> None:
             server.server_close()
         except Exception:  # noqa: BLE001
             pass
+    marker = out.get("browser_marker")
+    if not marker:
+        return
     try:
         import psutil
         me = psutil.Process()
         for child in me.children(recursive=True):
             try:
-                if child.create_time() >= started - 1 and "chrom" in child.name().lower():
+                if marker in child.cmdline():
                     for sub_proc in child.children(recursive=True):
                         sub_proc.kill()
                     child.kill()
@@ -370,7 +397,7 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     if not chromium_available():
         return Report("web", str(path), UNAVAILABLE,
                       note="Chromium is not installed; run `playwright install chromium`")
-    out: dict = {}
+    out: dict = {"cancelled": threading.Event()}
     # A fresh thread: Playwright's sync API refuses to run inside a running event loop.
     root = serve_root(path)
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
@@ -385,8 +412,9 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     if "error" in out:
         return Report("web", str(path), UNAVAILABLE, note=f"the browser could not run: {out['error']}")
     failures = list(dict.fromkeys(out.get("failures", [])))
-    status = FAIL if failures else PASS
-    return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []))
+    status = FAIL if failures else UNAVAILABLE if out.get("unavailable") else PASS
+    return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []),
+                  note=out.get("unavailable", ""))
 
 
 # --- scripts: static only --------------------------------------------------------------------------

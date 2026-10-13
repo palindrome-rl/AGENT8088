@@ -176,7 +176,8 @@ A deterministic smoke test of something the agent built; no model call.
 
 - **Web page** (`.html`, or a folder with `index.html`): loaded in headless
   Chromium from a throwaway static server on `127.0.0.1` that serves only the
-  page's own folder (no folder listings, no credential files, GET only). Every
+  page's folder, or the ancestor needed by its relative asset links (no folder
+  listings, no credential files, GET only). Every
   request to another host is aborted, so page code cannot reach the network; the
   SSRF rules and `browse_page` gating are not involved or loosened.
 - **Fails on:** an uncaught page error, a console error from the page's own code,
@@ -185,8 +186,13 @@ A deterministic smoke test of something the agent built; no model call.
   canvas pixels and form values are compared).
 - **Only warns on:** blocked requests to external hosts (hotlinked fonts, images,
   CDN scripts) and a page with no control to click.
+- A JavaScript dependency error alongside a blocked CDN script is inconclusive
+  (`unavailable`), not a pass. Blocked fonts/images never excuse local script errors.
+  Timed-out checks stop only their own marked browser process tree.
 - **Script** (`.py`, `.js`/`.mjs`/`.cjs`): syntax-checked (`compile`, `node
-  --check`); never executed.
+  --check`). Scripts inside the artifact workspace also get a brief `--help`
+  startup check in a disposable read-only sandbox when available. Without that
+  sandbox the result explicitly says it was not executed.
 - Without Chromium (`playwright install chromium`) it reports "unavailable"
   instead of failing the task.
 

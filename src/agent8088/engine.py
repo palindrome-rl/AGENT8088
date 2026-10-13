@@ -8,6 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
+import queue
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -2691,48 +2692,100 @@ class _IdleGuard:
     def __init__(self, stream, idle_seconds):
         self._stream = stream
         self._idle = idle_seconds
-        self._last = None
         self.fired = False
         self._stop = threading.Event()
-        if idle_seconds and idle_seconds > 0:
-            threading.Thread(target=self._watch, daemon=True).start()
+        self._chunks = queue.Queue(maxsize=1)
+        self._close_lock = threading.Lock()
+        self._close_started = False
 
-    def _watch(self):
-        poll = min(1.0, max(0.01, self._idle / 4))
-        while not self._stop.wait(poll):
-            if self._last is not None and time.monotonic() - self._last > self._idle:
-                self.fired = True
-                close = getattr(self._stream, "close", None)
+    def _put(self, kind, value=None):
+        while not self._stop.is_set():
+            try:
+                self._chunks.put((kind, value), timeout=0.05)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _read(self):
+        try:
+            if self._stop.is_set():
+                return
+            for chunk in self._stream:
+                if not self._put("chunk", chunk):
+                    return
+        except Exception as exc:
+            self._put("error", exc)
+        else:
+            self._put("end")
+        finally:
+            self._request_close()
+
+    def _request_close(self):
+        with self._close_lock:
+            if self._close_started:
+                return
+            self._close_started = True
+
+        def close_transport():
+            # LiteLLM wraps the SDK stream without exposing close itself.
+            # Closing its completion_stream also releases the HTTP response.
+            for stream in (self._stream, getattr(self._stream, "completion_stream", None)):
+                close = getattr(stream, "close", None)
                 if callable(close):
                     try:
                         close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                return
+                    except Exception:  # a generator can still be executing
+                        continue
+                    return
+
+        # Some SDKs block in close while another thread is reading. Never let
+        # cleanup prevent the caller from observing its timeout/interruption.
+        threading.Thread(target=close_transport, daemon=True).start()
 
     def _stalled(self):
         return ProviderStreamError(
             f"stream idle timeout: no data for {self._idle}s mid-reply", 504)
 
     def __iter__(self):
+        if not self._idle or self._idle <= 0:
+            try:
+                yield from self._stream
+            finally:
+                self._stop.set()
+            return
+        # The caller waits on a bounded queue, not the SDK's blocking iterator.
+        # This works even when close() cannot interrupt that iterator. Only one
+        # chunk is buffered; the SDK's request timeout bounds its reader thread.
+        threading.Thread(target=self._read, daemon=True).start()
+        started = False
         try:
-            for chunk in self._stream:
-                self._last = time.monotonic()
-                yield chunk
-        except Exception:
-            if self.fired:
-                raise self._stalled() from None
-            raise
+            while not self._stop.is_set():
+                deadline = time.monotonic() + self._idle if started else None
+                while not self._stop.is_set():
+                    remaining = deadline - time.monotonic() if deadline is not None else None
+                    if remaining is not None and remaining <= 0:
+                        self.fired = True
+                        raise self._stalled()
+                    try:
+                        kind, value = self._chunks.get(timeout=min(0.05, remaining) if remaining is not None else 0.05)
+                        break
+                    except queue.Empty:
+                        continue
+                else:
+                    return
+                if kind == "end":
+                    return
+                if kind == "error":
+                    raise value
+                started = True
+                yield value
         finally:
-            self._stop.set()
-        if self.fired:
-            raise self._stalled()
+            self.close()
 
     def close(self):
         self._stop.set()
-        close = getattr(self._stream, "close", None)
-        if callable(close):
-            close()
+        self._request_close()
 
     def __getattr__(self, name):
         return getattr(self._stream, name)
@@ -7440,6 +7493,20 @@ def _take_audit_verdict():
     return verdict
 
 
+def _audit_with_confirmation(*args, **kwargs):
+    """Use the same rollback confirmation for direct calls and plan steps."""
+    reason, note = _audit_plan_step(*args, **kwargs)
+    if reason and PLAN_AUDIT_CONFIRM_FAIL:
+        second_reason, second_note = _audit_plan_step(*args, **kwargs)
+        if not second_reason:
+            return "", (f"{AUDIT_UNKNOWN_NOTE} - auditors disagreed or the second run "
+                        f"could not confirm the failure ({note.strip()[:160]}; "
+                        f"{second_note.strip()[:160]}). The change was left in "
+                        "place: check it yourself before building on it.")
+        note = f"{note} (confirmed by a second auditor: {second_note.strip()[:160]})"
+    return reason, note
+
+
 def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
                      depth: int, snapshot) -> str:
     """Verify one top-level mutation and put a failed write back.
@@ -7459,24 +7526,8 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     if _readback_matches(tool_name, tool_args):
         _last_audit_verdict = "passed"
         return f"{result}\naudit: {AUDIT_PASSED_NOTE} - the file on disk matches what was written"
-    reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
-                                    plan_context=plan_context)
-    # Issue 15: one "fail" from a small model is not enough to destroy work.
-    # Ask a second, independent auditor; revert only if it agrees. Disagreement
-    # is recorded as inconclusive, which leaves the change in place and says so.
-    if reason and PLAN_AUDIT_CONFIRM_FAIL:
-        second_reason, second_note = _audit_plan_step(
-            step_text, tool_name, tool_args, result, depth, plan_context=plan_context)
-        if not second_reason:
-            _last_audit_verdict = "unknown"
-            return "\n".join([
-                result,
-                f"audit: {AUDIT_UNKNOWN_NOTE} - auditors disagreed; the first run "
-                f"reported a failure ({note.strip()[:160]}) and a second, independent "
-                f"run did not ({second_note.strip()[:160]}). The change was left in "
-                "place: check it yourself before building on it.",
-            ])
-        note = f"{note} (confirmed by a second auditor: {second_note.strip()[:160]})"
+    reason, note = _audit_with_confirmation(step_text, tool_name, tool_args, result, depth,
+                                           plan_context=plan_context)
     parts = [result]
     _last_audit_verdict = ("failed" if reason
                            else "passed" if note.startswith(AUDIT_PASSED_NOTE) else "unknown")
@@ -7674,8 +7725,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             halted, stopped_at = f"{tool_name} did not complete", idx
             break
         if will_audit:
-            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result,
-                                            depth, acceptance, evidence)
+            reason, note = _audit_with_confirmation(step_text, tool_name, tool_args, result,
+                                                    depth, acceptance, evidence)
             if note:
                 outputs.append(f"[{idx}] audit: {note}")
             if reason:
@@ -7689,6 +7740,9 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
                 elif PLAN_AUDIT_REVERT and TOOL_SPECS[tool_name].get("mode") != "write_text":
                     outputs.append(f"[{idx}] not reverted — {tool_name} has no undo; "
                                    "inspect the effect by hand")
+                elif PLAN_AUDIT_REVERT:
+                    outputs.append(f"[{idx}] NOT REVERTED — no snapshot was available; "
+                                   "the change is still on disk, inspect it by hand")
                 halted, stopped_at = reason, idx
                 break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
@@ -11162,6 +11216,37 @@ _JSON_TYPE_TO_ARG = {"string": "string", "integer": "integer", "number": "number
                      "boolean": "boolean", "array": "array", "object": "object"}
 
 
+def _schema_arg_problem(key, value, declared) -> str:
+    if not isinstance(declared, dict):
+        return ""
+    for keyword in ("anyOf", "oneOf"):
+        alternatives = declared.get(keyword)
+        if isinstance(alternatives, list) and alternatives:
+            problems = [_schema_arg_problem(key, value, part) for part in alternatives]
+            return "" if any(not problem for problem in problems) else problems[0]
+    kind = declared.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    kinds = [item for item in kinds if isinstance(item, str)]
+    if not kinds:
+        return ""  # refs, enums and unspecified types remain the server's job
+    problems = []
+    for expected in kinds:
+        if value is None:
+            problem = "must not be null" if expected != "null" else ""
+        elif expected == "null":
+            problem = "must be null"
+        elif expected == "string":
+            problem = f"must be text, got {_short_repr(value)}" if isinstance(value, (list, dict)) else ""
+        elif expected in _JSON_TYPE_TO_ARG:
+            problem = _arg_type_problem(key, value, expected)
+        else:
+            return ""  # do not reject a future/unknown schema type
+        if not problem:
+            return ""
+        problems.append(problem)
+    return problems[0]
+
+
 def _validate_against_schema(name: str, schema, args: dict) -> str:
     """Check an MCP (or other schema-carrying) tool call against its published JSON
     schema: required fields present, and no clear type mismatch. Lenient where
@@ -11169,20 +11254,17 @@ def _validate_against_schema(name: str, schema, args: dict) -> str:
     if not isinstance(schema, dict) or not isinstance(args, dict):
         return ""
     properties = schema.get("properties") or {}
+    if not isinstance(properties, dict):
+        return ""
     problems = [f"'{key}' is required" for key in (schema.get("required") or [])
-                if key not in args or args[key] is None]
+                if key not in args]
     for key, value in args.items():
         declared = properties.get(key)
-        if not isinstance(declared, dict) or value is None or str(key).startswith("_"):
+        if not isinstance(declared, dict) or str(key).startswith("_"):
             continue
-        kind = declared.get("type")
-        if kind == "string":
-            if isinstance(value, (list, dict)):
-                problems.append(f"'{key}' must be text, got {_short_repr(value)}")
-        elif kind in _JSON_TYPE_TO_ARG:
-            problem = _arg_type_problem(key, value, kind)
-            if problem:
-                problems.append(f"'{key}' {problem}")
+        problem = _schema_arg_problem(key, value, declared)
+        if problem:
+            problems.append(f"'{key}' {problem}")
     if not problems:
         return ""
     names = ", ".join(properties) or "(none)"

@@ -43,6 +43,8 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.api_key` | Literal key. Legacy — migrated to `.env` on first run. |
 | `provider.<name>.api_mode` | `openai` (default) or `litellm`. |
 | `provider.<name>.native_tools` | Use the provider's native function-calling API. Defaults to `1` for every provider except `ollama`, which uses the prompt-based convention. |
+| `tool_call_format` | `markers` by default; opt-in `native` omits text-marker lessons when native tool calling is active. |
+| `tool_selection_min_similarity` | `0.35`: semantic similarity required to offer a tool when keyword ranking has no matches. |
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
@@ -63,6 +65,7 @@ takes over:
 | `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
 | `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
+| `stream_idle_seconds` | `120` | Maximum silence after streaming starts before a retryable idle error. Works with OpenAI and LiteLLM streams; `0` disables it. SDK request timeouts still bound the initial response wait. |
 
 ### Fusion
 
@@ -329,6 +332,7 @@ where a silently half-done plan does damage.
 |---|---|---|
 | `plan_audit` | `0` | `1` turns on step verification. `/audit` shows and toggles it. |
 | `plan_audit_revert` | `1` | With auditing on, a write that **fails** verification is restored to its exact pre-step bytes: only verified state persists. |
+| `plan_audit_confirm_fail` | `1` | A tool or plan-step audit failure needs a second failing auditor before rollback. Disagreement is reported as inconclusive and leaves the change in place. |
 | `plan_audit_revert_max_bytes` | `1048576` | Files larger than this are not snapshotted, so they are not reverted — the plan output says so rather than implying otherwise. |
 | `plan_audit_max_per_turn` | `12` | Verification calls one top-level turn may spend. `0` stops verifying without turning the feature off. |
 | `plan_audit_timeout_seconds` | `120` | Wall clock for one auditor sub-run. |

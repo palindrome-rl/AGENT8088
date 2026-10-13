@@ -96,6 +96,7 @@ def test_silent_stream_becomes_a_retryable_error(engine):
     with pytest.raises(engine.ProviderStreamError) as caught:
         for chunk in guard:
             got.append(chunk)
+    assert release.wait(1), "the timed-out transport was not closed"
     assert got == ["first"] and stream.closed
     assert caught.value.status_code == 504 and engine._retryable_model_error(caught.value)
 

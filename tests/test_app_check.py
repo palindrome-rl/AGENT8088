@@ -324,13 +324,14 @@ def test_popup_counts_as_an_effect(tmp_path):
 
 
 @needs_chromium
-def test_error_from_a_blocked_cdn_script_is_only_a_warning(tmp_path):
+def test_error_from_a_blocked_cdn_script_is_inconclusive_not_a_false_pass(tmp_path):
     page = tmp_path / "index.html"
     page.write_text('<script src="https://cdn.example.com/chart.js"></script>'
                     '<button onclick="document.title=\'x\'">Go</button>'
                     '<script>new Chart(1)</script>', encoding="utf-8")
     report = app_check.check_web_page(page)
-    assert report.status == app_check.PASS
+    assert report.status == app_check.UNAVAILABLE
+    assert not report.failed
     assert any("blocked external script" in w for w in report.warnings)
 
 
