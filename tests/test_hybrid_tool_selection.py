@@ -239,3 +239,20 @@ def test_the_guard_leaves_diff_and_document_requests_alone(engine):
     for query in untouched:
         guarded = engine._apply_tool_intent_guards(query, {"git_diff"}, allowed)
         assert "git_diff" in guarded, query
+
+
+def test_a_greeting_matches_no_tool_and_offers_only_the_always_on_set(engine, monkeypatch):
+    """Audit issue 48: with no keyword hit and no clearly similar tool, 'hi' must not
+    carry the ten nearest schemas."""
+    allowed = set(engine.TOOL_SPECS)
+    names, texts, _ = engine._tool_selection_index(allowed)
+    vectors = [[1.0, 0.0] if i % 2 else [0.0, 1.0] for i in range(len(names))]
+    monkeypatch.setattr(engine, "_tool_selection_index", lambda a: (names, texts, vectors))
+    monkeypatch.setattr(engine, "_bm25_tool_ranking", lambda q, t: [])
+    embedder = type("E", (), {"embed_one": lambda self, q: [0.1, 0.1]})()   # cosine ~0.7 -> keep floor high
+    monkeypatch.setattr(engine.memory, "embedder", lambda: embedder)
+    monkeypatch.setattr(engine, "TOOL_SELECTION_MIN_SIMILARITY", 0.99)
+    picked = engine.select_tool_names_for_request("hi", allowed, mode="hybrid")
+    assert picked <= (engine._TOOL_SELECTION_ALWAYS | engine._TOOL_SELECTION_PINNED | {"search_tools"} | picked & engine._TOOL_SELECTION_ALWAYS)
+    assert len(picked) < len(allowed)
+    assert picked <= engine._TOOL_SELECTION_ALWAYS | engine._TOOL_SELECTION_PINNED | engine._apply_tool_intent_guards("hi", set(), allowed)

@@ -127,3 +127,23 @@ def test_other_hard_blocks_keep_the_generic_message(engine, monkeypatch):
     monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
     result = engine._run_tool("execute_shell", {"command": "rm -rf /"})
     assert "forbidden by Agent8088's safety policy" in result
+
+
+# --- audit issue 37: signal flags, PID lists, wrapped kill-by-name ---------------------------
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("command", [
+    "kill -n 9 1234", "kill -s KILL 1234", "Stop-Process -Id 1234,5678", "busybox kill 1234"])
+def test_valid_pid_kills_are_not_blocked(engine, command):
+    assert not engine._hard_blocked_shell(command)
+
+
+@_pytest.mark.parametrize("command", [
+    "busybox pkill python",
+    "python -c \"import subprocess; subprocess.run(['pkill', 'node'])\"",
+    "node -e \"require('child_process').exec('killall node')\"",
+    "Stop-Process -Name node", "pkill node", "kill -9 -1"])
+def test_wrapped_kill_by_name_is_blocked(engine, command):
+    assert engine._hard_blocked_shell(command)

@@ -218,6 +218,11 @@ def parse_diagnostics(text: str) -> tuple[Diagnostic, ...]:
     return tuple(found)
 
 
+_SUMMARY_ERRORS = re.compile(
+    r"\b(?:passed|failed|skipped|warnings?|deselected|xfailed|xpassed|total|tests?)\b"
+    r"|\berrors?\s*(?:[,;.)=]|in\s+[\d.]+s|$)", re.I)
+
+
 def _counted(pattern: str, line: str):
     match = re.search(pattern, line, re.I)
     return int(match.group(1)) if match else None
@@ -237,12 +242,24 @@ def _scan_line(line: str) -> str | None:
         return FAILED
     if re.match(r"\s*(?:---\s*)?FAIL\b", line):
         return FAILED
+    # mocha / tap style: "5 passing", "1 failing"
+    if _counted(r"^\W*(\d+)\s+failing\b", line):
+        return FAILED
+    # Go: a failing package prints "FAIL<TAB>pkg 0.02s" (caught above).
+    # "N errors" is a failure only on a summary line. Prose such as "handles
+    # 1 error case" is not one: it must end the count or sit beside another
+    # summary word.
     errors = _counted(r"\b(\d+)\s+errors?\b", line)
-    if errors:
+    if errors and _SUMMARY_ERRORS.search(line):
         return FAILED
 
     passed = _counted(r"\b(\d+)\s+(?:tests?\s+)?passed\b", line)
     if passed:
+        return PASSED
+    if _counted(r"^\W*(\d+)\s+passing\b", line):
+        return PASSED
+    # Go: "ok  <TAB>pkg<TAB>0.021s" or "ok pkg (cached)".
+    if re.match(r"ok\s+\S+\s+(?:[\d.]+s\b|\(cached\))", line):
         return PASSED
     if re.search(r"test result:\s*ok\b", line, re.I):
         return PASSED

@@ -132,3 +132,14 @@ def test_generate_tests_still_checks_the_code_under_test_after_a_timeout(engine,
     result = engine._exec_autotest({"filename": str(source)})
     assert result.startswith("WARNING:") and "MODIFIED" in result
     assert source.read_text(encoding="utf-8") == "def f():\n    return 1\n"
+
+
+def test_subagent_report_lists_a_file_the_parent_had_already_touched(engine):
+    """Audit issue 40: a file the parent wrote earlier and the sub-agent changed again
+    still belongs in the sub-agent's list."""
+    engine._WRITE_LOG.clear()
+    engine._WRITE_LOG.append("/w/shared.py")        # parent, before the sub-agent
+    start = len(engine._WRITE_LOG)
+    engine._WRITE_LOG.extend(["/w/shared.py", "/w/new.py", "/w/new.py"])
+    assert list(dict.fromkeys(engine._WRITE_LOG[start:])) == ["/w/shared.py", "/w/new.py"]
+    engine._WRITE_LOG.clear()

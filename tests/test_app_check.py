@@ -292,3 +292,75 @@ def test_the_report_text_is_short_and_lists_failures_then_warnings():
     assert sum(1 for line in text.splitlines() if line.startswith("- failure")) == app_check.MAX_ITEMS
     assert "Warnings (not failures):" in text and "Console:" in text
     assert len(report.text(limit=100)) <= 100
+
+
+# --- audit issues 24-30 ------------------------------------------------------------------------
+
+def test_serve_root_climbs_to_reach_parent_links(tmp_path):
+    (tmp_path / "docs").mkdir()
+    page = tmp_path / "docs" / "index.html"
+    page.write_text('<link rel="stylesheet" href="../style.css">', encoding="utf-8")
+    assert app_check.serve_root(page) == tmp_path
+    flat = tmp_path / "docs" / "flat.html"
+    flat.write_text('<link rel="stylesheet" href="style.css">', encoding="utf-8")
+    assert app_check.serve_root(flat) == tmp_path / "docs"
+
+
+@needs_chromium
+def test_page_with_parent_stylesheet_passes(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "style.css").write_text("body{color:red}", encoding="utf-8")
+    page = tmp_path / "docs" / "index.html"
+    page.write_text('<link rel="stylesheet" href="../style.css">' + WORKING, encoding="utf-8")
+    assert app_check.check_web_page(page).status == app_check.PASS
+
+
+@needs_chromium
+def test_popup_counts_as_an_effect(tmp_path):
+    page = tmp_path / "index.html"
+    page.write_text('<button onclick="alert(\'hi\')">Go</button>', encoding="utf-8")
+    report = app_check.check_web_page(page)
+    assert report.status == app_check.PASS and any("popup" in w for w in report.warnings)
+
+
+@needs_chromium
+def test_error_from_a_blocked_cdn_script_is_only_a_warning(tmp_path):
+    page = tmp_path / "index.html"
+    page.write_text('<script src="https://cdn.example.com/chart.js"></script>'
+                    '<button onclick="document.title=\'x\'">Go</button>'
+                    '<script>new Chart(1)</script>', encoding="utf-8")
+    report = app_check.check_web_page(page)
+    assert report.status == app_check.PASS
+    assert any("blocked external script" in w for w in report.warnings)
+
+
+def test_a_timed_out_probe_is_not_remembered(monkeypatch):
+    app_check._CHROMIUM_ANSWERS.clear()
+    answers = iter([None, True])
+    monkeypatch.setattr(app_check, "_chromium_available", lambda key: next(answers))
+    assert app_check.chromium_available() is False      # unknown this time
+    assert app_check.chromium_available() is True       # asked again, now known
+    assert app_check.chromium_available() is True       # definite answers are cached
+    app_check._CHROMIUM_ANSWERS.clear()
+
+
+def test_script_that_crashes_on_start_fails(tmp_path):
+    script = tmp_path / "tool.py"
+    script.write_text("import missing_module_xyz\n", encoding="utf-8")
+    crash = lambda cmd, timeout: ("Traceback (most recent call last):\n"
+                                  "ModuleNotFoundError: No module named 'missing_module_xyz'\n"
+                                  "Command exited with status 1.")
+    report = app_check.check_script(script, run=crash)
+    assert report.status == app_check.FAIL and "crashed" in report.failures[0]
+    usage = lambda cmd, timeout: "usage: tool.py [-h]\nCommand exited with status 2."
+    assert app_check.check_script(script, run=usage).status == app_check.PASS
+    assert app_check.check_script(script, run=lambda c, t: "Command timed out after 10s.").status == app_check.PASS
+    assert app_check.check_script(script).note == "compiles; not executed"
+
+
+def test_timed_out_check_shuts_its_server_down(monkeypatch):
+    stopped = []
+    server = type("S", (), {"shutdown": lambda self: stopped.append("shutdown"),
+                            "server_close": lambda self: stopped.append("close")})()
+    app_check._abandon({"server": server}, 0.0)
+    assert stopped == ["shutdown", "close"]
