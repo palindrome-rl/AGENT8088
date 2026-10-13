@@ -47,7 +47,7 @@ class Pipeline:
             path.write_text(args["content"], encoding="utf-8")
             return f"Wrote {len(args['content'])} bytes to {path}"
 
-        def check(path, timeout=20, deny=None):
+        def check(path, timeout=20, deny=None, **_kw):
             self.checked.append(Path(path).name)
             status = self.verdicts[min(len(self.checked) - 1, len(self.verdicts) - 1)]
             failures = ["clicking the first control (button \"Go\") changed nothing on the page"] if status == app_check.FAIL else []

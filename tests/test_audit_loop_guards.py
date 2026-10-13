@@ -547,3 +547,10 @@ def test_a_refused_subagent_leaves_no_permission_state_behind(engine, monkeypatc
     assert engine._one_shot_grants == {"already_approved"}
     assert engine._active_role == "assistant", (
         "later tokens are billed to the auditor, so /audit over-reports")
+
+
+@pytest.fixture(autouse=True)
+def _model_audit_runs(engine, monkeypatch):
+    """These tests exercise the model auditor; the read-back shortcut for an
+    ordinary write_file would answer first (see test_auditor_robustness)."""
+    monkeypatch.setattr(engine, "_readback_matches", lambda *a, **k: False)

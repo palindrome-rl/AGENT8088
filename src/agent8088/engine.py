@@ -8,6 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
+import queue
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
 except ImportError:
@@ -618,6 +619,13 @@ DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
 # hiccup usually lasts 30-60 s, and the old 3.5 s window ended runs that a
 # slightly longer wait would have survived. The turn budget still caps it.
 API_MAX_RETRIES = max(0, _config_int("api_max_retries", 5))
+# Seconds of silence, once a reply has started streaming, after which the stream
+# is treated as stalled and retried. 0 disables.
+STREAM_IDLE_SECONDS = max(0, _config_int("stream_idle_seconds", 120))
+try:
+    TOOL_SELECTION_MIN_SIMILARITY = float(APP_CONFIG.get("tool_selection_min_similarity", 0.35))
+except (TypeError, ValueError):
+    TOOL_SELECTION_MIN_SIMILARITY = 0.35
 API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 1000))
 API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 30000))
 API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio", 0.1)))
@@ -1709,6 +1717,8 @@ def _segment_stops_processes_unsafely(segment: list) -> bool:
     if not words:
         return False
     exe = Path(words[0]).stem.lower()
+    if exe == "busybox" and len(words) > 1:
+        return _segment_stops_processes_unsafely(words[1:])   # busybox pkill ...
     args = [word.lower() for word in words[1:]]
     if exe in _KILL_BY_NAME_COMMANDS:
         return True
@@ -1724,21 +1734,45 @@ def _segment_stops_processes_unsafely(segment: list) -> bool:
         pids = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ("/pid", "-pid")]
         return not pids or bool(_own_pids() & set(pids))
     if exe in _KILL_PIDS_COMMANDS:
-        if any(arg.split(":", 1)[0] in _STOP_BY_NAME_FLAGS for arg in args):
+        if exe in ("kill", "tskill", "pskill"):
+            # `kill -n 9 1234` / `kill -s KILL 1234`: the word after -n/-s is a
+            # signal, not a process name. Only Stop-Process uses -Name.
+            cleaned, skip = [], False
+            for arg in args:
+                if skip:
+                    skip = False
+                elif arg in ("-n", "-s"):
+                    skip = True
+                else:
+                    cleaned.append(arg)
+            args = cleaned
+            by_name_flags = frozenset(["-inputobject", "-input", "-processname"])
+        else:
+            by_name_flags = _STOP_BY_NAME_FLAGS
+        if any(arg.split(":", 1)[0] in by_name_flags for arg in args):
             return True
         if any(arg in ("-l", "-L") for arg in words[1:]):
             return False  # kill -l: list signal names
         if len(args) >= 2 and args[-1] == "-1" or "0" in args:
             return True  # kill -9 -1 / kill 0: every process the user can signal
-        targets = [arg for arg in args if _PID_TARGET.fullmatch(arg)]
+        # Stop-Process -Id 1,2 names two processes in one argument.
+        expanded = [piece for arg in args for piece in (arg.split(",") if "," in arg else [arg])]
+        targets = [arg for arg in expanded if _PID_TARGET.fullmatch(arg)]
         # No literal PID means the target comes from a pipe, a name or a
         # substitution (`... | Stop-Process`, `kill $(pgrep x)`), which cannot be checked.
         return not targets or bool(_own_pids() & set(targets))
     return False
 
 
+_INLINE_INTERPRETER = re.compile(r"\b(?:python3?|py|node|nodejs|perl|ruby|php|deno|bun)(?:\.exe)?\s+-[ce]\b", re.I)
+_KILL_BY_NAME_TEXT = re.compile(
+    r"\b(?:pkill|killall5?|pskill)\b|\btaskkill\b[^\n]*?[/-]im\b|\bstop-process\b[^\n]*?-name\b", re.I)
+
+
 def _command_text_stops_processes(command: str) -> bool:
     """Whole-command patterns the per-segment check cannot see (PowerShell/Python loops)."""
+    if _INLINE_INTERPRETER.search(command) and _KILL_BY_NAME_TEXT.search(command):
+        return True   # python -c "os.system('pkill node')" and the like
     if _PROCESS_ENUMERATION.search(command) and _PROCESS_KILL_CALL.search(command):
         return True
     return bool(_WMI_KILL_BY_NAME.search(command))
@@ -2647,6 +2681,116 @@ def _raise_if_interrupted(interrupt_check, stream=None):
     raise AgentInterrupted()
 
 
+class _IdleGuard:
+    """Wrap a chunk stream so silence after the first chunk becomes a retryable error.
+
+    The retry rules key on the error's wording ("timeout"); a stall that the
+    provider words differently ended the run. Here the stall is detected by the
+    clock, closed, and raised as a ProviderStreamError with a 504 status.
+    """
+
+    def __init__(self, stream, idle_seconds):
+        self._stream = stream
+        self._idle = idle_seconds
+        self.fired = False
+        self._stop = threading.Event()
+        self._chunks = queue.Queue(maxsize=1)
+        self._close_lock = threading.Lock()
+        self._close_started = False
+
+    def _put(self, kind, value=None):
+        while not self._stop.is_set():
+            try:
+                self._chunks.put((kind, value), timeout=0.05)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _read(self):
+        try:
+            if self._stop.is_set():
+                return
+            for chunk in self._stream:
+                if not self._put("chunk", chunk):
+                    return
+        except Exception as exc:
+            self._put("error", exc)
+        else:
+            self._put("end")
+        finally:
+            self._request_close()
+
+    def _request_close(self):
+        with self._close_lock:
+            if self._close_started:
+                return
+            self._close_started = True
+
+        def close_transport():
+            # LiteLLM wraps the SDK stream without exposing close itself.
+            # Closing its completion_stream also releases the HTTP response.
+            for stream in (self._stream, getattr(self._stream, "completion_stream", None)):
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # a generator can still be executing
+                        continue
+                    return
+
+        # Some SDKs block in close while another thread is reading. Never let
+        # cleanup prevent the caller from observing its timeout/interruption.
+        threading.Thread(target=close_transport, daemon=True).start()
+
+    def _stalled(self):
+        return ProviderStreamError(
+            f"stream idle timeout: no data for {self._idle}s mid-reply", 504)
+
+    def __iter__(self):
+        if not self._idle or self._idle <= 0:
+            try:
+                yield from self._stream
+            finally:
+                self._stop.set()
+            return
+        # The caller waits on a bounded queue, not the SDK's blocking iterator.
+        # This works even when close() cannot interrupt that iterator. Only one
+        # chunk is buffered; the SDK's request timeout bounds its reader thread.
+        threading.Thread(target=self._read, daemon=True).start()
+        started = False
+        try:
+            while not self._stop.is_set():
+                deadline = time.monotonic() + self._idle if started else None
+                while not self._stop.is_set():
+                    remaining = deadline - time.monotonic() if deadline is not None else None
+                    if remaining is not None and remaining <= 0:
+                        self.fired = True
+                        raise self._stalled()
+                    try:
+                        kind, value = self._chunks.get(timeout=min(0.05, remaining) if remaining is not None else 0.05)
+                        break
+                    except queue.Empty:
+                        continue
+                else:
+                    return
+                if kind == "end":
+                    return
+                if kind == "error":
+                    raise value
+                started = True
+                yield value
+        finally:
+            self.close()
+
+    def close(self):
+        self._stop.set()
+        self._request_close()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def _start_interrupt_watcher(stream, interrupt_check):
     if not interrupt_check:
         return None, None
@@ -2726,6 +2870,24 @@ def create_completion(client, messages, tools, max_tokens=2000, system_prompt=No
         _active_budget.add_usage(response)
     _check_model_budget()  # a late response must not authorize tool execution
     return response
+
+
+def _named_extra_keys(exc: Exception, extra_body) -> set:
+    """The extra_body keys a provider's rejection actually names.
+
+    Resending without ALL optional fields silently loses thinking control and
+    routing that the provider accepted. When the error text names a key (or a
+    key nested in one, like enable_thinking inside chat_template_kwargs), only
+    that key is dropped; an empty set means the error did not say.
+    """
+    lowered = str(exc).lower()
+    named = set()
+    for key, value in (extra_body or {}).items():
+        if str(key).lower() in lowered:
+            named.add(key)
+        elif isinstance(value, dict) and any(str(sub).lower() in lowered for sub in value):
+            named.add(key)
+    return named
 
 
 def _extras_rejected(exc: Exception, thinking=None) -> bool:
@@ -3039,7 +3201,7 @@ def _resolve_temperature(provider_name: str, temperature: float) -> float:
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
                        temperature=0.1, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False,
-                       thinking=None, timeout=None):
+                       thinking=None, timeout=None, _drop_extra=frozenset()):
     selected_model = model_name or MODEL_NAME
     full_messages = _normalised_messages(system_prompt or current_system_prompt(), messages)
     temperature = _resolve_temperature(provider_name, temperature)
@@ -3092,6 +3254,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if on_token is None:
             return response
         collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
+        response = _IdleGuard(response, STREAM_IDLE_SECONDS)
         stop, watcher = _start_interrupt_watcher(response, interrupt_check)
         try:
             for chunk in response:
@@ -3155,6 +3318,8 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             if isinstance(value, dict) and isinstance(extra_body.get(key), dict):
                 value = {**extra_body[key], **value}
             extra_body[key] = value
+    if extra_body and _drop_extra:
+        extra_body = {k: v for k, v in extra_body.items() if k not in _drop_extra}
     if extra_body and not _skip_optional:
         request_options["extra_body"] = extra_body
     _raise_if_interrupted(interrupt_check)
@@ -3178,7 +3343,11 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             return _do_create()
         except Exception as exc:
-            if request_options.pop("extra_body", None) and _extras_rejected(exc, thinking):
+            sent = request_options.pop("extra_body", None)
+            if sent and _extras_rejected(exc, thinking):
+                kept = {k: v for k, v in sent.items() if k not in _named_extra_keys(exc, sent)}
+                if kept and len(kept) < len(sent):
+                    request_options["extra_body"] = kept   # only the rejected field goes
                 return _do_create()
             raise
     # Streaming path — Rich UI passes on_token for live token-by-token rendering
@@ -3215,6 +3384,15 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     except Exception as exc:
         _close_stream_ctx()
         if not _skip_optional and _extras_rejected(exc, thinking):
+            sent = request_options.get("extra_body") or {}
+            named = _named_extra_keys(exc, sent)
+            if named and len(named) < len(sent) and not (named & _drop_extra):
+                return _create_completion(
+                    client, messages, tools, max_tokens=max_tokens,
+                    system_prompt=system_prompt, temperature=temperature,
+                    on_token=on_token, interrupt_check=interrupt_check,
+                    model_name=model_name, provider_name=provider_name,
+                    thinking=thinking, timeout=timeout, _drop_extra=_drop_extra | named)
             return _create_completion(
                 client, messages, tools, max_tokens=max_tokens,
                 system_prompt=system_prompt, temperature=temperature,
@@ -3225,6 +3403,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
     collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
     stream_usage = None
     stream_first = None
+    stream = _IdleGuard(stream, STREAM_IDLE_SECONDS)
     stop, watcher = _start_interrupt_watcher(stream, interrupt_check)
     try:
         for chunk in stream:
@@ -3358,6 +3537,9 @@ def _retryable_model_error(error: Exception) -> bool:
         # base_url mentions "connection" and "timeout") must not override it.
         return False
     if _is_provider_repetition_stop(error):
+        return True
+    if isinstance(error, ProviderStreamError) and status is None:
+        # An error chunk with no code: nothing says the request was at fault.
         return True
     name = type(error).__name__.lower()
     text = str(error).lower()
@@ -3565,6 +3747,7 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
 
     last_error = None
     primary_error = None
+    stall_changes = 0
     attempts = API_MAX_RETRIES + 1  # 1 initial try + API_MAX_RETRIES retries
     attempt = 0
     while attempt < attempts:
@@ -3588,6 +3771,16 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
         except Exception as error:
             primary_error = primary_error or error
             last_error = error
+            if _is_provider_stall(error) and thinking is not None:
+                # Thinking is already reduced and it stalled again: shrink the
+                # output limit, then give up streaming. One change per retry.
+                stall_changes += 1
+                if stall_changes == 1:
+                    max_tokens = max(1024, int(max_tokens) // 2)
+                    notify(f"Provider stalled again; retrying with a lower output limit ({max_tokens}).")
+                elif stall_changes == 2 and token_handler is not None:
+                    token_handler = None
+                    notify("Provider stalled again; retrying without streaming.")
             if thinking is None and _is_provider_stall(error):
                 # The same request just failed for a reason that depends on the
                 # request (an upstream idle timeout, a 5xx, a looping reply cut
@@ -4206,7 +4399,10 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
-    semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
+    # With no keyword match at all, only a clearly similar tool is worth offering:
+    # "hi" must not carry the ten least-unrelated tool schemas.
+    floor = 0 if lexical else TOOL_SELECTION_MIN_SIMILARITY
+    semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > floor]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
         return _keyword_tool_selection(query, names, texts, allowed,
                                        "the keyword and semantic rankings share no candidate",
@@ -4692,7 +4888,15 @@ def render_tool_name_index(specs: dict) -> str:
     return "\n".join(lines)
 
 
-def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
+# markers (default): the prompt teaches the text marker convention even when the
+# provider calls tools natively, and the salvage code catches blended output.
+# native: with native tool calling active the marker lines are left out so the
+# model sees one convention. Opt in per model after comparing malformed-name rate
+# and task success; the default does not change.
+TOOL_CALL_FORMAT = str(APP_CONFIG.get("tool_call_format", "markers")).strip().lower()
+
+
+def render_tool_docs(specs: dict, catalogue: bool = True, markers: bool = True) -> str:
     """Generate the tool section of the system prompt from TOOL_SPECS, so the
     prompt can never drift from tools.txt. Required because the Ollama backend
     rejects the OpenAI tools param: the system prompt is the model's ONLY
@@ -4717,10 +4921,13 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     lines = [
         "",
         "## Tools",
-        "When a tool genuinely helps, call it by emitting exactly:",
-        '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
-        "The name after ✿FUNCTION✿ must be exactly one schema name: no parentheses, "
-        "arguments, or extra text. Put every argument only in the JSON object after ✿ARGS✿.",
+        *(["When a tool genuinely helps, call it by emitting exactly:",
+           '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
+           "The name after ✿FUNCTION✿ must be exactly one schema name: no parentheses, "
+           "arguments, or extra text. Put every argument only in the JSON object after ✿ARGS✿."]
+          if markers else
+          ["When a tool genuinely helps, call it through the tool-calling interface, using "
+           "its exact schema name and arguments. Do not write tool calls as text."]),
         "You may send several calls in one reply, one per line; they run in order and each "
         "gets its own result. Batch independent reads, searches and checks together; send a "
         "step that depends on an earlier result in the next reply. To fix a file, edit the "
@@ -5100,7 +5307,8 @@ def compose_system_prompt(*, specs: dict | None = None, skills: dict | None = No
     if native_tools is None:
         native_tools = _native_tools_enabled(build_tools_def(specs))
     prompt = (BASE_SYSTEM_PROMPT + "\n"
-              + render_tool_docs(specs, catalogue=not native_tools)
+              + render_tool_docs(specs, catalogue=not native_tools,
+                                 markers=not (native_tools and TOOL_CALL_FORMAT == "native"))
               + (render_tool_name_index(specs) if native_tools else "")
               + render_capability_guidance(specs, native_tools=native_tools)
               + render_skill_docs(skills))
@@ -6313,6 +6521,8 @@ _CHECK_PROGRAMS = frozenset({
     "readlink", "env", "printenv", "nproc", "free", "df", "du",
 })
 _TEST_RUNNER_COMMANDS = {("go", "test"), ("cargo", "test"), ("npm", "test"), ("yarn", "test"),
+                         ("npx", "jest"), ("npx", "vitest"), ("npx", "mocha"),
+                         ("jest",), ("vitest",), ("mocha",), ("tox",),
                          ("pnpm", "test"), ("make", "test"), ("make", "check"),
                          ("npm", "run", "test"), ("dotnet", "test")}
 _PY_MODULE_CHECKS = frozenset({"pytest", "unittest", "doctest", "json.tool"})
@@ -6387,6 +6597,38 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
     if name == "run_tests":
         return False
     return True
+
+
+_NON_RUNNER_SEGMENT = re.compile(r"^\s*(?:echo|printf|cat|type|print)\b", re.I)
+
+
+def _runs_a_test_runner(command: str) -> bool:
+    """True when the command really invokes a test runner (possibly after a
+    `cd x &&`), and does not also print text of its own that could be mistaken
+    for a result. `echo "3 tests passed"` is not a test."""
+    segments = [part for part in re.split(r"&&|;|\n", command or "") if part.strip()]
+    if not segments or any(_NON_RUNNER_SEGMENT.match(part) for part in segments):
+        return False
+    return any(_standalone_test_command(part.strip()) for part in segments)
+
+
+def _evidence_status(name: str, args: dict, result: str, status: str, source: str) -> str:
+    """Only a real test runner's output can say a check passed or failed.
+
+    run_tests and a recognised runner command are evidence. Everything else
+    (reading a file, `echo "all tests passed"`, a web page) may contain the
+    words but ran nothing, so its text is ignored; a non-zero exit status of a
+    shell command still counts as a failure.
+    """
+    if status not in ("passed", "failed"):
+        return status
+    if name == "run_tests":
+        return status
+    if name == "execute_shell" and _runs_a_test_runner(str((args or {}).get("command", ""))):
+        return status
+    if status == "failed" and name == "execute_shell" and "exit status" in source:
+        return status
+    return "unknown"
 
 
 def _standalone_test_command(command: str) -> bool:
@@ -6582,6 +6824,11 @@ def _plan_step_failed(result: str) -> bool:
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
+# Issue 15: a wrong "fail" from a small model is frequent and destroys correct
+# work. With this on, an unconfirmed fail costs one more independent auditor
+# sample and only reverts when that one fails too.
+PLAN_AUDIT_CONFIRM_FAIL = APP_CONFIG.get("plan_audit_confirm_fail", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
     "1", "true", "yes", "on")
 PLAN_REVERT_MAX_BYTES = _config_int("plan_audit_revert_max_bytes", 1 << 20)
@@ -6641,6 +6888,36 @@ _NON_AUDITABLE_TOOLS = {
     "convert_document",
 }
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
+_VERDICT_LINE_RE = re.compile(
+    r"^[ \t>*_`#.)\]-]*(?:\d+[.)]\s*)?VERDICT[*_`]*\s*:\s*[*_`\"\']*\s*(pass|fail|unknown)\b",
+    re.IGNORECASE | re.MULTILINE)
+# Harness prefixes that sit in front of the model's own first line: a sub-agent
+# answer arrives as "[subagent:auditor] ...", sometimes behind "[note: ...]".
+# They are ours, not the model's, so they must not hide a verdict written first.
+_ANSWER_PREFIX_RE = re.compile(r"^(?:\s*\[[^\]\n]{0,80}\]\s*)+", re.MULTILINE)
+# The audit's own result, kept out of band: text in a tool result (a file, a
+# web page) can imitate "audit: verification passed", this cannot.
+_last_audit_verdict = None
+
+
+def _parse_audit_verdict(answer: str):
+    """The auditor's verdict, or None.
+
+    Bold/backtick decoration is ignored ("**VERDICT:** pass"), and the harness's
+    own "[subagent:auditor] " prefix is stripped first -- it is not the model's
+    text, and leaving it in hid every verdict a terse model wrote on line one.
+
+    A verdict that starts a line wins; when those disagree the answer is
+    "unknown" rather than whichever came first. With no line-start verdict a
+    single inline one still counts (AU-2), but an echoed template quoting two
+    different verdicts in prose is no verdict at all.
+    """
+    text = _ANSWER_PREFIX_RE.sub("", answer or "")
+    found = {m.group(1).lower() for m in _VERDICT_LINE_RE.finditer(text)}
+    if found:
+        return found.pop() if len(found) == 1 else "unknown"
+    inline = {m.group(1).lower() for m in _VERDICT_RE.finditer(text)}
+    return inline.pop() if len(inline) == 1 else None
 # Auditor calls spent by the turn in flight. Reset by the outermost run_agent
 # only — a sub-agent must not hand itself a fresh verification budget, for the
 # same reason it does not get a fresh token one.
@@ -7018,6 +7295,13 @@ def _subagent_ceiling(type_name: str) -> tuple:
     return SUBAGENT_TIMEOUT_SECONDS, "subagent_timeout_seconds"
 
 
+def _head_and_tail(text: str, head: int = 200, tail: int = 500) -> str:
+    """Test runners and compilers print their verdict last: keep both ends."""
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]}\n[... {len(text) - head - tail} characters omitted ...]\n{text[-tail:]}"
+
+
 def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
                      result: str, depth: int,
                      acceptance: str = "", evidence: str = "",
@@ -7055,7 +7339,7 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     # outright. Unwrapped first so the untrusted-content markers a shell result
     # arrives in cannot be truncated mid-marker by the 500-char cut, and the
     # closing fence is neutralised so output cannot end its own quote.
-    quoted = _unwrap_untrusted(result)[:500].replace(
+    quoted = _head_and_tail(_unwrap_untrusted(result)).replace(
         AUDIT_RESULT_FENCE_END, "<<<END_STEP_RESULT (quoted)>>>").replace(
         AUDIT_RESULT_FENCE, "<<<STEP_RESULT (quoted)>>>")
     task = (
@@ -7131,10 +7415,9 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     finally:
         if _active_budget is not None:
             _active_budget.credit_idle(time.monotonic() - started)
-    verdict = _VERDICT_RE.search(answer or "")
-    if verdict is None:
+    status = _parse_audit_verdict(answer)
+    if status is None:
         return "", f"audit inconclusive — no verdict returned ({(answer or '')[:120]})"
-    status = verdict.group(1).lower()
     if status == "fail":
         return f"{tool_name} failed verification", answer.strip()[:300]
     # A pass used to return nothing at all. The auditor ran, read the file and
@@ -7165,6 +7448,65 @@ def _audit_applies(tool_name: str, tool_args: dict, depth: int) -> bool:
     return _plan_step_is_auditable(tool_name, "", tool_args)
 
 
+def _readback_matches(name: str, args: dict) -> bool:
+    """True when a whole-file write_file is on disk exactly as written."""
+    if name != "write_file" or str(args.get("mode") or "overwrite").lower() != "overwrite":
+        return False
+    if args.get("source_url") or "content" not in args:
+        return False
+    try:
+        target = resolve_write_path(str(args.get("filename") or ""))
+        return target.read_text(encoding="utf-8", errors="strict") == _structured_text_argument(args["content"])
+    except (ValueError, OSError, UnicodeError):
+        return False
+
+
+def _audit_is_redundant(tool_name: str, tool_args: dict, result: str,
+                        acceptance: str = "") -> bool:
+    """Issue 13: a test run already is the check, so auditing it buys nothing.
+
+    run_tests and a recognised test-runner command whose output carries a pass
+    or fail verdict are evidence in their own right; sending them to a six-turn
+    auditor repeats the work and can dominate the task budget.
+
+    Three things keep the audit: output with no verdict, which establishes
+    nothing; a step whose author named acceptance criteria, which asks for a
+    judgement the runner cannot make; and a command that also runs a program of
+    its own, which is not a bare test run.
+    """
+    if acceptance:
+        return False
+    if tool_name == "run_tests":
+        runner = True
+    elif tool_name == "execute_shell":
+        # Strictly standalone: `python fix.py && pytest` runs a program that may
+        # have written files, and that part still deserves an auditor.
+        runner = _standalone_test_command(str((tool_args or {}).get("command", "")))
+    else:
+        return False
+    return runner and tool_output.detect_verdict(result).status in ("passed", "failed")
+
+
+def _take_audit_verdict():
+    global _last_audit_verdict
+    verdict, _last_audit_verdict = _last_audit_verdict, None
+    return verdict
+
+
+def _audit_with_confirmation(*args, **kwargs):
+    """Use the same rollback confirmation for direct calls and plan steps."""
+    reason, note = _audit_plan_step(*args, **kwargs)
+    if reason and PLAN_AUDIT_CONFIRM_FAIL:
+        second_reason, second_note = _audit_plan_step(*args, **kwargs)
+        if not second_reason:
+            return "", (f"{AUDIT_UNKNOWN_NOTE} - auditors disagreed or the second run "
+                        f"could not confirm the failure ({note.strip()[:160]}; "
+                        f"{second_note.strip()[:160]}). The change was left in "
+                        "place: check it yourself before building on it.")
+        note = f"{note} (confirmed by a second auditor: {second_note.strip()[:160]})"
+    return reason, note
+
+
 def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
                      depth: int, snapshot) -> str:
     """Verify one top-level mutation and put a failed write back.
@@ -7173,13 +7515,22 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     list to halt here, so the equivalent is to hand the model a result it cannot
     read as success and to say plainly that nothing later should be built on top
     of it. Only a `fail` undoes anything —
-    an auditor that could not reach its model must not be able to destroy work.
+    an auditor that could not reach its model must not be able to destroy work —
+    and with plan_audit_confirm_fail on, only a fail a second auditor agreed with.
     """
+    global _last_audit_verdict
     step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
     plan_context = _plan_approved_text[:1500] if _plan_approved else ""
-    reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
-                                    plan_context=plan_context)
+    # A whole-file write can be checked by reading it back: no model call, no
+    # chance of a wrong "fail" from a model that saw only 500 characters.
+    if _readback_matches(tool_name, tool_args):
+        _last_audit_verdict = "passed"
+        return f"{result}\naudit: {AUDIT_PASSED_NOTE} - the file on disk matches what was written"
+    reason, note = _audit_with_confirmation(step_text, tool_name, tool_args, result, depth,
+                                           plan_context=plan_context)
     parts = [result]
+    _last_audit_verdict = ("failed" if reason
+                           else "passed" if note.startswith(AUDIT_PASSED_NOTE) else "unknown")
     if note:
         parts.append(f"audit: {note}")
     if reason:
@@ -7188,6 +7539,10 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
         elif PLAN_AUDIT_REVERT and TOOL_SPECS.get(tool_name, {}).get("mode") != "write_text":
             parts.append(f"not reverted — {tool_name} has no undo; "
                          "inspect the effect by hand")
+        elif PLAN_AUDIT_REVERT:
+            parts.append(f"NOT REVERTED — no snapshot of {tool_name}'s target was taken "
+                         "(file too large, or its path could not be resolved); the bad "
+                         "change is still on disk, inspect it by hand")
         parts.append(f"Error: verification failed — {reason}. Stop the current work and "
                      "report what actually happened; do not assume any later action is "
                      "safe to run.")
@@ -7344,6 +7699,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
             result = f"Error: {exc}"
+        if will_audit and _audit_is_redundant(tool_name, tool_args, result, acceptance):
+            will_audit = False
         _remember_escalation(tool_name, tool_args, result)
         # Unwrapped: shell results arrive inside the untrusted-content markers, so
         # matching the raw string meant a shell step in a plan never offered the
@@ -7368,8 +7725,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             halted, stopped_at = f"{tool_name} did not complete", idx
             break
         if will_audit:
-            reason, note = _audit_plan_step(step_text, tool_name, tool_args, result,
-                                            depth, acceptance, evidence)
+            reason, note = _audit_with_confirmation(step_text, tool_name, tool_args, result,
+                                                    depth, acceptance, evidence)
             if note:
                 outputs.append(f"[{idx}] audit: {note}")
             if reason:
@@ -7383,6 +7740,9 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
                 elif PLAN_AUDIT_REVERT and TOOL_SPECS[tool_name].get("mode") != "write_text":
                     outputs.append(f"[{idx}] not reverted — {tool_name} has no undo; "
                                    "inspect the effect by hand")
+                elif PLAN_AUDIT_REVERT:
+                    outputs.append(f"[{idx}] NOT REVERTED — no snapshot was available; "
+                                   "the change is still on disk, inspect it by hand")
                 halted, stopped_at = reason, idx
                 break
     _plan_execution_grant = False  # clear temporary grant — back to plan-only
@@ -7796,6 +8156,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
     files_before = list(_TURN_FILES_TOUCHED)
+    write_log_start = len(_WRITE_LOG)
     messages = history if history is not None else []
     messages.append(_delegated_turn(task, from_user))
     # A task the person typed is its own authority. One the parent model wrote
@@ -7845,7 +8206,8 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     if reason and reason.startswith("Time budget") and "Time budget exceeded" in str(answer):
         answer = _subagent_time_limit_report(
             type_name, child_budget.max_seconds, answer,
-            [path for path in _TURN_FILES_TOUCHED if path not in files_before])
+            list(dict.fromkeys([path for path in _TURN_FILES_TOUCHED if path not in files_before]
+                                + _WRITE_LOG[write_log_start:])))
     answer = _cap_subagent_answer(answer)
     if model_warning:
         answer = f"[note: {model_warning}]\n\n{answer}"
@@ -10513,7 +10875,8 @@ def _run_sandbox_command(command: str, timeout: int = 25,
         workspace = Path(temporary.name)
         shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns(
-                            ".env*", "*.pem", "*.key", "*.p12", "__pycache__"))
+                            ".env*", "*.pem", "*.key", "*.p12", "__pycache__",
+                            "node_modules", ".venv", "venv", ".git", "dist", "build"))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
     try:
         return _explain_sandbox_denial(
@@ -10846,6 +11209,70 @@ def _short_repr(value) -> str:
     return text if len(text) <= 40 else text[:37] + "..."
 
 
+_TEXT_ONLY_ARGS = frozenset({
+    "filename", "command", "query", "url", "path", "directory", "pattern", "old_string",
+    "new_string", "code", "action", "agent_type", "image", "task"})
+_JSON_TYPE_TO_ARG = {"string": "string", "integer": "integer", "number": "number",
+                     "boolean": "boolean", "array": "array", "object": "object"}
+
+
+def _schema_arg_problem(key, value, declared) -> str:
+    if not isinstance(declared, dict):
+        return ""
+    for keyword in ("anyOf", "oneOf"):
+        alternatives = declared.get(keyword)
+        if isinstance(alternatives, list) and alternatives:
+            problems = [_schema_arg_problem(key, value, part) for part in alternatives]
+            return "" if any(not problem for problem in problems) else problems[0]
+    kind = declared.get("type")
+    kinds = kind if isinstance(kind, list) else [kind]
+    kinds = [item for item in kinds if isinstance(item, str)]
+    if not kinds:
+        return ""  # refs, enums and unspecified types remain the server's job
+    problems = []
+    for expected in kinds:
+        if value is None:
+            problem = "must not be null" if expected != "null" else ""
+        elif expected == "null":
+            problem = "must be null"
+        elif expected == "string":
+            problem = f"must be text, got {_short_repr(value)}" if isinstance(value, (list, dict)) else ""
+        elif expected in _JSON_TYPE_TO_ARG:
+            problem = _arg_type_problem(key, value, expected)
+        else:
+            return ""  # do not reject a future/unknown schema type
+        if not problem:
+            return ""
+        problems.append(problem)
+    return problems[0]
+
+
+def _validate_against_schema(name: str, schema, args: dict) -> str:
+    """Check an MCP (or other schema-carrying) tool call against its published JSON
+    schema: required fields present, and no clear type mismatch. Lenient where
+    models are routinely sloppy and servers coerce (numbers as text)."""
+    if not isinstance(schema, dict) or not isinstance(args, dict):
+        return ""
+    properties = schema.get("properties") or {}
+    if not isinstance(properties, dict):
+        return ""
+    problems = [f"'{key}' is required" for key in (schema.get("required") or [])
+                if key not in args]
+    for key, value in args.items():
+        declared = properties.get(key)
+        if not isinstance(declared, dict) or str(key).startswith("_"):
+            continue
+        problem = _schema_arg_problem(key, value, declared)
+        if problem:
+            problems.append(f"'{key}' {problem}")
+    if not problems:
+        return ""
+    names = ", ".join(properties) or "(none)"
+    return (f"Error: '{name}' called with invalid arguments: {'; '.join(problems)}. "
+            f"Its arguments are: {names}. Correct the call and send it again; "
+            "do not repeat it unchanged.")
+
+
 def _validate_tool_args(name: str, spec: dict, args: dict) -> str:
     """Check a built-in tool call against its declared arguments.
 
@@ -10860,7 +11287,9 @@ def _validate_tool_args(name: str, spec: dict, args: dict) -> str:
     declare no arguments, and for the internal keys the harness itself passes.
     """
     declared = list(spec.get("args") or [])
-    if not declared or "parameters" in spec or spec.get("mode") == "mcp":
+    if "parameters" in spec or spec.get("mode") == "mcp":
+        return _validate_against_schema(name, spec.get("parameters"), args)
+    if not declared:
         return ""
     allowed = _tolerated_args(name, spec)
     problems = []
@@ -10876,6 +11305,12 @@ def _validate_tool_args(name: str, spec: dict, args: dict) -> str:
             problem = _arg_type_problem(param, args[param], expected)
             if problem:
                 problems.append(f"'{param}' {problem}")
+    for param in declared:
+        # Every other argument is text. Only plainly textual ones are checked, so a
+        # tool that takes a list or object under an untyped name is never refused.
+        if (param in _TEXT_ONLY_ARGS and param not in (spec.get("arg_types") or {})
+                and isinstance(args.get(param), (list, dict))):
+            problems.append(f"'{param}' must be text, got {_short_repr(args[param])}")
     if not problems:
         return ""
     return (f"Error: '{name}' called with invalid arguments: {'; '.join(problems)}. "
@@ -12402,6 +12837,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # looking current.
         note_mutation(f"write {target}")
         target_str = str(target)
+        if target_str:
+            _WRITE_LOG.append(target_str)
         if target_str and target_str not in _TURN_FILES_TOUCHED:
             _TURN_FILES_TOUCHED.append(target_str)
 
@@ -12461,7 +12898,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
             return app_check.check_target(
-                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path).text()
+                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+                run=_smoke_script_runner(read_target)).text()
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()
@@ -13116,12 +13554,10 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    # A passing test command already supplies verification evidence. Auditing
+    # A test run already supplies verification evidence, pass or fail. Auditing
     # that evidence with another agent repeats the check and can dominate the
     # task budget. Writes bundled with a test still need their usual audit.
-    test_evidence = (name == "execute_shell"
-                     and _standalone_test_command(args.get("command", ""))
-                     and tool_output.detect_verdict(result).status == "passed")
+    test_evidence = _audit_is_redundant(name, args, result)
     if (will_audit and not test_evidence
             and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
@@ -13801,6 +14237,9 @@ memory_capture_thread = None
 # a subagent's writes are still work the outer turn accomplished, so they
 # accumulate here too rather than being invisible to the memory it captures.
 _TURN_FILES_TOUCHED: list = []
+# Every write in order, repeats included. _TURN_FILES_TOUCHED lists each file once,
+# so a file the parent wrote earlier and a sub-agent then changed looked untouched.
+_WRITE_LOG: list = []
 
 
 def _memory_extract_completion(prompt: str):
@@ -15911,6 +16350,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         global memory_capture_thread, _TURN_FILES_TOUCHED
         memory_capture_thread = None
         _TURN_FILES_TOUCHED = []
+        _WRITE_LOG.clear()
         # Paint before recall, not after. Recall does a network round trip, and
         # the loop's own first spin("thinking...") is on the far side of it --
         # so without this the terminal stays blank for the whole call and the
@@ -16956,6 +17396,32 @@ _CHANGE_REQUEST = re.compile(
     r"install|develop|code|produce)\b", re.IGNORECASE)
 
 
+def _smoke_script_runner(target):
+    """A runner that starts a script in the read-only sandbox, or None.
+
+    Only scripts inside the sandbox workspace qualify: that is the one place the
+    sandboxed shell can see them, and the run happens on a disposable read-only
+    copy, so a script cannot change the project by being started.
+    """
+    try:
+        inside = ARTIFACTS_ROOT in Path(target).resolve().parents
+    except OSError:
+        inside = False
+    if not inside or _resolve_sandbox_backend() == "unavailable":
+        return None
+
+    def run(command: str, timeout: int) -> str:
+        global _sandbox_readonly
+        previous, _sandbox_readonly = _sandbox_readonly, True
+        try:
+            relative = Path(target).resolve().parent.relative_to(ARTIFACTS_ROOT)
+            prefix = f"cd {shlex.quote(relative.as_posix())} && " if str(relative) != "." else ""
+            return _run_sandbox_command(prefix + command, timeout)
+        finally:
+            _sandbox_readonly = previous
+    return run
+
+
 def _smoke_test_step(trajectory, written: list):
     """Smoke-test the pages and scripts this run wrote, once per state of the work.
 
@@ -16969,7 +17435,8 @@ def _smoke_test_step(trajectory, written: list):
     for target in targets:
         if str(target) not in pending:
             continue
-        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path)
+        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+                                        run=_smoke_script_runner(target))
         if report.status == app_check.SKIPPED:
             continue
         trajectory.record_smoke(str(target), report.summary(), report.failed)
@@ -17003,7 +17470,9 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
     written = trajectory.written_paths()
     nudge = None
     if depth == 0 and completion_checks.admits_unfinished_work(reply):
-        promised = bool(_CHANGE_REQUEST.search(request)) and not trajectory.mutation_count()
+        promised = (bool(_CHANGE_REQUEST.search(request))
+                    and not completion_checks.is_advice_request(request)
+                    and not trajectory.mutation_count())
         if trajectory.has_open_items() or promised:
             nudge = completion_checks.Nudge(
                 "unfinished",
@@ -17034,9 +17503,11 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         nudge = completion_checks.Nudge(
             "verify",
             completion_checks.continue_text(
-                "Changed work has no fresh verification evidence.", completion_checks.VERIFY_ASK),
+                "Changed work has no fresh verification evidence.",
+                completion_checks.verify_ask(
+                    trajectory.written_paths(), completion_checks.project_has_tests(PROJECT_ROOT))),
             unmet="changed work has no passing check")
-    if nudge is None and not DISPOSABLE_CONTAINER:
+    if nudge is None and not DISPOSABLE_CONTAINER and not trajectory.smoke_failures():
         temp_dir, project = tempfile.gettempdir(), str(PROJECT_ROOT)
         # The system temp dir is scratch space, unless the project itself lives there.
         relevant = lambda path: completion_checks.is_library_code(path, temp_dir, project)
@@ -17049,6 +17520,16 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         return nudge
     trajectory.note_unmet(budget.unmet)
     return None
+
+
+def _write_target_existed(name: str, args: dict) -> bool:
+    """Whether a file-writing call is about to change a file that already exists."""
+    if name not in ("write_file", "edit_file") or not isinstance(args, dict):
+        return False
+    try:
+        return resolve_write_path(str(args.get("filename") or "")).is_file()
+    except (ValueError, OSError):
+        return False
 
 
 def _with_task_notes(answer: str, trajectory) -> str:
@@ -17065,6 +17546,13 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and (open_parts := trajectory.open_subgoals()):
+        notes.append("Not completed: " + "; ".join(open_parts[:6])
+                     + ("; ..." if len(open_parts) > 6 else ""))
+    if trajectory is not None and (edited := trajectory.edited_existing_tests()):
+        listed = ", ".join(Path(p).name for p in edited[:5])
+        notes.append(f"Test-integrity note: existing test file(s) were changed this run ({listed}). "
+                     "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
         notes.append(CHECKS_FAILED_NOTE)
     if location_note := _workspace_note(trajectory):
@@ -18058,6 +18546,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if on_tool:
                 on_tool(name)
             operation = None
+            existed_before = _write_target_existed(name, args)
             mutation_seq_before = _MUTATION_SEQ
             if trajectory is not None:
                 operation = trajectory.before_tool(name)
@@ -18067,6 +18556,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # is the next beat, not a repeat of it.
             spin_msg = "Fetching results…" if name == "web_search" else f"running {name}..."
             cap_seq_before = _MUTATION_SEQ
+            _take_audit_verdict()
             with spin(spin_msg):
                 result = exec_tool(name, json.dumps(args), depth=depth)
             for event in _drain_trace_events():
@@ -18081,9 +18571,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # confirmed the write, that IS the fresh evidence the turn was
                 # waiting for, so say so rather than letting the summary fall
                 # through to "no automated verification passed".
-                status = verdict.status
-                if f"audit: {AUDIT_PASSED_NOTE}" in result:
+                status = _evidence_status(name, args, result, verdict.status, verdict.source)
+                audit_verdict = _take_audit_verdict()
+                if audit_verdict == "passed":
                     status = "passed"
+                elif audit_verdict == "failed":
+                    status = "failed"
                 mutated = _MUTATION_SEQ != mutation_seq_before
                 if mutated and _runs_changed_program(name, args, result, trajectory):
                     # Running the code this run just changed is how it gets
@@ -18091,7 +18584,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                 trajectory.after_tool(
-                    operation, result, failed=_plan_step_failed(result),
+                    operation, result,
+                    failed=_plan_step_failed(result) or audit_verdict == "failed",
                     blocked=result.startswith("ESCALATION_REQUEST\x1f"),
                     mutated=mutated, verdict=status,
                     # Every write tool in tools.txt uses 'filename' as its
@@ -18099,6 +18593,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
                     command=str(args.get("command") or ""),
+                    existed=existed_before,
                 )
                 if on_trajectory_state:
                     on_trajectory_state()

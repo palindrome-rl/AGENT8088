@@ -192,3 +192,10 @@ def test_without_a_verdict_the_turn_still_admits_it_is_unverified():
                        mutated=True, verdict="unknown")
 
     assert tracker.needs_verification()
+
+
+@pytest.fixture(autouse=True)
+def _model_audit_runs(engine, monkeypatch):
+    """These tests exercise the model auditor; the read-back shortcut for an
+    ordinary write_file would answer first (see test_auditor_robustness)."""
+    monkeypatch.setattr(engine, "_readback_matches", lambda *a, **k: False)
