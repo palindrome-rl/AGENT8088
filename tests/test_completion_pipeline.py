@@ -59,8 +59,9 @@ def failing_then_ok(results):
             import agent8088.engine as engine_module
             engine_module.note_mutation(name)
             args = json.loads(arguments)
-            path = Path(args["filename"])
-            path = path if path.is_absolute() else engine_module.ARTIFACTS_ROOT / path
+            # Match the real write contract: explicitly requested filenames
+            # belong at the project root; unspecified files use artifacts/.
+            path = engine_module.resolve_write_path(args["filename"])
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(args.get("content", ""), encoding="utf-8")
         return results.pop(0) if results else "ok"

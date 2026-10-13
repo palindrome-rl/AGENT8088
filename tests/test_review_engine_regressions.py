@@ -79,6 +79,23 @@ def test_new_invalid_python_test_is_refused_even_without_cleanup(engine, monkeyp
     assert not target.exists()
 
 
+@pytest.mark.parametrize("content", [
+    "<think>\nunfinished reasoning", "<think>only reasoning</think>\n",
+])
+def test_reasoning_without_code_does_not_erase_existing_tests(engine, monkeypatch,
+                                                            tmp_path, content):
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ARTIFACTS_ROOT", tmp_path / "artifacts")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
+    target = tmp_path / "tests" / "test_existing.py"
+    target.parent.mkdir()
+    original = "def test_existing():\n    assert True\n"
+    target.write_text(original, encoding="utf-8")
+    result = engine.run_tool("write_file", {"filename": str(target), "content": content})
+    assert "NOT written" in result
+    assert target.read_text(encoding="utf-8") == original
+
+
 def test_rewrite_limit_uses_resolved_target_aliases(engine, monkeypatch, tmp_path):
     writes = []
     responses = iter(("repo/../repo/Script.py", "repo/Script.py", None))

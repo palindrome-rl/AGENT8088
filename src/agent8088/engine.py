@@ -12805,7 +12805,7 @@ def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tu
     candidate = _REASONING_PAIR_RE.sub("", text, count=1)
     if fences:
         candidate = _strip_code_fences(candidate)
-    if candidate != text and not _python_syntax_error(candidate):
+    if candidate.strip() and candidate != text and not _python_syntax_error(candidate):
         if (not candidate.endswith("\n") and
                 (text.endswith("\n") or re.search(r"\r?\n```[ \t]*$", text))):
             candidate += "\n"
@@ -12832,6 +12832,11 @@ def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tu
                 break
     if fences:
         cleaned = _strip_code_fences(cleaned)
+    if text.strip() and not cleaned.strip():
+        # A reasoning-only response contains no replacement code. Retain the
+        # invalid input so the test-file guard refuses it rather than erasing
+        # an existing test. An explicit empty content argument remains valid.
+        return text, False
     if cleaned != text and not cleaned.endswith("\n") and text.endswith("\n"):
         cleaned += "\n"
     return cleaned, cleaned != text
