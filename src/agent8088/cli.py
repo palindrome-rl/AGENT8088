@@ -34,6 +34,10 @@ try:
     import termios, tty
 except ImportError:  # not available on Windows
     termios = tty = None
+try:
+    import msvcrt
+except ImportError:  # Windows only
+    msvcrt = None
 
 from rich.console import Console, Group
 from rich.panel import Panel
@@ -96,20 +100,25 @@ class EscListener:
     Only does anything on a real, interactive tty; on any other stdin it's a no-op so
     piped/non-terminal runs behave exactly as before. `triggered` is a threading.Event
     that gets set the moment ESC is seen.
+
+    Windows has no termios: msvcrt polls the console there instead, with no mode
+    switch, because getch() reads key events whatever mode the console is in.
     """
     def __init__(self):
         self.triggered = threading.Event()
         self._stop = threading.Event()
         self._thread = None
         self._old_settings = None
-        self._active = termios is not None and sys.stdin.isatty()
+        self._active = ((termios is not None or msvcrt is not None)
+                        and sys.stdin is not None and sys.stdin.isatty())
 
     def __enter__(self):
         if not self._active:
             return self
         try:
-            self._old_settings = termios.tcgetattr(sys.stdin.fileno())
-            tty.setcbreak(sys.stdin.fileno())
+            if termios is not None:
+                self._old_settings = termios.tcgetattr(sys.stdin.fileno())
+                tty.setcbreak(sys.stdin.fileno())
         except Exception:
             self._active = False
             return self
@@ -118,6 +127,8 @@ class EscListener:
         return self
 
     def _watch(self):
+        if termios is None:
+            return self._watch_console()
         fd = sys.stdin.fileno()
         while not self._stop.is_set():
             ready, _, _ = select.select([fd], [], [], 0.05)
@@ -132,6 +143,22 @@ class EscListener:
                 self.triggered.set()
                 return
 
+    def _watch_console(self):
+        while not self._stop.is_set():
+            if not msvcrt.kbhit():
+                self._stop.wait(0.05)
+                continue
+            ch = msvcrt.getch()
+            if ch == b"\x1b":
+                self.triggered.set()
+                return
+            # Arrow and function keys arrive as two bytes, b"\xe0" or b"\x00" and
+            # then a code, and the code can be ESC (Alt+] is b"\x00\x1b"). Read it
+            # now so it is never taken for a key of its own. kbhit() already sees
+            # the pending half, so a lone b"\xe0" typed as a character can't block.
+            if ch in (b"\x00", b"\xe0") and msvcrt.kbhit():
+                msvcrt.getch()
+
     def __exit__(self, *exc):
         if not self._active:
             return False
@@ -139,7 +166,8 @@ class EscListener:
         if self._thread:
             self._thread.join(timeout=0.2)
         try:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
+            if termios is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
         except Exception:
             pass
         return False
@@ -165,15 +193,17 @@ class EscListener:
             self._thread.join(timeout=0.2)
             self._thread = None
         try:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
+            if termios is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_settings)
         except Exception:
             pass
         try:
             yield
         finally:
             try:
-                self._old_settings = termios.tcgetattr(sys.stdin.fileno())
-                tty.setcbreak(sys.stdin.fileno())
+                if termios is not None:
+                    self._old_settings = termios.tcgetattr(sys.stdin.fileno())
+                    tty.setcbreak(sys.stdin.fileno())
             except Exception:
                 # Terminal is gone (prompt closed the tty, or stdin was
                 # replaced). Stay inactive rather than half-owning stdin.
@@ -2433,7 +2463,8 @@ def do_chat(query):
             if msg.startswith("thinking"):
                 flush_reasoning()
                 stream.reset()
-            live.update(_StatusLine(msg, turn_start, tokens_ref, interruptible=msg.startswith("thinking")))
+            live.update(_StatusLine(msg, turn_start, tokens_ref,
+                                    interruptible=esc._active and msg.startswith("thinking")))
             return nullcontext()
 
         def on_token(kind, delta):
@@ -2443,7 +2474,7 @@ def do_chat(query):
                 # system prompt / internal state, so showing it raw is a leak. Keep
                 # the animated status line instead. `/reasoning on` reveals it (masked).
                 if not S.show_reasoning:
-                    live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=True))
+                    live.update(_StatusLine("thinking", turn_start, tokens_ref, interruptible=esc._active))
                     return
                 reasoning_parts.append(delta)
                 live.update(_stream_view(reasoning_parts, stream.prose_text()))
@@ -2452,7 +2483,7 @@ def do_chat(query):
             # status line naming what is being composed, rather than echoing JSON.
             if stream.feed(delta):
                 live.update(_StatusLine(stream.status_label(), turn_start, tokens_ref,
-                                        interruptible=True))
+                                        interruptible=esc._active))
             else:
                 live.update(_stream_view(reasoning_parts, stream.prose_text()))
 
@@ -2460,7 +2491,7 @@ def do_chat(query):
             # Retry / fallback notices: in the status line while it waits, and
             # one dim line above it so the reason survives the transient Live.
             console.print(Text(f"  ↻ {message}", style="dim"))
-            live.update(_StatusLine(message, turn_start, tokens_ref, interruptible=True))
+            live.update(_StatusLine(message, turn_start, tokens_ref, interruptible=esc._active))
 
         def on_stream_reset():
             # A reply that broke off mid-stream is being retried. The live
@@ -2468,7 +2499,7 @@ def do_chat(query):
             # fragment instead of leaving it glued in front of the retry.
             stream.reset()
             reasoning_parts.clear()
-            live.update(_StatusLine("reconnecting", turn_start, tokens_ref, interruptible=True))
+            live.update(_StatusLine("reconnecting", turn_start, tokens_ref, interruptible=esc._active))
 
         # Let sub-agents render their own nested, animated activity in this Live.
         A.subagent_ui = _make_subagent_ui(live)
@@ -2535,7 +2566,7 @@ def do_chat(query):
         # Show the animated status line now, not when the engine first reports it:
         # recall and routing run before the model call, and the screen was blank
         # for that whole stretch.
-        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=True))
+        live.update(_StatusLine("thinking...", turn_start, tokens_ref, interruptible=esc._active))
         try:
             answer = A.run_agent(
                 S.messages, max_turns=_turn_max_turns(A.PERMISSION_MODE),

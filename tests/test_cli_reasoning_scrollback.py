@@ -23,6 +23,8 @@ def session(monkeypatch):
 
 
 class _Esc:
+    _active = False
+
     def __init__(self):
         import threading
         self.triggered = threading.Event()
