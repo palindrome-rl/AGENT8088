@@ -36,9 +36,10 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | Tool | Mode | Args | readonly? | What it does |
 |---|---|---|---|---|
 | `read_text` | `read_text` | `filename`, `offset`*, `limit`* | ✅ | Read a file. Extracts `.docx`/`.xlsx`/`.pptx`/`.pdf` to text. Paginated. Refuses credential files. |
-| `write_file` | `write_text` | `filename`, `content`*, `source_url`* | prompt | Write a file, or fetch and save binary/remote content from a URL. Path-zone + sensitive + shell-rc checked. |
+| `write_file` | `write_text` | `filename`, `content`*, `source_url`*, `mode`* | prompt | Write a file, or fetch and save binary/remote content from a URL. `mode` is `overwrite` (default) or `append`; a long file is written as a first part plus appended parts. Path-zone + sensitive + shell-rc checked. |
 | `edit_file` | `write_text` | `filename`, `old_string`, `new_string`* | prompt | Exact-replacement edit of one matching place; refuses an ambiguous match and writes nothing. Empty `new_string` deletes it. |
 | `read_content` | `last_output` | `ref`, `offset`*, `length`* | ✅ | Read a window from a session-scoped content ref, without re-reading the source. |
+| `check_app` | `read_text` | `path` | ✅ | Smoke-test a web page or script (see below). Same read gate as `read_text`. |
 | `document_read` | `read_text` | `filename`, `action`*, `cursor`*, `query`*, `version`* | ✅ | Cached document extraction with lossless cursors: `overview`, `search`, `read`, `process` (whole-document synthesis outside the turn loop). Never obeys instructions in documents. |
 | `repository_read` | `read_text` | `source`, `action`*, `path`*, `query`*, `cursor`*, `snapshot_id`*, `include`*, `exclude`*, `revision`* | ✅ | Survey a local directory or an HTTPS github.com repo: `overview`, `search`, `read`. Remote defaults to root files only and needs permission. Untrusted evidence. |
 | `repo_map` | `repomap` | `focus`*, `budget`*, `detail_level`* | ✅ | Outline the repository's most depended-on classes and functions, ranked by dependents. Definition lines only. |
@@ -170,6 +171,33 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `calc`, `eval`, `math` | `calculate` |
 | `last`, `prev_output` | `last_output` |
 
+## `check_app`
+
+A deterministic smoke test of something the agent built; no model call.
+
+- **Web page** (`.html`, or a folder with `index.html`): loaded in headless
+  Chromium from a throwaway static server on `127.0.0.1` that serves only the
+  page's own folder (no folder listings, no credential files, GET only). Every
+  request to another host is aborted, so page code cannot reach the network; the
+  SSRF rules and `browse_page` gating are not involved or loosened.
+- **Fails on:** an uncaught page error, a console error from the page's own code,
+  an own file that is missing or fails to load, a first control that an overlay
+  covers, and a first control whose click changes nothing (HTML, address, title,
+  canvas pixels and form values are compared).
+- **Only warns on:** blocked requests to external hosts (hotlinked fonts, images,
+  CDN scripts) and a page with no control to click.
+- **Script** (`.py`, `.js`/`.mjs`/`.cjs`): syntax-checked (`compile`, `node
+  --check`); never executed.
+- Without Chromium (`playwright install chromium`) it reports "unavailable"
+  instead of failing the task.
+
+It also runs automatically on the pages and scripts a run wrote, just before the
+reply is accepted (see [completion checks](11-architecture.md#completion-checks)),
+once per state of the work. `completion_smoke_test` chooses what happens with a
+failure: `report` (default) puts it in the answer's notes and never blocks,
+`enforce` also sends the model back to fix it (at most
+`completion_smoke_max_failures` times a request), `off` skips it.
+
 ## Argument transforms
 
 Some plausible-but-wrong shapes are rewritten rather than rejected — e.g.
@@ -177,7 +205,33 @@ Some plausible-but-wrong shapes are rewritten rather than rejected — e.g.
 the agent recovers instead of looping when the model invents a tool that
 *sounds* right.
 
-## Tool modes explained
+## Argument checking
+
+A built-in tool's arguments are checked against its declared schema before it
+runs. A name the tool does not have (`write_file(text=...)`) is refused with a
+"did you mean" suggestion, and so is a value of the wrong kind (a list for an
+integer). The refusal is handled as a malformed call: the model is told what to
+fix and retries without it counting as a failed step. Left alone on purpose: the
+path aliases (`file`, `file_path`, `filepath`, `path`), `execute_shell`'s
+`timeout`, the sub-agent and plan spellings those tools have always taken,
+prose fields such as `description` or `reason` (dropped), numbers sent as text,
+and JSON strings standing in for a list or object. MCP tools carry their own
+schema and are not checked here.
+
+## Writing a long file
+
+`write_file` takes `mode`: `overwrite` (default) or `append`. A long file is
+written as a first part (default mode) followed by parts with `mode="append"`,
+in order, about 4-6 KB each. Large single calls are where argument JSON fails
+to parse or the reply is cut off at the output limit; the error messages for
+both point here.
+
+Parts of one file are treated as one write: they count once toward
+`max_writes_per_turn` (every byte counts toward `max_write_bytes`), and with
+`/audit on` the file is audited once, at the next call that is not another part
+of it or when the model finishes, and a failed audit restores the file as it was
+before the first part.
+
 
 `mode` is the contract between a tool and the permission layer. Adding a tool to
 `tools.txt` with an existing mode inherits that mode's gating automatically.
