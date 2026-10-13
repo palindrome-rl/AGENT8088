@@ -60,6 +60,7 @@ def test_streamed_gateway_errors_are_retryable_whichever_attribute_carries_the_c
 def test_client_errors_stay_non_retryable(engine):
     assert not engine._retryable_model_error(Failure(400, "bad request: connection timeout in body"))
     assert not engine._retryable_model_error(Failure(400, "bad request", attr="code"))
+    assert not engine._retryable_model_error(Failure(401, "repetition detected"))
 
 
 def test_stall_detection(engine):
@@ -123,6 +124,135 @@ def test_repetition_stop_is_retried_once_with_thinking_reduced(call):
 def test_identical_stall_then_success_reduces_thinking_for_the_retry(call):
     call([Failure(504, "Provider idle timeout"), _response()])
     assert call.seen == [None, "length_retry"]
+
+
+@pytest.mark.parametrize("message", ["model is repeating the same chunk", "repetition detected"])
+def test_repetition_without_numeric_code_retries_with_reduced_thinking(call, message):
+    result = call([Failure(None, message, attr="code"), _response()])
+    assert result.choices[0].message.content == "ok"
+    assert call.seen == [None, "length_retry"]
+
+
+def test_litellm_stall_changes_the_real_completion_arguments(engine, monkeypatch):
+    import sys
+    requests = []
+
+    def completion(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            raise Failure(504, "idle timeout")
+        return _response()
+
+    monkeypatch.setitem(sys.modules, "litellm", N(completion=completion))
+    monkeypatch.setattr(engine, "MODEL_TELEMETRY_ENABLED", False)
+    monkeypatch.setattr(engine, "_fallback_targets", lambda: [])
+    monkeypatch.setattr(engine, "_interruptible_sleep", lambda *a, **k: None)
+    result = engine._create_completion_with_fallback(
+        [{"role": "user", "content": "hello"}], [], temperature=.1,
+        system_prompt="test", on_token=None, interrupt_check=lambda: False,
+        trace=None, turn=1, max_tokens=4096,
+        client_override={"api_mode": "litellm"}, provider_override="litellm",
+        model_override="openai/model")
+    assert result.choices[0].message.content == "ok"
+    assert "reasoning_effort" not in requests[0]
+    assert requests[1]["reasoning_effort"] == "none"
+
+
+def test_litellm_retry_keeps_custom_wire_fields(engine, monkeypatch):
+    import sys
+    requests = []
+    monkeypatch.setitem(sys.modules, "litellm", N(
+        completion=lambda **kwargs: requests.append(kwargs) or _response()))
+    monkeypatch.setitem(engine.PROVIDERS, "litellm", {
+        "length_retry_extra_body": '{"chat_template_kwargs":{"enable_thinking":false}}'})
+    engine._create_completion(
+        {"api_mode": "litellm"}, [{"role": "user", "content": "hello"}], [],
+        provider_name="litellm", model_name="openai/model", thinking="length_retry")
+    assert requests[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_litellm_rejected_retry_dial_is_removed_once(engine, monkeypatch):
+    import sys
+    requests = []
+
+    def completion(**kwargs):
+        requests.append(kwargs)
+        if len(requests) == 1:
+            raise Failure(400, "unsupported reasoning_effort")
+        return _response()
+
+    monkeypatch.setitem(sys.modules, "litellm", N(completion=completion))
+    result = engine._create_completion(
+        {"api_mode": "litellm"}, [{"role": "user", "content": "hello"}], [],
+        provider_name="litellm", model_name="openai/model", thinking="length_retry")
+    assert result.choices[0].message.content == "ok"
+    assert len(requests) == 2
+    assert requests[0]["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in requests[1]
+    assert "allowed_openai_params" not in requests[1]
+
+
+@pytest.mark.parametrize("adapter", ["openai", "litellm"])
+def test_stream_error_recovery_over_local_http(engine, monkeypatch, adapter):
+    """Exercise real SDK transports, not just mocked completion functions."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from openai import OpenAI
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            if len(requests) == 1:
+                chunks = [{"error": {"message": "upstream idle timeout", "code": "504"}}]
+            else:
+                chunks = [{"id": "local-test", "object": "chat.completion.chunk", "created": 0,
+                           "model": "review-test", "choices": [{"index": 0,
+                           "delta": {"role": "assistant", "content": "recovered"},
+                           "finish_reason": None}]},
+                          {"id": "local-test", "object": "chat.completion.chunk", "created": 0,
+                           "model": "review-test", "choices": [{"index": 0, "delta": {},
+                           "finish_reason": "stop"}]}]
+            payload = ("".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
+                       + "data: [DONE]\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}/v1"
+    client = (OpenAI(base_url=base, api_key="local-test", max_retries=0) if adapter == "openai"
+              else {"api_mode": "litellm", "api_base": base, "api_key": "local-test"})
+    monkeypatch.setattr(engine, "MODEL_TELEMETRY_ENABLED", False)
+    monkeypatch.setattr(engine, "_fallback_targets", lambda: [])
+    monkeypatch.setattr(engine, "_interruptible_sleep", lambda *a, **k: None)
+    try:
+        result = engine._create_completion_with_fallback(
+            [{"role": "user", "content": "hello"}], [], temperature=.1,
+            system_prompt="test", on_token=lambda *a: None,
+            interrupt_check=lambda: False, trace=None, turn=1, max_tokens=128,
+            client_override=client, provider_override=adapter,
+            model_override="review-test" if adapter == "openai" else "openai/review-test")
+        assert result.choices[0].message.content == "recovered"
+        assert len(requests) == 2
+        assert "reasoning_effort" not in requests[0]
+        assert requests[1]["reasoning_effort"] == "none"
+    finally:
+        if adapter == "openai":
+            client.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
 
 
 def test_non_stall_retryable_error_keeps_the_request_unchanged(call):

@@ -67,7 +67,12 @@ artifacts/*
 
 # Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
 # content, and specific to whichever machine/session created it.
-.claude/
+.claude/*
+# Shared, checked-in agent config: the branch-sync guard (see CLAUDE.md).
+!.claude/settings.json
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/sync-development/
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/

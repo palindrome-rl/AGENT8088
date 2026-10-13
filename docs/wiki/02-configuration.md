@@ -273,7 +273,7 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
-| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
+| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check or a successful test of changed work before the model is told to answer; a fresh summary is requested 2 rounds later. A write resets the count. Research and failed tests do not start it. `0` disables it. |
 | `initial_completion_cap` | `8192` | Ceiling for the completion-token cap of an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry (up to `write_output_cap`); plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
 | `adaptive_completion_cap` | `1` | With the ceiling above, cap an ordinary call at twice the median size of the last five normal replies (reasoning included), never below `main_llm_min_tokens` (4096). A runaway call then stops after a few minutes instead of the full ceiling. `0` keeps the fixed ceiling. |
 | `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
@@ -305,8 +305,8 @@ is a plausible accident that the permission gate does not catch. Both default to
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_writes_per_turn` | `0` | Files one request may write. |
-| `max_write_bytes` | `0` | Bytes a single write may contain. |
+| `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
@@ -360,6 +360,7 @@ where a silently half-done plan does damage.
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `subagent_max_seconds.<profile>` | Wall clock, in seconds, for one sub-agent profile. **Overrides the profile's `max_seconds`.** Without either, `subagent_timeout_seconds` (300) applies. |
 | `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
 
 ### Changing a limit without editing this file
