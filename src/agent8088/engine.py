@@ -13677,6 +13677,10 @@ def _resolve_author() -> str:
         return os.environ.get("USERNAME") or os.environ.get("USER") or ""
 
 
+def _memory_embedding_client():
+    return get_client(MEMORY_EMBED_PROVIDER)[0]
+
+
 def configure_memory() -> None:
     """Wire the memory package to this engine's config, client and redactor.
 
@@ -13686,7 +13690,7 @@ def configure_memory() -> None:
     try:
         memory.configure(
             config=APP_CONFIG,
-            client_factory=lambda: get_client(MEMORY_EMBED_PROVIDER)[0],
+            client_factory=_memory_embedding_client,
             embed_provider=MEMORY_EMBED_PROVIDER,
             completion=_memory_extract_completion,
             redact=_redact_secrets,
