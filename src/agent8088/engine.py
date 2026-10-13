@@ -529,6 +529,10 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
+# Whole-file rewrites of one path in a run: a corrective note from REWRITE_NUDGE_AFTER,
+# a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
+MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
+REWRITE_NUDGE_AFTER = 4
 # Follow-ups the completion checks may send in one request when a reply is empty,
 # admits unfinished work, leaves a named file missing, skips a part of a
 # multi-part request, or leaves changed work unverified. One budget for all of
@@ -4713,6 +4717,10 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
         '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
         "The name after ✿FUNCTION✿ must be exactly one schema name: no parentheses, "
         "arguments, or extra text. Put every argument only in the JSON object after ✿ARGS✿.",
+        "You may send several calls in one reply, one per line; they run in order and each "
+        "gets its own result. Batch independent reads, searches and checks together; send a "
+        "step that depends on an earlier result in the next reply. To fix a file, edit the "
+        "broken part rather than rewriting the whole file again.",
         "Use a tool ONLY when it helps complete the task. Not every message needs a tool — "
         "for greetings, small talk, opinions, general knowledge, or unclear/garbled input, "
         "just answer directly in plain text. Never mention your tools or their availability "
@@ -13401,7 +13409,6 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
             try:
                 calls.append({"name": resolved,
                               "arguments": _loads_tool_args(_scan_json_object(text, m.end()))})
-                break
             except Exception:
                 pass
     # 4) tool name followed by an inline {"command": "..."}
@@ -17097,6 +17104,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
@@ -17928,6 +17936,34 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
+            rewrite_note = ""
+            if (name == "write_file" and MAX_FILE_REWRITES and "__parse_error__" not in args
+                    and str(args.get("mode") or "overwrite").strip().lower() == "overwrite"
+                    and args.get("filename")):
+                rewrite_key = str(args["filename"])
+                rewrite_counts[rewrite_key] = rewrite_counts.get(rewrite_key, 0) + 1
+                rewrites = rewrite_counts[rewrite_key]
+                if rewrites > MAX_FILE_REWRITES:
+                    result = (f"Refused: {rewrite_key} has been rewritten {rewrites - 1} times "
+                              "in this run without settling. Stop rewriting the whole file. "
+                              "Read the latest failing output, make a targeted change with "
+                              "edit_file, or report what is still wrong.")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": result, "blocked": True})
+                    messages.append({"role": "user",
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "rewrite_limit", "path": rewrite_key})
+                    continue
+                if rewrites >= REWRITE_NUDGE_AFTER:
+                    rewrite_note = (f"\n{_HARNESS_PREFIX}{rewrite_key} has now been rewritten "
+                                    f"{rewrites} times. Rewriting the whole file again rarely "
+                                    "helps: read the failing output, then change only the broken "
+                                    "part with edit_file (or append the next chunk).")
             # The user may have hit ESC while this response was still streaming.
             # Without a check here the tool they just cancelled runs anyway, and
             # the interrupt is only noticed at the top of the next turn — after
@@ -18172,7 +18208,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   "trigger": "repeated_failure", "tool": name,
                                   "code": code, "outcome": status})
             messages.append({"role": "user", "content":
-                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
+                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}{rewrite_note}"})
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
