@@ -178,8 +178,10 @@ function wireSocket(ws: WebSocket) {
           interruptRequested = false
           if (wasInterrupted) pauseQueueIfPending()
         }
+        // There is one running turn across chats. A background completion must
+        // also clear any working state left by a history refresh of this view.
+        setStreaming(false)
         if (visible) {
-          setStreaming(false)
           resetStreaming()
         }
         // Clear the finished turn before starting the queued one. Otherwise
@@ -379,6 +381,10 @@ export async function syncSession(includeHistory = false) {
 
 /** Send one frame, or hold it in the outbox until the socket is back. */
 function sendFrame(msg: WSClientMessage): boolean {
+  if ((msg.type === 'chat' || msg.type === 'command') && !msg.session_id) {
+    // Capture the owner before a disconnected frame waits in the outbox.
+    msg = { ...msg, session_id: useSessionStore.getState().sessionId || undefined }
+  }
   if (msg.type === 'interrupt') {
     interruptRequested = true
     stopLocally()
