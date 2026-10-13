@@ -79,6 +79,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "written_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
+        "check_failing": False,
         "subgoals_built": False,
         "unmet_checks": [],
         "smoke_notes": [],
@@ -171,11 +172,12 @@ class TrajectoryState:
             if path not in written:
                 written.append(path)
                 del written[:-MAX_WRITTEN]
-        # The newest check decides: a pass, or a write that has not been
-        # re-checked yet, clears a failure; a failing run sets it.
-        if operation["verdict"] == "failed" and not mutated:
+        # Changing a file is not evidence that the failed check is fixed.
+        # Keep the failure visible until a subsequent check actually passes,
+        # including failures from checks that also modify the workspace.
+        if operation["verdict"] == "failed":
             self.data["check_failing"] = True
-        elif operation["verdict"] == "passed" or mutated:
+        elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
@@ -352,7 +354,7 @@ class TrajectoryState:
         return self.data.get("verification") == "pending"
 
     def check_failing(self) -> bool:
-        """True while the newest check failed and nothing has fixed it since."""
+        """True until a subsequent passing check resolves the latest failure."""
         return bool(self.data.get("check_failing"))
 
     def request_verification(self) -> bool:

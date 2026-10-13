@@ -9586,8 +9586,9 @@ def _run_prompt_file(path: str) -> int:
         _flush_memory_capture()
     # One machine-readable line for the harness (container/run-agent.sh): a
     # budget stop or a model failure otherwise ends like any answered run.
-    print(f"\n[agent8088] run ended: {_run_end_reason(S.last_trace)}", flush=True)
-    return 0
+    end_reason = _run_end_reason(S.last_trace)
+    print(f"\n[agent8088] run ended: {end_reason}", flush=True)
+    return 1 if end_reason == "checks_failed" else 0
 
 
 def _run_end_reason(steps):

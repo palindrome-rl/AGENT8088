@@ -86,3 +86,23 @@ def test_prompt_file_leaves_trace_off_by_default(cli, monkeypatch, tmp_path):
     rc, seen = _run(cli, monkeypatch, ["--prompt-file", str(prompt)])
     assert rc == 0 and seen == ["do the thing"]
     assert not trace_dir.exists()
+
+
+@pytest.mark.parametrize("incomplete, expected", [(True, 1), (False, 0)])
+def test_prompt_file_returns_failure_for_failed_checks(cli, monkeypatch, tmp_path,
+                                                     capsys, incomplete, expected):
+    prompt = tmp_path / "instruction.md"
+    prompt.write_text("Fix the failing checks", encoding="utf-8")
+    monkeypatch.setattr(cli.A, "DISPOSABLE_CONTAINER", True)
+    monkeypatch.setattr(cli.S, "show_trace", False)
+    monkeypatch.setattr(cli.S, "conversation_trace", [])
+    monkeypatch.setattr(cli, "_flush_memory_capture", lambda: None)
+
+    def chat(query):
+        cli.S.last_trace = [{"type": "final_answer", "incomplete": incomplete}]
+
+    monkeypatch.setattr(cli, "do_chat", chat)
+    monkeypatch.setattr(sys, "argv", ["agent8088", "--prompt-file", str(prompt)])
+    assert cli.main() == expected
+    reason = "checks_failed" if incomplete else "answered"
+    assert f"run ended: {reason}" in capsys.readouterr().out
