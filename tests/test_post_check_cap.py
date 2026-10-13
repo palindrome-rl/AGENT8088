@@ -16,6 +16,10 @@ def _calc(i):
     return f'✿FUNCTION✿: calculate ✿ARGS✿: {{"expression": "{i}+1"}}'
 
 
+def _run_tests():
+    return '✿FUNCTION✿: run_tests ✿ARGS✿: {}'
+
+
 def _run(engine, monkeypatch, script, *, mutate_at=(), cap=5):
     """script(call_index, messages) -> reply text. Round i of calculate
     mutates state when i is in mutate_at."""
@@ -273,12 +277,17 @@ def test_verified_work_is_bounded_without_a_final_answer_attempt(
     monkeypatch.setattr(engine, "MAX_POST_CHECK_ROUNDS", 2)
     calls = []
 
+    # The check rounds call run_tests: since issue 1 (V-1) a test verdict is
+    # only believed from a real runner, so printing "1 passed" from any other
+    # tool no longer counts as evidence and would never arm the cap.
     def model(messages, tools, **kwargs):
         calls.append(messages)
         if _wrap_up_asked(messages):
             return _response("fresh summary")
         i = len(calls) - 1
-        return _response("finished" if i >= 12 else _calc(i))
+        if i >= 12:
+            return _response("finished")
+        return _response(_run_tests() if i in (1, 3) else _calc(i))
 
     def execute(name, arguments, depth=0):
         i = len(calls) - 1

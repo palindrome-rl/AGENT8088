@@ -54,3 +54,25 @@ def test_unrecoverable_revert_is_announced(engine, monkeypatch):
                         lambda *a, **k: ("write_file failed verification", "VERDICT: fail"))
     out = engine._audit_tool_call("write_file", {"filename": "big.bin", "content": "x"}, "Wrote", 0, None)
     assert "NOT REVERTED" in out
+
+
+@pytest.mark.parametrize("answer,expected", [
+    # _exec_subagent returns "[subagent:auditor] <answer>", so a model that puts
+    # its verdict first has it pushed off the start of the line.
+    ("[subagent:auditor] VERDICT: fail — the file on disk is empty.", "fail"),
+    ("[subagent:auditor] VERDICT: pass", "pass"),
+    ("[subagent:auditor] VERDICT: unknown — could not reach the file", "unknown"),
+    ("[note: model fell back] [subagent:auditor] VERDICT: fail", "fail"),
+    # A numbered or lettered list item is still the start of a line.
+    ("1. VERDICT: fail", "fail"),
+    ("2) VERDICT: pass", "pass"),
+    # The only verdict in the reply counts even mid-sentence (AU-2).
+    ("The write looks correct. VERDICT: pass", "pass"),
+    ("Analysis shows a mismatch, so VERDICT: fail.", "fail"),
+    # ...but an inline verdict must not beat a line-start one, and two
+    # different inline verdicts are no verdict at all (a quoted template).
+    ("Template says VERDICT: pass if ok.\nVERDICT: fail", "fail"),
+    ("It says VERDICT: pass but VERDICT: fail", None),
+])
+def test_verdict_survives_the_subagent_prefix_and_inline_use(engine, answer, expected):
+    assert engine._parse_audit_verdict(answer) == expected

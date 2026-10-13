@@ -6771,6 +6771,11 @@ def _plan_step_failed(result: str) -> bool:
 
 
 PLAN_AUDIT = APP_CONFIG.get("plan_audit", "0").strip().lower() in ("1", "true", "yes", "on")
+# Issue 15: a wrong "fail" from a small model is frequent and destroys correct
+# work. With this on, an unconfirmed fail costs one more independent auditor
+# sample and only reverts when that one fails too.
+PLAN_AUDIT_CONFIRM_FAIL = APP_CONFIG.get("plan_audit_confirm_fail", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 PLAN_AUDIT_REVERT = APP_CONFIG.get("plan_audit_revert", "1").strip().lower() in (
     "1", "true", "yes", "on")
 PLAN_REVERT_MAX_BYTES = _config_int("plan_audit_revert_max_bytes", 1 << 20)
@@ -6830,8 +6835,13 @@ _NON_AUDITABLE_TOOLS = {
     "convert_document",
 }
 _VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail|unknown)", re.IGNORECASE)
-_VERDICT_LINE_RE = re.compile(r"^[ \t>*_`#-]*VERDICT[*_`]*\s*:\s*[*_`]*\s*(pass|fail|unknown)\b",
-                              re.IGNORECASE | re.MULTILINE)
+_VERDICT_LINE_RE = re.compile(
+    r"^[ \t>*_`#.)\]-]*(?:\d+[.)]\s*)?VERDICT[*_`]*\s*:\s*[*_`\"\']*\s*(pass|fail|unknown)\b",
+    re.IGNORECASE | re.MULTILINE)
+# Harness prefixes that sit in front of the model's own first line: a sub-agent
+# answer arrives as "[subagent:auditor] ...", sometimes behind "[note: ...]".
+# They are ours, not the model's, so they must not hide a verdict written first.
+_ANSWER_PREFIX_RE = re.compile(r"^(?:\s*\[[^\]\n]{0,80}\]\s*)+", re.MULTILINE)
 # The audit's own result, kept out of band: text in a tool result (a file, a
 # web page) can imitate "audit: verification passed", this cannot.
 _last_audit_verdict = None
@@ -6840,15 +6850,21 @@ _last_audit_verdict = None
 def _parse_audit_verdict(answer: str):
     """The auditor's verdict, or None.
 
-    Bold/backtick decoration is ignored ("**VERDICT:** pass"). Only a verdict
-    that starts a line counts, so an echoed example ("VERDICT: pass if ...")
-    inside a sentence is not read; and when the lines disagree the answer is
-    "unknown" rather than whichever came first.
+    Bold/backtick decoration is ignored ("**VERDICT:** pass"), and the harness's
+    own "[subagent:auditor] " prefix is stripped first -- it is not the model's
+    text, and leaving it in hid every verdict a terse model wrote on line one.
+
+    A verdict that starts a line wins; when those disagree the answer is
+    "unknown" rather than whichever came first. With no line-start verdict a
+    single inline one still counts (AU-2), but an echoed template quoting two
+    different verdicts in prose is no verdict at all.
     """
-    found = {m.group(1).lower() for m in _VERDICT_LINE_RE.finditer(answer or "")}
-    if not found:
-        return None
-    return found.pop() if len(found) == 1 else "unknown"
+    text = _ANSWER_PREFIX_RE.sub("", answer or "")
+    found = {m.group(1).lower() for m in _VERDICT_LINE_RE.finditer(text)}
+    if found:
+        return found.pop() if len(found) == 1 else "unknown"
+    inline = {m.group(1).lower() for m in _VERDICT_RE.finditer(text)}
+    return inline.pop() if len(inline) == 1 else None
 # Auditor calls spent by the turn in flight. Reset by the outermost run_agent
 # only — a sub-agent must not hand itself a fresh verification budget, for the
 # same reason it does not get a fresh token one.
@@ -7392,6 +7408,32 @@ def _readback_matches(name: str, args: dict) -> bool:
         return False
 
 
+def _audit_is_redundant(tool_name: str, tool_args: dict, result: str,
+                        acceptance: str = "") -> bool:
+    """Issue 13: a test run already is the check, so auditing it buys nothing.
+
+    run_tests and a recognised test-runner command whose output carries a pass
+    or fail verdict are evidence in their own right; sending them to a six-turn
+    auditor repeats the work and can dominate the task budget.
+
+    Three things keep the audit: output with no verdict, which establishes
+    nothing; a step whose author named acceptance criteria, which asks for a
+    judgement the runner cannot make; and a command that also runs a program of
+    its own, which is not a bare test run.
+    """
+    if acceptance:
+        return False
+    if tool_name == "run_tests":
+        runner = True
+    elif tool_name == "execute_shell":
+        # Strictly standalone: `python fix.py && pytest` runs a program that may
+        # have written files, and that part still deserves an auditor.
+        runner = _standalone_test_command(str((tool_args or {}).get("command", "")))
+    else:
+        return False
+    return runner and tool_output.detect_verdict(result).status in ("passed", "failed")
+
+
 def _take_audit_verdict():
     global _last_audit_verdict
     verdict, _last_audit_verdict = _last_audit_verdict, None
@@ -7406,7 +7448,8 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     list to halt here, so the equivalent is to hand the model a result it cannot
     read as success and to say plainly that nothing later should be built on top
     of it. Only a `fail` undoes anything —
-    an auditor that could not reach its model must not be able to destroy work.
+    an auditor that could not reach its model must not be able to destroy work —
+    and with plan_audit_confirm_fail on, only a fail a second auditor agreed with.
     """
     global _last_audit_verdict
     step_text = f"{tool_name} {json.dumps(tool_args, default=str)[:200]}"
@@ -7418,6 +7461,22 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
         return f"{result}\naudit: {AUDIT_PASSED_NOTE} - the file on disk matches what was written"
     reason, note = _audit_plan_step(step_text, tool_name, tool_args, result, depth,
                                     plan_context=plan_context)
+    # Issue 15: one "fail" from a small model is not enough to destroy work.
+    # Ask a second, independent auditor; revert only if it agrees. Disagreement
+    # is recorded as inconclusive, which leaves the change in place and says so.
+    if reason and PLAN_AUDIT_CONFIRM_FAIL:
+        second_reason, second_note = _audit_plan_step(
+            step_text, tool_name, tool_args, result, depth, plan_context=plan_context)
+        if not second_reason:
+            _last_audit_verdict = "unknown"
+            return "\n".join([
+                result,
+                f"audit: {AUDIT_UNKNOWN_NOTE} - auditors disagreed; the first run "
+                f"reported a failure ({note.strip()[:160]}) and a second, independent "
+                f"run did not ({second_note.strip()[:160]}). The change was left in "
+                "place: check it yourself before building on it.",
+            ])
+        note = f"{note} (confirmed by a second auditor: {second_note.strip()[:160]})"
     parts = [result]
     _last_audit_verdict = ("failed" if reason
                            else "passed" if note.startswith(AUDIT_PASSED_NOTE) else "unknown")
@@ -7589,6 +7648,8 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
             result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
         except Exception as exc:
             result = f"Error: {exc}"
+        if will_audit and _audit_is_redundant(tool_name, tool_args, result, acceptance):
+            will_audit = False
         _remember_escalation(tool_name, tool_args, result)
         # Unwrapped: shell results arrive inside the untrusted-content markers, so
         # matching the raw string meant a shell step in a plan never offered the
@@ -13411,12 +13472,10 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    # A passing test command already supplies verification evidence. Auditing
+    # A test run already supplies verification evidence, pass or fail. Auditing
     # that evidence with another agent repeats the check and can dominate the
     # task budget. Writes bundled with a test still need their usual audit.
-    test_evidence = (name == "execute_shell"
-                     and _standalone_test_command(args.get("command", ""))
-                     and tool_output.detect_verdict(result).status == "passed")
+    test_evidence = _audit_is_redundant(name, args, result)
     if (will_audit and not test_evidence
             and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
