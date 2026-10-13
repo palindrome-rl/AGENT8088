@@ -13423,6 +13423,27 @@ def _environment_diagnostic() -> str:
 _WRITE_FILE_PARTS_HINT = (
     " For a long file, write the first part (about 4-6 KB) with write_file, then add "
     "each further part with mode=\"append\".")
+# After a cut-off that was all reasoning: in our own runs nearly every one was the model
+# drafting a large file inside its thinking, so the retry has to say what to do instead.
+_NO_DRAFTING_HINT = (
+    " If you were about to write a large file, do not draft its contents in your "
+    "reasoning: call write_file with only the first part (about 4-6 KB), then add each "
+    "further part with mode=\"append\".")
+
+
+def _has_partial_native_call(message) -> bool:
+    """A native tool call was still streaming when the output ran out.
+
+    Normally its name has arrived, so _native_tool_text already turns it into a
+    marker line and the cut-off is classed as a call being written. This covers a
+    call whose arguments arrived without a name: it must not read as an empty reply.
+    """
+    for call in getattr(message, "tool_calls", None) or []:
+        function = getattr(call, "function", None)
+        arguments = str(getattr(function, "arguments", "") or "").strip()
+        if function is not None and arguments not in ("", "{}"):
+            return True
+    return False
 
 
 def _chunk_key(name: str, args: dict) -> str:
@@ -18037,13 +18058,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 f"Model output reached its {turn_max_tokens}-token limit. "
                 "The partial response was not executed."
             )
-            if content:
+            partial_native = not content and _has_partial_native_call(message)
+            can_write = "write_file" in round_allowed_tools
+            if content or partial_native:
                 # A genuinely large answer/tool call was in progress.
                 retry_instruction = (
                     f"{warning} Retry with one complete, concise tool call; "
                     "split large work across calls if needed."
                 )
-                if "write_file" in content:
+                if "write_file" in content or (partial_native and can_write):
                     retry_instruction += _WRITE_FILE_PARTS_HINT
             else:
                 # The whole budget was spent on reasoning before any answer or
@@ -18055,6 +18078,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "immediately in plain text, or call one tool — do not "
                     "think out loud."
                 )
+                if can_write:
+                    retry_instruction += _NO_DRAFTING_HINT
             if on_result:
                 on_result("error", warning)
             length_retries += 1
@@ -18063,7 +18088,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # gets a larger cap. Plain prose with no call in progress is a loop,
             # and more room only repeats it. Empty output is a hidden runaway
             # (e.g. an unclosed native tool call); it keeps the small retry cap.
-            if content and "✿FUNCTION✿" in content:
+            if (content and "✿FUNCTION✿" in content) or partial_native:
                 cutoff_kind, cap_hint = "tool_call", _write_retry_cap(turn_max_tokens, turn_completion_limit)
                 prose_cutoffs = 0
             elif content:
@@ -18134,13 +18159,17 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     + ". Reply within 200 tokens with exactly one short tool call "
                     "or a final answer. Do not include analysis.")
             elif length_retries == 1:
+                if content or partial_native:
+                    detail = "Make one short, complete tool call; split large work across calls."
+                    if "write_file" in content or (partial_native and can_write):
+                        detail += _WRITE_FILE_PARTS_HINT
+                else:
+                    detail = ("That budget went entirely to reasoning: stop reasoning and "
+                              "reply in plain text or call one tool.")
+                    if can_write:
+                        detail += _NO_DRAFTING_HINT
                 retry_instruction = (
-                    f"{warning} The previous attempt was cut off and discarded. "
-                    + ("Make one short, complete tool call; split large work across calls."
-                       + (_WRITE_FILE_PARTS_HINT if "write_file" in content else "")
-                       if content else
-                       "That budget went entirely to reasoning: stop reasoning and "
-                       "reply in plain text or call one tool."))
+                    f"{warning} The previous attempt was cut off and discarded. " + detail)
             else:
                 retry_instruction = (
                     "Your last responses reached the output limit and were discarded. "
@@ -18253,6 +18282,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     retry_empty = empty_retries < 1
             if retry_empty:
                 empty_retries += 1
+                # The call finished with nothing to act on, usually because the
+                # budget went to reasoning. Repeating it with thinking on tends to
+                # repeat the result, so this one retry runs with thinking off.
+                thinking_off_retry = True
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
                 if work_pending:
@@ -18262,7 +18295,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "
                         "plain text. Do not think out loud and do not call any tools."))
                 if trace is not None:
-                    trace.append({"turn": turn, "type": "empty_answer", "pending": work_pending})
+                    trace.append({"turn": turn, "type": "empty_answer", "pending": work_pending,
+                                  "thinking_off": True})
                 continue
 
             if not answer:

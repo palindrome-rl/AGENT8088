@@ -229,7 +229,10 @@ schema and are not checked here.
 written as a first part (default mode) followed by parts with `mode="append"`,
 in order, about 4-6 KB each. Large single calls are where argument JSON fails
 to parse or the reply is cut off at the output limit; the error messages for
-both point here.
+both point here. So does the retry after a cut-off that was all reasoning: in
+practice that is usually the model drafting a large file inside its thinking, so
+the retry tells it not to, and to write the first part now. (The hint is only
+given to a run that has `write_file`.)
 
 Parts of one file are treated as one write: they count once toward
 `max_writes_per_turn` (every byte counts toward `max_write_bytes`), and with

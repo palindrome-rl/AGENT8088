@@ -107,7 +107,10 @@ says to *continue*, never to give a final answer:
 
 0. **Empty reply.** With work pending (a failed tool, an unverified change, a part
    of the request not done) the follow-up is "Your last reply was empty. Continue
-   the task". With nothing pending it is the single legacy retry.
+   the task". With nothing pending it is the single legacy retry. Either way the
+   retry runs with thinking off (one call only): a reply that finished with nothing
+   to act on usually spent its budget reasoning, and repeating it with thinking on
+   tends to repeat the result.
 1. **Admits unfinished work.** The reply says, in plain words, that it is not
    done ("not finished yet", "still need to", "remaining steps", "I'll now",
    `TODO` outside code) *and* the run shows open items, or the request asked for
