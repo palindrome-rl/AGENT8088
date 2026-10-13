@@ -8600,6 +8600,48 @@ def _resolve_update_branch(install_dir):
                   "default branch could not be determined. Nothing was changed.")
 
 
+def _find_npm(home):
+    """npm for the web build: the managed Node the installer provides, else PATH."""
+    import shutil
+    exe = "npm.cmd" if os.name == "nt" else "npm"
+    managed = home / "node" / exe if os.name == "nt" else home / "node" / "bin" / exe
+    if managed.exists():
+        return str(managed)
+    return shutil.which(exe)
+
+
+def _rebuild_web_ui(install_dir, home, runner=None):
+    """Rebuild web/dist from the checked-out source so the UI matches the CLI.
+
+    Returns (ok, message). Never reports success after a failed install/build:
+    the old bundle is left in place and the message says it is stale.
+    """
+    import subprocess
+    run = runner or (lambda argv, cwd, env: subprocess.run(
+        argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=900))
+    web = install_dir / "web"
+    if not (web / "package.json").exists():
+        return True, "No web/ source in this install; nothing to rebuild."
+    npm = _find_npm(home)
+    if npm is None:
+        return False, ("Web UI NOT updated: Node.js/npm was not found, so the browser keeps "
+                       "serving the old build. Install Node.js 20+ (or re-run the installer), "
+                       f"then run `npm ci && npm run build` in {web}.")
+    env = dict(os.environ)
+    env["PATH"] = str(Path(npm).parent) + os.pathsep + env.get("PATH", "")
+    install_cmd = "ci" if (web / "package-lock.json").exists() else "install"
+    for step in ([npm, install_cmd], [npm, "run", "build"]):
+        try:
+            result = run(step, str(web), env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"Web UI NOT updated: `{' '.join(step[1:])}` could not run ({exc})."
+        if result.returncode != 0:
+            tail = ((result.stderr or "") + (result.stdout or "")).strip().splitlines()[-8:]
+            return False, (f"Web UI NOT updated: `npm {' '.join(step[1:])}` failed; the old "
+                           "build is still being served.\n  " + "\n  ".join(tail))
+    return True, "Web UI rebuilt."
+
+
 def _run_update(force=False):
     """Move the install to the tip of UPDATE_BRANCH, then reinstall the package.
 
@@ -8664,6 +8706,13 @@ def _run_update(force=False):
     print(f"Already at the latest commit of {branch} ({after})."
           if before == after else f"Updated {branch}: {before} -> {after}")
 
+    web_ok, web_message = (
+        _rebuild_web_ui(install_dir, home)
+        if before != after or force or not (install_dir / "web" / "dist" / "index.html").exists()
+        else (True, ""))
+    if web_message:
+        print(web_message)
+
     install_argv = [str(uv_cmd), "pip", "install", "--python", str(venv_python),
                     "--reinstall-package", "agent8088", "-e", str(install_dir)]
     agent_exe = install_dir / "venv" / venv_subdir / "agent8088.exe"
@@ -8696,11 +8745,14 @@ def _run_update(force=False):
         )
         print("Code updated. Package reinstall will finish after this process exits.")
         print(f"If it does not, check {log_path}")
-        return True
+        return web_ok
 
     install = subprocess.run(install_argv, cwd=str(install_dir))
     if install.returncode != 0:
         print("Code updated, but package reinstall failed.")
+        return False
+    if not web_ok:
+        print("Code and dependencies updated, but the Web UI is stale (see above).")
         return False
     print("Code and dependencies updated. Changes take effect on next launch.")
     return True
