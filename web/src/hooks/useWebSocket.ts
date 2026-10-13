@@ -24,6 +24,8 @@ let reconnectAttempts = 0
 let outbox: WSClientMessage[] = []
 /** Once Stop is pressed, late stream frames must not turn the composer red again. */
 let interruptRequested = false
+/** A sent turn can reach the backend after a simultaneous status request. */
+let localTurnPending = false
 /** A model step began (spin 'thinking...' / tool_start) and has not streamed
  *  reasoning yet: its first delta opens a new section. Pending rather than an
  *  eager '' push, so a step without reasoning leaves no empty section. */
@@ -170,6 +172,7 @@ function wireSocket(ws: WebSocket) {
           const ui = useUIStore.getState()
           if (ui.approvalPending?.sessionId === eventSession) setApprovalPending(null)
           if (ui.planApprovalPending?.sessionId === eventSession) setPlanApprovalPending(null)
+          localTurnPending = false
           useSessionStore.getState().setRunningSession(null)
           const wasInterrupted = interruptRequested
           interruptRequested = false
@@ -256,7 +259,22 @@ function wireSocket(ws: WebSocket) {
     // Anything typed while the socket was down goes now, in order.
     const pending = outbox
     outbox = []
-    pending.forEach((msg) => ws.send(JSON.stringify(msg)))
+    localTurnPending = pending.some((msg) => msg.type === 'chat' || msg.type === 'command')
+    for (let index = 0; index < pending.length; index += 1) {
+      try {
+        ws.send(JSON.stringify(pending[index]))
+      } catch {
+        // Keep every unsent frame if the connection closes during replay.
+        outbox.unshift(...pending.slice(index))
+        localTurnPending = false
+        const store = useSessionStore.getState()
+        store.setStreaming(false)
+        store.setRunningSession(null)
+        store.setSendFailure('Connection interrupted — unsent messages are queued for reconnection.')
+        ws.close()
+        return
+      }
+    }
     // A reconnect may have missed events, so re-read authoritative state.
     void syncSession(true)
   }
@@ -267,6 +285,7 @@ function wireSocket(ws: WebSocket) {
   }
 
   ws.onclose = () => {
+    localTurnPending = false
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
     if (disposed) return
     reconnectAttempts += 1
@@ -326,9 +345,9 @@ export async function syncSession(includeHistory = false) {
     store.setStatus(status)
     store.setSessionName(status.session_name || '')
     store.setSessionId(status.session_id || '')
-    // Only a turn this tab started sends it turn_complete, so the server can
-    // clear a stale running task here but never set one.
-    if (status.running_session === null) store.setRunningSession(null)
+    // A queued turn may not have reached the backend yet. Its completion frame
+    // clears local state; a simultaneous idle status must not clear it early.
+    if (status.running_session === null && !localTurnPending) store.setRunningSession(null)
 
     if (!includeHistory) return
     const historyResponse = await fetch('/api/history')
@@ -366,6 +385,7 @@ function sendFrame(msg: WSClientMessage): boolean {
   }
   if (msg.type === 'chat' || msg.type === 'command') {
     interruptRequested = false
+    localTurnPending = true
     const store = useSessionStore.getState()
     const target = ((msg.type === 'chat' || msg.type === 'command') && msg.session_id) || store.sessionId
     store.setRunningSession({ id: target, name: target === store.sessionId ? store.sessionName : '' })
@@ -381,7 +401,9 @@ function sendFrame(msg: WSClientMessage): boolean {
       sharedWs.send(JSON.stringify(msg))
       return true
     } catch {
-      return false
+      // The frame was not accepted. Queue it below and reconnect instead of
+      // leaving an optimistic running turn that can never complete.
+      sharedWs.close()
     }
   }
   // Queue it and say so, rather than returning silently - a dropped message
@@ -393,6 +415,7 @@ function sendFrame(msg: WSClientMessage): boolean {
     return false
   }
   outbox.push(msg)
+  localTurnPending = false
   store.setStreaming(false)
   store.setRunningSession(null)
   store.setSendFailure(
