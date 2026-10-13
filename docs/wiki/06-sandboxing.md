@@ -42,7 +42,7 @@ are needed.
 |---|---|
 | macOS | Node.js 20.11+, `ripgrep` |
 | Linux | Node.js 20.11+, `bubblewrap`, `socat`, `ripgrep` |
-| Windows | Supported Node.js (managed automatically if needed), one UAC prompt to create a restricted sandbox account |
+| Windows | Supported Node.js (managed automatically if needed); setup runs as the current user, with no admin elevation or separate sandbox account |
 
 On Windows, setup and runtime both prefer Agent8088's managed Node when it
 meets the Node.js 20.11+ requirement. An older managed installation is skipped
@@ -50,8 +50,17 @@ in favor of a supported PATH version. If neither is suitable, sandbox setup
 downloads the pinned Node.js 22.11.0 build and verifies its SHA-256 checksum.
 Setup requires npm; running an already-installed sandbox only requires Node.
 
-The Windows prompt provisions a low-privilege local account that sandboxed
-commands run as — that's why it's a one-time elevation.
+On Windows the sandbox restricts file writes (a restricted token plus NTFS
+ACLs on the current account); it does not filter the network, and `/sandbox`
+says so.
+
+**The Windows native backend restricts file writes only.** It does not apply
+`sandbox_allowed_domains`, and a sandboxed command sees the host's process list.
+`/sandbox`, `/doctor` and the start-up notice say so ("network policy not
+enforced on this backend (write restriction only)"), and `/doctor` warns when
+`sandbox_allowed_domains` is set there. For network isolation on Windows use
+`sandbox_backend=docker`. Stopping processes by name is refused in every mode
+for the same reason (see [permissions](03-permissions-and-security.md)).
 
 ## Docker fallback
 
@@ -63,7 +72,11 @@ docker_network=none
 ```
 
 `docker_network=none` is the safer default — no network from inside the
-container at all.
+container at all. `docker_network=allowlist` gives the container the same
+allowlist the native runtime enforces: it joins an internal Docker network
+whose only way out is a small proxy container (`agent8088-egress-proxy-*`,
+left running between sessions) that allows only `sandbox_allowed_domains`.
+If the proxy cannot start, the container gets no network.
 
 Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that
@@ -72,11 +85,18 @@ Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
 ## Network egress
 
-Sandboxed commands have no network unless you allow specific domains:
+Sandboxed commands have no network unless you allow specific domains
+(**macOS, Linux and Docker** -- the Windows native backend does not enforce this,
+see above):
 
 ```ini
 sandbox_allowed_domains=api.example.com,pypi.org
 ```
+
+`default` in the list adds the common package registries, code hosts and docs
+sites (PyPI, npm, GitHub, crates.io, Go proxy, Maven Central, RubyGems, conda,
+Hugging Face, ...), so `sandbox_allowed_domains=default` is enough for most
+`npm install` / `pip install` / `git clone` tasks.
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP

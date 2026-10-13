@@ -199,6 +199,21 @@ forcing or overwriting forms — `checkout -B`, `checkout <path>`, `checkout --`
 stay blocked. Use `git switch <branch>` to change branches: a bare
 `git checkout <name>` cannot be told apart from `git checkout <file>`.
 
+### 3b. Stopping processes by name
+
+`pkill`, `killall`, `taskkill /IM` (or `/FI`), `Stop-Process -Name`,
+`Get-Process ... | Stop-Process`, `... | xargs kill`, `kill $(pgrep ...)`,
+`wmic process where name=... delete` and a `.Kill()` loop over an enumerated
+process list are refused in every mode. They stop every process of that name on
+the machine, including unrelated jobs and Agent8088's own interpreter, and on
+the Windows native sandbox the process list is the host's. `kill -9 -1`,
+`kill 0` and any attempt to stop Agent8088 or its parent by PID are refused too.
+
+Stopping a process by a literal PID stays allowed (`kill 12345`,
+`taskkill /PID 12345 /F`, `Stop-Process -Id 12345`, `kill %1`, `kill $!`), so a
+server the agent started can be stopped. The refusal says so. A script file that
+does the stopping is not inspected.
+
 ### 4. System-prompt exfiltration
 
 Requests for `system.md`, "your instructions", "the prompt you were given" and
