@@ -81,6 +81,9 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "passed_checks": 0,
         "subgoals_built": False,
         "unmet_checks": [],
+        "smoke_notes": [],
+        "smoke_failures": 0,
+        "smoke_checked": {},
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
@@ -130,6 +133,7 @@ class TrajectoryState:
             # budget is per request and must not, or the session goes silent.
             self.data["verification_requests"] = 0
             self.data["unmet_checks"] = []
+            self.data["smoke_failures"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -308,6 +312,26 @@ class TrajectoryState:
         return (int(self.data.get("mutation_count") or 0),
                 int(self.data.get("passed_checks") or 0),
                 len(self.open_subgoals()))
+
+    def smoke_unchecked(self, paths: list[str]) -> list[str]:
+        """Deliverables not yet smoke-tested at the current state of the work."""
+        checked = self.data.setdefault("smoke_checked", {})
+        return [p for p in paths if checked.get(p) != self.mutation_count()]
+
+    def record_smoke(self, path: str, summary: str, failed: bool) -> None:
+        self.data.setdefault("smoke_checked", {})[path] = self.mutation_count()
+        notes = self.data.setdefault("smoke_notes", [])
+        notes[:] = [n for n in notes if not n.startswith(summary.split(":", 1)[0] + ":")]
+        notes.append(_text(summary))
+        del notes[:-4]
+        if failed:
+            self.data["smoke_failures"] = int(self.data.get("smoke_failures") or 0) + 1
+
+    def smoke_failures(self) -> int:
+        return int(self.data.get("smoke_failures") or 0)
+
+    def smoke_review(self) -> str:
+        return " ".join(self.data.get("smoke_notes") or [])
 
     def note_unmet(self, reasons: list[str]) -> None:
         self.data["unmet_checks"] = [_text(r) for r in reasons][:6]

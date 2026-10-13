@@ -19,7 +19,7 @@ from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
-from agent8088 import (cli_anything, completion as completion_checks, diffview,
+from agent8088 import (app_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
                        memory, patching, providers, routing, testing_support,
                        tool_output,
@@ -535,6 +535,15 @@ MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # them; a follow-up that makes progress hands its slot back. 0 turns the checks off.
 MAX_COMPLETION_CONTINUATIONS = max(0, _config_int(
     "max_completion_continuations", completion_checks.DEFAULT_CONTINUATIONS))
+# The smoke test of what a run built (a web page loaded in headless Chromium, a
+# script syntax-checked), run before the reply is accepted. `report` shows the
+# result in the answer and never blocks; `enforce` also asks the model to fix a
+# failure, up to COMPLETION_SMOKE_MAX_FAILURES times a request; `off` skips it.
+COMPLETION_SMOKE_TEST = str(APP_CONFIG.get("completion_smoke_test", "report")).strip().lower()
+if COMPLETION_SMOKE_TEST not in ("off", "report", "enforce"):
+    COMPLETION_SMOKE_TEST = "report"
+COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds", 20))
+COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
@@ -12293,6 +12302,15 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         # security code and no second gate to keep in sync. It also keeps the
         # auditor's larger result allowance, which _tool_result_for_model keys
         # on the literal name "read_text".
+        if name == "check_app":
+            # Handled inside read_text, like document_read: the path has already been
+            # through the sensitive-file floor, the allowed-path check and the
+            # permission gate. The page runs in headless Chromium with every request
+            # to another host aborted; a script is only syntax-checked.
+            if not read_target.exists():
+                return f"Error: {read_target} does not exist, so there is nothing to check."
+            return app_check.check_target(
+                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path).text()
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()
@@ -16643,6 +16661,37 @@ _CHANGE_REQUEST = re.compile(
     r"install|develop|code|produce)\b", re.IGNORECASE)
 
 
+def _smoke_test_step(trajectory, written: list):
+    """Smoke-test the pages and scripts this run wrote, once per state of the work.
+
+    Every result goes in the answer's notes. Only in `enforce` mode does a failure
+    become a follow-up, and then at most COMPLETION_SMOKE_MAX_FAILURES times.
+    """
+    roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
+    targets = app_check.deliverable_targets(written, roots)
+    pending = trajectory.smoke_unchecked([str(t) for t in targets])
+    failures = []
+    for target in targets:
+        if str(target) not in pending:
+            continue
+        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path)
+        if report.status == app_check.SKIPPED:
+            continue
+        trajectory.record_smoke(str(target), report.summary(), report.failed)
+        if report.failed:
+            failures.append(report)
+    if (failures and COMPLETION_SMOKE_TEST == "enforce"
+            and trajectory.smoke_failures() <= COMPLETION_SMOKE_MAX_FAILURES):
+        detail = "\n".join(r.text(900) for r in failures)
+        return completion_checks.Nudge(
+            "smoke",
+            completion_checks.continue_text(
+                f"The smoke test of what you built failed:\n{detail}",
+                "Continue: fix these problems, then check again with check_app."),
+            unmet="the smoke test failed: " + "; ".join(Path(r.target).name for r in failures))
+    return None
+
+
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
                            deliverables_due: bool = False):
     """The first completion check a text reply fails, or None to accept it.
@@ -16671,6 +16720,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             request, reply, written, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()])
         if missing:
             nudge = completion_checks.outputs_nudge(missing)
+    if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":
+        nudge = _smoke_test_step(trajectory, written)
     if nudge is None and deliverables_due:
         nudge = completion_checks.Nudge("deliverables", DELIVERABLES_CHECK_NUDGE,
                                         unmet="the deliverables re-check was not completed")
@@ -16716,6 +16767,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
     if (trajectory is not None and trajectory.needs_verification()
             and (unmet := trajectory.unmet_review())):
         notes.append(f"Task-state note: {unmet}")
+    if trajectory is not None and (smoke := trajectory.smoke_review()):
+        notes.append(f"Smoke test: {smoke}")
     if location_note := _workspace_note(trajectory):
         notes.append(location_note)
     for note in notes:
