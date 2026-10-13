@@ -218,6 +218,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
 | `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
+| `compaction_cooldown_turns` | `6` | Turns to wait after a successful automatic compaction before looking again, unless the context is already above 90% of the window. `0` removes the wait. |
+| `compaction_summary_max_chars` | `16000` | Longest the carried-over conversation summary may grow. Compaction keeps an earlier summary exactly as written and summarizes only what came after it, so a long run's first facts are not blurred by repeated rewriting; past this size the oldest summary sections are dropped whole, never rephrased. Each summary ends with a short harness record the model does not write (files written this run, verified checks), rebuilt from live state at every compaction. |
 | `diagnostic_after_failures` | `2` | After this many identical failures in a row (same tool, same error code), the model is shown a read-only check of where commands run: the working-directory status, a short listing, the user, free disk space and which interpreters exist. The same check is shown before the agent accepts an answer that says the environment is unavailable. Minimum `2`. |
 | `max_image_bytes` | `20 MB` | Cap on an image attachment. |
 | `document_process_concurrency` | `4` | Document chunks `document_read action=process` keeps in flight (clamped 1-16). Chunk requests are independent, so this multiplies throughput almost linearly until the provider rate-limits. |
