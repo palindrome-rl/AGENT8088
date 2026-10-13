@@ -111,7 +111,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
-| Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+| Native sandbox runtime | yes (auto-setup) | yes (auto-setup, no admin needed) |
 
 ### Supported platforms
 
@@ -149,7 +149,7 @@ agent8088                    # start the interactive agent
 
 The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
 
-> **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
+> The installer sets up the native sandbox automatically. If setup did not finish, run `agent8088 --sandbox-setup` to retry. On Windows, use your normal, non-admin terminal: the backend restricts file writes using the current account and does not create a separate sandbox account. For network isolation on Windows, use `sandbox_backend=docker`.
 
 ### Use the web UI
 

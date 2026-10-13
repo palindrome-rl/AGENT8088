@@ -42,7 +42,7 @@ are needed.
 |---|---|
 | macOS | Node.js 20.11+, `ripgrep` |
 | Linux | Node.js 20.11+, `bubblewrap`, `socat`, `ripgrep` |
-| Windows | Supported Node.js (managed automatically if needed), one UAC prompt to create a restricted sandbox account |
+| Windows | Supported Node.js (managed automatically if needed); setup runs as the current user, with no admin elevation or separate sandbox account |
 
 On Windows, setup and runtime both prefer Agent8088's managed Node when it
 meets the Node.js 20.11+ requirement. An older managed installation is skipped
