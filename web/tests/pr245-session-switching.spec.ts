@@ -87,6 +87,7 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
     type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
   })
   await page.getByRole('button', { name: /^chat-b(?: running)?$/ }).click()
+  running = false
   await emit({ type: 'turn_complete', session_id: ids['chat-b'] })
   await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
     type: 'command', command: 'plan', args: 'audit chat A', session_id: ids['chat-a'],
