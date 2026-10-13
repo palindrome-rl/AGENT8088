@@ -171,6 +171,12 @@ class TrajectoryState:
             if path not in written:
                 written.append(path)
                 del written[:-MAX_WRITTEN]
+        # The newest check decides: a pass, or a write that has not been
+        # re-checked yet, clears a failure; a failing run sets it.
+        if operation["verdict"] == "failed" and not mutated:
+            self.data["check_failing"] = True
+        elif operation["verdict"] == "passed" or mutated:
+            self.data["check_failing"] = False
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self.data["verification"] = "pending"
@@ -344,6 +350,10 @@ class TrajectoryState:
 
     def needs_verification(self) -> bool:
         return self.data.get("verification") == "pending"
+
+    def check_failing(self) -> bool:
+        """True while the newest check failed and nothing has fixed it since."""
+        return bool(self.data.get("check_failing"))
 
     def request_verification(self) -> bool:
         # Each write re-arms the reminder, and a model that answers it by

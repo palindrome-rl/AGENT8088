@@ -9593,7 +9593,8 @@ def _run_prompt_file(path: str) -> int:
 def _run_end_reason(steps):
     """Why the last turn ended, from its trace steps (newest decisive one).
 
-    answered | time_budget | turn_limit | model_error | interrupted | unknown
+    answered | checks_failed | time_budget | turn_limit | model_error | interrupted
+    | unknown
     (unknown: no trace, or the turn left none of these steps).
     """
     if S.conversation_trace and S.conversation_trace[-1].get("interrupted"):
@@ -9607,7 +9608,7 @@ def _run_end_reason(steps):
         if kind in {"budget_wrap_up", "max_turns"}:
             return "turn_limit"
         if kind == "final_answer":
-            return "answered"
+            return "checks_failed" if step.get("incomplete") else "answered"
     return "unknown"
 
 

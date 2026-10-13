@@ -16695,6 +16695,14 @@ DELIVERABLES_CHECK_NUDGE = (
     "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
 POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+# The newest check failed: never tell the model it passed.
+POST_CHECK_FAILED_NUDGE = (
+    "The latest check FAILED and is still unfixed. Fix the failure now if you can. "
+    "If you cannot, give your final answer stating plainly that the check fails and "
+    "what remains broken. Do not claim the work is complete or verified."
+)
+CHECKS_FAILED_NOTE = ("Incomplete: the latest automated check failed and was not "
+                      "fixed. Treat the result as unfinished.")
 
 
 def _redirected_write_locations(trajectory) -> list[str]:
@@ -16853,6 +16861,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and trajectory.check_failing():
+        notes.append(CHECKS_FAILED_NOTE)
     if location_note := _workspace_note(trajectory):
         notes.append(location_note)
     for note in notes:
@@ -17624,7 +17634,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if on_answer:
                 on_answer(answer)
             if trace is not None:
-                trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                trace.append({"turn": turn, "type": "final_answer", "content": answer,
+                              "incomplete": bool(trajectory is not None
+                                                 and trajectory.check_failing())})
             return answer
 
         if on_calls:
@@ -18090,11 +18102,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     if on_answer:
                         on_answer(answer)
                     if trace is not None:
-                        trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                        trace.append({"turn": turn, "type": "final_answer", "content": answer,
+                                      "incomplete": bool(trajectory is not None
+                                                 and trajectory.check_failing())})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
-                    messages.append(_harness_turn(POST_CHECK_CAP_NUDGE))
+                    messages.append(_harness_turn(
+                        POST_CHECK_FAILED_NUDGE if (trajectory is not None
+                                                    and trajectory.check_failing())
+                        else POST_CHECK_CAP_NUDGE))
                     if trace is not None:
                         trace.append({"turn": turn, "type": "post_check_cap",
                                       "rounds": post_check_rounds})
