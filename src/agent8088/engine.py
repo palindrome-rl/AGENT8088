@@ -7564,8 +7564,26 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     except OSError:
         snapshot = None
 
+    touched_before = set(_TURN_FILES_TOUCHED)
     report = _exec_subagent({"agent_type": "test-writer", "task": brief}, depth=depth)
     after = _file_fingerprint(source)
+    broken = []
+    for written in _TURN_FILES_TOUCHED:
+        written_path = Path(written)
+        if (written in touched_before or written_path.suffix.lower() != ".py"
+                or written_path == source):
+            continue
+        try:
+            problem = _python_syntax_error(written_path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if problem:
+            broken.append(f"{written_path} ({problem})")
+    if broken:
+        report = ("WARNING: generated test code is not valid Python, so the tests "
+                  "were NOT created successfully: " + "; ".join(broken)
+                  + ". Rewrite those files with plain code, or call generate_tests "
+                  "again.\n\n" + report)
 
     # `after` is "" when the file was deleted outright, which is a modification
     # too -- requiring it to be truthy would let the worst case through silently.
@@ -12498,6 +12516,10 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                            f"edit the project's own file.")
             return result
         content = _structured_text_argument(args.get(content_arg, ""))
+        cleaned_code = False
+        if name in ("write_file", "edit_file") and args.get("_private") is not True:
+            content, cleaned_code = _clean_generated_code(
+                content, target, fences=name == "write_file")
         if not continues_series:
             _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -12601,6 +12623,18 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"given, so {target} was left unchanged. Pass content to write "
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
+        if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
+                and (syntax_error := _python_syntax_error(content))
+                and (cleaned_code or (old_content.strip()
+                                      and not _python_syntax_error(old_content)))):
+            # Writing this would break collection of the whole suite. Leave the
+            # file as it was and let the author correct and resend.
+            _turn_writes -= 1
+            return efficiency.tool_error(
+                "invalid_python", f"{target} was NOT written: the content is not valid "
+                f"Python ({syntax_error}).",
+                "Send the complete, corrected file again with plain code only: no "
+                "reasoning tags, no Markdown fences, no commentary.", recoverable=True)
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
@@ -12610,6 +12644,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             # A later append continues from here; an older series on this path is over.
             _turn_chunked[str(target)] = len(content.encode("utf-8"))
         result = f"Wrote {len(content)} bytes to {target}" + _docker_shell_path_hint(target)
+        if cleaned_code:
+            result += " (reasoning markup was removed from the content before writing)"
         if shadowed is not None:
             result += (f" — NOT {shadowed}. A bare filename is stored in "
                        f"artifacts/; pass that absolute path if you meant to "
@@ -12672,6 +12708,51 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         return _wrap_untrusted(text, f"shell command: {_redact_secrets(command[:160])}") + note
 
     return f"Unknown tool mode '{mode}' for tool '{name}'"
+
+
+_REASONING_TAGS = "think|thinking|reason|reasoning|thought|scratchpad"
+# Wrappers count only when the tag owns its line (opener at line start, closer
+# at line end), so code that merely mentions a tag in a string or comment stays.
+_REASONING_PAIR_RE = re.compile(
+    rf"^[ \t]*<({_REASONING_TAGS})>.*?</\1>[ \t]*$\n?", re.DOTALL | re.IGNORECASE | re.MULTILINE)
+_REASONING_CLOSE_LINE_RE = re.compile(
+    rf"^[ \t]*</(?:{_REASONING_TAGS})>[ \t]*$\n?", re.IGNORECASE | re.MULTILINE)
+_REASONING_OPEN_LINE_RE = re.compile(
+    rf"^[ \t]*<(?:{_REASONING_TAGS})>[ \t]*$.*", re.DOTALL | re.IGNORECASE | re.MULTILINE)
+_CLEANED_CODE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".rb", ".go", ".rs"})
+
+
+def _python_syntax_error(code: str) -> str:
+    """"" when `code` parses as Python, else a one-line SyntaxError summary."""
+    import ast
+    try:
+        ast.parse(code)
+    except (SyntaxError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tuple:
+    """Strip model reasoning wrappers (and a surrounding Markdown fence) from
+    code about to be written. Returns (text, changed). Other file types, and
+    tags that are part of real code, pass through untouched."""
+    if target.suffix.lower() not in _CLEANED_CODE_SUFFIXES or not text:
+        return text, False
+    cleaned = _REASONING_PAIR_RE.sub("", text)
+    if _REASONING_CLOSE_LINE_RE.search(cleaned):
+        # A closer with no opener: whatever precedes it leaked reasoning. Keep
+        # the part after it only if that is what makes the file valid Python.
+        tail = _REASONING_CLOSE_LINE_RE.split(cleaned, maxsplit=1)[1]
+        if (target.suffix.lower() == ".py" and _python_syntax_error(cleaned)
+                and not _python_syntax_error(_REASONING_CLOSE_LINE_RE.sub("", tail))):
+            cleaned = tail
+        cleaned = _REASONING_CLOSE_LINE_RE.sub("", cleaned)
+    cleaned = _REASONING_OPEN_LINE_RE.sub("", cleaned)
+    if fences:
+        cleaned = _strip_code_fences(cleaned)
+    if cleaned != text and not cleaned.endswith("\n") and text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, cleaned != text
 
 
 def _make_diff(old: str, new: str, filename: str) -> list:
