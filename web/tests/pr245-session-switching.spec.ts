@@ -34,7 +34,7 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
         setTimeout(() => this.onopen?.({}), 0)
       }
       send(data: string) { ((window as any).__sent ??= []).push(JSON.parse(data)) }
-      close() { this.readyState = 3 }
+      close() { this.readyState = 3; setTimeout(() => this.onclose?.({}), 0) }
     }
     ;(window as any).WebSocket = Socket
   })
@@ -86,10 +86,23 @@ test('switch chats during a turn, keep approval in its chat, queue for the other
   expect(await page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
     type: 'chat', text: 'One more in B', session_id: ids['chat-b'],
   })
-  await page.getByRole('button', { name: 'chat-b', exact: true }).click()
+  await page.getByRole('button', { name: /^chat-b(?: running)?$/ }).click()
   await emit({ type: 'turn_complete', session_id: ids['chat-b'] })
   await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
     type: 'command', command: 'plan', args: 'audit chat A', session_id: ids['chat-a'],
   })
   await expect(page.getByText('/plan audit chat A', { exact: true })).toHaveCount(0)
+
+  // A thrown socket send must retain the prompt and replay it on reconnect.
+  running = false
+  await emit({ type: 'turn_complete', session_id: ids['chat-a'] })
+  await expect(page.getByRole('button', { name: 'Stop generating', exact: true })).toHaveCount(0)
+  await page.evaluate(() => {
+    (window as any).__socket.send = () => { throw new Error('connection closed during send') }
+  })
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('Recover this message')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__sent.at(-1))).toMatchObject({
+    type: 'chat', text: 'Recover this message', session_id: ids['chat-b'],
+  })
 })
