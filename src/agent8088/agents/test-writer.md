@@ -3,6 +3,7 @@ name: test-writer
 description: Writes tests for code that already exists, runs them, and reports the result.
 tools: read_text, run_tests, write_file, edit_file, execute_shell, last_output
 max_turns: 12
+max_seconds: 90
 model: inherit
 ---
 You write tests for code someone else has already written. You do not change that code.
