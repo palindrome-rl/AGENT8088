@@ -35,6 +35,8 @@ def sessions(tmp_path, monkeypatch):
 
 
 class _Esc:
+    _active = False  # do_chat reads it to decide whether to show the hint
+
     def __init__(self):
         self.triggered = threading.Event()
         self._active = False

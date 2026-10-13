@@ -21,6 +21,9 @@ Work in this order, and do not skip the second step.
    found a real bug is a success: report it. A failing test that you wrote wrong,
    fix once.
 
+File content must be plain code only: no reasoning tags such as <think>, no Markdown
+fences, no commentary. A test file that does not parse is refused and not written.
+
 NEVER edit the file under test. If a test fails because the code is wrong, say so in
 your report and leave the code exactly as you found it. Making a test pass by
 changing the code it tests destroys the only thing the test was for, and the file is

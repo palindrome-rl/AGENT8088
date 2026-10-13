@@ -297,3 +297,34 @@ def test_verified_work_is_bounded_without_a_final_answer_attempt(
     if should_cap:
         assert answer.startswith("fresh summary")
         assert len(calls) == (8 if second_write else 6)
+
+
+def test_failed_check_gets_a_failure_nudge_and_an_incomplete_result(engine, monkeypatch):
+    # Every check here reports a failing verdict: the cap must not say "checks
+    # are complete", and the run must end flagged incomplete, not as success.
+    from agent8088 import trajectory as T
+    real = T.TrajectoryState.after_tool
+
+    def failing(self, operation, result, **kw):
+        kw["verdict"] = "failed"
+        return real(self, operation, result, **kw)
+
+    monkeypatch.setattr(T.TrajectoryState, "after_tool", failing)
+    seen = []
+
+    def script(i, messages):
+        seen.extend(str(m.get("content")) for m in messages)
+        return "tests still fail" if _wrap_up_asked(messages) else _keeps_checking(i, messages)
+
+    monkeypatch.setattr(engine, "DISPOSABLE_CONTAINER", True)
+    answer, _calls, kinds = _run(engine, monkeypatch, script)
+    assert "post_check_backstop" in kinds
+    assert not any(engine.POST_CHECK_CAP_NUDGE in m for m in seen)
+    assert any(engine.POST_CHECK_FAILED_NUDGE in m for m in seen)
+    assert engine.CHECKS_FAILED_NOTE in answer
+
+
+def test_cli_maps_incomplete_final_answer_to_checks_failed():
+    from agent8088 import cli
+    assert cli._run_end_reason([{"type": "final_answer", "incomplete": True}]) == "checks_failed"
+    assert cli._run_end_reason([{"type": "final_answer"}]) == "answered"

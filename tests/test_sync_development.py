@@ -302,7 +302,7 @@ def test_cli_check_exits_nonzero_when_behind(remote_and_clone, tmp_path):
     git(clone, "fetch", "-q", "origin")
 
     proc = subprocess.run(
-        ["python3", str(SCRIPT), "--check", "--no-fetch", "--repo", str(clone)],
+        [sys.executable, str(SCRIPT), "--check", "--no-fetch", "--repo", str(clone)],
         capture_output=True,
         text=True,
     )
@@ -314,7 +314,7 @@ def test_cli_check_exits_zero_when_synced(remote_and_clone):
     _, clone = remote_and_clone
     git(clone, "checkout", "-q", "-b", "feat/x")
     proc = subprocess.run(
-        ["python3", str(SCRIPT), "--check", "--no-fetch", "--repo", str(clone)],
+        [sys.executable, str(SCRIPT), "--check", "--no-fetch", "--repo", str(clone)],
         capture_output=True,
         text=True,
     )

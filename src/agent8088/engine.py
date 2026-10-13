@@ -529,6 +529,10 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
+# Whole-file rewrites of one path in a run: a corrective note from REWRITE_NUDGE_AFTER,
+# a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
+MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
+REWRITE_NUDGE_AFTER = 4
 # Follow-ups the completion checks may send in one request when a reply is empty,
 # admits unfinished work, leaves a named file missing, skips a part of a
 # multi-part request, or leaves changed work unverified. One budget for all of
@@ -576,6 +580,10 @@ WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
 # Tokens a model may spend reasoning on an ordinary turn, where the provider can
 # be told (see _reasoning_budget_extra_body). 0 = leave the provider's default.
 REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
+# Completion cap for a call that runs with thinking off (the retry after an empty or
+# reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
+# tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
+THINKING_OFF_MAX_TOKENS = 4096
 # Consecutive prose-only cut-offs (no tool call in progress: the model is looping
 # in plain text) tolerated before the final no-tools round.
 PROSE_CUTOFF_MAX = 2
@@ -1011,6 +1019,10 @@ _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this tur
 # observes" has to be a guarantee, not a default. See _exec_subagent.
 _permission_floor_readonly = False
 _sandbox_readonly = False
+# Where sandboxed shell commands run. artifacts/ unless a file the user named
+# was written elsewhere in the project this turn: then the project root, so the
+# shell sees that file at the same mapped path (never wider than the project).
+_shell_workspace_root = None
 _last_audit_share = 0.0     # verification's share of the last completed turn's tokens
 
 
@@ -1094,8 +1106,9 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
-    global _failure_streak, _diagnostic_shown
+    global _failure_streak, _diagnostic_shown, _shell_workspace_root
     _turn_writes = 0
+    _shell_workspace_root = None
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
@@ -3428,7 +3441,8 @@ def _model_error_context(provider_name: str, model_name: str) -> dict:
             "base_url": active_endpoint_url(provider_name) if provider_name else active_endpoint_url(),
             "model": model_name or MODEL_NAME,
             "api_key_env": profile.get("api_key_env") or None,
-            "timeout_seconds": TIMEOUT_SECONDS}
+            "timeout_seconds": TIMEOUT_SECONDS,
+            "env_file": str(ENV_FILE_PATH)}
 
 
 def explain_model_error(error, provider_name: str = "", model_name: str = ""):
@@ -4707,6 +4721,10 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
         '✿' + 'FUNCTION' + '✿' + ': tool_name ' + '✿' + 'ARGS' + '✿' + ': {"arg": "value"}',
         "The name after ✿FUNCTION✿ must be exactly one schema name: no parentheses, "
         "arguments, or extra text. Put every argument only in the JSON object after ✿ARGS✿.",
+        "You may send several calls in one reply, one per line; they run in order and each "
+        "gets its own result. Batch independent reads, searches and checks together; send a "
+        "step that depends on an earlier result in the next reply. To fix a file, edit the "
+        "broken part rather than rewriting the whole file again.",
         "Use a tool ONLY when it helps complete the task. Not every message needs a tool — "
         "for greetings, small talk, opinions, general knowledge, or unclear/garbled input, "
         "just answer directly in plain text. Never mention your tools or their availability "
@@ -4715,8 +4733,8 @@ def render_tool_docs(specs: dict, catalogue: bool = True) -> str:
     ]
     lines.append("Mandatory routing — call the matching tool before writing an answer:")
     lines.append(
-        "- When a tool error has suggested_action, relay it exactly; never invent admin rights, "
-        "paths, executables, or setup commands.")
+        "- Act on a tool error's suggested_action yourself; ask the user only for what only "
+        "they can do; never invent admin rights, paths, executables, or setup commands.")
     if "read_text" in specs:
         lines.append("- A direct request to read a file MUST call read_text.")
     if "execute_shell" in specs:
@@ -4996,9 +5014,10 @@ def render_capability_guidance(specs: dict, *, native_tools: bool) -> str:
     if "spawn_subagent" in specs:
         sections.append(
             "## Subagents\n"
-            "Delegate only an independent task that needs several steps. Give it a complete "
-            "goal, expected deliverable, and authority boundary. Do not delegate a one-tool "
-            "action, and synthesize the final answer yourself."
+            "Delegate independent multi-step work: explore for a broad search across many "
+            "files, coder for a change spanning several files. Give a complete goal, "
+            "deliverable and limits; never delegate a one-tool action; write the final "
+            "answer yourself."
         )
     mcp_tools = [spec for spec in specs.values() if spec.get("mode") == "mcp"]
     if mcp_tools:
@@ -5039,6 +5058,10 @@ def render_permission_context(mode: str | None = None) -> str:
     """State the live permission boundary once for every front end."""
     mode = mode or PERMISSION_MODE
     lines = [f"\n\n## Current Permission Mode: {mode}"]
+    # Not "allowed when sandboxed": file tools never run in the sandbox, and a
+    # 26B model read that as "I can only write inside the sandbox, not on the PC".
+    where = ("File tools work on this computer's files in the allowed paths; "
+             "only shell and code run sandboxed.")
     if mode == "plan-only":
         lines.append(
             # Restored from the "## Plan Mode" section that the layered-prompt
@@ -5053,18 +5076,17 @@ def render_permission_context(mode: str | None = None) -> str:
         )
     elif mode == "full-auto":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Catastrophic commands and "
-            "credential-path writes remain blocked."
+            f"{where} Catastrophic commands and credential-path writes remain blocked."
         )
     elif mode == "edit":
         lines.append(
-            "Permission-gated tools are allowed when sandboxed. Use only the actions needed; "
+            f"{where} Use only the actions needed; "
             "catastrophic commands and credential-path writes remain blocked."
         )
     else:
         lines.append(
             "Reads and safe shell commands are allowed. Writes and mutations require user "
-            "approval; rely on the tool result for the actual decision."
+            f"approval; rely on the tool result for the actual decision. {where}"
         )
     return "\n".join(lines) + "\n"
 
@@ -5299,6 +5321,29 @@ def _inside_a_repository(target: Path) -> bool:
     return False
 
 
+def _user_named_path(raw_path: str, parsed: Path) -> bool:
+    """Did the person's own message name this path (as typed, or project-relative)?"""
+    turns = _authorising_turns(_CURRENT_RUN_MESSAGES or [])
+    if not turns:
+        return False
+    spellings = {str(raw_path or "").replace("\\", "/").strip()}
+    try:
+        if parsed.is_absolute():
+            spellings.add(parsed.relative_to(PROJECT_ROOT).as_posix())
+    except ValueError:
+        pass
+    spellings = {text[2:] if text.startswith("./") else text for text in spellings}
+    spellings = {text.lower() for text in spellings if text and text not in (".", "..")}
+    if not spellings:
+        return False
+    for message in turns:
+        said = _message_text(message).replace("\\", "/").lower()
+        for text in spellings:
+            if re.search(rf"(?<![\w./-]){re.escape(text)}(?![\w-])", said):
+                return True
+    return False
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -5322,6 +5367,13 @@ def resolve_write_path(raw_path: str) -> Path:
         if not _path_is_allowed(resolved):
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
+    if _user_named_path(raw_path, p):
+        # The user typed this exact path: it is the deliverable, not a file the
+        # agent invented, so it stays where they said (inside the permitted
+        # workspace -- the checks below still refuse anything else).
+        named = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
+        if (named == PROJECT_ROOT or PROJECT_ROOT in named.parents) and _path_is_allowed(named):
+            return named
     if p.is_absolute():
         resolved = p.resolve()
         if (not resolved.exists() and resolved != ARTIFACTS_ROOT
@@ -6228,6 +6280,24 @@ def _git_tool_changed_tree(name: str, result: str) -> bool:
     text = str(result or "")
     return not (text.lstrip().startswith("Error") or "exited with status" in text
                 or "nothing to commit" in text or "nothing added to commit" in text)
+
+
+_SHELL_GIT_COMMAND = re.compile(r"(?:^|[\s;&|(])git\s")
+
+
+def _git_tools_hint(command: str) -> str:
+    """Where a git command the shell refused can still go, or "".
+
+    `git push` is hard-blocked in the shell and the sandbox refuses writes under
+    .git, so a commit-and-push through execute_shell always fails. Told only
+    "forbidden by safety policy", small models reported a security block and
+    stopped until the user wrote "you have full permission". The git tools run
+    git on this computer, and git_push asks the user for its own approval."""
+    if not _SHELL_GIT_COMMAND.search(command or ""):
+        return ""
+    return ("Use the git tools instead: git_commit, git_push, git_branch, git_checkout. "
+            "They run git on this computer, and git_push shows the user an approval "
+            "prompt itself, so call it rather than asking for permission first.")
 
 
 # --- what a shell command after a finishing check is -------------------------
@@ -7541,8 +7611,26 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     except OSError:
         snapshot = None
 
+    touched_before = set(_TURN_FILES_TOUCHED)
     report = _exec_subagent({"agent_type": "test-writer", "task": brief}, depth=depth)
     after = _file_fingerprint(source)
+    broken = []
+    for written in _TURN_FILES_TOUCHED:
+        written_path = Path(written)
+        if (written in touched_before or written_path.suffix.lower() != ".py"
+                or written_path == source):
+            continue
+        try:
+            problem = _python_syntax_error(written_path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if problem:
+            broken.append(f"{written_path} ({problem})")
+    if broken:
+        report = ("WARNING: generated test code is not valid Python, so the tests "
+                  "were NOT created successfully: " + "; ".join(broken)
+                  + ". Rewrite those files with plain code, or call generate_tests "
+                  "again.\n\n" + report)
 
     # `after` is "" when the file was deleted outright, which is a modification
     # too -- requiring it to be truthy would let the worst case through silently.
@@ -9989,11 +10077,12 @@ def _docker_shell_path_hint(target) -> str:
     entry = capabilities.get(capabilities.SANDBOX)
     if entry is None or entry.active != "docker":
         return ""
+    mounted = _shell_workspace_root or ARTIFACTS_ROOT
     try:
-        relative = Path(target).resolve().relative_to(ARTIFACTS_ROOT)
+        relative = Path(target).resolve().relative_to(mounted)
     except ValueError:
         return (" (shell commands run in Docker and cannot see this file: only "
-                f"{ARTIFACTS_ROOT} is mounted there, at /workspace)")
+                f"{mounted} is mounted there, at /workspace)")
     return f" (shell commands see it as /workspace/{relative.as_posix()})"
 
 
@@ -10376,7 +10465,7 @@ _SANDBOX_DENIED_RE = re.compile(
     r"|(?:\[Errno 13\] |: )Permission denied(?! \(publickey\))")
 
 
-def _explain_sandbox_denial(result: str, workspace: Path) -> str:
+def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> str:
     """Say where the sandbox lets a command write when it was refused access.
 
     "Access is denied" alone does not tell the model the boundary is deliberate,
@@ -10385,12 +10474,17 @@ def _explain_sandbox_denial(result: str, workspace: Path) -> str:
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    if hint := _git_tools_hint(command):
+        return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only, and programs "
+            "the sandbox temp folder; everything else is read-only to them. To create "
+            "or change a file elsewhere in the allowed paths, use write_file or "
+            "edit_file: they act on this computer's files, not the sandbox. Programs "
             "outside the agent's own runtime may be refused. Creating virtual "
             "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder, use the packages the agent's "
-            "Python already has, or ask the user to install what is missing.")
+            "here: keep outputs under that folder and use the packages the agent's "
+            "Python already has or another tool; ask the user to install something "
+            "only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
@@ -10408,9 +10502,12 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     if backend == "unavailable":
         return _sandbox_required_error()
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
-    command = _artifact_workspace_command(command)
     temporary = None
     workspace = ARTIFACTS_ROOT
+    if _shell_workspace_root is not None and not _sandbox_readonly:
+        workspace = _shell_workspace_root
+    else:
+        command = _artifact_workspace_command(command)
     if _sandbox_readonly:
         temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
         workspace = Path(temporary.name)
@@ -10422,7 +10519,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
         return _explain_sandbox_denial(
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
-            ARTIFACTS_ROOT if temporary is None else workspace)
+            workspace if temporary is None else workspace, command)
     finally:
         if temporary:
             temporary.cleanup()
@@ -12185,7 +12282,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                detail=command[:200], reason="hard_blocked_shell")
         if last_refusal_was_process_stop():
             return PROCESS_STOP_REFUSAL
-        return "Error: This shell operation is forbidden by Agent8088's safety policy."
+        refusal = "This shell operation is forbidden by Agent8088's safety policy."
+        if hint := _git_tools_hint(command):
+            # Its own suggested_action: the generic one ("do not bypass
+            # permissions") read as "do not use another route" to small models.
+            return efficiency.tool_error("blocked_shell_git", refusal, hint, recoverable=True)
+        return f"Error: {refusal}"
 
     if mode == "shell":
         web_urls = _shell_web_urls(command)
@@ -12466,7 +12568,16 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
             return result
+        global _shell_workspace_root
+        if (not DISPOSABLE_CONTAINER and PROJECT_ROOT in target.parents
+                and ARTIFACTS_ROOT not in target.parents and target != ARTIFACTS_ROOT
+                and _user_named_path(write_path, Path(write_path).expanduser())):
+            _shell_workspace_root = PROJECT_ROOT
         content = _structured_text_argument(args.get(content_arg, ""))
+        cleaned_code = False
+        if name in ("write_file", "edit_file") and args.get("_private") is not True:
+            content, cleaned_code = _clean_generated_code(
+                content, target, fences=name == "write_file")
         if not continues_series:
             _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -12570,6 +12681,16 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"given, so {target} was left unchanged. Pass content to write "
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
+        if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
+                and (syntax_error := _python_syntax_error(content))):
+            # Writing this would break collection of the whole suite. Leave the
+            # file as it was and let the author correct and resend.
+            _turn_writes -= 1
+            return efficiency.tool_error(
+                "invalid_python", f"{target} was NOT written: the content is not valid "
+                f"Python ({syntax_error}).",
+                "Send the complete, corrected file again with plain code only: no "
+                "reasoning tags, no Markdown fences, no commentary.", recoverable=True)
         if args.get("_private") is True:
             _write_private_text(target, content)
         else:
@@ -12579,6 +12700,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             # A later append continues from here; an older series on this path is over.
             _turn_chunked[str(target)] = len(content.encode("utf-8"))
         result = f"Wrote {len(content)} bytes to {target}" + _docker_shell_path_hint(target)
+        if cleaned_code:
+            result += " (reasoning markup was removed from the content before writing)"
         if shadowed is not None:
             result += (f" — NOT {shadowed}. A bare filename is stored in "
                        f"artifacts/; pass that absolute path if you meant to "
@@ -12643,6 +12766,88 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     return f"Unknown tool mode '{mode}' for tool '{name}'"
 
 
+_REASONING_TAGS = "think|thinking|reason|reasoning|thought|scratchpad"
+# Only a leading Python reasoning wrapper may be removed by this pattern.
+# Parsing the source first protects tag-looking lines inside real code.
+_REASONING_PAIR_RE = re.compile(
+    rf"\A[ \t]*<({_REASONING_TAGS})>(?:[^\r\n]*</\1>[ \t]*(?:\r?\n|\Z)|[ \t]*\r?\n.*?\r?\n[ \t]*</\1>[ \t]*(?:\r?\n|\Z))",
+    re.DOTALL | re.IGNORECASE)
+_REASONING_CLOSE_LINE_RE = re.compile(
+    rf"^[ \t]*</(?:{_REASONING_TAGS})>[ \t]*$\r?\n?", re.IGNORECASE | re.MULTILINE)
+_REASONING_OPEN_LINE_RE = re.compile(
+    rf"\A[ \t]*<(?:{_REASONING_TAGS})>[ \t]*\r?\n.*", re.DOTALL | re.IGNORECASE)
+_CLEANED_CODE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".rb", ".go", ".rs"})
+
+
+def _python_syntax_error(code: str) -> str:
+    """"" when `code` parses as Python, else a one-line SyntaxError summary."""
+    import ast
+    try:
+        ast.parse(code)
+    except (SyntaxError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tuple:
+    """Remove outer code fences, and leaked reasoning from invalid Python.
+
+    Valid Python and tag text in other languages are preserved. Returns
+    (text, changed); unsupported file types pass through untouched.
+    """
+    if target.suffix.lower() not in _CLEANED_CODE_SUFFIXES or not text:
+        return text, False
+    if target.suffix.lower() != ".py":
+        cleaned = _strip_code_fences(text) if fences else text
+        return cleaned, cleaned != text
+    # Valid Python is authoritative: tag-looking lines may live inside a
+    # multiline string or comment and must survive untouched.
+    if target.suffix.lower() == ".py" and not _python_syntax_error(text):
+        return text, False
+    # Remove only an enclosing reasoning preamble and outer fence before
+    # judging Python syntax. Otherwise a fence makes valid source appear
+    # invalid and a legitimate </think> inside a triple-quoted string can be
+    # mistaken for a leaked reasoning closer.
+    candidate = _REASONING_PAIR_RE.sub("", text, count=1)
+    if fences:
+        candidate = _strip_code_fences(candidate)
+    if candidate.strip() and candidate != text and not _python_syntax_error(candidate):
+        if (not candidate.endswith("\n") and
+                (text.endswith("\n") or re.search(r"\r?\n```[ \t]*$", text))):
+            candidate += "\n"
+        return candidate, True
+    cleaned = _REASONING_PAIR_RE.sub("", text)
+    if target.suffix.lower() == ".py" and _REASONING_CLOSE_LINE_RE.search(cleaned):
+        # A closer with no opener: whatever precedes it leaked reasoning. Keep
+        # the part after it only if that is what makes the file valid Python.
+        tail = _REASONING_CLOSE_LINE_RE.split(cleaned, maxsplit=1)[1]
+        if (target.suffix.lower() == ".py" and _python_syntax_error(cleaned)
+                and not _python_syntax_error(_REASONING_CLOSE_LINE_RE.sub("", tail))):
+            cleaned = tail
+        cleaned = _REASONING_CLOSE_LINE_RE.sub("", cleaned)
+    cleaned = _REASONING_OPEN_LINE_RE.sub("", cleaned)
+    if target.suffix.lower() == ".py":
+        # A runaway opening tag after a complete file is also model markup.
+        # Require the prefix to parse before dropping the tail, so source text
+        # that happens to contain a tag can never be truncated.
+        for opening in re.finditer(
+                rf"(?im)^[ \t]*<(?:{_REASONING_TAGS})>[ \t]*(?:\r?\n|$)", cleaned):
+            prefix = cleaned[:opening.start()]
+            if prefix.strip() and not _python_syntax_error(prefix):
+                cleaned = prefix
+                break
+    if fences:
+        cleaned = _strip_code_fences(cleaned)
+    if text.strip() and not cleaned.strip():
+        # A reasoning-only response contains no replacement code. Retain the
+        # invalid input so the test-file guard refuses it rather than erasing
+        # an existing test. An explicit empty content argument remains valid.
+        return text, False
+    if cleaned != text and not cleaned.endswith("\n") and text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, cleaned != text
+
+
 def _make_diff(old: str, new: str, filename: str) -> list:
     """Return a unified diff as a list of lines for Rich UI colorized display."""
     import difflib
@@ -12686,7 +12891,8 @@ def _not_found_tool_error(error: FileNotFoundError) -> str:
     stem = program[:-4] if program.lower().endswith(".exe") else program
     hint = _INSTALL_HINTS.get(stem.lower())
     if hint or (os.sep not in str(missing) and "/" not in str(missing) and "." not in stem):
-        action = (f"`{stem}` is not installed or not on PATH: {hint}. Tell the user; do not try to install it yourself."
+        action = (f"`{stem}` is not installed or not on PATH. Do the job another way with the tools you "
+                  f"have if you can; otherwise tell the user ({hint}). Do not try to install it yourself."
                   if hint else f"`{stem}` is not installed or not on PATH. Use another tool, or tell the user it is missing.")
         return efficiency.tool_error('not_found', f'Program not found: {stem}', action, recoverable=True)
     return efficiency.tool_error('not_found', f'File not found: {missing}',
@@ -12874,7 +13080,8 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except PermissionError as e:
         target = f": {e.filename}" if getattr(e, "filename", None) else ""
         result = efficiency.tool_error('permission_denied', f'The operating system denied access{target}.',
-            'Ask the user to resolve access or choose an accessible path. Do not bypass permissions.')
+            'Choose an accessible path or another way to do this; ask the user only if this exact '
+            'path is required. Do not bypass permissions.')
     except (ValueError, TypeError) as e:
         result = efficiency.tool_error('invalid_input', str(e),
             'Inspect the tool schema and correct the input; do not repeat unchanged arguments.', recoverable=True)
@@ -12883,6 +13090,12 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     except Exception as e:
         result = f"Error: {e}" if str(e) else f"Error: {type(e).__name__}"
 
+    if result.startswith('Error: Path not allowed'):
+        # The real boundary, so the model does not report "sandbox only".
+        allowed = ", ".join(str(path) for path in ALLOWED_PATHS) or "none"
+        result = efficiency.tool_error('path_not_allowed', result.removeprefix('Error:').strip(),
+            f"File tools work on this computer's files, but only inside: {allowed}. Use a path "
+            f"there; only the user can allow another folder, via allowed_paths in {_config_file()}.")
     if result.startswith('Error:') and '"suggested_action"' not in result:
         validation = _is_missing_argument_error(result) or _is_parse_error_result(result)
         result = efficiency.tool_error('invalid_arguments' if validation else 'tool_failure',
@@ -13159,7 +13372,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
             if resolved in allowed:
                 d["name"] = resolved
                 d["arguments"] = d.get("arguments", {})
-                calls.append(d)
+                calls.append({**d, "_source_pos": m.start()})
         except Exception:
             pass
     # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}, once per block
@@ -13180,13 +13393,15 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                      if position + 1 < len(headers) else len(text))
             raw_args = _scan_json_object(text, header.end(), limit)
             try:
-                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args)})
+                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args),
+                              "_source_pos": header.start()})
             except Exception:
                 # An ARGS block was sent but is unparseable. Surfacing empty
                 # args here would make the tool report the argument as
                 # missing, which sends the model chasing the wrong problem.
                 # Flag the parse failure instead.
-                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args)})
+                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args),
+                              "_source_pos": header.start()})
         # An ✿ARGS✿ block that is not a JSON object matches no header above (they
         # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
         # IS present — so the call was dropped and the model saw no result at
@@ -13221,25 +13436,51 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 continue
             params = {key: value.strip("\n") for key, value in re.findall(
                 r"<parameter=([\w.-]+)>(.*?)</parameter>", m.group(2), re.DOTALL)}
-            calls.append({"name": resolved, "arguments": params})
+            calls.append({"name": resolved, "arguments": params, "_source_pos": m.start()})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     # The arguments object's extent is found by counting braces, for the same
     # reason the ✿ARGS✿ branch above does it: a non-greedy `(\{.*?\})` stops at
     # the first '}' and truncates any nested object, which made the whole call
     # unparseable and silently dropped it. MCP tools declare their own
     # parameter schemas and can legitimately take nested objects.
-    if not calls:
-        for m in re.finditer(
-                r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
-            resolved = _resolve_tool_name(m.group(1))
-            if resolved not in allowed:
-                continue
-            try:
-                calls.append({"name": resolved,
-                              "arguments": _loads_tool_args(_scan_json_object(text, m.end()))})
-                break
-            except Exception:
-                pass
+    # Always scan bare JSON as well: mixed native/text replies are common.
+    # Skip candidates nested inside marker argument objects, where they are
+    # examples/data rather than additional calls.
+    marker_spans = []
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"<\|mask_start\|>.*?<\|mask_end\|>", text, re.DOTALL))
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"✿\{.*?\}✿", text, re.DOTALL))
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"<function=[\w.-]+>.*?</function>", text, re.DOTALL))
+    for header in re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text):
+        end = _scan_json_object(text, header.end())
+        marker_spans.append((header.start(), header.end() + len(end)))
+    # Find outer objects independently of tool names. Otherwise an unknown
+    # tool name (or an ordinary JSON data container) lets a nested example
+    # become a call simply because its parent did not match the call regex.
+    root_starts = set()
+    consumed_until = -1
+    for opening in re.finditer(r"\{", text):
+        if opening.start() < consumed_until:
+            continue
+        raw_object = _scan_json_object(text, opening.start())
+        root_starts.add(opening.start())
+        consumed_until = opening.start() + len(raw_object)
+    for m in re.finditer(
+            r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
+        if (m.start() not in root_starts
+                or any(start < m.start() < end for start, end in marker_spans)):
+            continue
+        resolved = _resolve_tool_name(m.group(1))
+        if resolved not in allowed:
+            continue
+        try:
+            calls.append({"name": resolved,
+                          "arguments": _loads_tool_args(_scan_json_object(text, m.end())),
+                          "_source_pos": m.start()})
+        except Exception:
+            pass
     # 4) tool name followed by an inline {"command": "..."}
     if not calls:
         for name in allowed:
@@ -13265,6 +13506,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                     calls.append({"name": resolved, "arguments": d.get("arguments", {})})
             except Exception:
                 pass
+    calls.sort(key=lambda call: call.pop("_source_pos", len(text)))
     return calls
 
 
@@ -14108,7 +14350,8 @@ def _model_failure_reason(error, provider_name: str = "", model_name: str = "") 
     if friendly.kind in ("unknown", "bad_request"):
         # Nothing more specific to say: keep the long-standing wording.
         message = f"the model backend errored ({detail})."
-    elif (detail and detail not in message and len(detail) <= 120
+    elif (friendly.kind != "auth"  # a provider's 401 text can echo part of the key
+          and detail and detail not in message and len(detail) <= 120
           and not any(ch in detail for ch in "{}<>")):
         message = f"{message.rstrip('.')} ({detail})."
     if not message.endswith((".", "!", "?", "…", ")")):
@@ -15351,6 +15594,8 @@ def describe_capabilities() -> str:
         f"- Writes per turn: {_on_off(MAX_WRITES_PER_TURN)}",
         f"- Max bytes per write: {_on_off(MAX_WRITE_BYTES)}",
         f"- New generated files: {ARTIFACTS_ROOT}",
+        f"- File tools (this computer, not the sandbox) reach: "
+        f"{', '.join(str(path) for path in ALLOWED_PATHS) or 'everywhere'}",
         f"- Web search: {_search_chain_summary()}{_limited_suffix(capabilities.SEARCH)}",
         f"- Egress allowlist: {', '.join(EGRESS_ALLOWED_DOMAINS) or 'not set (all public hosts reachable)'}",
         f"- Egress blocklist: {', '.join(EGRESS_BLOCKED_DOMAINS) or 'not set'}",
@@ -16653,6 +16898,14 @@ DELIVERABLES_CHECK_NUDGE = (
     "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
 POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+# The newest check failed: never tell the model it passed.
+POST_CHECK_FAILED_NUDGE = (
+    "The latest check FAILED and is still unfixed. Fix the failure now if you can. "
+    "If you cannot, give your final answer stating plainly that the check fails and "
+    "what remains broken. Do not claim the work is complete or verified."
+)
+CHECKS_FAILED_NOTE = ("Incomplete: the latest automated check failed and was not "
+                      "fixed. Treat the result as unfinished.")
 
 
 def _redirected_write_locations(trajectory) -> list[str]:
@@ -16759,7 +17012,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                 unmet="the reply says the work is unfinished")
     if nudge is None and depth == 0:
         missing = completion_checks.missing_outputs(
-            request, reply, written, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()])
+            request, reply, written, [PROJECT_ROOT, Path.cwd()],
+            mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [])
         if missing:
             nudge = completion_checks.outputs_nudge(missing)
     if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":
@@ -16811,6 +17065,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and trajectory.check_failing():
+        notes.append(CHECKS_FAILED_NOTE)
     if location_note := _workspace_note(trajectory):
         notes.append(location_note)
     for note in notes:
@@ -16910,7 +17166,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     recent_call_tokens = []  # the last few, for the adaptive first-call cap
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
-    last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
+    thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
+    last_cutoff_kind = ""       # kind of the last cut-off
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -16919,6 +17176,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
@@ -17138,15 +17396,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
-        # A3.2/A3.4: this one call runs with thinking off after an empty
-        # cut-off (the whole allowance went to reasoning, or to an unclosed tool
-        # call the runtime hides) and, for any other kind, from the 2nd
-        # consecutive cut-off; the next ordinary turn is back to normal thinking.
-        # Retrying an empty cut-off with thinking still on mostly cuts off again
-        # and costs a full call each time.
+        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
+        # thinking off; the next ordinary turn is back to normal thinking.
         retry_kwargs = ({"thinking": "length_retry"}
-                        if length_retries >= 2 or length_retries and last_cutoff_kind == "empty"
-                        else {})
+                        if length_retries >= 2 or thinking_off_retry else {})
+        if retry_kwargs and last_cutoff_kind != "tool_call":
+            # Thinking is off for this call, so it only has to write a short answer
+            # or one call: cap it at 4096 (or a lower initial_completion_cap).
+            turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
+                                  INITIAL_COMPLETION_CAP or THINKING_OFF_MAX_TOKENS)
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",
@@ -17326,6 +17584,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             else:
                 cutoff_kind, cap_hint = "empty", 0
                 prose_cutoffs = 0
+            # Thinking ate the budget (empty, or reasoning near the cap): the next call
+            # runs with thinking off, before the cap changes. A tool call being written
+            # keeps thinking on, since it needs room rather than less reasoning.
+            reasoning_chars = len(_extract_reasoning(message))
+            thinking_off_retry = cutoff_kind != "tool_call" and (
+                cutoff_kind == "empty" or reasoning_chars >= 0.9 * 4 * turn_max_tokens)
             last_cutoff_kind = cutoff_kind
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
@@ -17394,6 +17658,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "Your last responses reached the output limit and were discarded. "
                     "Reply within 200 tokens with exactly one complete tool call or a "
                     "final answer. Do not include analysis or thinking.")
+            if thinking_off_retry and length_retries == 1:
+                retry_instruction += " Call one tool or answer right away."
             messages.append(_harness_turn(retry_instruction))
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
@@ -17411,7 +17677,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
         cap_hint = prose_cutoffs = 0
-        last_cutoff_kind = ""
+        thinking_off_retry, last_cutoff_kind = False, ""
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -17582,7 +17848,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if on_answer:
                 on_answer(answer)
             if trace is not None:
-                trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                trace.append({"turn": turn, "type": "final_answer", "content": answer,
+                              "incomplete": bool(trajectory is not None
+                                                 and trajectory.check_failing())})
             return answer
 
         if on_calls:
@@ -17748,6 +18016,40 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
                 continue
 
+            rewrite_note = ""
+            if (name == "write_file" and MAX_FILE_REWRITES and "__parse_error__" not in args
+                    and str(args.get("mode") or "overwrite").strip().lower() == "overwrite"
+                    and args.get("filename")):
+                try:
+                    rewrite_target = resolve_write_path(str(args["filename"]))
+                    rewrite_key = os.path.normcase(os.path.realpath(os.fspath(rewrite_target)))
+                except (OSError, TypeError, ValueError):
+                    # Preserve the existing write/error path for unusual names;
+                    # canonicalization is bookkeeping and must never block it.
+                    rewrite_key = os.path.normcase(os.path.abspath(str(args["filename"])))
+                rewrite_counts[rewrite_key] = rewrite_counts.get(rewrite_key, 0) + 1
+                rewrites = rewrite_counts[rewrite_key]
+                if rewrites > MAX_FILE_REWRITES:
+                    result = (f"Refused: {rewrite_key} has been rewritten {rewrites - 1} times "
+                              "in this run without settling. Stop rewriting the whole file. "
+                              "Read the latest failing output, make a targeted change with "
+                              "edit_file, or report what is still wrong.")
+                    tool_outputs.append(result)
+                    if on_result:
+                        on_result(name, result)
+                    if turn_tools is not None:
+                        turn_tools.append({"name": name, "arguments": args,
+                                           "result": result, "blocked": True})
+                    messages.append({"role": "user",
+                                     "content": f"{_TOOL_RESULT_PREFIX}{name}):\n{result}"})
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "rewrite_limit", "path": rewrite_key})
+                    continue
+                if rewrites >= REWRITE_NUDGE_AFTER:
+                    rewrite_note = (f"\n{_HARNESS_PREFIX}{rewrite_key} has now been rewritten "
+                                    f"{rewrites} times. Rewriting the whole file again rarely "
+                                    "helps: read the failing output, then change only the broken "
+                                    "part with edit_file (or append the next chunk).")
             # The user may have hit ESC while this response was still streaming.
             # Without a check here the tool they just cancelled runs anyway, and
             # the interrupt is only noticed at the top of the next turn — after
@@ -17796,6 +18098,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    command=str(args.get("command") or ""),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -17927,8 +18230,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         trace.append({"turn": turn, "type": "denial_breaker",
                                       "content": answer})
                     return answer
-                messages.append(_harness_turn("Permission denied by the user. You remain in readonly mode. "
-                    "Tell the user what you could not do and why the task cannot be completed."))
+                # No mode claim: a denial does not change the mode, and "you
+                # remain in readonly mode" was false after a declined git_push
+                # in edit or full-auto, telling the model writes were now off.
+                messages.append(_harness_turn(f"Permission denied by the user, so {name} did not run. "
+                    "Do not retry it. Tell the user what you could not do and why."))
                 continue
 
             usable = (not _plan_step_failed(result)
@@ -17989,7 +18295,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   "trigger": "repeated_failure", "tool": name,
                                   "code": code, "outcome": status})
             messages.append({"role": "user", "content":
-                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}"})
+                             f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}{rewrite_note}"})
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
@@ -18045,11 +18351,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     if on_answer:
                         on_answer(answer)
                     if trace is not None:
-                        trace.append({"turn": turn, "type": "final_answer", "content": answer})
+                        trace.append({"turn": turn, "type": "final_answer", "content": answer,
+                                      "incomplete": bool(trajectory is not None
+                                                 and trajectory.check_failing())})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
-                    messages.append(_harness_turn(POST_CHECK_CAP_NUDGE))
+                    messages.append(_harness_turn(
+                        POST_CHECK_FAILED_NUDGE if (trajectory is not None
+                                                    and trajectory.check_failing())
+                        else POST_CHECK_CAP_NUDGE))
                     if trace is not None:
                         trace.append({"turn": turn, "type": "post_check_cap",
                                       "rounds": post_check_rounds})

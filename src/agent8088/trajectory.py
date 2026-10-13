@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from pathlib import PurePath
 
@@ -24,6 +25,14 @@ CODE_SUFFIXES = frozenset({
     ".kt", ".cs", ".php", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
 })
 
+# Throwaway scripts. A scratch file is not a deliverable, so it never prompts a
+# run or a test.
+SCRATCH_DIRS = frozenset({"scratch", "tmp", "temp", ".scratch"})
+SCRATCH_PREFIXES = ("scrape_", "inspect_", "debug_", "download_", "check_",
+                    "probe_", "tmp_", "test_run_")
+# A shell run that printed one of these did not succeed, so it proves nothing.
+_RUN_FAILED_RE = re.compile(r"^Error:|Command exited with status [1-9]\d*|timed out after \d+s")
+
 
 def _is_test_path(path: str) -> bool:
     p = PurePath(path)
@@ -36,6 +45,26 @@ def _is_test_path(path: str) -> bool:
 
 def _is_code_path(path: str) -> bool:
     return PurePath(path).suffix.lower() in CODE_SUFFIXES
+
+
+def _is_scratch_path(path: str, workspace: str = "") -> bool:
+    p = PurePath(path)
+    if workspace:
+        # A project under a folder named 'temp' is not scratch; only the part
+        # inside the workspace is judged.
+        try:
+            p = p.relative_to(workspace)
+        except ValueError:
+            pass
+    return (any(part.lower() in SCRATCH_DIRS for part in p.parts[:-1])
+            or p.name.lower().startswith(SCRATCH_PREFIXES))
+
+
+def _names_run(command: str, path: str) -> bool:
+    """Whether a shell command mentions a file by its name or its module."""
+    tokens = {PurePath(path).name, _module_key(path)} - {""}
+    return any(re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w.-])", command, re.IGNORECASE)
+               for token in tokens)
 
 
 def _module_key(path: str) -> str:
@@ -79,6 +108,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "written_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
+        "check_failing": False,
         "subgoals_built": False,
         "unmet_checks": [],
         "smoke_notes": [],
@@ -147,7 +177,7 @@ class TrajectoryState:
 
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
-                   path: str = "") -> None:
+                   path: str = "", command: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
@@ -171,6 +201,13 @@ class TrajectoryState:
             if path not in written:
                 written.append(path)
                 del written[:-MAX_WRITTEN]
+        # Changing a file is not evidence that the failed check is fixed.
+        # Keep the failure visible until a subsequent check actually passes,
+        # including failures from checks that also modify the workspace.
+        if operation["verdict"] == "failed":
+            self.data["check_failing"] = True
+        elif operation["verdict"] == "passed":
+            self.data["check_failing"] = False
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self.data["verification"] = "pending"
@@ -192,9 +229,9 @@ class TrajectoryState:
             del self.data["evidence"][:-MAX_EVIDENCE]
         if self.data["consecutive_setbacks"] >= 2:
             self.data["stalled"] = True
-        self._track_tests(operation, path, mutated=mutated)
+        self._track_tests(operation, path, mutated=mutated, command=command)
 
-    def _track_tests(self, operation: dict, path: str, *, mutated: bool) -> None:
+    def _track_tests(self, operation: dict, path: str, *, mutated: bool, command: str = "") -> None:
         """Maintain the list of code files changed this run with no test written.
 
         Only successful writes count. A blocked or failed write changed nothing,
@@ -211,6 +248,13 @@ class TrajectoryState:
             self.data["tests_requested"] = False
             return
 
+        if tool == "execute_shell":
+            # Running the file this run changed is its check, like a passing
+            # run_tests, but only when the run actually succeeded.
+            if not _RUN_FAILED_RE.search(operation.get("result", "")):
+                untested[:] = [p for p in untested if not _names_run(command, p)]
+            return
+
         if not path:
             return
 
@@ -225,6 +269,9 @@ class TrajectoryState:
         if _is_test_path(path):
             key = _module_key(path)
             untested[:] = [p for p in untested if _module_key(p) != key]
+            return
+
+        if _is_scratch_path(path, self.data.get("workspace", "")):
             return
 
         if path not in untested:
@@ -336,6 +383,16 @@ class TrajectoryState:
     def note_unmet(self, reasons: list[str]) -> None:
         self.data["unmet_checks"] = [_text(r) for r in reasons][:6]
 
+    def nudge_text(self) -> str:
+        """The one-shot nudge. It adds work to the task and never asks for a final answer."""
+        text = ("Continue the task, and also run what you built: "
+                + ", ".join(self.untested_paths())
+                + ". Execute each runnable file and report what it printed; "
+                "for a module, exercise it the same way.")
+        if "test" in str(self.data.get("goal") or "").lower():
+            text += " The user asked for tests, so also call generate_tests on each one."
+        return text
+
     def _set_step(self, name: str, status: str) -> None:
         for step in self.data.get("checklist", []):
             if step.get("name") == name:
@@ -344,6 +401,10 @@ class TrajectoryState:
 
     def needs_verification(self) -> bool:
         return self.data.get("verification") == "pending"
+
+    def check_failing(self) -> bool:
+        """True until a subsequent passing check resolves the latest failure."""
+        return bool(self.data.get("check_failing"))
 
     def request_verification(self) -> bool:
         # Each write re-arms the reminder, and a model that answers it by

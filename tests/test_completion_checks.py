@@ -73,11 +73,19 @@ def test_missing_and_empty_outputs_are_found(tmp_path):
     assert missing == ["empty.txt", "absent.txt"]
 
 
-def test_a_written_file_satisfies_a_bare_name_wherever_it_landed(tmp_path):
+def test_a_written_file_in_the_wrong_folder_does_not_satisfy_a_bare_name(tmp_path):
     landed = tmp_path / "elsewhere" / "report.md"
     landed.parent.mkdir()
     landed.write_text("content", encoding="utf-8")
-    assert c.missing_outputs("Write report.md", "done", [str(landed)], [tmp_path]) == []
+    assert c.missing_outputs("Write report.md", "done", [str(landed)], [tmp_path]) == ["report.md"]
+
+
+@pytest.mark.parametrize("requested", ["report.md", "./report.md"])
+def test_relative_and_absolute_requested_paths_resolve_at_the_target(tmp_path, requested):
+    target = tmp_path / "report.md"
+    target.write_text("content", encoding="utf-8")
+    assert c.missing_outputs(f"Write {requested}", "done", [], [tmp_path]) == []
+    assert c.missing_outputs(f"Write {target}", "done", [], [tmp_path]) == []
 
 
 def test_a_claimed_deliverable_that_is_now_empty_is_reported(tmp_path):
@@ -278,3 +286,50 @@ def test_a_project_living_under_the_temp_dir_is_not_all_scratch():
     assert c.is_library_code("/var/tmp/proj/src/a.py", temp, root)
     assert not c.is_library_code("/var/tmp/proj/scratch/a.py", temp, root)
     assert not c.is_library_code("/var/tmp/other/a.py", temp, root)
+
+
+# --- sheet #9: misplaced, empty and partial outputs -------------------------------
+
+def test_requested_file_found_only_in_artifacts_is_misplaced(tmp_path):
+    from agent8088 import completion as C
+    project, art = tmp_path, tmp_path / "artifacts"
+    art.mkdir()
+    (art / "report.md").write_text("x", encoding="utf-8")
+    found = C.missing_outputs("Write report.md with the results.", "Done, report.md written.",
+                              [str(art / "report.md")], [project], mirror_roots=[art])
+    assert len(found) == 1 and found[0].startswith("report.md") and "requested path" in found[0]
+    (project / "report.md").write_text("x", encoding="utf-8")
+    assert C.missing_outputs("Write report.md with the results.", "Done.",
+                             [str(project / "report.md")], [project], mirror_roots=[art]) == []
+
+
+def test_nested_request_is_not_satisfied_by_a_same_named_file_elsewhere(tmp_path):
+    from agent8088 import completion as C
+    other = tmp_path / "scratch"
+    other.mkdir()
+    (other / "out.json").write_text("{}", encoding="utf-8")
+    missing = C.missing_outputs("Save the data to phase3/out.json.", "Saved phase3/out.json.",
+                                [str(other / "out.json")], [tmp_path])
+    assert missing == ["phase3/out.json"]
+
+
+def test_empty_or_missing_output_folder_is_reported(tmp_path):
+    from agent8088 import completion as C
+    request = "Generate the charts into output/ and finish."
+    assert C.missing_outputs(request, "Phase 3 is complete.", [], [tmp_path]) == ["output/ (missing or empty)"]
+    (tmp_path / "output").mkdir()
+    assert C.missing_outputs(request, "done", [], [tmp_path]) == ["output/ (missing or empty)"]
+    (tmp_path / "output" / "a.png").write_bytes(b"png")
+    assert C.missing_outputs(request, "done", [], [tmp_path]) == []
+
+
+def test_partial_outputs_list_only_the_absent_ones(tmp_path):
+    from agent8088 import completion as C
+    (tmp_path / "a.txt").write_text("1", encoding="utf-8")
+    missing = C.missing_outputs("Create a.txt and b.txt.", "both created", [], [tmp_path])
+    assert missing == ["b.txt"]
+
+
+def test_input_directories_and_prose_slashes_are_not_outputs(tmp_path):
+    from agent8088 import completion as C
+    assert C.named_output_dirs("Read the files in data/ and summarise; use and/or as needed.") == []

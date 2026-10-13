@@ -209,7 +209,7 @@ def _is_ollama(provider, base_url) -> bool:
 # --- classifier -------------------------------------------------------------
 
 def explain_model_error(exc, *, provider=None, base_url=None, model=None,
-                        api_key_env=None, timeout_seconds=None) -> Friendly:
+                        api_key_env=None, timeout_seconds=None, env_file=None) -> Friendly:
     """Classify a model-call failure into a Friendly message + fix."""
     where = (base_url or "").strip() or "the model server"
     who = provider or "the provider"
@@ -227,10 +227,15 @@ def explain_model_error(exc, *, provider=None, base_url=None, model=None,
             False)
 
     if status in (401, 403):
-        key = api_key_env or "the provider's API key"
+        # Never the key itself, nor the provider's text: some echo part of it.
+        where_key = env_file or "your .env file"
+        if api_key_env:
+            where_key = f"{api_key_env} in {where_key}"
+        why = "invalid or revoked" if status == 401 else "invalid, revoked, or not allowed to use this model"
         return Friendly(
-            "auth", f"API key rejected by {who} (HTTP {status}).",
-            f"Check {key}, or run `agent8088 --setup`.", False)
+            "auth", f"API key rejected by {who} (HTTP {status}). The key is {why}.",
+            f"Put a valid key in {where_key}, or run /model setup "
+            "(`agent8088 --setup` from a shell).", False)
 
     if status == 404:
         if _MODEL_404.search(text) or (model and model.lower() in text and "not found" in text):

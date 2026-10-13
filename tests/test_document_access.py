@@ -204,3 +204,77 @@ def test_extraction_survives_an_os_that_refuses_memory_limits(monkeypatch, capsy
     monkeypatch.setattr(resource, 'setrlimit', refuse)
     access._limit_worker_memory()  # must not raise
     assert 'memory ceiling' in capsys.readouterr().err
+
+
+# --- sheet #36: keyword / normalized passage search ------------------------------
+
+def _search(tmp_path, text, query):
+    path = tmp_path / 'paper.txt'
+    path.write_text(text, encoding='utf-8')
+    return json.loads(access.read(path, {'action': 'search', 'query': query}))
+
+
+PAPER = ('## Page 3\nWe pick the bandwidth by the median\nheuristic on a random subsample of the data.\n'
+         + 'filler text. ' * 400
+         + '\n## Page 9\nThe Median Heuristic, however, is noisy.\n')
+
+
+def test_keywords_not_adjacent_still_find_the_passage(tmp_path):
+    result = _search(tmp_path, PAPER, 'median heuristic bandwidth subsample')
+    assert result['match_count'] >= 1
+    best = result['matches'][0]
+    assert best['match'] == 'all_terms' and best['location'] == 'Page 3'
+    assert best['terms_missing'] == []
+
+
+def test_partial_coverage_is_labelled_with_the_missing_terms(tmp_path):
+    result = _search(tmp_path, PAPER, 'median heuristic quantile')
+    partial = [m for m in result['matches'] if m['match'] == 'partial']
+    assert partial and partial[0]['terms_missing'] == ['quantile']
+    assert result['terms_absent_from_document'] == ['quantile']
+    assert 'terms_missing' in result['note']
+
+
+def test_exact_phrase_spans_line_breaks_case_and_punctuation(tmp_path):
+    result = _search(tmp_path, PAPER, '"median heuristic"')
+    assert result['match_count'] == 2
+    assert all(m['exact_phrase'] for m in result['matches'])
+    assert {m['location'] for m in result['matches']} == {'Page 3', 'Page 9'}
+
+
+def test_unrelated_text_is_not_returned_as_a_match(tmp_path):
+    result = _search(tmp_path, PAPER, 'photosynthesis chlorophyll')
+    assert result['match_count'] == 0 and result['matches'] == []
+    assert 'key terms' in result['note']
+    # One shared word out of four is not evidence either.
+    weak = _search(tmp_path, PAPER, 'median photosynthesis chlorophyll mitochondria')
+    assert weak['match_count'] == 0
+
+
+def test_plural_and_case_variants_match(tmp_path):
+    result = _search(tmp_path, 'Kernels are chosen. A kernel matters.', 'KERNEL')
+    assert result['match_count'] == 1
+
+
+def test_search_ranks_matching_passages_after_many_early_keyword_hits(tmp_path):
+    text = ('alpha ' * 21000) + ('gap ' * 1000) + 'alpha beta gamma'
+    result = _search(tmp_path, text, 'alpha beta gamma')
+    assert result['match_count'] >= 1
+    assert result['matches'][0]['match'] == 'all_terms'
+    assert 'alpha beta gamma' in result['matches'][0]['text']
+
+
+def test_search_keeps_separate_relevant_passages_within_heap_candidate_range(tmp_path):
+    text = ('alpha beta gamma' + (' filler' * 430)) + '\nMiddle: alpha beta gamma\n' + (' gap' * 430) + '\nLater: alpha beta gamma'
+    result = _search(tmp_path, text, 'alpha beta gamma')
+    assert result['match_count'] == 3
+    assert any('Middle: alpha beta gamma' in match['text'] for match in result['matches'])
+    assert any('Later: alpha beta gamma' in match['text'] for match in result['matches'])
+
+
+def test_dense_anchor_cluster_cannot_fill_the_candidate_heap(tmp_path, monkeypatch):
+    monkeypatch.setattr(access, '_SEARCH_MAX_CANDIDATES', 2)
+    text = ('x y ' * 40) + ('gap ' * 750) + 'later: x y'
+    result = _search(tmp_path, text, 'x y')
+    assert result['match_count'] == 2
+    assert any('later: x y' in match['text'] for match in result['matches'])

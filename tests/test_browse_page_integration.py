@@ -135,11 +135,11 @@ def test_ssrf_proxy_blocks_a_request_the_page_itself_makes(local_test_page, monk
     assert "fetch succeeded" not in result
 
 
-def test_browse_page_refuses_a_loopback_target_end_to_end():
+def test_browse_page_refuses_a_loopback_target_end_to_end(engine):
     """Needs neither a real browser nor a real model - the SSRF gate in
     _exec_browser runs before any browser-use code, so this one is not
     marked @_run_live and always runs."""
-    result = A._exec_browser({
+    result = engine._exec_browser({
         "url": "http://127.0.0.1:9/",
         "task": "read the page",
     })
