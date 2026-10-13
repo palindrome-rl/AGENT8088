@@ -2,6 +2,34 @@
 
 import json
 
+import pytest
+
+
+@pytest.mark.parametrize("command", [None, 123, {"unexpected": "object"}, []])
+def test_malformed_shell_command_remains_a_tool_error(engine, monkeypatch, command):
+    monkeypatch.setattr(engine, "run_tool", lambda *a, **k: "Error: command must be a string")
+    assert not engine._standalone_test_command(command)
+    result = engine.exec_tool("execute_shell", json.dumps({"command": command}))
+    assert "Error: command must be a string" in result
+
+
+@pytest.mark.parametrize("command,output,audited", [
+    ("python -m pytest -q", "3 passed", False),
+    ("python verify.py", "1 passed", True),
+    ("python fix.py && python -m pytest -q", "3 passed", True),
+    ("python -m pytest -q", "no verdict available", True),
+])
+def test_passing_tests_do_not_spawn_a_redundant_auditor(
+        engine, monkeypatch, command, output, audited):
+    monkeypatch.setattr(engine, "PLAN_AUDIT", True)
+    monkeypatch.setattr(engine, "PLAN_AUDIT_REVERT", False)
+    monkeypatch.setattr(engine, "run_tool", lambda *a, **k: output)
+    seen = []
+    monkeypatch.setattr(engine, "_audit_tool_call",
+                        lambda *a: seen.append(a) or output)
+    engine.exec_tool("execute_shell", json.dumps({"command": command}))
+    assert bool(seen) == audited
+
 
 def _enable_audit(engine, tmp_path, verdict="VERDICT: pass"):
     engine.ALLOWED_PATHS = [tmp_path]
