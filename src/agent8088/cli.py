@@ -823,7 +823,10 @@ def banner():
     details.add_row("Model", f"{active_profile}:{A.MODEL_NAME}")
     details.add_row("Backend", backend)
     details.add_row("Endpoint", str(endpoint))
-    details.add_row("Sandbox", A.sandbox_status()["resolved"])
+    sandbox_info = A.sandbox_status()
+    details.add_row("Sandbox", sandbox_info["resolved"]
+                    + (" (network policy not enforced)"
+                       if sandbox_info.get("network_enforced") is False else ""))
     details.add_row("Subagents", f"{len(A.SUBAGENT_SPECS)} loaded · {', '.join(sorted(A.SUBAGENT_SPECS))}")
     details.add_row("Session", f"temperature {S.temperature} · max turns {S.max_turns}")
 
@@ -4356,8 +4359,13 @@ def _doctor_base_checks():
         "" if config_found else "Run `agent8088 --setup`."))
     checks.append(_doctor_check("Working directory", *A.working_directory_status()))
     sandbox = A.sandbox_status()
-    checks.append(_doctor_check("Sandbox", "info",
-                                f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"))
+    unenforced = sandbox.get("network_enforced") is False
+    checks.append(_doctor_check(
+        "Sandbox", "warn" if unenforced and A.SANDBOX_ALLOWED_DOMAINS else "info",
+        f"{sandbox['resolved']} ({sandbox['verification']}) · {sandbox['detail']}"
+        + (f" · network policy {A.NETWORK_NOT_ENFORCED}" if unenforced else ""),
+        "sandbox_allowed_domains has no effect here; use sandbox_backend=docker to restrict the network."
+        if unenforced and A.SANDBOX_ALLOWED_DOMAINS else ""))
     checks.append(_doctor_check("Capabilities", "info",
                                 f"{len(_active_tool_specs())} tools · {len(_active_skills())} active skills"))
     checks.append(_doctor_search_check())
