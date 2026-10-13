@@ -12676,9 +12676,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
         if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
-                and (syntax_error := _python_syntax_error(content))
-                and (cleaned_code or (old_content.strip()
-                                      and not _python_syntax_error(old_content)))):
+                and (syntax_error := _python_syntax_error(content))):
             # Writing this would break collection of the whole suite. Leave the
             # file as it was and let the author correct and resend.
             _turn_writes -= 1
@@ -12763,14 +12761,15 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
 
 
 _REASONING_TAGS = "think|thinking|reason|reasoning|thought|scratchpad"
-# Wrappers count only when the tag owns its line (opener at line start, closer
-# at line end), so code that merely mentions a tag in a string or comment stays.
+# Only a leading Python reasoning wrapper may be removed by this pattern.
+# Parsing the source first protects tag-looking lines inside real code.
 _REASONING_PAIR_RE = re.compile(
-    rf"^[ \t]*<({_REASONING_TAGS})>.*?</\1>[ \t]*$\n?", re.DOTALL | re.IGNORECASE | re.MULTILINE)
+    rf"\A[ \t]*<({_REASONING_TAGS})>(?:[^\r\n]*</\1>[ \t]*(?:\r?\n|\Z)|[ \t]*\r?\n.*?\r?\n[ \t]*</\1>[ \t]*(?:\r?\n|\Z))",
+    re.DOTALL | re.IGNORECASE)
 _REASONING_CLOSE_LINE_RE = re.compile(
-    rf"^[ \t]*</(?:{_REASONING_TAGS})>[ \t]*$\n?", re.IGNORECASE | re.MULTILINE)
+    rf"^[ \t]*</(?:{_REASONING_TAGS})>[ \t]*$\r?\n?", re.IGNORECASE | re.MULTILINE)
 _REASONING_OPEN_LINE_RE = re.compile(
-    rf"^[ \t]*<(?:{_REASONING_TAGS})>[ \t]*$.*", re.DOTALL | re.IGNORECASE | re.MULTILINE)
+    rf"\A[ \t]*<(?:{_REASONING_TAGS})>[ \t]*\r?\n.*", re.DOTALL | re.IGNORECASE)
 _CLEANED_CODE_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".rb", ".go", ".rs"})
 
 
@@ -12785,13 +12784,34 @@ def _python_syntax_error(code: str) -> str:
 
 
 def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tuple:
-    """Strip model reasoning wrappers (and a surrounding Markdown fence) from
-    code about to be written. Returns (text, changed). Other file types, and
-    tags that are part of real code, pass through untouched."""
+    """Remove outer code fences, and leaked reasoning from invalid Python.
+
+    Valid Python and tag text in other languages are preserved. Returns
+    (text, changed); unsupported file types pass through untouched.
+    """
     if target.suffix.lower() not in _CLEANED_CODE_SUFFIXES or not text:
         return text, False
+    if target.suffix.lower() != ".py":
+        cleaned = _strip_code_fences(text) if fences else text
+        return cleaned, cleaned != text
+    # Valid Python is authoritative: tag-looking lines may live inside a
+    # multiline string or comment and must survive untouched.
+    if target.suffix.lower() == ".py" and not _python_syntax_error(text):
+        return text, False
+    # Remove only an enclosing reasoning preamble and outer fence before
+    # judging Python syntax. Otherwise a fence makes valid source appear
+    # invalid and a legitimate </think> inside a triple-quoted string can be
+    # mistaken for a leaked reasoning closer.
+    candidate = _REASONING_PAIR_RE.sub("", text, count=1)
+    if fences:
+        candidate = _strip_code_fences(candidate)
+    if candidate != text and not _python_syntax_error(candidate):
+        if (not candidate.endswith("\n") and
+                (text.endswith("\n") or re.search(r"\r?\n```[ \t]*$", text))):
+            candidate += "\n"
+        return candidate, True
     cleaned = _REASONING_PAIR_RE.sub("", text)
-    if _REASONING_CLOSE_LINE_RE.search(cleaned):
+    if target.suffix.lower() == ".py" and _REASONING_CLOSE_LINE_RE.search(cleaned):
         # A closer with no opener: whatever precedes it leaked reasoning. Keep
         # the part after it only if that is what makes the file valid Python.
         tail = _REASONING_CLOSE_LINE_RE.split(cleaned, maxsplit=1)[1]
@@ -12800,6 +12820,16 @@ def _clean_generated_code(text: str, target: Path, *, fences: bool = True) -> tu
             cleaned = tail
         cleaned = _REASONING_CLOSE_LINE_RE.sub("", cleaned)
     cleaned = _REASONING_OPEN_LINE_RE.sub("", cleaned)
+    if target.suffix.lower() == ".py":
+        # A runaway opening tag after a complete file is also model markup.
+        # Require the prefix to parse before dropping the tail, so source text
+        # that happens to contain a tag can never be truncated.
+        for opening in re.finditer(
+                rf"(?im)^[ \t]*<(?:{_REASONING_TAGS})>[ \t]*(?:\r?\n|$)", cleaned):
+            prefix = cleaned[:opening.start()]
+            if prefix.strip() and not _python_syntax_error(prefix):
+                cleaned = prefix
+                break
     if fences:
         cleaned = _strip_code_fences(cleaned)
     if cleaned != text and not cleaned.endswith("\n") and text.endswith("\n"):
@@ -13331,7 +13361,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
             if resolved in allowed:
                 d["name"] = resolved
                 d["arguments"] = d.get("arguments", {})
-                calls.append(d)
+                calls.append({**d, "_source_pos": m.start()})
         except Exception:
             pass
     # 2) ✿FUNCTION✿: name ✿ARGS✿: {...}, once per block
@@ -13352,13 +13382,15 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                      if position + 1 < len(headers) else len(text))
             raw_args = _scan_json_object(text, header.end(), limit)
             try:
-                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args)})
+                calls.append({"name": resolved, "arguments": _loads_tool_args(raw_args),
+                              "_source_pos": header.start()})
             except Exception:
                 # An ARGS block was sent but is unparseable. Surfacing empty
                 # args here would make the tool report the argument as
                 # missing, which sends the model chasing the wrong problem.
                 # Flag the parse failure instead.
-                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args)})
+                calls.append({"name": resolved, "arguments": _parse_error_args(raw_args),
+                              "_source_pos": header.start()})
         # An ✿ARGS✿ block that is not a JSON object matches no header above (they
         # require a '{'), and the loose-line branch below skips it because ✿ARGS✿
         # IS present — so the call was dropped and the model saw no result at
@@ -13393,24 +13425,43 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                 continue
             params = {key: value.strip("\n") for key, value in re.findall(
                 r"<parameter=([\w.-]+)>(.*?)</parameter>", m.group(2), re.DOTALL)}
-            calls.append({"name": resolved, "arguments": params})
+            calls.append({"name": resolved, "arguments": params, "_source_pos": m.start()})
     # 3) bare JSON {"name": "...", "arguments": {...}}
     # The arguments object's extent is found by counting braces, for the same
     # reason the ✿ARGS✿ branch above does it: a non-greedy `(\{.*?\})` stops at
     # the first '}' and truncates any nested object, which made the whole call
     # unparseable and silently dropped it. MCP tools declare their own
     # parameter schemas and can legitimately take nested objects.
-    if not calls:
-        for m in re.finditer(
-                r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
-            resolved = _resolve_tool_name(m.group(1))
-            if resolved not in allowed:
-                continue
-            try:
-                calls.append({"name": resolved,
-                              "arguments": _loads_tool_args(_scan_json_object(text, m.end()))})
-            except Exception:
-                pass
+    # Always scan bare JSON as well: mixed native/text replies are common.
+    # Skip candidates nested inside marker argument objects, where they are
+    # examples/data rather than additional calls.
+    marker_spans = []
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"<\|mask_start\|>.*?<\|mask_end\|>", text, re.DOTALL))
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"✿\{.*?\}✿", text, re.DOTALL))
+    marker_spans.extend((match.start(), match.end()) for match in re.finditer(
+        r"<function=[\w.-]+>.*?</function>", text, re.DOTALL))
+    for header in re.finditer(r'✿FUNCTION✿\s*:\s*(\w+)\s*✿ARGS✿\s*:\s*(?=\{)', text):
+        end = _scan_json_object(text, header.end())
+        marker_spans.append((header.start(), header.end() + len(end)))
+    bare_spans = []
+    for m in re.finditer(
+            r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(?=\{)', text, re.DOTALL):
+        if (any(start < m.start() < end for start, end in marker_spans)
+                or any(start < m.start() < end for start, end in bare_spans)):
+            continue
+        raw_call = _scan_json_object(text, m.start())
+        bare_spans.append((m.start(), m.start() + len(raw_call)))
+        resolved = _resolve_tool_name(m.group(1))
+        if resolved not in allowed:
+            continue
+        try:
+            calls.append({"name": resolved,
+                          "arguments": _loads_tool_args(_scan_json_object(text, m.end())),
+                          "_source_pos": m.start()})
+        except Exception:
+            pass
     # 4) tool name followed by an inline {"command": "..."}
     if not calls:
         for name in allowed:
@@ -13436,6 +13487,7 @@ def find_tool_calls(text: str, allowed: set = None) -> list:
                     calls.append({"name": resolved, "arguments": d.get("arguments", {})})
             except Exception:
                 pass
+    calls.sort(key=lambda call: call.pop("_source_pos", len(text)))
     return calls
 
 
@@ -17940,7 +17992,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if (name == "write_file" and MAX_FILE_REWRITES and "__parse_error__" not in args
                     and str(args.get("mode") or "overwrite").strip().lower() == "overwrite"
                     and args.get("filename")):
-                rewrite_key = str(args["filename"])
+                try:
+                    rewrite_target = resolve_write_path(str(args["filename"]))
+                    rewrite_key = os.path.normcase(os.path.realpath(os.fspath(rewrite_target)))
+                except (OSError, TypeError, ValueError):
+                    # Preserve the existing write/error path for unusual names;
+                    # canonicalization is bookkeeping and must never block it.
+                    rewrite_key = os.path.normcase(os.path.abspath(str(args["filename"])))
                 rewrite_counts[rewrite_key] = rewrite_counts.get(rewrite_key, 0) + 1
                 rewrites = rewrite_counts[rewrite_key]
                 if rewrites > MAX_FILE_REWRITES:
