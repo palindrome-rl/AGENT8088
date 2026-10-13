@@ -46,6 +46,8 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
+| `provider.<name>.reasoning_budget_tokens` | Thinking-token budget for that provider, overriding `reasoning_budget_tokens`; `0` turns it off for the provider. |
+| `provider.<name>.reasoning_budget_extra_body` | JSON object that tells that provider the budget, with `{budget}` standing for the number, e.g. `{"thinking": {"budget_tokens": {budget}}}`. Without it only OpenRouter is configured (`{"reasoning": {"max_tokens": N}}`); other providers are left alone. |
 | `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
 | `provider.<name>.length_retry_extra_body` | JSON fields sent only on the retry after a length cut-off, to turn thinking off for that one call. Defaults by provider: Ollama `{"think": false}`, vLLM `{"chat_template_kwargs": {"enable_thinking": false}}`, others `{"reasoning_effort": "none"}`. A provider that rejects them gets the call again without them. |
 | `fallback_models` | Comma-separated `provider:model` chain for transient errors, missing models, capacity failures, and independent-provider authentication failures. |
@@ -64,9 +66,9 @@ takes over:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `api_max_retries` | `3` | Attempts per call on retryable errors (429/503/connection). `0` disables. |
-| `api_retry_initial_delay_ms` | `500` | First backoff delay. |
-| `api_retry_max_delay_ms` | `10000` | Ceiling for the exponential backoff. |
+| `api_max_retries` | `5` | Retries per call on retryable errors (408/429/5xx, connection, errors the provider reports inside a stream). `0` disables. With the default delays the retries span about 30 s. |
+| `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
+| `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
 
 ### Fusion
@@ -149,8 +151,8 @@ not per call.
 |---|---|---|
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
-| `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox. |
-| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings. |
+| `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
+| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |
 | `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
 ## Gateway
@@ -289,11 +291,18 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
-| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
-| `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
-| `main_llm_min_tokens` | `4096` | Floor for the completion cap after a length cut-off: the retry gets about twice what the last normal reply used, never less than this and never more than the provider's limit. Resets after a normal reply. |
-| `length_retry_max_tokens` | `0` | Ceiling for the cap a cut-off retry earns. `0` = only the provider's limit. |
-| `length_cutoff_max_retries` | `4` | Consecutive length cut-offs before one final round with no tools that returns the partial answer and names the setting to raise. On the way: the 2nd retry turns thinking off, the 3rd compacts the conversation. `0` disables the final round. |
+| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check or a successful test of changed work before the model is told to answer; a fresh summary is requested 2 rounds later. A write resets the count. Research and failed tests do not start it. `0` disables it. |
+| `max_completion_continuations` | `3` | Follow-ups the completion checks may send in one request (empty reply, reply admitting unfinished work, a named file missing, a part of a multi-part request skipped, changed work unverified). A follow-up that makes progress hands its slot back. When spent the answer is accepted with a "Not completed" note. `0` turns the checks off. See [architecture](11-architecture.md#completion-checks). |
+| `completion_smoke_test` | `report` | What to do with a failed [`check_app`](04-tools.md#check_app) smoke test of a page or script the run wrote: `report` shows it in the answer and never blocks, `enforce` also asks the model to fix it, `off` skips it. |
+| `completion_smoke_timeout_seconds` | `20` | Time allowed for one page check. |
+| `completion_smoke_max_failures` | `2` | Failed smoke tests per request that `enforce` sends back to the model before accepting the answer with a note. |
+| `initial_completion_cap` | `8192` | Ceiling for the completion-token cap of an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry (up to `write_output_cap`); plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
+| `adaptive_completion_cap` | `1` | With the ceiling above, cap an ordinary call at twice the median size of the last five normal replies (reasoning included), never below `main_llm_min_tokens` (4096). A runaway call then stops after a few minutes instead of the full ceiling. `0` keeps the fixed ceiling. |
+| `main_llm_min_tokens` | `4096` | Floor for the adaptive completion cap and for the cap earned by a cut-off retry, bounded by the provider's limit. |
+| `length_retry_max_tokens` | `0` | Additional ceiling for a cut-off retry's completion cap. `0` leaves the other configured and provider limits in effect. |
+| `length_cutoff_max_retries` | `4` | Consecutive length cut-offs before one final no-tools round reports the incomplete output. `0` disables this retry-count stop; other budgets still apply. |
+| `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
+| `reasoning_budget_tokens` | `0` | Tokens a model may spend thinking on an ordinary turn, where the provider can be told (see `provider.<name>.reasoning_budget_extra_body`). `0` leaves the provider's default. Prefer this to raising the output cap: a larger cap makes every runaway call proportionally longer without making an answer more likely. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
@@ -321,8 +330,8 @@ is a plausible accident that the permission gate does not catch. Both default to
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_writes_per_turn` | `0` | Files one request may write. |
-| `max_write_bytes` | `0` | Bytes a single write may contain. |
+| `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
@@ -386,6 +395,7 @@ where a silently half-done plan does damage.
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `subagent_max_seconds.<profile>` | Wall clock, in seconds, for one sub-agent profile. **Overrides the profile's `max_seconds`.** Without either, `subagent_timeout_seconds` (300) applies. |
 | `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
 
 ### Changing a limit without editing this file

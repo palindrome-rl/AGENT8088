@@ -128,7 +128,13 @@ export function PromptBar() {
 
     const baseName = topicSessionName(topic)
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      const name = attempt === 0 ? baseName : `${baseName}-${attempt + 1}`
+      // A taken name is not the user's problem: stamp it with the time of
+      // creation (then a counter, then a random tail) until the backend accepts it.
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
+      const name = attempt === 0 ? baseName
+        : attempt === 1 ? `${baseName}-${stamp}`
+        : attempt < 9 ? `${baseName}-${stamp}-${attempt}`
+        : `${baseName}-${stamp}-${crypto.randomUUID().slice(0, 6)}`
       const response = await fetch('/api/sessions/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -300,14 +306,15 @@ export function PromptBar() {
           setSessionError(error instanceof Error ? error.message : 'Could not create a session')
           return
         }
-        addMessage({ role: 'user', content: trimmed })
       }
+      addMessage({ role: 'user', content: trimmed })
       if (cmd.toLowerCase() === 'raw') {
         setRawResult(null)
         setRawLoading(true)
         setRawPanelOpen(true)
       }
-      wsSend({ type: 'command', command: cmd, args: rest.join(' ') })
+      wsSend({ type: 'command', command: cmd, args: rest.join(' '),
+        session_id: useSessionStore.getState().sessionId || undefined })
     } else {
       const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       try {

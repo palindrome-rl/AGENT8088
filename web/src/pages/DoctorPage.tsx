@@ -11,8 +11,8 @@ import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
-async function fetchJSON<T>(url: string): Promise<T> {
-  return apiFetch<T>(url, { action: 'run diagnostics' })
+async function fetchJSON<T>(url: string, timeoutMs?: number): Promise<T> {
+  return apiFetch<T>(url, { action: 'run diagnostics', timeoutMs })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -136,7 +136,9 @@ export default function DoctorPage() {
   // Doctor health check
   const doctorQuery = useQuery({
     queryKey: ['doctor'],
-    queryFn: () => fetchJSON<DoctorReport>('/api/doctor'),
+    // Live probes (sandbox tools, Docker, provider, Chromium) can legitimately
+    // exceed the ordinary 30-second API deadline when optional services are down.
+    queryFn: () => fetchJSON<DoctorReport>('/api/doctor', 120_000),
   })
 
   // Fix mutation

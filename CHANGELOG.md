@@ -4,6 +4,30 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.2 branch maintenance - 2026-10-13
+
+### Improved
+
+- Shared completion checks catch unfinished work, missing outputs and unchecked
+  changes with a bounded follow-up budget. `check_app` smoke-tests generated
+  pages and scripts, with configurable reporting or enforcement.
+- Adaptive output limits, thinking-off recovery and chunked file writes keep
+  long replies and repetitive rewrites bounded. Successful tests no longer
+  trigger redundant audits.
+- Provider errors inside streams are retried; keyword tool ranking still works
+  without embeddings, and MCP text results preserve structured data when present.
+- Durable tasks can be deleted safely after their workers stop. Chat switching,
+  queued commands and automatically named sessions retain the correct identity.
+- Document extraction caching, persistent memory recall, Windows ESC handling
+  and CLI reasoning scrollback are more reliable.
+- Docker allowlist networking uses an egress proxy. Windows native sandbox
+  documentation accurately describes write-only confinement and non-admin setup.
+- The public Doctor page allows a bounded two minutes for live health probes;
+  desktop and mobile acceptance checks wait for completed diagnostic results.
+
+Public installation URLs, update channel, version 1.2.0, MIT licensing and
+public-specific diagnostics remain preserved.
+
 ## v1.2 branch maintenance - 2026-10-12
 
 ### Improved

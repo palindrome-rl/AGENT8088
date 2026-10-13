@@ -846,8 +846,9 @@ section("8f. SANDBOX — repeated network failures point at the setting")
 # sandbox could never reach: the network is closed unless sandbox_allowed_domains
 # names the host. Telling the model up front makes it give up before trying, so
 # the note comes only after the third failure, once per turn.
-_rb, _ad = E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS
+_rb, _ad, _plat = E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS, E.sys.platform
 E._resolve_sandbox_backend = lambda: "native"
+E.sys.platform = "linux"  # the Windows sandbox filters no network, so it gets no note
 E.SANDBOX_ALLOWED_DOMAINS = []
 E.reset_turn_counters()
 dns_fail = "curl: (6) Could not resolve host: onfe.itch.io\nCommand exited with status 6."
@@ -901,7 +902,7 @@ ok("run_tool adds the note on the third failure", "sandbox_allowed_domains" in r
    and "sandbox_allowed_domains" not in runs[1], runs[2][-80:])
 ok("note sits outside the untrusted wrapper",
    runs[2].rfind("sandbox_allowed_domains") > runs[2].rfind("END_UNTRUSTED_CONTENT"))
-E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS = _rb, _ad
+E._resolve_sandbox_backend, E.SANDBOX_ALLOWED_DOMAINS, E.sys.platform = _rb, _ad, _plat
 E.reset_turn_counters()
 
 section("8g. CONFIG BLOCKERS — the third refusal names who can change it")

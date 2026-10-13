@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from functools import wraps
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,25 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 log = logging.getLogger("agent8088.web")
+_SESSION_VIEW_LOCK = threading.Lock()
+
+
+def _session_view_exclusive(handler):
+    """Serialize session navigation with CLI commands bound through C.S."""
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        await _acquire_session_view_lock()
+        try:
+            return await handler(*args, **kwargs)
+        finally:
+            _SESSION_VIEW_LOCK.release()
+    return wrapped
+
+
+async def _acquire_session_view_lock():
+    """Wait without leaving a thread blocked if the request is cancelled."""
+    while not _SESSION_VIEW_LOCK.acquire(blocking=False):
+        await asyncio.sleep(0.01)
 
 # --- Engine imports (lazy, to avoid import-order issues) ---
 _engine = None
@@ -329,7 +349,10 @@ async def _serialize_session_changes(request: Request, call_next):
     change the running chat (or run a second model call)."""
     if (request.url.path.startswith("/api/sessions/")
             and request.method in {"POST", "PATCH", "DELETE"}):
-        if _running:
+        if _running or _SESSION_VIEW_LOCK.locked():
+            # A contextual CLI command serializes navigation through the
+            # session-view lock. Let the endpoint wait there instead of
+            # rejecting it as an unrelated concurrent turn.
             return await call_next(request)
         if not _TURN_LOCK.acquire(blocking=False):
             return _error(ANOTHER_TURN_RUNNING, 409)
@@ -716,10 +739,16 @@ def _task_store():
 
 def _task_view(task: dict, operations: list[dict] | None = None) -> dict:
     """Return task state without its checkpointed model messages."""
-    view = {key: value for key, value in task.items() if key != "messages_json"}
+    view = {key: value for key, value in task.items()
+            if key not in {"messages_json", "worker_pid"}}
+    view["worker_active"] = bool(task.get("worker_pid"))
     if operations is not None:
         view["operations"] = operations
     return view
+
+
+_durable_task_workers: set[str] = set()
+_durable_task_workers_lock = threading.Lock()
 
 
 def _run_durable_task(task_id: str) -> None:
@@ -741,10 +770,21 @@ def _run_durable_task(task_id: str) -> None:
         log.exception("durable task %s failed to start", task_id)
     finally:
         store.close()
+        with _durable_task_workers_lock:
+            _durable_task_workers.discard(task_id)
 
 
 def _start_durable_task(task_id: str) -> None:
-    threading.Thread(target=_run_durable_task, args=(task_id,), daemon=True).start()
+    with _durable_task_workers_lock:
+        if task_id in _durable_task_workers:
+            return
+        _durable_task_workers.add(task_id)
+    try:
+        threading.Thread(target=_run_durable_task, args=(task_id,), daemon=True).start()
+    except Exception:
+        with _durable_task_workers_lock:
+            _durable_task_workers.discard(task_id)
+        raise
 
 
 @app.get("/api/tasks")
@@ -792,8 +832,17 @@ async def resume_task(task_id: str):
             task = store.resolve(task_id)
         except KeyError:
             return _error(f"task not found: {task_id}", 404)
-        if task["state"] == "running":
-            return _error("task is already running", 409)
+        if task["state"] in {"running", "queued", "cancelling"}:
+            with _durable_task_workers_lock:
+                worker_active = task["id"] in _durable_task_workers
+            if worker_active or store.worker_is_alive(task["id"]):
+                message = "task is still stopping" if task["state"] == "cancelling" else "task is already running"
+                return _error(message, 409)
+            if task["state"] in {"running", "cancelling"} or int(task.get("worker_pid") or 0):
+                # A process restart can leave an owned task running or queued.
+                # Recover only after confirming the recorded worker is gone.
+                store.recover(task["id"])
+            task = store.get(task["id"])
         if task["state"] in {"completed", "cancelled"}:
             return _error(f"task is {task['state']} and cannot resume", 409)
     finally:
@@ -811,6 +860,24 @@ async def end_task(task_id: str):
         except KeyError:
             return _error(f"task not found: {task_id}", 404)
         return _task_view(store.cancel(task["id"]))
+    finally:
+        store.close()
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: str):
+    store = _task_store()
+    try:
+        try:
+            task = store.resolve(task_id)
+        except KeyError:
+            return _error(f"task not found: {task_id}", 404)
+        if not store.delete(task["id"]):
+            message = ("task is running or queued; end the task first" if
+                       task["state"] in {"running", "queued", "cancelling"} else
+                       "task worker is still finishing; try again in a moment")
+            return _error(message, 409)
+        return {"ok": True}
     finally:
         store.close()
 
@@ -1252,6 +1319,7 @@ class SessionRenameBody(BaseModel):
     new_name: str
 
 @app.patch("/api/sessions/{name}")
+@_session_view_exclusive
 async def rename_session(name: str, body: SessionRenameBody):
     """Rename a saved session without changing its transcript."""
     C = _cl()
@@ -1288,6 +1356,7 @@ async def rename_session(name: str, body: SessionRenameBody):
     return {"ok": True, "name": new_name}
 
 @app.delete("/api/sessions/{name}")
+@_session_view_exclusive
 async def delete_session(name: str):
     """Delete a saved session and clear it if it is active."""
     C = _cl()
@@ -1301,10 +1370,13 @@ async def delete_session(name: str):
     if _owns_running_turn(safe_name):
         return _error(RUNNING_SESSION_BUSY.format(name=safe_name), 409)
     active = C.S.name == safe_name
+    deleted_id = _file_session_id(_read_session_file(path))
     try:
         path.unlink()
     except OSError as exc:
         return _error(f"could not delete session: {exc}", 500)
+    if deleted_id:
+        _session_allowlist.pop(deleted_id, None)
     if active:
         # A new object, never a clear in place (KeyError: 'checklist' when a
         # turn still held the old one).
@@ -1312,6 +1384,7 @@ async def delete_session(name: str):
     return {"ok": True, "name": safe_name, "active": active}
 
 @app.post("/api/sessions/new")
+@_session_view_exclusive
 async def new_session(body: SessionActionBody):
     """Create a named session, or start an unnamed draft when name is blank."""
     C = _cl()
@@ -1320,9 +1393,6 @@ async def new_session(body: SessionActionBody):
     if not body.name.strip():
         _save_outgoing_view(C)
         C.S = _blank_session(C)
-        # ponytail: grants are one global list, so switching chats mid-run
-        # revokes the running chat's too (it re-asks); per-chat sets if that annoys.
-        _session_allowlist.clear()
         return {"ok": True, "name": "", "id": C.S.id}
     try:
         safe_name = C._session_name(body.name)
@@ -1334,13 +1404,11 @@ async def new_session(body: SessionActionBody):
     _save_outgoing_view(C)
     C.S = _blank_session(C, safe_name)
     _save_session(C, C.S)
-    # ponytail: grants are one global list, so switching chats mid-run
-    # revokes the running chat's too (it re-asks); per-chat sets if that annoys.
-    _session_allowlist.clear()
     return {"ok": True, "name": safe_name, "id": C.S.id}
 
 
 @app.post("/api/sessions/resume")
+@_session_view_exclusive
 async def resume_session(body: SessionActionBody):
     """Resume a named session."""
     C = _cl()
@@ -1364,7 +1432,6 @@ async def resume_session(body: SessionActionBody):
     if not isinstance(data, dict):
         return _error("could not load session: invalid session file", 400)
     loaded = _load_session(C, safe_name, data)
-    _session_allowlist.clear()
     _save_outgoing_view(C)
     # A new object, never mutated in place: a running turn keeps its own.
     C.S = loaded
@@ -1372,6 +1439,7 @@ async def resume_session(body: SessionActionBody):
 
 
 @app.post("/api/sessions/reset")
+@_session_view_exclusive
 async def reset_session():
     """Clear active session, retain name."""
     C = _cl()
@@ -1379,6 +1447,7 @@ async def reset_session():
         return _error(RUNNING_SESSION_BUSY.format(name=C.S.name or "This chat"), 409)
     # Replace, not clear in place (KeyError: 'checklist' otherwise).
     S = C.S
+    _session_allowlist.pop(_sid(S), None)
     S.messages = []
     S.trajectory_state = {}
     S.last_trace = None
@@ -1390,6 +1459,7 @@ async def reset_session():
 
 
 @app.post("/api/sessions/compact")
+@_session_view_exclusive
 async def compact_session(body: SessionActionBody):
     """Compact conversation — summarize older turns."""
     C = _cl()
@@ -2476,9 +2546,10 @@ async def _run_turn(handler, ws: WebSocket, msg: dict, A, C) -> None:
 _pending_approvals: dict = {}
 _pending_plan_approvals: dict = {}
 _pending_direct_tools: dict = {}
-# change_types the user approved "for this session". Outlives a turn (the
-# engine's own grants are one-shot) and is cleared on new/resumed session.
-_session_allowlist: set = set()
+# change_types the user approved "for this session", keyed by the stable web
+# session id. Switching the viewed chat must not revoke or transfer a running
+# chat's grants.
+_session_allowlist: dict[str, set[str]] = {}
 # Never session-wide: a push grant is bound to one target, so allowing the type
 # would re-issue it for any later target (a staging approval pushing to
 # production); and a plan's approval must be given per plan.
@@ -2705,7 +2776,8 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
         if not request.startswith("ESCALATION_REQUEST\x1f") or len(parts) < 5:
             return False  # not a request we can read: fail closed
         _, _target_mode, change_type, paths, _reason = parts
-        if change_type in _session_allowlist:
+        session_grants = _session_allowlist.setdefault(session_id, set())
+        if change_type in session_grants:
             A.grant_escalation(change_type, paths)
             return True
         esc_id = f"esc-{int(time.time()*1000)}-{id(result)}"
@@ -2726,7 +2798,7 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
             # always shows one, so ignore it there.
             if (entry.get("session_scope") and change_type not in _NO_SESSION_SCOPE
                     and A.PERMISSION_MODE != "plan-only"):
-                _session_allowlist.add(change_type)
+                _session_allowlist.setdefault(session_id, set()).add(change_type)
             # The type and target matter: a git push only runs when the grant
             # names its exact target, so a bare grant never let it through.
             A.grant_escalation(change_type, paths)
@@ -2849,9 +2921,69 @@ def _save_session_quietly(C, S) -> None:
 
 
 async def _handle_command(ws: WebSocket, msg: dict, A, C):
+    """Route contextual commands to the chat captured when they were queued.
+
+    `/new` and `/resume` are navigation commands: they intentionally operate
+    on the currently viewed chat and may change it. Other commands, including
+    inline `/plan`, belong to the originating chat.
+    """
+    command = str(msg.get("command", "")).strip().lstrip("/")
+    navigation = command.lower() in {"new", "resume"}
+    view_locked = command.lower() != "plan"
+    if view_locked:
+        # CLI handlers read the process-global C.S while they run in a worker
+        # thread. Keep HTTP navigation serialized until that short command ends.
+        await _acquire_session_view_lock()
+    target_id = msg.get("session_id")
+    viewed = getattr(C, "S", None)
+    if target_id or viewed is not None:
+        msg["_session_id"] = (target_id if target_id and not navigation
+                              else (_sid(viewed) if viewed is not None else ""))
+    if target_id and not navigation:
+        target = _turn_session(C, target_id)
+        if target is None:
+            if view_locked:
+                _SESSION_VIEW_LOCK.release()
+            await ws.send_json({"type": "command_result", "command": command,
+                                "result": "error: chat no longer exists",
+                                "session_id": target_id})
+            return
+        C.S = target
+    else:
+        target = viewed
+    command_session = target
+    try:
+        await _handle_command_impl(ws, msg, A, C)
+    finally:
+        if not navigation:
+            # The user may have switched chats after queuing this command.
+            # Keep that view while persisting any command-side session changes.
+            if command_session is not None and getattr(C, "S", None) is command_session:
+                _save_session_quietly(C, command_session)
+                if command_session is not viewed:
+                    C.S = viewed
+        if not navigation and command.lower() != "plan" and not msg.get("_busy_rejected"):
+            # Keep command input in the owning chat's durable transcript. The
+            # web composer echoes it immediately; persistence makes it reappear
+            # after switching away and back.
+            args = str(msg.get("args", "")).strip()
+            command_session.messages.append({"role": "user", "content": f"/{command}" + (f" {args}" if args else "")})
+            _save_session_quietly(C, command_session)
+        if view_locked:
+            _SESSION_VIEW_LOCK.release()
+
+
+async def _send_command_event(ws, msg, event):
+    if msg.get("_session_id"):
+        event.setdefault("session_id", msg["_session_id"])
+    await ws.send_json(event)
+
+
+async def _handle_command_impl(ws: WebSocket, msg: dict, A, C):
     """Execute a slash command and return the result."""
     if _TURN_LOCK.locked():
-        await ws.send_json({"type": "error", "message": ANOTHER_TURN_RUNNING})
+        msg["_busy_rejected"] = True
+        await _send_command_event(ws, msg, {"type": "error", "message": ANOTHER_TURN_RUNNING})
         return
     command = str(msg.get("command", "")).strip().lstrip("/")
     args = msg.get("args", "")
@@ -2865,30 +2997,30 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             msg["text"] = str(args)
             await _handle_chat(ws, msg, A, C)
         else:
-            await ws.send_json({"type": "command_result", "command": command,
+            await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                                 "result": "plan mode — reads only. Agent8088 will research, propose a "
                                           "plan, and wait for your approval before anything is written or run."})
         return
     # /help lists "/exit, /quit" and the CLI accepts both; /quit used to be
     # "unknown command" here.
     if command.lower() in {"exit", "quit"}:
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": f"/{command} is CLI-only and does nothing in the browser."})
         return
     if command.lower() == "agent" and not str(args).strip():
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": "cancelled — try /agent <name> <task>, or /agents to list them"})
         return
     if command.lower() == "fusion" and str(args).strip().lower() == "setup":
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": "Use Settings → Fusion to configure the panel and judge in the web UI."})
         return
     if command.lower() == "agents" and str(args).strip().lower().split(" ", 1)[0] in {"new", "delete"}:
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": "Use Settings → Sub-Agents to manage profiles in the web UI."})
         return
     if command.lower() == "agents" and str(args).strip().lower().startswith("edit"):
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": "/agents edit opens a local terminal editor and is not available in the web UI."})
         return
     model_arg = str(args).strip().lower()
@@ -2897,13 +3029,13 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             (command.lower() == "model" and model_arg in {"setup", "auto setup", "auto-setup"})):
         # auto setup is an interactive checklist too; run in the browser it
         # leaked prompt_toolkit's "expecting a Windows console" error.
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": "Use Settings → Config → Model Switcher for interactive model selection and setup. "
                                       "You can still switch directly with /model <provider>[:model]."})
         return
     handler = C.COMMANDS.get(command.lower())
     if not handler:
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                              "result": f"unknown command: /{command}"})
         return
     try:
@@ -2933,6 +3065,8 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             buf = io.StringIO()
             temp_console = RichConsole(file=buf, force_terminal=False, no_color=True, width=120)
             original_console = C.console
+            prior_session_id = _sid(C.S)
+            prior_session_name = C.S.name
             C.console = temp_console
             C.WEB_CONFIRM = {"command": f"/{command} {run_args}".strip(), "yes": confirmed}
             try:
@@ -2940,15 +3074,27 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
             finally:
                 C.console = original_console
                 C.WEB_CONFIRM = None
-            if command.lower() in ("new", "resume"):
-                _session_allowlist.clear()  # as the /api/sessions endpoints do
+            if command.lower() == "new" and C.S.name != prior_session_name:
+                # The CLI reuses its Session object for /new. Give the new
+                # conversation a fresh identity so the old grants cannot carry.
+                _session_allowlist.pop(prior_session_id, None)
+                new_id = uuid.uuid4().hex
+                C.S.id = new_id
+                if C.S.name:
+                    session_path = C._session_path(C.S.name)
+                    saved = _read_session_file(session_path)
+                    if saved:
+                        saved["id"] = new_id
+                        _save_session_file(session_path, saved)
+            if command.lower() == "reset" and not C.S.messages:
+                _session_allowlist.pop(_sid(C.S), None)
             return buf.getvalue()
 
         output = await loop.run_in_executor(None, _exec_command)
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                             "result": scrub_markup(output)})
     except Exception as exc:
-        await ws.send_json({"type": "command_result", "command": command,
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
                              "result": f"error: {exc}"})
 
 

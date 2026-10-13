@@ -5,12 +5,23 @@ All calls are non-raising and fail gracefully if mem0ai is not installed or erro
 """
 
 import json
+import inspect
 import logging
 import os
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("agent8088.memory.mem0")
+
+
+def _serialized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 # Telemetry is disabled unconditionally -- nothing leaves the machine.
 os.environ["MEM0_TELEMETRY"] = "false"
@@ -62,6 +73,9 @@ class Mem0MemoryStore:
         self.vector_store_type = str(self.config.get("vector_store", "qdrant")).strip().lower()
         self._memory = None
         self._available = None
+        self._lock = threading.RLock()
+        self.operation_error = ""
+        self.failed_operation = ""
         # Which embedder the config chain below actually settles on. /memory
         # reports this instead of guessing: the default is Ollama (nomic, shared
         # with the native engine), while `memory_mem0_embed_provider=fastembed`
@@ -74,6 +88,7 @@ class Mem0MemoryStore:
         # to mem0ai simply not being installed.
         self.last_error = ""
 
+    @_serialized
     def _init_memory(self):
         if self._available is False:
             return None
@@ -208,6 +223,10 @@ class Mem0MemoryStore:
             qdrant_cfg: Dict[str, Any] = {
                 "path": str(self.path),
             }
+            if self.vector_store_type == "qdrant":
+                # Older Mem0 releases delete a local path on reopen when this
+                # is false. Every Agent8088 memory store is persistent.
+                qdrant_cfg["on_disk"] = True
             if embed_dims:
                 qdrant_cfg["embedding_model_dims"] = embed_dims
 
@@ -217,6 +236,7 @@ class Mem0MemoryStore:
                     "config": qdrant_cfg,
                 },
                 "version": "v1.1",
+                "history_db_path": str(self.path / "history.db"),
             }
             if llm_section:
                 cfg["llm"] = llm_section
@@ -228,6 +248,33 @@ class Mem0MemoryStore:
                     "dims": embed_dims,
                 }
 
+            # Mem0's constructor validates its configuration but does not
+            # contact the embedding service. In particular, an unpulled local
+            # Ollama model used to look healthy until the first recall, where
+            # Mem0 swallowed the failure and returned an empty list. The native
+            # embedder uses the same provider/model configuration, so probe it
+            # once before claiming Mem0 is available. Falling back to SQLite
+            # preserves local keyword recall and status explains the split.
+            if (self.embedder is not None
+                    and embed_provider == "ollama"):
+                probe = self.embedder
+                model = embedder_section["config"]["model"]
+                if getattr(probe, "model", "") != model and self.client_factory:
+                    from .embed import Embedder
+                    probe = Embedder(self.client_factory, model)
+                if probe.available():
+                    dims = getattr(probe, "dim", None)
+                    if isinstance(dims, int) and dims > 0:
+                        qdrant_cfg["embedding_model_dims"] = dims
+                        self.embedder_info["dims"] = dims
+                else:
+                    detail = getattr(probe, "last_error", "")
+                    self.last_error = (f"embedding service unavailable for "
+                                       f"{embed_provider}/{model}"
+                                       + (f": {detail}" if detail else ""))[:300]
+                    self._memory = None
+                    self._available = False
+                    return None
             if hasattr(memory_cls, "from_config"):
                 self._memory = memory_cls.from_config(cfg)
             else:
@@ -253,6 +300,7 @@ class Mem0MemoryStore:
         self._init_memory()
         return self
 
+    @_serialized
     def close(self) -> None:
         memory = self._memory
         self._memory = None
@@ -266,14 +314,36 @@ class Mem0MemoryStore:
         if callable(close):
             close()
 
+    def _failed(self, operation, exc):
+        self.failed_operation = operation
+        self.operation_error = " ".join(str(exc).split())[:300] or type(exc).__name__
+
+    def _succeeded(self, operation):
+        if self.failed_operation == operation:
+            self.failed_operation = ""
+            self.operation_error = ""
+
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
+        self.close()
         return False
+
+    def _read(self, method, *, user_id, limit, query=None):
+        """Choose the SDK shape before calling; an internal error is not an API change."""
+        parameters = inspect.signature(method).parameters
+        modern = "top_k" in parameters or any(
+            value.kind == inspect.Parameter.VAR_KEYWORD for value in parameters.values())
+        kwargs = ({"filters": {"user_id": str(user_id)}, "top_k": int(limit)}
+                  if modern else {"user_id": str(user_id)})
+        if not modern and "limit" in parameters:
+            kwargs["limit"] = int(limit)
+        return method(str(query), **kwargs) if query is not None else method(**kwargs)
 
     # -- writes ------------------------------------------------------------
 
+    @_serialized
     def add(self, text, *, user_id: str = "owner", embedding=None, embed_model: str = "",
             project: Optional[str] = None, agent_id: Optional[str] = None,
             run_id: Optional[str] = None, categories=None, source: str = "extracted",
@@ -299,22 +369,26 @@ class Mem0MemoryStore:
         full_metadata.update(metadata or {})
         metadata = full_metadata
         try:
-            try:
-                resp = mem.add(text, user_id=str(user_id), metadata=metadata, infer=False)
-            except TypeError:
-                resp = mem.add(text, user_id=str(user_id), metadata=metadata)
+            # Extraction already happened in Agent8088. Never retry with
+            # Mem0's default inference after an internal TypeError.
+            resp = mem.add(text, user_id=str(user_id), metadata=metadata, infer=False)
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []
             elif isinstance(resp, list):
                 items = resp
-            if items and isinstance(items[0], dict):
-                return str(items[0].get("id") or "")
-            return "stored"
+            for item in items:
+                if isinstance(item, dict) and item.get("id") and item.get("event") != "DELETE":
+                    self._succeeded("add")
+                    return str(item["id"])
+            self._failed("add", RuntimeError("Mem0 did not confirm a saved memory"))
+            return None
         except Exception as exc:
+            self._failed("add", exc)
             log.debug("mem0 add failed: %s", exc)
             return None
 
+    @_serialized
     def delete(self, memory_id: str) -> bool:
         mem = self._init_memory()
         if mem is None:
@@ -326,6 +400,7 @@ class Mem0MemoryStore:
             log.debug("mem0 delete failed: %s", exc)
             return False
 
+    @_serialized
     def delete_all(self, *, user_id: str = "owner") -> int:
         mem = self._init_memory()
         if mem is None:
@@ -347,6 +422,7 @@ class Mem0MemoryStore:
 
     # -- reads -------------------------------------------------------------
 
+    @_serialized
     def search(self, query: str, *, user_id: str = "owner", embedding=None, model: str = "",
                limit: int = 5, rrf_k: int = 60, min_score: float = 0.0,
                record_access: bool = True) -> List[Dict[str, Any]]:
@@ -354,12 +430,7 @@ class Mem0MemoryStore:
         if mem is None:
             return []
         try:
-            try:
-                # mem0 2.x renamed limit -> top_k; limit landed in **kwargs and
-                # raised, so every search silently returned nothing.
-                resp = mem.search(str(query), filters={"user_id": str(user_id)}, top_k=int(limit))
-            except (TypeError, ValueError):
-                resp = mem.search(str(query), user_id=str(user_id), limit=int(limit))
+            resp = self._read(mem.search, query=query, user_id=user_id, limit=limit)
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []
@@ -388,20 +459,20 @@ class Mem0MemoryStore:
                     # genuinely stored yet invisible through this adapter.
                     "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
+            self._succeeded("search")
             return results
         except Exception as exc:
+            self._failed("search", exc)
             log.debug("mem0 search failed: %s", exc)
             return []
 
+    @_serialized
     def get_all(self, *, user_id: str = "owner", limit: int = 200) -> List[Dict[str, Any]]:
         mem = self._init_memory()
         if mem is None:
             return []
         try:
-            try:
-                resp = mem.get_all(filters={"user_id": str(user_id)}, top_k=int(limit))
-            except (TypeError, ValueError):
-                resp = mem.get_all(user_id=str(user_id))
+            resp = self._read(mem.get_all, user_id=user_id, limit=limit)
             items = []
             if isinstance(resp, dict):
                 items = resp.get("results") or []
@@ -419,8 +490,10 @@ class Mem0MemoryStore:
                     "created_at": item.get("created_at"),
                     "metadata": json.dumps(item.get("metadata")) if item.get("metadata") else None,
                 })
+            self._succeeded("get_all")
             return out
         except Exception as exc:
+            self._failed("get_all", exc)
             log.debug("mem0 get_all failed: %s", exc)
             return []
 
@@ -442,4 +515,6 @@ class Mem0MemoryStore:
             "embedder": self.embedder_info,
             "llm": self.llm_info,
             "error": self.last_error,
+            "operation_error": self.operation_error,
+            "failed_operation": self.failed_operation,
         }

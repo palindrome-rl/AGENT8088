@@ -137,7 +137,7 @@ Tried in order when the primary fails with a **retryable** error — HTTP 429,
 5xx, or a timeout/connection error. Deterministic failures (401, 400) do not
 trigger fallback, because retrying a bad key on a different provider just wastes
 a call. Before moving on, the same provider is retried with exponential backoff
-(`api_max_retries`, default 3; `0` means immediate failover).
+(`api_max_retries`, default 5; `0` means immediate failover).
 
 ## API keys
 
@@ -190,6 +190,23 @@ With `native_tools` enabled the full tool schemas go on the wire; with it off
 (`ollama` by default) the prompt carries the tool index and `describe_tool` can
 load one schema on demand. `tool_selection=hybrid` narrows the native schema set
 to the most relevant tools per request.
+
+Hybrid selection ranks tools with BM25 keyword matching and, when an embedding
+model is reachable, with embeddings, then offers the top 10 plus the always-on
+and pinned tools. An unavailable embedder does not trigger a full-catalog
+fallback (catalogs of 10 tools or fewer are already small enough to send whole):
+
+| Situation | What is offered |
+| --- | --- |
+| No embedder, or the embedding call fails | BM25 top 10 plus the always-on and pinned tools |
+| The two rankers share no candidate | The union of both top-10 lists plus the always-on and pinned tools |
+| No keyword matches, but usable semantic candidates | Semantic top 10 plus the always-on and pinned tools |
+| Neither ranker has candidates (for example a greeting with no embedder) | Only the always-on and pinned tools |
+
+The model still sees every tool name in the names-only index and can load any
+schema with `search_tools`, so a keyword miss costs a turn rather than the tool.
+Each fallback reason is logged once per process at INFO. To always send every
+schema, set `tool_selection=full` (`/tool-selection full`).
 
 ## Fusion — cross-provider panel + judge
 

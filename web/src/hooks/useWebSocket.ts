@@ -24,6 +24,8 @@ let reconnectAttempts = 0
 let outbox: WSClientMessage[] = []
 /** Once Stop is pressed, late stream frames must not turn the composer red again. */
 let interruptRequested = false
+/** A sent turn can reach the backend after a simultaneous status request. */
+let localTurnPending = false
 /** A model step began (spin 'thinking...' / tool_start) and has not streamed
  *  reasoning yet: its first delta opens a new section. Pending rather than an
  *  eager '' push, so a step without reasoning leaves no empty section. */
@@ -170,13 +172,16 @@ function wireSocket(ws: WebSocket) {
           const ui = useUIStore.getState()
           if (ui.approvalPending?.sessionId === eventSession) setApprovalPending(null)
           if (ui.planApprovalPending?.sessionId === eventSession) setPlanApprovalPending(null)
+          localTurnPending = false
           useSessionStore.getState().setRunningSession(null)
           const wasInterrupted = interruptRequested
           interruptRequested = false
           if (wasInterrupted) pauseQueueIfPending()
         }
+        // There is one running turn across chats. A background completion must
+        // also clear any working state left by a history refresh of this view.
+        setStreaming(false)
         if (visible) {
-          setStreaming(false)
           resetStreaming()
         }
         // Clear the finished turn before starting the queued one. Otherwise
@@ -193,6 +198,10 @@ function wireSocket(ws: WebSocket) {
         void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
         break
       case 'command_result':
+        {
+        const commandName = data.command.toLowerCase()
+        const sessionOps = ['new', 'resume', 'reset', 'compact']
+        if (!visible && !sessionOps.includes(commandName)) break
         if (data.command.toLowerCase() === 'raw') {
           // Parse the raw model call result (content, reasoning, tool_calls)
           let parsed: { content: string; reasoning?: string; tool_calls?: unknown } | null = null
@@ -222,8 +231,7 @@ function wireSocket(ws: WebSocket) {
         // (parity with CLI — every /command prints to console; the web UI
         // should show that output in the chat). Skip 'raw' (handled above
         // with structured parsing) and session ops (handled with notifications).
-        const cmd = data.command.toLowerCase()
-        const sessionOps = ['new', 'resume', 'reset', 'compact']
+        const cmd = commandName
         if (sessionOps.includes(cmd)) {
           void syncSession(true).then(() => {
             void useQueryClientHelper().invalidateQueries({ queryKey: ['sessions'] })
@@ -242,6 +250,7 @@ function wireSocket(ws: WebSocket) {
           addMessage({ role: 'assistant', content: scrubMarkup(data.result), format: 'terminal' })
         }
         break
+        }
     }
   }
 
@@ -252,7 +261,22 @@ function wireSocket(ws: WebSocket) {
     // Anything typed while the socket was down goes now, in order.
     const pending = outbox
     outbox = []
-    pending.forEach((msg) => ws.send(JSON.stringify(msg)))
+    localTurnPending = pending.some((msg) => msg.type === 'chat' || msg.type === 'command')
+    for (let index = 0; index < pending.length; index += 1) {
+      try {
+        ws.send(JSON.stringify(pending[index]))
+      } catch {
+        // Keep every unsent frame if the connection closes during replay.
+        outbox.unshift(...pending.slice(index))
+        localTurnPending = false
+        const store = useSessionStore.getState()
+        store.setStreaming(false)
+        store.setRunningSession(null)
+        store.setSendFailure('Connection interrupted — unsent messages are queued for reconnection.')
+        ws.close()
+        return
+      }
+    }
     // A reconnect may have missed events, so re-read authoritative state.
     void syncSession(true)
   }
@@ -263,6 +287,7 @@ function wireSocket(ws: WebSocket) {
   }
 
   ws.onclose = () => {
+    localTurnPending = false
     // Reconnect only while the app wants a socket — no zombie loops after unmount.
     if (disposed) return
     reconnectAttempts += 1
@@ -322,9 +347,9 @@ export async function syncSession(includeHistory = false) {
     store.setStatus(status)
     store.setSessionName(status.session_name || '')
     store.setSessionId(status.session_id || '')
-    // Only a turn this tab started sends it turn_complete, so the server can
-    // clear a stale running task here but never set one.
-    if (status.running_session === null) store.setRunningSession(null)
+    // A queued turn may not have reached the backend yet. Its completion frame
+    // clears local state; a simultaneous idle status must not clear it early.
+    if (status.running_session === null && !localTurnPending) store.setRunningSession(null)
 
     if (!includeHistory) return
     const historyResponse = await fetch('/api/history')
@@ -356,14 +381,19 @@ export async function syncSession(includeHistory = false) {
 
 /** Send one frame, or hold it in the outbox until the socket is back. */
 function sendFrame(msg: WSClientMessage): boolean {
+  if ((msg.type === 'chat' || msg.type === 'command') && !msg.session_id) {
+    // Capture the owner before a disconnected frame waits in the outbox.
+    msg = { ...msg, session_id: useSessionStore.getState().sessionId || undefined }
+  }
   if (msg.type === 'interrupt') {
     interruptRequested = true
     stopLocally()
   }
   if (msg.type === 'chat' || msg.type === 'command') {
     interruptRequested = false
+    localTurnPending = true
     const store = useSessionStore.getState()
-    const target = (msg.type === 'chat' && msg.session_id) || store.sessionId
+    const target = ((msg.type === 'chat' || msg.type === 'command') && msg.session_id) || store.sessionId
     store.setRunningSession({ id: target, name: target === store.sessionId ? store.sessionName : '' })
     // Only the chat being viewed shows the turn streaming.
     if (target === store.sessionId) {
@@ -377,7 +407,9 @@ function sendFrame(msg: WSClientMessage): boolean {
       sharedWs.send(JSON.stringify(msg))
       return true
     } catch {
-      return false
+      // The frame was not accepted. Queue it below and reconnect instead of
+      // leaving an optimistic running turn that can never complete.
+      sharedWs.close()
     }
   }
   // Queue it and say so, rather than returning silently - a dropped message
@@ -389,6 +421,7 @@ function sendFrame(msg: WSClientMessage): boolean {
     return false
   }
   outbox.push(msg)
+  localTurnPending = false
   store.setStreaming(false)
   store.setRunningSession(null)
   store.setSendFailure(
@@ -415,10 +448,12 @@ export function drainPromptQueue() {
   if (!next) return
   store.removeQueuedPrompt(next.id)
   if (next.kind === 'command') {
-    // Commands act on the chat being viewed.
     const [command, ...rest] = next.text.replace(/^\//, '').split(' ')
-    if (planTaskOf(next.text)) store.addMessage({ role: 'user', content: next.text })
-    sendFrame({ type: 'command', command, args: rest.join(' ') })
+    const target = next.sessionId || store.sessionId
+    if (target === store.sessionId) {
+      store.addMessage({ role: 'user', content: next.text })
+    }
+    sendFrame({ type: 'command', command, args: rest.join(' '), session_id: target || undefined })
     return
   }
   // The transcript echo happens here rather than at enqueue time, so a queued

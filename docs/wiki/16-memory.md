@@ -361,14 +361,25 @@ deletes anything — each engine keeps its own store on disk:
 | mem0 | `memory_mem0_dir` (default `<AGENT8088_HOME>/mem0`) — embedded local Qdrant |
 
 A fact learned under one engine is invisible to the other until you switch back.
-Changing the *embedder* (or its dimensions) is the exception to "switching never
-migrates": mem0 has no migration, so clear `memory_mem0_dir` when switching
-embedding models, or new writes fail dimension checks against the old
-collection.
+When changing embedding models or dimensions, use a new `memory_mem0_dir` and
+keep the old directory with its original model settings. Mem0 does not migrate
+or re-embed existing vectors automatically; mixing models can produce incorrect
+recall, and different dimensions can fail writes. Do not clear the old store to
+make a new model work.
 `/memory` always reports which engine is live and where its store lives — if the
 mem0 library is missing or cannot start (e.g. another process holds the Qdrant
 folder lock), it says so and falls back to native for the turn rather than
 failing.
+
+Local Qdrant persistence is explicitly enabled, with Mem0 history stored in the
+same private directory. Background capture keeps the shared Mem0 connection
+open for recall; reset and relevant configuration changes close it before a new
+store opens. Reloading unchanged settings keeps the existing connection.
+
+A saved-memory notification requires a confirmed Mem0 memory ID. Failed writes
+and searches are reported in `/memory` and `/doctor`, rather than being treated
+as successful saves or genuine empty search results. Agent8088 extracts facts
+itself and sends them to Mem0 with `infer=False`.
 
 **Notes:** Mem0 telemetry is disabled unconditionally (`MEM0_TELEMETRY=false`);
 nothing leaves the machine. If `mem0ai` is not installed, Agent8088 falls back

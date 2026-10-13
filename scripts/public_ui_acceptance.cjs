@@ -20,6 +20,10 @@ const path = require('node:path');
     assert.ok(Array.isArray((await status.json()).capabilities));
     for (const route of ['/', '/tools', '/config', '/doctor']) {
       await page.goto(base + route, { waitUntil: 'networkidle', timeout: 120000 });
+      if (route === '/doctor') {
+        await page.locator('table').first().waitFor({ state: 'visible', timeout: 120000 });
+        assert.ok(await page.locator('table tbody tr').count(), 'Doctor returned no health checks');
+      }
       await page.screenshot({ path: path.join(output, `${route.slice(1) || 'chat'}-desktop.png`), fullPage: true });
       assert.ok((await page.locator('body').innerText()).length > 100, `empty ${route}`);
     }
@@ -33,6 +37,8 @@ const path = require('node:path');
     }
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${base}/doctor`, { waitUntil: 'networkidle', timeout: 120000 });
+    await page.locator('table').first().waitFor({ state: 'visible', timeout: 120000 });
+    assert.ok(await page.locator('table tbody tr').count(), 'Mobile Doctor returned no health checks');
     await page.screenshot({ path: path.join(output, 'doctor-mobile.png'), fullPage: true });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false,
       'Doctor page overflows the mobile viewport');

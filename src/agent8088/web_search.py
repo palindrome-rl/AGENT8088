@@ -549,6 +549,23 @@ class SearxngProvider(WebSearchProvider):
                                 url=str(r.get("url") or ""),
                                 snippet=str(r.get("content") or "")[:MAX_SNIPPET_CHARS])
                    for r in ranked[:limit] if r.get("url")]
+        unresponsive = payload.get("unresponsive_engines") or []
+        if not results and unresponsive:
+            # SearXNG distinguishes a genuine empty result from engines that
+            # failed to answer. Preserve that distinction so `/search` can
+            # explain a broken local stack without calling an empty query a
+            # service outage.
+            names = []
+            for engine in unresponsive[:8]:
+                if isinstance(engine, (list, tuple)) and engine:
+                    names.append(str(engine[0]))
+                elif isinstance(engine, dict):
+                    names.append(str(engine.get("name") or engine.get("engine") or "unknown"))
+                else:
+                    names.append(str(engine))
+            return SearchFailure(
+                "SearXNG returned no results and reported unresponsive engines: "
+                + ", ".join(names) + ". Check `/search doctor` and the container logs.")
         return SearchSuccess(results, provider=self.name)
 
 

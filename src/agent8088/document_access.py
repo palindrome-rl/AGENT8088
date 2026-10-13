@@ -4,6 +4,7 @@ Authorization remains with the caller. This cache is process-local, bounded,
 and keyed by resolved file identity; it is never an authorization mechanism.
 """
 from collections import OrderedDict
+import heapq
 from pathlib import Path
 from threading import RLock
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -310,6 +311,134 @@ def load(path):
     return text
 
 
+_SEARCH_STOPWORDS = frozenset(
+    "the a an and or of to in on for with that this it is are be as at by from into".split())
+_SEARCH_BEFORE, _SEARCH_AFTER, _SEARCH_MAX_PASSAGES = 300, 700, 8
+_SEARCH_MAX_CANDIDATES = 4096
+_SEARCH_BUCKET_CHARS = _SEARCH_BEFORE + _SEARCH_AFTER
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _stem(word):
+    word = word.lower()
+    for suffix in ("ing", "es", "s", "ed"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[:-len(suffix)]
+    return word
+
+
+def _search(text, query):
+    """Rank passages by how many of the query's key terms they hold.
+
+    A quoted query is an exact phrase (case, punctuation and line breaks
+    ignored). Otherwise every term counts on its own, so a passage with three of
+    four terms is returned and labelled partial, with the missing term named.
+    Nothing is returned for a passage that holds too few of the terms to be
+    evidence for the question.
+    """
+    quoted = len(query) > 1 and query[0] == query[-1] and query[0] in "\"'"
+    words = _WORD_RE.findall(query)
+    terms = []
+    for word in words:
+        stem = _stem(word)
+        if stem not in terms and (quoted or word.lower() not in _SEARCH_STOPWORDS or len(words) == 1):
+            terms.append(stem)
+    if not terms:
+        raise ValueError("search needs at least one word")
+    phrase = (re.compile(r"\W+".join(re.escape(w) for w in words), re.IGNORECASE | re.UNICODE)
+              if len(words) > 1 else None)
+    spots = {term: [] for term in terms}
+    for match in _WORD_RE.finditer(text):
+        stem = _stem(match.group())
+        if stem in spots:
+            spots[stem].append(match.start())
+    absent = [t for t in terms if not spots[t]]
+    phrase_starts = [m.start() for m in phrase.finditer(text)] if phrase else []
+    from bisect import bisect_left, bisect_right
+
+    def covered(lo, hi):
+        return [t for t in terms if bisect_right(spots[t], hi) > bisect_left(spots[t], lo)]
+
+    if quoted and phrase:
+        anchors = phrase_starts
+        needed = len(terms)
+    else:
+        # Rank the whole document while keeping candidate memory bounded. A
+        # prefix slice can hide a stronger passage after many early keyword hits.
+        anchors = heapq.merge(*(spots[t] for t in terms))
+        needed = 1 if len(terms) == 1 else (len(terms) + 1) // 2
+    scored = []
+
+    def retain(item):
+        rank = item[0]
+        if len(scored) < _SEARCH_MAX_CANDIDATES:
+            heapq.heappush(scored, item)
+        elif rank > scored[0][0]:
+            heapq.heapreplace(scored, item)
+
+    previous = None
+    bucket = None
+    bucket_best = None
+    for pos in anchors:
+        if pos == previous:
+            continue
+        previous = pos
+        current_bucket = pos // _SEARCH_BUCKET_CHARS
+        if bucket is not None and current_bucket != bucket:
+            if bucket_best is not None:
+                retain(bucket_best)
+            bucket_best = None
+        bucket = current_bucket
+        lo, hi = max(0, pos - _SEARCH_BEFORE), pos + _SEARCH_AFTER
+        found = covered(lo, hi)
+        if len(found) < needed:
+            continue
+        first_phrase = bisect_left(phrase_starts, lo)
+        exact = first_phrase < len(phrase_starts) and phrase_starts[first_phrase] <= hi
+        hits = sum(bisect_right(spots[t], hi) - bisect_left(spots[t], lo) for t in terms)
+        rank = (len(found), exact, hits, -pos)
+        item = (rank, pos, lo, hi, found)
+        if bucket_best is None or rank > bucket_best[0]:
+            bucket_best = item
+    if bucket_best is not None:
+        retain(bucket_best)
+    scored.sort(key=lambda item: item[0], reverse=True)
+    markers = [(m.start(), m.group()[3:].strip()) for m in re.finditer(r"(?m)^## .+$", text)]
+    passages, taken = [], []
+    for (coverage, exact, _hits, _neg), pos, lo, hi, found in scored:
+        if any(abs(pos - other) < _SEARCH_BEFORE + _SEARCH_AFTER for other in taken):
+            continue
+        taken.append(pos)
+        label = [name for start, name in markers if start <= pos]
+        end = min(len(text), hi)
+        passages.append({
+            "cursor": lo,
+            "text": text[lo:end],
+            "location": label[-1] if label else None,
+            "match": "all_terms" if coverage == len(terms) else "partial",
+            "exact_phrase": exact,
+            "terms_found": found,
+            "terms_missing": [t for t in terms if t not in found],
+        })
+        if len(passages) >= _SEARCH_MAX_PASSAGES:
+            break
+    result = {
+        "query_terms": terms,
+        "match_count": len(passages),
+        "partial_evidence": True,
+        "matches": passages,
+    }
+    if absent:
+        result["terms_absent_from_document"] = absent
+    if not passages:
+        result["note"] = ("No passage holds enough of these terms. Try fewer, more distinctive "
+                          "key terms (2-3 words), or read the document by cursor.")
+    elif any(p["match"] == "partial" for p in passages):
+        result["note"] = ("Some passages hold only part of the terms; check terms_missing before "
+                          "treating one as evidence for the full question.")
+    return result
+
+
 def read(path, args, max_chars=CHUNK_CHARS):
     text = load(path)
     version = hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -333,13 +462,7 @@ def read(path, args, max_chars=CHUNK_CHARS):
         query = str(args.get("query") or "").strip()
         if not query or len(query) > 200:
             raise ValueError("search requires a query of 1 to 200 characters")
-        count, matches = 0, []
-        for match in re.finditer(re.escape(query), text, re.IGNORECASE):
-            count += 1
-            if len(matches) < 12:
-                matches.append(match)
-        return json.dumps({**base, "match_count": count, "partial_evidence": True,
-                           "matches": [{"cursor": max(0, m.start()-300), "text": text[max(0,m.start()-300):m.end()+700]} for m in matches[:12]]}, ensure_ascii=False)
+        return json.dumps({**base, **_search(text, query)}, ensure_ascii=False)
     raise ValueError("action must be overview, read, or search")
 
 

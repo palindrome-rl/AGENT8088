@@ -237,7 +237,7 @@ this interactive autosave behavior. `/save` remains a separate JSON export.
 | `/cli-anything [task]` | Show integration status, or route a task through the CLI-Anything skill |
 | `/browser [status\|close\|reset\|stop]` | Show the headless browser session state, or close it and clear its temp files |
 | `/local [list\|available <query>\|pull <name>\|remove <name>]` | Bare form probes hardware and recommends local Ollama models; the CLI counterpart to the `local_models`-mode tools |
-| `/task [list\|start <goal>\|resume <id>\|end <id>\|output <id>]` | Start, resume, or inspect a restart-safe model task backed by `task_runtime.TaskStore`. Bare or `list` shows stored tasks |
+| `/task [list\|start <goal>\|resume <id>\|end <id>\|delete <id>\|output <id>]` | Start, resume, or inspect a restart-safe model task backed by `task_runtime.TaskStore`. Bare or `list` shows stored tasks; `delete` removes a task that is not running (end it first) |
 
 ### Permissions and isolation
 

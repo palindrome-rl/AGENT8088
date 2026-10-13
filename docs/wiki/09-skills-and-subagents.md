@@ -108,6 +108,7 @@ name: reviewer
 description: Reviews a diff for correctness and flags risky changes.
 tools: read_text, execute_shell, last_output
 max_turns: 8
+max_seconds: 120
 model: inherit
 ---
 
@@ -116,6 +117,15 @@ point at with a file and line. Do not restate what the code does.
 ```
 
 The body becomes the sub-agent's system prompt.
+
+`max_seconds` is optional: the wall clock for this profile, in seconds. Without
+it the profile gets `subagent_timeout_seconds` (300). `max_turns` bounds rounds,
+and one round can take minutes, so only `max_seconds` bounds time. The bundled
+`test-writer` has 90 so that a slow test-writing run cannot use the time the main
+work needs for repairs. When a sub-agent reaches its limit it is stopped and the
+parent is told so, which files it had written, and its last output, as partial
+work to build on. A turn that has less time left than the profile's limit still
+wins: a sub-agent never outlives the turn that spawned it.
 
 You can also just ask for one in conversation — the agent calls
 `create_subagent`, which validates the name, tools, turn budget and model, and
