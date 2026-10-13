@@ -1011,6 +1011,10 @@ _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this tur
 # observes" has to be a guarantee, not a default. See _exec_subagent.
 _permission_floor_readonly = False
 _sandbox_readonly = False
+# Where sandboxed shell commands run. artifacts/ unless a file the user named
+# was written elsewhere in the project this turn: then the project root, so the
+# shell sees that file at the same mapped path (never wider than the project).
+_shell_workspace_root = None
 _last_audit_share = 0.0     # verification's share of the last completed turn's tokens
 
 
@@ -1094,8 +1098,9 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
-    global _failure_streak, _diagnostic_shown
+    global _failure_streak, _diagnostic_shown, _shell_workspace_root
     _turn_writes = 0
+    _shell_workspace_root = None
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
@@ -5304,6 +5309,29 @@ def _inside_a_repository(target: Path) -> bool:
     return False
 
 
+def _user_named_path(raw_path: str, parsed: Path) -> bool:
+    """Did the person's own message name this path (as typed, or project-relative)?"""
+    turns = _authorising_turns(_CURRENT_RUN_MESSAGES or [])
+    if not turns:
+        return False
+    spellings = {str(raw_path or "").replace("\\", "/").strip()}
+    try:
+        if parsed.is_absolute():
+            spellings.add(parsed.relative_to(PROJECT_ROOT).as_posix())
+    except ValueError:
+        pass
+    spellings = {text[2:] if text.startswith("./") else text for text in spellings}
+    spellings = {text.lower() for text in spellings if text and text not in (".", "..")}
+    if not spellings:
+        return False
+    for message in turns:
+        said = _message_text(message).replace("\\", "/").lower()
+        for text in spellings:
+            if re.search(rf"(?<![\w./-]){re.escape(text)}(?![\w-])", said):
+                return True
+    return False
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -5327,6 +5355,13 @@ def resolve_write_path(raw_path: str) -> Path:
         if not _path_is_allowed(resolved):
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
+    if _user_named_path(raw_path, p):
+        # The user typed this exact path: it is the deliverable, not a file the
+        # agent invented, so it stays where they said (inside the permitted
+        # workspace -- the checks below still refuse anything else).
+        named = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
+        if (named == PROJECT_ROOT or PROJECT_ROOT in named.parents) and _path_is_allowed(named):
+            return named
     if p.is_absolute():
         resolved = p.resolve()
         if (not resolved.exists() and resolved != ARTIFACTS_ROOT
@@ -10028,11 +10063,12 @@ def _docker_shell_path_hint(target) -> str:
     entry = capabilities.get(capabilities.SANDBOX)
     if entry is None or entry.active != "docker":
         return ""
+    mounted = _shell_workspace_root or ARTIFACTS_ROOT
     try:
-        relative = Path(target).resolve().relative_to(ARTIFACTS_ROOT)
+        relative = Path(target).resolve().relative_to(mounted)
     except ValueError:
         return (" (shell commands run in Docker and cannot see this file: only "
-                f"{ARTIFACTS_ROOT} is mounted there, at /workspace)")
+                f"{mounted} is mounted there, at /workspace)")
     return f" (shell commands see it as /workspace/{relative.as_posix()})"
 
 
@@ -10452,9 +10488,12 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     if backend == "unavailable":
         return _sandbox_required_error()
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
-    command = _artifact_workspace_command(command)
     temporary = None
     workspace = ARTIFACTS_ROOT
+    if _shell_workspace_root is not None and not _sandbox_readonly:
+        workspace = _shell_workspace_root
+    else:
+        command = _artifact_workspace_command(command)
     if _sandbox_readonly:
         temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
         workspace = Path(temporary.name)
@@ -10466,7 +10505,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
         return _explain_sandbox_denial(
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
-            ARTIFACTS_ROOT if temporary is None else workspace, command)
+            workspace if temporary is None else workspace, command)
     finally:
         if temporary:
             temporary.cleanup()
@@ -12515,6 +12554,11 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
             return result
+        global _shell_workspace_root
+        if (not DISPOSABLE_CONTAINER and PROJECT_ROOT in target.parents
+                and ARTIFACTS_ROOT not in target.parents and target != ARTIFACTS_ROOT
+                and _user_named_path(write_path, Path(write_path).expanduser())):
+            _shell_workspace_root = PROJECT_ROOT
         content = _structured_text_argument(args.get(content_arg, ""))
         cleaned_code = False
         if name in ("write_file", "edit_file") and args.get("_private") is not True:
@@ -16890,7 +16934,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                 unmet="the reply says the work is unfinished")
     if nudge is None and depth == 0:
         missing = completion_checks.missing_outputs(
-            request, reply, written, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()])
+            request, reply, written, [PROJECT_ROOT, Path.cwd()],
+            mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [])
         if missing:
             nudge = completion_checks.outputs_nudge(missing)
     if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":

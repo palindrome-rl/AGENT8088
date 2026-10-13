@@ -121,28 +121,79 @@ def _nonempty_file(path: Path) -> bool:
         return False
 
 
-def missing_outputs(request: str, reply: str, written: Iterable[str],
-                    roots: Iterable[Path]) -> list[str]:
-    """Named or claimed deliverables that do not exist or are empty.
+_DIR_TOKEN = re.compile(r"(?<![\w/\\.:@-])((?:~?\.{0,2}[\\/])?(?:[\w.-]+[\\/])+)(?=[\s,.;:)`'\"]|$)")
+_DIR_WORD = re.compile(
+    r"\b(?:folder|directory|dir)\s+(?:called\s+|named\s+)?[`'\"]?([\w.-]+(?:[\\/][\w.-]+)*)",
+    re.IGNORECASE)
 
-    Two sources: paths the request asked for, and paths this run wrote that the
-    reply names as its result (an empty or removed file is not one). The check is
-    deterministic and makes no model call.
+
+def named_output_dirs(request: str) -> list[str]:
+    """Directories the request asks to be filled (`out/`, "a folder named results")."""
+    found: list[str] = []
+    for sentence in _SENTENCE_SPLIT.split(_prose(request)):
+        spots = [(m.start(), m.group(1).rstrip("/\\")) for m in _DIR_TOKEN.finditer(sentence)]
+        spots += [(m.start(), m.group(1)) for m in _DIR_WORD.finditer(sentence)]
+        for start, path in spots:
+            before = sentence[:start]
+            output = [m.end() for m in _OUTPUT_CUE.finditer(before)]
+            inputs = [m.end() for m in _INPUT_CUE.finditer(before)]
+            if (not output or (inputs and max(inputs) > max(output)) or not path
+                    or path in found or path in (".", "..", "~")):
+                continue
+            found.append(path)
+    return found
+
+
+def _has_content(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(_nonempty_file(f) for f in path.rglob("*"))
+    except OSError:
+        return False
+
+
+def _under(path: Path, roots: Iterable[Path]) -> bool:
+    return any(root == path or root in path.parents for root in roots)
+
+
+def missing_outputs(request: str, reply: str, written: Iterable[str],
+                    roots: Iterable[Path], mirror_roots: Iterable[Path] = ()) -> list[str]:
+    """Named or claimed deliverables that do not exist, are empty, or sit in the
+    wrong place.
+
+    Three sources: paths the request asked for, directories it asked to be
+    filled, and paths this run wrote that the reply names as its result (an empty
+    or removed file is not one). `mirror_roots` (the artifacts folder) is where
+    unspecified work goes by default; a requested path found only there is
+    reported as misplaced rather than satisfied. The check is deterministic and
+    makes no model call.
     """
     roots = [Path(r) for r in roots]
+    mirrors = [Path(r) for r in mirror_roots]
     written = list(written)
     missing: list[str] = []
     for path in named_output_paths(request):
-        name = PurePath(path.replace("\\", "/")).name
-        satisfied = (any(_nonempty_file(c) for c in _candidates(path, roots))
-                     or any(PurePath(w).name == name and _exists_somewhere(w, roots) for w in written))
+        wanted = PurePath(path.replace("\\", "/"))
+        satisfied = any(_nonempty_file(c) for c in _candidates(path, roots))
         if not satisfied:
-            missing.append(path)
+            tail = [part.lower() for part in wanted.parts if part not in ("", ".", "..", "/")]
+            for w in written:
+                parts = [part.lower() for part in PurePath(w.replace("\\", "/")).parts]
+                if (tail and parts[-len(tail):] == tail and _exists_somewhere(w, roots + mirrors)
+                        and not _under(Path(w), mirrors)):
+                    satisfied = True
+                    break
+        if not satisfied:
+            elsewhere = any(_nonempty_file(c) for c in _candidates(path, mirrors))
+            missing.append(f"{path} (found only in {mirrors[0]}; create it at the requested path)"
+                           if elsewhere and mirrors else path)
+    for path in named_output_dirs(request):
+        if not any(_has_content(c) for c in _candidates(path, roots)):
+            missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
     for path in written:
         name = PurePath(path).name
-        if name.lower() in lowered and not _exists_somewhere(path, roots) and path not in missing:
-            if not any(PurePath(m.replace("\\", "/")).name == name for m in missing):
+        if name.lower() in lowered and not _exists_somewhere(path, roots + mirrors) and path not in missing:
+            if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     return missing
 
