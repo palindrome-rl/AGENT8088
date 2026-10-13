@@ -5347,6 +5347,74 @@ def _agent_data_dir() -> Path:
     return Path.home() / ".agent8088"
 
 
+# --- Backups of files the agent overwrites ---------------------------------------------
+# Before the first change to a file that already exists, its original bytes are copied
+# to <data dir>/backups/<session>/. Nothing about this reaches the model: the tool
+# result is unchanged, so it costs no tokens and cannot be acted on by mistake. It
+# exists so a bad overwrite is recoverable by a person (copy the file back; index.jsonl
+# in the session folder lists every backup). A failed backup never blocks the write.
+FILE_BACKUPS = str(APP_CONFIG.get("file_backups", "1")).strip().lower() in ("1", "true", "yes", "on")
+FILE_BACKUP_MAX_FILE_BYTES = max(0, _config_int("file_backup_max_file_mb", 10)) * 1024 * 1024
+FILE_BACKUP_MAX_SESSION_BYTES = max(0, _config_int("file_backup_max_mb", 200)) * 1024 * 1024
+FILE_BACKUP_KEEP_DAYS = max(0, _config_int("file_backup_keep_days", 14))
+_BACKUP_SESSION = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+_backed_up: set = set()
+_backup_state = {"bytes": 0, "pruned": False}
+
+
+def _backup_root() -> Path:
+    return _agent_data_dir() / "backups"
+
+
+def _prune_old_backups() -> None:
+    """Delete backup sessions older than file_backup_keep_days (once per process)."""
+    if _backup_state["pruned"] or not FILE_BACKUP_KEEP_DAYS:
+        return
+    _backup_state["pruned"] = True
+    cutoff = time.time() - FILE_BACKUP_KEEP_DAYS * 86400
+    root = _backup_root()
+    try:
+        for session in root.iterdir():
+            if session.is_dir() and session.name != _BACKUP_SESSION and session.stat().st_mtime < cutoff:
+                shutil.rmtree(session, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _backup_original(target: Path) -> str:
+    """Copy `target`'s current bytes aside, once per file per session. Returns the
+    backup path, or "" when nothing was backed up (new file, off, too big, error)."""
+    if not FILE_BACKUPS or DISPOSABLE_CONTAINER:
+        return ""
+    try:
+        if not target.is_file():
+            return ""
+        key = str(target.resolve())
+        if key in _backed_up:
+            return ""
+        size = target.stat().st_size
+        if FILE_BACKUP_MAX_FILE_BYTES and size > FILE_BACKUP_MAX_FILE_BYTES:
+            _log.info("not backing up %s: %d bytes is over file_backup_max_file_mb", target, size)
+            return ""
+        if FILE_BACKUP_MAX_SESSION_BYTES and _backup_state["bytes"] + size > FILE_BACKUP_MAX_SESSION_BYTES:
+            _log.info("not backing up %s: this session's backups reached file_backup_max_mb", target)
+            return ""
+        _prune_old_backups()
+        folder = _backup_root() / _BACKUP_SESSION
+        folder.mkdir(parents=True, exist_ok=True)
+        copy = folder / f"{hashlib.sha1(key.encode('utf-8')).hexdigest()[:10]}-{target.name}"
+        shutil.copy2(target, copy)
+        _backed_up.add(key)
+        _backup_state["bytes"] += size
+        with open(folder / "index.jsonl", "a", encoding="utf-8") as index:
+            index.write(json.dumps({"path": key, "backup": str(copy), "bytes": size,
+                                    "time": datetime.now().isoformat(timespec="seconds")}) + "\n")
+        return str(copy)
+    except Exception as exc:  # noqa: BLE001 -- a backup must never stop the write it protects
+        _log.debug("file backup failed for %s: %s", target, exc)
+        return ""
+
+
 AGENTS_DIR = Path(APP_CONFIG.get("agents_dir", str(APP_DIR / "agents"))).expanduser()
 USER_AGENTS_DIR = Path(APP_CONFIG.get("user_agents_dir",
                                       str(_agent_data_dir() / "agents"))).expanduser()
@@ -12997,6 +13065,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 target = _target_with_derived_extension(
                     target, source_url, fetch_content_type)
             target.parent.mkdir(parents=True, exist_ok=True)
+            _backup_original(target)
             target.write_bytes(fetched)
             _last_write_diff = None  # binary output -- a text diff would be noise
             result = (f"Wrote {len(fetched)} bytes to {target} (fetched from {source_url})"
@@ -13023,6 +13092,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             old_content = _read_text_limited(target) if target.exists() else ""
         except ValueError:
             old_content = ""
+        if not continues_series:
+            _backup_original(target)
         # create_document declares mode=write_text on purpose rather than a mode
         # of its own: a dozen separate places key on "write_text" (sensitive-file
         # floor, path zones, plan-only blocking, plan-audit revert, closure

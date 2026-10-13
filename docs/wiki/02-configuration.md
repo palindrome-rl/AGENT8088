@@ -313,6 +313,10 @@ is a plausible accident that the permission gate does not catch. Both default to
 | Key | Default | Purpose |
 |---|---|---|
 | `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `file_backups` | `1` | Copy a file's original bytes aside before the first change to it in a session. See [Backups of overwritten files](04-tools.md#backups-of-overwritten-files). |
+| `file_backup_max_file_mb` | `10` | Largest single file that is backed up (larger files are skipped). |
+| `file_backup_max_mb` | `200` | Total backed up per session; past it, further backups are skipped. |
+| `file_backup_keep_days` | `14` | Backup sessions older than this are deleted (`0` keeps them all). |
 | `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
