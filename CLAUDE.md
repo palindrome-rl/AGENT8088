@@ -49,6 +49,35 @@ It matters because a careless live run damages real state:
   (`pkill -f '<venv-path>/bin/agent8088'`), never a broad `chrome`/`chromium`
   match that could close the developer's own windows.
 
+# Promoting to staging
+
+Moving merged `development` work onto the `staging-1.2` release branch follows
+the recipe in
+[`.claude/skills/promote-to-staging/SKILL.md`](.claude/skills/promote-to-staging/SKILL.md).
+Read it before the merge. Claude Code loads it as a skill; Codex and OpenCode
+read the file directly.
+
+`staging-1.2` is long-lived and carries a trimmed, release-configured tree, so
+a promotion is more than a merge:
+
+- Merge `development` **into** `staging-1.2` with `--no-ff`, so the staging tip
+  stays the first parent. Never rebase, squash, or cherry-pick: the next
+  promotion reads that first-parent chain to find its own baseline.
+- Derive the deliberate divergence from `staging-1.2` against its own second
+  parent, not from a plain diff against `development`. A plain diff cannot tell
+  "staging keeps this different" apart from "staging is simply behind", and
+  acting on it strips real new source.
+- Restore what auto-merge clobbers without reporting a conflict:
+  `memory_engine=native` and the one-line `sandbox_allowed_domains` comment in
+  `src/agent8088/config.txt`, and staging's `.claude/` form in `.gitignore`.
+- Leave the development harness behind: `tests/`, `.claude/`,
+  `scripts/sync_development.py`, handoff/audit/QA notes, and staging's own
+  `AGENTS.md` and `CLAUDE.md`.
+- Commit as
+  `Merge development PRs <N>-<M> into staging-1.2; preserve staging release settings`,
+  and ask before pushing — `staging-1.2` is what `agent8088 --update` installs
+  from.
+
 # Development memory
 
 Use TencentDB Agent Memory only as optional development context for this repository.

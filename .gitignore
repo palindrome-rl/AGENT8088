@@ -74,6 +74,7 @@ artifacts/*
 .claude/skills/*
 !.claude/skills/sync-development/
 !.claude/skills/agent8088-live-testing/
+!.claude/skills/promote-to-staging/
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
