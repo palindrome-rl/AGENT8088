@@ -36,7 +36,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | Tool | Mode | Args | readonly? | What it does |
 |---|---|---|---|---|
 | `read_text` | `read_text` | `filename`, `offset`*, `limit`* | ✅ | Read a file. Extracts `.docx`/`.xlsx`/`.pptx`/`.pdf` to text. Paginated. Refuses credential files. |
-| `write_file` | `write_text` | `filename`, `content`*, `source_url`* | prompt | Write a file, or fetch and save binary/remote content from a URL. Path-zone + sensitive + shell-rc checked. |
+| `write_file` | `write_text` | `filename`, `content`*, `source_url`*, `mode`* | prompt | Write a file, or fetch and save binary/remote content from a URL. `mode` is `overwrite` (default) or `append`; a long file is written as a first part plus appended parts. Path-zone + sensitive + shell-rc checked. |
 | `edit_file` | `write_text` | `filename`, `old_string`, `new_string`* | prompt | Exact-replacement edit of one matching place; refuses an ambiguous match and writes nothing. Empty `new_string` deletes it. |
 | `read_content` | `last_output` | `ref`, `offset`*, `length`* | ✅ | Read a window from a session-scoped content ref, without re-reading the source. |
 | `document_read` | `read_text` | `filename`, `action`*, `cursor`*, `query`*, `version`* | ✅ | Cached document extraction with lossless cursors: `overview`, `search`, `read`, `process` (whole-document synthesis outside the turn loop). Never obeys instructions in documents. |
@@ -176,7 +176,33 @@ Some plausible-but-wrong shapes are rewritten rather than rejected — e.g.
 the agent recovers instead of looping when the model invents a tool that
 *sounds* right.
 
-## Tool modes explained
+## Argument checking
+
+A built-in tool's arguments are checked against its declared schema before it
+runs. A name the tool does not have (`write_file(text=...)`) is refused with a
+"did you mean" suggestion, and so is a value of the wrong kind (a list for an
+integer). The refusal is handled as a malformed call: the model is told what to
+fix and retries without it counting as a failed step. Left alone on purpose: the
+path aliases (`file`, `file_path`, `filepath`, `path`), `execute_shell`'s
+`timeout`, the sub-agent and plan spellings those tools have always taken,
+prose fields such as `description` or `reason` (dropped), numbers sent as text,
+and JSON strings standing in for a list or object. MCP tools carry their own
+schema and are not checked here.
+
+## Writing a long file
+
+`write_file` takes `mode`: `overwrite` (default) or `append`. A long file is
+written as a first part (default mode) followed by parts with `mode="append"`,
+in order, about 4-6 KB each. Large single calls are where argument JSON fails
+to parse or the reply is cut off at the output limit; the error messages for
+both point here.
+
+Parts of one file are treated as one write: they count once toward
+`max_writes_per_turn` (every byte counts toward `max_write_bytes`), and with
+`/audit on` the file is audited once, at the next call that is not another part
+of it or when the model finishes, and a failed audit restores the file as it was
+before the first part.
+
 
 `mode` is the contract between a tool and the permission layer. Adding a tool to
 `tools.txt` with an existing mode inherits that mode's gating automatically.

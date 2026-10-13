@@ -255,7 +255,10 @@ fired. Three things bound it now:
   reverts nothing; it says so in the tool result. There is no unlimited value:
   to stop verifying, set `plan_audit=0`.
 - **`plan_audit_timeout_seconds`** (120) — one auditor sub-run.
-- **`subagent_timeout_seconds`** (300) — every other sub-agent. `_exec_subagent`
+- **`subagent_timeout_seconds`** (300) — every other sub-agent, unless its profile
+  sets `max_seconds` (or `subagent_max_seconds.<profile>` is configured); the bundled
+  `test-writer` has 90. On reaching it the sub-run is stopped and the parent gets the
+  files it had written and its last output as partial work. `_exec_subagent`
   shares the parent's *remaining* tokens and cost, so delegating still cannot
   restart the turn's allowance, and a sub-run's clock is capped by whatever the
   turn itself has left — a 300s sub-agent cannot extend a turn with 60s on it.

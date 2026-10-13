@@ -258,3 +258,42 @@ def test_replan_nudge_does_not_start_the_cap(engine, monkeypatch):
     kinds = [t["type"] for t in trace]
     assert answer.startswith("finished after reading")
     assert "post_check_cap" not in kinds and "post_check_backstop" not in kinds
+
+
+@pytest.mark.parametrize("changed,verdict,second_write,should_cap", [
+    (True, "1 passed", False, True),
+    (True, "1 passed", True, True),
+    (False, "1 passed", False, False),
+    (True, "1 failed", False, False),
+    (True, "inspected file", False, False),
+])
+def test_verified_work_is_bounded_without_a_final_answer_attempt(
+        engine, monkeypatch, changed, verdict, second_write, should_cap):
+    monkeypatch.setattr(engine, "DISPOSABLE_CONTAINER", False)
+    monkeypatch.setattr(engine, "MAX_POST_CHECK_ROUNDS", 2)
+    calls = []
+
+    def model(messages, tools, **kwargs):
+        calls.append(messages)
+        if _wrap_up_asked(messages):
+            return _response("fresh summary")
+        i = len(calls) - 1
+        return _response("finished" if i >= 12 else _calc(i))
+
+    def execute(name, arguments, depth=0):
+        i = len(calls) - 1
+        if changed and (i == 0 or (second_write and i == 2)):
+            engine.note_mutation("write output")
+            return "wrote output"
+        return verdict if i in (1, 3) else "inspected file"
+
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", model)
+    monkeypatch.setattr(engine, "exec_tool", execute)
+    trace = []
+    answer = engine.run_agent([{"role": "user", "content": "complete work"}],
+                              max_turns=20, trace=trace, dynamic_turns=False)
+    kinds = [event["type"] for event in trace]
+    assert ("post_check_backstop" in kinds) == should_cap
+    if should_cap:
+        assert answer.startswith("fresh summary")
+        assert len(calls) == (8 if second_write else 6)

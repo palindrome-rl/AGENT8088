@@ -57,9 +57,9 @@ takes over:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `api_max_retries` | `3` | Attempts per call on retryable errors (429/503/connection). `0` disables. |
-| `api_retry_initial_delay_ms` | `500` | First backoff delay. |
-| `api_retry_max_delay_ms` | `10000` | Ceiling for the exponential backoff. |
+| `api_max_retries` | `5` | Retries per call on retryable errors (408/429/5xx, connection, errors the provider reports inside a stream). `0` disables. With the default delays the retries span about 30 s. |
+| `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
+| `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
 
 ### Fusion
@@ -271,7 +271,7 @@ number of rounds. All default to `0`, meaning disabled.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_turn_seconds` | `0` | Wall-clock ceiling for one request. |
-| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check (deliverables, verification, re-plan, tests) before the model is told to answer; the answer so far is returned 2 rounds later. A write resets the count. `0` disables it. |
+| `max_post_check_rounds` | `5` | Tool rounds with no file or state change allowed after a finishing check or a successful test of changed work before the model is told to answer; a fresh summary is requested 2 rounds later. A write resets the count. Research and failed tests do not start it. `0` disables it. |
 | `max_completion_continuations` | `3` | Follow-ups the completion checks may send in one request (empty reply, reply admitting unfinished work, a named file missing, a part of a multi-part request skipped, changed work unverified). A follow-up that makes progress hands its slot back. When spent the answer is accepted with a "Not completed" note. `0` turns the checks off. See [architecture](11-architecture.md#completion-checks). |
 | `initial_completion_cap` | `8192` | Completion-token cap for an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry; plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
@@ -301,8 +301,8 @@ is a plausible accident that the permission gate does not catch. Both default to
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_writes_per_turn` | `0` | Files one request may write. |
-| `max_write_bytes` | `0` | Bytes a single write may contain. |
+| `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
 wave through by mistake, and reset only by the outermost request so a subagent
@@ -356,6 +356,7 @@ where a silently half-done plan does damage.
 | `default_subagent` | Profile used when none is named. |
 | `max_subagent_answer_chars` | Cap on a sub-agent's returned answer (default `6000`, `0` disables). A sub-agent exists to keep work out of the parent's context, so an unbounded answer defeats the delegation. Truncation is marked in the text, never silent. |
 | `subagent_max_turns.<profile>` | Rounds one sub-agent profile may take. **Overrides the profile's own frontmatter.** |
+| `subagent_max_seconds.<profile>` | Wall clock, in seconds, for one sub-agent profile. **Overrides the profile's `max_seconds`.** Without either, `subagent_timeout_seconds` (300) applies. |
 | `tool_timeout.<tool>` | Seconds one tool may run. **Overrides the inline `timeout=` in `tools.txt`.** |
 
 ### Changing a limit without editing this file

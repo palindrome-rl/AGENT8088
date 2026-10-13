@@ -524,8 +524,8 @@ DEFAULT_MAX_TURNS = 50
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
-# Tool rounds allowed after a finishing nudge (deliverables re-check,
-# verification, re-plan, tests) with no state change before the model is told to
+# Tool rounds allowed after a finishing nudge or successful verification of
+# changed work, with no state change before the model is told to
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
@@ -582,9 +582,12 @@ DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
 # --- Retry before failover ---
 # Retries the same provider this many times (with exponential backoff) before
 # falling through the fallback_models chain. 0 = immediate failover.
-API_MAX_RETRIES = max(0, _config_int("api_max_retries", 3))
-API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 500))
-API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 10000))
+# The defaults wait about 31 s in total (1+2+4+8+16 s): a gateway or provider
+# hiccup usually lasts 30-60 s, and the old 3.5 s window ended runs that a
+# slightly longer wait would have survived. The turn budget still caps it.
+API_MAX_RETRIES = max(0, _config_int("api_max_retries", 5))
+API_RETRY_INITIAL_DELAY_MS = max(0, _config_int("api_retry_initial_delay_ms", 1000))
+API_RETRY_MAX_DELAY_MS = max(1, _config_int("api_retry_max_delay_ms", 30000))
 API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio", 0.1)))
 
 # --- Write blast radius: bounds how much damage one turn can do ---
@@ -978,6 +981,12 @@ _outer_turn_budget = None
 # the telemetry line attribute spend to whichever role incurred it.
 _active_role = "main"
 _turn_writes = 0       # writes performed in the current turn (see MAX_WRITES_PER_TURN)
+# Chunked writes (write_file mode=append). A file written in several parts is one
+# write for max_writes_per_turn, with its bytes summed for max_write_bytes, one
+# byte-exact snapshot taken before the first part, and one audit after the last.
+_turn_chunked: dict = {}         # resolved path -> bytes written to it in this series
+_chunk_snapshots: dict = {}      # resolved path -> snapshot taken before the series began
+_pending_chunk_audits: dict = {}  # resolved path -> {"chunks", "bytes", "args"} awaiting audit
 _consecutive_denials = 0  # denial circuit breaker (see DENIAL_BREAKER_THRESHOLD)
 
 
@@ -1041,6 +1050,9 @@ def reset_turn_counters() -> None:
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     global _failure_streak, _diagnostic_shown
     _turn_writes = 0
+    _turn_chunked.clear()
+    _chunk_snapshots.clear()
+    _pending_chunk_audits.clear()
     _plan_tool_ran = False
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
@@ -1587,8 +1599,104 @@ def _lex_command(command: str):
         return None
 
 
+# --- Process-stop floor (always-on, every mode) ---
+# A command that stops processes by name (pkill python, taskkill /IM node.exe,
+# Stop-Process -Name ...) stops every process of that name on the machine:
+# unrelated user jobs and Agent8088's own interpreter included. On the Windows
+# native sandbox the process list is the host's, so "inside the sandbox" does
+# not help. Stopping a process by a literal PID stays allowed, except
+# Agent8088 itself and its parent. Checked per command segment from
+# _hard_blocked_shell, so wrappers (bash -c, powershell -Command) and command
+# substitutions are covered by its recursion. A script file that does the
+# stopping is not inspected.
+_KILL_BY_NAME_COMMANDS = frozenset(["pkill", "killall", "killall5", "skill", "snice"])
+_KILL_PIDS_COMMANDS = frozenset(["kill", "stop-process", "spps", "tskill", "pskill"])
+_COMMAND_PREFIXES = frozenset([
+    "sudo", "doas", "nohup", "time", "nice", "ionice", "env", "command", "exec",
+    "builtin", "stdbuf", "setsid", "timeout",
+])
+_STOP_BY_NAME_FLAGS = frozenset(["-name", "-n", "-processname", "-inputobject", "-input"])
+_PID_TARGET = re.compile(r"\d+|%\w+|\$!")
+_PROCESS_ENUMERATION = re.compile(
+    r"get-process|\bgps\b|\[system\.diagnostics\.process\]|process_iter", re.IGNORECASE)
+_PROCESS_KILL_CALL = re.compile(r"\.(?:kill|terminate)\s*\(", re.IGNORECASE)
+_WMI_KILL_BY_NAME = re.compile(
+    r"(?:wmic\s+process|win32_process)[\s\S]*?\bname\b[\s\S]*?\b(?:delete|terminate)\b",
+    re.IGNORECASE)
+_process_refusal = threading.local()
+
+PROCESS_STOP_REFUSAL = (
+    "Error: Stopping processes by name, or every process, is blocked: it can stop "
+    "unrelated programs and Agent8088's own interpreter. Stop a process you started "
+    "by its PID instead.")
+
+
+def _own_pids() -> set:
+    pids = {str(os.getpid())}
+    try:
+        pids.add(str(os.getppid()))
+    except OSError:
+        pass
+    return pids
+
+
+def _segment_stops_processes_unsafely(segment: list) -> bool:
+    """True if one command segment stops processes by name, all of them, or Agent8088."""
+    words = [str(part).strip("'\"") for part in segment]
+    while words and (Path(words[0]).stem.lower() in _COMMAND_PREFIXES
+                     or re.fullmatch(r"[A-Za-z_]\w*=\S*", words[0])
+                     or re.fullmatch(r"\d+[smhd]?", words[0])):
+        words = words[1:]
+    if not words:
+        return False
+    exe = Path(words[0]).stem.lower()
+    args = [word.lower() for word in words[1:]]
+    if exe in _KILL_BY_NAME_COMMANDS:
+        return True
+    if exe == "xargs":
+        # The targets arrive on a pipe and cannot be checked.
+        return any(Path(word).stem.lower() in _KILL_BY_NAME_COMMANDS | _KILL_PIDS_COMMANDS | {"taskkill"}
+                   for word in args)
+    if exe == "wmic":
+        return bool(_WMI_KILL_BY_NAME.search(" ".join(words)))
+    if exe == "taskkill":
+        if any(arg.split(":", 1)[0] in ("/im", "-im", "/fi", "-fi") for arg in args):
+            return True
+        pids = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ("/pid", "-pid")]
+        return not pids or bool(_own_pids() & set(pids))
+    if exe in _KILL_PIDS_COMMANDS:
+        if any(arg.split(":", 1)[0] in _STOP_BY_NAME_FLAGS for arg in args):
+            return True
+        if any(arg in ("-l", "-L") for arg in words[1:]):
+            return False  # kill -l: list signal names
+        if len(args) >= 2 and args[-1] == "-1" or "0" in args:
+            return True  # kill -9 -1 / kill 0: every process the user can signal
+        targets = [arg for arg in args if _PID_TARGET.fullmatch(arg)]
+        # No literal PID means the target comes from a pipe, a name or a
+        # substitution (`... | Stop-Process`, `kill $(pgrep x)`), which cannot be checked.
+        return not targets or bool(_own_pids() & set(targets))
+    return False
+
+
+def _command_text_stops_processes(command: str) -> bool:
+    """Whole-command patterns the per-segment check cannot see (PowerShell/Python loops)."""
+    if _PROCESS_ENUMERATION.search(command) and _PROCESS_KILL_CALL.search(command):
+        return True
+    return bool(_WMI_KILL_BY_NAME.search(command))
+
+
+def last_refusal_was_process_stop() -> bool:
+    """True if the most recent _hard_blocked_shell call in this thread refused for the process-stop floor."""
+    return bool(getattr(_process_refusal, "hit", False))
+
+
 def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
+    if _depth == 0:
+        _process_refusal.hit = False
     if _is_unrecoverable_command(command):
+        return True
+    if _command_text_stops_processes(command):
+        _process_refusal.hit = True
         return True
     if _matches_user_deny(command):
         return True
@@ -1651,6 +1759,9 @@ def _hard_blocked_shell(command: str, _depth: int = 0) -> bool:
         first = Path(segment[0]).stem.lower()
         if first in _NON_EXEC_GIT_TEXT_COMMANDS:
             continue
+        if _segment_stops_processes_unsafely(segment):
+            _process_refusal.hit = True
+            return True
         for index, part in enumerate(segment):
             if Path(part).stem.lower() == "git" and _dangerous_git_args(segment[index + 1:]):
                 return True
@@ -2826,6 +2937,18 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             "model": selected_model, "messages": full_messages, "max_tokens": max_tokens,
             "temperature": temperature, "stream": on_token is not None, **penalties,
         }
+        if thinking == "length_retry" and not _skip_optional:
+            # LiteLLM translates the native reasoning dial for its adapters.
+            # Provider-specific wire fields remain in extra_body instead.
+            retry_options = dict(_length_retry_extra_body(provider_name))
+            if "reasoning_effort" in retry_options:
+                kwargs["reasoning_effort"] = retry_options.pop("reasoning_effort")
+                # Custom OpenAI-compatible model names are absent from
+                # LiteLLM's capability catalog. Try the configured dial on
+                # the wire, with the same clean 400 fallback as the SDK lane.
+                kwargs["allowed_openai_params"] = ["reasoning_effort"]
+            if retry_options:
+                kwargs["extra_body"] = retry_options
         if _native_tools_enabled(tools, provider_name):
             kwargs["tools"] = tools
         if timeout is not None:
@@ -2835,7 +2958,17 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         if client.get("api_key"):
             kwargs["api_key"] = client["api_key"]
         _raise_if_interrupted(interrupt_check)
-        response = completion(**kwargs)
+        try:
+            response = completion(**kwargs)
+        except Exception as exc:
+            if (not _skip_optional and thinking == "length_retry"
+                    and _extras_rejected(exc, thinking=thinking)):
+                return _create_completion(
+                    client, messages, tools, max_tokens=max_tokens, system_prompt=system_prompt,
+                    temperature=temperature, on_token=on_token, interrupt_check=interrupt_check,
+                    model_name=model_name, provider_name=provider_name, _skip_optional=True,
+                    thinking=thinking, timeout=timeout)
+            raise
         if on_token is None:
             return response
         collected, collected_reasoning, tool_chunks, finish_reason = [], [], {}, None
@@ -2843,6 +2976,9 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
         try:
             for chunk in response:
                 _raise_if_interrupted(interrupt_check, response)
+                if not getattr(chunk, "choices", None):
+                    _raise_for_error_chunk(chunk)
+                    continue
                 choice = chunk.choices[0]
                 delta = choice.delta
                 finish_reason = getattr(choice, "finish_reason", None) or finish_reason
@@ -2972,6 +3108,7 @@ def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=N
             if getattr(chunk, 'usage', None) is not None:
                 stream_usage = chunk.usage
             if not chunk.choices:
+                _raise_for_error_chunk(chunk)
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
@@ -3025,14 +3162,79 @@ def _fallback_targets() -> list:
 _fallback_targets()  # report invalid targets at startup, before a call fails
 
 
+class ProviderStreamError(RuntimeError):
+    """An error the provider reported inside a streamed reply.
+
+    Some gateways answer HTTP 200 and then send an error chunk (with an empty
+    ``choices`` list) when the upstream model times out or stops a looping
+    reply. The OpenAI client raises on such a chunk itself; other clients, and
+    the LiteLLM path here, would otherwise read it as an empty reply or fail on
+    ``choices[0]``. ``status_code`` carries the error's own code (for example
+    504) so the ordinary retry rules apply.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _raise_for_error_chunk(chunk) -> None:
+    """Raise ProviderStreamError when a streamed chunk is an error, not data."""
+    if getattr(chunk, "choices", None):
+        return
+    error = getattr(chunk, "error", None)
+    if error is None:
+        extra = getattr(chunk, "model_extra", None)
+        error = extra.get("error") if isinstance(extra, dict) else None
+    if not error:
+        return
+    if isinstance(error, dict):
+        message, code = error.get("message"), error.get("code")
+    else:
+        message, code = getattr(error, "message", None), getattr(error, "code", None)
+    try:
+        status = int(code) if code is not None and not isinstance(code, bool) else None
+    except (TypeError, ValueError):
+        status = None
+    raise ProviderStreamError(str(message or "The provider reported an error mid-stream"), status)
+
+
+_REPETITION_GUARD_MARKERS = ("repeating the same chunk", "repeating the same", "repetition detected")
+
+
+def _is_provider_repetition_stop(error: Exception) -> bool:
+    """The provider cut off a looping reply (reported as an error, often a 502)."""
+    text = str(error).lower()
+    return any(marker in text for marker in _REPETITION_GUARD_MARKERS)
+
+
+def _is_provider_stall(error: Exception) -> bool:
+    """A gateway/upstream failure that retrying the identical request may repeat.
+
+    Idle timeouts, 5xx from the upstream and a looping-reply stop are all cases
+    where the same request has already failed once for a reason that depends on
+    that request, so the retry changes it (see _create_completion_with_fallback).
+    """
+    from agent8088.errors import status_code as _status_code
+    status = _status_code(error)
+    text = str(error).lower()
+    return (isinstance(status, int) and 500 <= status < 600
+            or "idle timeout" in text or _is_provider_repetition_stop(error))
+
+
 def _retryable_model_error(error: Exception) -> bool:
-    status = getattr(error, "status_code", None)
+    from agent8088.errors import status_code as _status_code
+    # The SDK's streamed-error exception carries the error's code in .code, not
+    # .status_code, so read it the same way the rest of the harness does.
+    status = _status_code(error)
     if status in (408, 429) or isinstance(status, int) and status >= 500:
         return True
     if isinstance(status, int) and 400 <= status < 500:
         # A definite client error: the body text (an HTML page for a wrong
         # base_url mentions "connection" and "timeout") must not override it.
         return False
+    if _is_provider_repetition_stop(error):
+        return True
     name = type(error).__name__.lower()
     text = str(error).lower()
     retryable = (
@@ -3261,6 +3463,14 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
         except Exception as error:
             primary_error = primary_error or error
             last_error = error
+            if thinking is None and _is_provider_stall(error):
+                # The same request just failed for a reason that depends on the
+                # request (an upstream idle timeout, a 5xx, a looping reply cut
+                # off by the provider). Repeating it unchanged tends to repeat
+                # the failure, so the retry is sent with thinking reduced, the
+                # same switch the output-limit retry uses. One change per call.
+                thinking = "length_retry"
+                notify("Provider stopped the reply; retrying with reduced thinking.")
             if emitted:
                 # The reply broke off mid-stream. Redoing it once is safe:
                 # tool calls only run after a complete response, so any
@@ -3701,7 +3911,7 @@ def _tool_selection_index(names: set[str]) -> tuple[list[str], list[str], list[l
 
     A catalog changes rarely; embed all of it once rather than making every user
     turn pay for 48 tool descriptions. The existing embedder has its own circuit
-    breaker, so a missing embedding model degrades to full tool exposure.
+    breaker, so a missing embedding model degrades to keyword-only ranking.
     """
     entries = [(name, _tool_selection_text(name, TOOL_SPECS[name]))
                for name in sorted(names) if name in TOOL_SPECS]
@@ -3810,14 +4020,46 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+_TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
+
+
+def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
+                            allowed: set[str], reason: str,
+                            semantic: list[int] | None = None) -> set[str]:
+    """Narrow the schema set without the embedding leg.
+
+    Used whenever hybrid ranking cannot run or its two rankers disagree. The old
+    behaviour was to offer the full catalog, which on a small model costs tens of
+    thousands of prompt tokens and offers many wrong tools, so the feature
+    failed silently in exactly the situation (no embedder) it was added for.
+    BM25 alone, plus the always-on and pinned tools, is the fallback; when a
+    semantic ranking exists but shares nothing with BM25 the union of both top
+    lists is used instead.
+    """
+    if reason not in _TOOL_SELECTION_FALLBACK_LOGGED:
+        _TOOL_SELECTION_FALLBACK_LOGGED.add(reason)
+        _log.info("tool selection: %s; ranking by keyword match instead of offering "
+                  "the full tool catalog", reason)
+    top_k = TOOL_SELECTION_TOP_K
+    ranked = _bm25_tool_ranking(query, texts)[:top_k]
+    if semantic:
+        ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
+    picked = {names[index] for index in ranked}
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    return _apply_tool_intent_guards(query, selected, set(allowed))
+
+
 def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | None = None,
                                   provider: str = "", model: str = "") -> set[str]:
-    """Choose direct schemas before the model sees a request, or fail open.
+    """Choose direct schemas before the model sees a request.
 
     This is deliberately not a chat-model router. BM25 handles literal tool
     language and the existing embedding endpoint handles paraphrases; RRF keeps
-    either signal from dominating. If the semantic leg is unavailable or the two
-    rankers have no shared candidate, retain the old full catalog.
+    either signal from dominating. If the semantic leg is unavailable, BM25 alone
+    chooses the schemas; if the two rankers have no shared candidate, the union
+    of both top lists is offered. The full catalog is only offered when
+    selection is off ("full" mode, an unmeasured model in "auto" mode, or a
+    catalog no larger than the top-k).
     """
     selected_mode = (mode or TOOL_SELECTION or "hybrid").lower()
     if selected_mode == "auto":
@@ -3827,21 +4069,23 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         return set(allowed)
     names, texts, vectors = _tool_selection_index(set(allowed))
     if len(vectors) != len(names):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "no embedder available")
     try:
         active_embedder = memory.embedder()
         query_vector = active_embedder.embed_one(query) if active_embedder else []
     except Exception as exc:  # noqa: BLE001 - optional performance path
         _log.debug("tool selection query embedding unavailable: %s", exc)
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     if not query_vector:
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed, "embedding failed")
     lexical = _bm25_tool_ranking(query, texts)
     semantic = sorted(range(len(names)), key=lambda i: _cosine(query_vector, vectors[i]),
                       reverse=True)
     semantic = [index for index in semantic if _cosine(query_vector, vectors[index]) > 0]
     if not lexical or not semantic or not set(lexical[:TOOL_SELECTION_TOP_K]) & set(semantic[:TOOL_SELECTION_TOP_K]):
-        return _apply_tool_intent_guards(query, set(allowed), set(allowed))
+        return _keyword_tool_selection(query, names, texts, allowed,
+                                       "the keyword and semantic rankings share no candidate",
+                                       semantic=semantic)
     scores = Counter()
     for ranking in (lexical, semantic):
         for position, index in enumerate(ranking, 1):
@@ -4801,6 +5045,11 @@ def load_subagent_specs(agents_dir: Path, user_agents_dir: Path = None) -> dict:
                 # timeouts above.
                 "max_turns": (_config_int(f"subagent_max_turns.{name}", 0)
                               or _positive_int(meta.get("max_turns", "8"), 8)),
+                # Wall clock for this profile alone; 0 means "use
+                # subagent_timeout_seconds". max_turns bounds rounds, and a
+                # round can take minutes, so it does not bound time.
+                "max_seconds": (_config_int(f"subagent_max_seconds.{name}", 0)
+                                or _positive_int(meta.get("max_seconds", "0"), 0)),
                 # Optional permission floor for the sub-run. Only "readonly" is
                 # honoured: a profile may restrict itself below the caller's mode,
                 # never widen past it.
@@ -5952,6 +6201,23 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
     return True
 
 
+def _standalone_test_command(command: str) -> bool:
+    """Recognise explicit test runners, without assuming scripts are tests."""
+    if not isinstance(command, str):
+        return False
+    if re.search(r"[;&|\n><`]|\$\(", command):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    return (bool(words) and words[0] in {"pytest", "py.test"}
+            or any(tuple(words[:len(prefix)]) == prefix
+                   for prefix in _TEST_RUNNER_COMMANDS)
+            or len(words) > 2 and words[0] in {"python", "python3"}
+            and words[1] == "-m" and words[2] in {"pytest", "unittest", "doctest"})
+
+
 def _exec_structured_tool(name: str, args: dict, timeout: int) -> str:
     argv = _structured_tool_argv(name, args)
     on_host = bool((TOOL_SPECS.get(name) or {}).get("host"))
@@ -6558,6 +6824,9 @@ def _subagent_ceiling(type_name: str) -> tuple:
     """
     if type_name == "auditor":
         return PLAN_AUDIT_TIMEOUT_SECONDS, "plan_audit_timeout_seconds"
+    own = (SUBAGENT_SPECS.get(type_name) or {}).get("max_seconds") or 0
+    if own > 0:
+        return own, f"subagent_max_seconds.{type_name}"
     return SUBAGENT_TIMEOUT_SECONDS, "subagent_timeout_seconds"
 
 
@@ -7177,6 +7446,25 @@ def _exec_autotest(args: dict, depth: int = 0) -> str:
     return report
 
 
+def _subagent_time_limit_report(type_name: str, limit: int, answer: str, written: list) -> str:
+    """What the parent is told when a sub-agent hit its own wall clock.
+
+    The sub-run's loop already ends with the exception text and its last tool
+    output. That reads as a failure, and it hides the one fact the parent needs
+    to carry on: what the sub-agent had already put on disk. So say that first,
+    and say plainly that the rest is partial work to build on, not a crash.
+    """
+    lines = [f"Sub-agent '{type_name}' reached its {limit}s time limit and was stopped. "
+             "What follows is partial work, not a failure of the task."]
+    if written:
+        shown = ", ".join(written[:10]) + (f" (+{len(written) - 10} more)" if len(written) > 10 else "")
+        lines.append(f"Files it wrote or changed: {shown}")
+    else:
+        lines.append("It had not written any file.")
+    lines.append(answer)
+    return "\n".join(lines)
+
+
 def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
                    from_user: bool = False) -> str:
     """Run a delegated task in a tool-restricted sub-agent loop.
@@ -7301,6 +7589,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     # with `find / -maxdepth 5` and the turn sat there until it was killed.
     child_budget = _subagent_budget(parent_budget, *_subagent_ceiling(type_name))
     _active_budget = child_budget
+    files_before = list(_TURN_FILES_TOUCHED)
     messages = history if history is not None else []
     messages.append(_delegated_turn(task, from_user))
     # A task the person typed is its own authority. One the parent model wrote
@@ -7346,6 +7635,11 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
             _one_shot_grants.clear()
             _one_shot_grants.update(saved_grants)
 
+    reason = child_budget.exceeded()
+    if reason and reason.startswith("Time budget") and "Time budget exceeded" in str(answer):
+        answer = _subagent_time_limit_report(
+            type_name, child_budget.max_seconds, answer,
+            [path for path in _TURN_FILES_TOUCHED if path not in files_before])
     answer = _cap_subagent_answer(answer)
     if model_warning:
         answer = f"[note: {model_warning}]\n\n{answer}"
@@ -9020,6 +9314,20 @@ def _resolve_sandbox_backend() -> str:
     return "docker" if _docker_usable() else "unavailable"
 
 
+NETWORK_NOT_ENFORCED = "not enforced on this backend (write restriction only)"
+
+
+def _native_enforces_network() -> bool:
+    """Whether the native backend on this OS applies the network allowlist.
+
+    The Windows backend is an ACL runner: it restricts where a command can
+    write, and a sandboxed command still reaches any host and sees the host's
+    process list. macOS (sandbox-exec) and Linux (bubblewrap + proxy) apply
+    sandbox_allowed_domains. Docker runs with no network regardless of OS.
+    """
+    return sys.platform != "win32"
+
+
 def sandbox_status() -> dict:
     resolved = _resolve_sandbox_backend()
     detail = {
@@ -9066,11 +9374,21 @@ def sandbox_status() -> dict:
         detail += " (candidate; not yet verified by a sandboxed command)"
     if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure):
         failure = _native_sandbox_failure or _docker_sandbox_failure
+    unenforced = resolved == "native" and not _native_enforces_network()
+    if unenforced:
+        network = NETWORK_NOT_ENFORCED
+        if SANDBOX_ALLOWED_DOMAINS:
+            network += (f"; sandbox_allowed_domains ({', '.join(SANDBOX_ALLOWED_DOMAINS)}) "
+                        "is not applied")
+    else:
+        network = ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked"
     return {
         "requested": SANDBOX_BACKEND,
         "resolved": resolved,
         "detail": detail,
-        "network": ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked",
+        "network": network,
+        "network_enforced": None if resolved == "unavailable" else not unenforced,
+        "host_processes_shared": unenforced,
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
         "failure": (failure or "")[:300],
@@ -9459,6 +9777,25 @@ def _report_sandbox(status: dict | None = None) -> None:
         status = status or sandbox_status()
         resolved = status.get("resolved")
         requested = str(status.get("requested") or "auto")
+        # Reported apart from the backend itself: a switch from native to docker
+        # is announced only on a state change, and a native backend that is
+        # degraded for its network would hide that switch.
+        if status.get("network_enforced") is False:
+            applied = ("; sandbox_allowed_domains is not applied"
+                       if SANDBOX_ALLOWED_DOMAINS else "")
+            capabilities.report(
+                capabilities.SANDBOX_NETWORK, active="file-writes-only", preferred="enforced",
+                state=capabilities.DEGRADED,
+                reason=f"network policy {NETWORK_NOT_ENFORCED}",
+                impact=("sandboxed commands can reach any host and see the host's "
+                        f"processes{applied}"),
+                fix="sandbox_backend=docker for network isolation")
+        elif status.get("network_enforced") and resolved == "native":
+            capabilities.report(capabilities.SANDBOX_NETWORK, active="enforced",
+                                preferred="enforced", state=capabilities.OK)
+        else:
+            # Docker has no network at all, which its own notice already says.
+            capabilities.clear(capabilities.SANDBOX_NETWORK)
         if resolved == "native":
             capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
                                 state=capabilities.OK)
@@ -10016,9 +10353,11 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
     Distinct from "the argument is missing" on purpose: telling the model an
     argument is absent when it did send one sends it chasing the wrong problem.
     """
+    hint = (" For a long file, send the first part (about 4-6 KB) with write_file and "
+            'each further part with mode="append".' if name == "write_file" else "")
     return (f"Error: could not parse the arguments for '{name}'. Send valid "
             f"JSON with newlines escaped as \\n, e.g. "
-            f'{{"code": "a = 1\\nprint(a)"}}. Received: {raw[:200]}')
+            f'{{"code": "a = 1\\nprint(a)"}}.{hint} Received: {raw[:200]}')
 
 
 # Every shape a "you left the argument out" refusal takes: the generic one below,
@@ -10026,7 +10365,7 @@ def _tool_arg_parse_error(name: str, raw: str) -> str:
 # 'url'", "sandboxed execution requires 'code'"). Matching only the first meant
 # the search loop — eight identical argument-less calls — went uncorrected.
 _MISSING_ARG_RE = re.compile(
-    r"^Error: .*?(was called with no arguments|requires '\w+')")
+    r"^Error: .*?(was called with no arguments|requires '\w+'|called with invalid arguments)")
 
 
 def _is_missing_argument_error(result: str) -> bool:
@@ -10079,6 +10418,122 @@ def _tool_arg_missing_error(name: str, missing: str) -> str:
     return (f"Error: '{name}' was called with no arguments. Send an ✿ARGS✿ "
             f"block containing '{missing}', e.g. "
             f'✿ARGS✿: {json.dumps({missing: "..."})}')
+
+
+# Fields a model adds to explain a call rather than to configure it. They carry
+# no meaning for any tool, so they are dropped instead of refused: a refusal
+# would cost a round trip to remove a sentence of prose.
+_IGNORED_META_ARGS = frozenset(
+    ["description", "reason", "explanation", "rationale", "comment", "thought", "thoughts"])
+# Spellings individual tools have always accepted besides their declared
+# arguments (the path aliases are handled in _tool_path, the others where the
+# tool reads its arguments). Listed so validation does not refuse them.
+_PATH_ARG_ALIASES = ("filename", "file", "file_path", "filepath", "path")
+_TOLERATED_ARGS = {
+    "spawn_subagent": {"type", "prompt", "instruction", "model"},
+    "execute_shell": {"timeout"},
+    "present_plan": {"plan", "text", "steps"},
+    "execute_plan": {"plan", "text", "steps"},
+}
+# What a model reaches for when it half-remembers a name: a wrong spelling is
+# looked up here before falling back to the closest declared name.
+_ARG_SYNONYMS = {
+    "content": ("text", "body", "data", "contents", "file_content", "file_contents"),
+    "filename": ("path", "file", "file_path", "filepath", "name", "target"),
+    "command": ("cmd", "script", "shell", "bash"),
+    "query": ("q", "search", "search_query", "text", "keywords"),
+    "url": ("link", "uri", "href", "address"),
+    "old_string": ("old", "find", "search", "old_text", "original"),
+    "new_string": ("new", "replace", "replacement", "new_text"),
+    "mode": ("append", "write_mode", "overwrite", "method"),
+}
+
+
+def _tolerated_args(name: str, spec: dict) -> set:
+    declared = set(spec.get("args") or [])
+    allowed = declared | _TOLERATED_ARGS.get(name, set())
+    if spec.get("path_arg") and spec["path_arg"] in declared:
+        allowed |= set(_PATH_ARG_ALIASES)
+    if spec.get("mode") == "docker":
+        allowed |= set(_CODE_ARG_ALIASES) | {"image", "images"}
+    return allowed
+
+
+def _suggest_arg(unknown: str, declared: list) -> str:
+    """The declared argument a wrong name was most likely meant to be, or ""."""
+    lowered = unknown.lower()
+    for real in declared:
+        if lowered in _ARG_SYNONYMS.get(real, ()):
+            return real
+    import difflib
+    close = difflib.get_close_matches(lowered, [d.lower() for d in declared], n=1, cutoff=0.6)
+    return next((d for d in declared if d.lower() == close[0]), "") if close else ""
+
+
+def _arg_type_problem(param: str, value, expected: str) -> str:
+    """Why `value` cannot be a(n) `expected`, or "" when it can.
+
+    Refuses only a value of the wrong *kind* (a list for an integer, true/false
+    for a number). Text that merely does not parse as a number is let through:
+    the tools fall back to their default for it, and a read with a garbled
+    offset has always started from the top rather than failed. A JSON string
+    standing in for an array or object has always worked, so it still does.
+    """
+    if expected in ("integer", "number"):
+        if isinstance(value, (bool, list, dict)):
+            return f"must be a{'n integer' if expected == 'integer' else ' number'}, got {_short_repr(value)}"
+        return ""
+    if expected == "boolean":
+        if isinstance(value, (list, dict)):
+            return f"must be true or false, got {_short_repr(value)}"
+        return ""
+    if expected == "array" and not isinstance(value, (list, str)):
+        return f"must be a list, got {_short_repr(value)}"
+    if expected == "object" and not isinstance(value, (dict, str)):
+        return f"must be an object, got {_short_repr(value)}"
+    return ""
+
+
+def _short_repr(value) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _validate_tool_args(name: str, spec: dict, args: dict) -> str:
+    """Check a built-in tool call against its declared arguments.
+
+    Returns an error message, or "" when the call is fine. Unknown names and
+    mistyped values used to pass straight through: an invented name was ignored
+    and the model believed it had taken effect (`append=true` on a write that
+    overwrote), and a wrong-typed value failed somewhere deeper with a message
+    about the symptom. Missing required arguments keep their own, per-tool
+    messages; this adds the unknown and mistyped cases.
+
+    Skipped for MCP tools (they carry their own JSON schema), for tools that
+    declare no arguments, and for the internal keys the harness itself passes.
+    """
+    declared = list(spec.get("args") or [])
+    if not declared or "parameters" in spec or spec.get("mode") == "mcp":
+        return ""
+    allowed = _tolerated_args(name, spec)
+    problems = []
+    for key in args:
+        if (key in allowed or str(key).startswith("_")
+                or str(key).lower() in _IGNORED_META_ARGS):
+            continue
+        hint = _suggest_arg(str(key), declared)
+        problems.append(f"'{key}' is not an argument of this tool"
+                        + (f" (did you mean '{hint}'?)" if hint else ""))
+    for param, expected in (spec.get("arg_types") or {}).items():
+        if param in args and args[param] is not None:
+            problem = _arg_type_problem(param, args[param], expected)
+            if problem:
+                problems.append(f"'{param}' {problem}")
+    if not problems:
+        return ""
+    return (f"Error: '{name}' called with invalid arguments: {'; '.join(problems)}. "
+            f"Its arguments are: {', '.join(declared)}. Correct the call and send it "
+            "again; do not repeat it unchanged.")
 
 
 _CODE_ARG_ALIASES = ("code", "script", "python", "source", "snippet", "command")
@@ -10907,6 +11362,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     timeout = _budget_capped_timeout(min(max(1, _declared_timeout), MAX_TOOL_TIMEOUT_SECONDS))
     if args.get("__parse_error__"):
         return _tool_arg_parse_error(name, str(args["__parse_error__"]))
+    invalid = _validate_tool_args(name, spec, args)
+    if invalid:
+        return invalid
     approval_key = _tool_call_key(name, args)
 
     if mode == "skill":
@@ -11339,6 +11797,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     # check and the recording that follows it agree on one spelling.
     ledger_command = ""
     write_path = ""
+    write_mode = "overwrite"
+    continues_series = False  # an append to a file already written in this series
     target = None
     path_zone = "default"
     shadowed = None
@@ -11368,7 +11828,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         command = "write_file"
         write_path = _tool_path(spec, args)
         if not write_path:
-            return "Error: write tool requires a file path."
+            return _tool_arg_missing_error(name, spec.get("path_arg") or "filename")
         try:
             target = resolve_write_path(write_path)
         except ValueError as exc:
@@ -11393,10 +11853,23 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="blocked_path")
             return f"Error: Write path is blocked: {target}"
+        if name == "write_file":
+            write_mode = str(args.get("mode") or "overwrite").strip().lower()
+            if write_mode not in ("overwrite", "append"):
+                return (f"Error: '{name}' called with invalid arguments: 'mode' must be "
+                        f"'overwrite' or 'append', got {_short_repr(args.get('mode'))}. "
+                        "Correct the call and send it again; do not repeat it unchanged.")
+            if write_mode == "append" and args.get("source_url"):
+                return (f"Error: '{name}' called with invalid arguments: mode='append' adds "
+                        "text and cannot be combined with source_url. Correct the call and "
+                        "send it again; do not repeat it unchanged.")
+            continues_series = write_mode == "append" and str(target) in _turn_chunked
         # Blast radius. Checked here — before the permission gate — so an
         # approved turn cannot be talked into writing 500 files, and so the
-        # refusal is not something the user can wave through by mistake.
-        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN:
+        # refusal is not something the user can wave through by mistake. The
+        # parts of one file written in pieces are one write, but every byte of
+        # them counts toward the byte limit.
+        if MAX_WRITES_PER_TURN and _turn_writes >= MAX_WRITES_PER_TURN and not continues_series:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_writes_per_turn")
             return (f"Error: this turn has already written {_turn_writes} files, "
@@ -11405,9 +11878,15 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         write_size = len(_structured_text_argument(
             args.get(spec.get("content_arg") or "content", "")
         ).encode("utf-8"))
-        if MAX_WRITE_BYTES and write_size > MAX_WRITE_BYTES:
+        series_bytes = _turn_chunked.get(str(target), 0) if continues_series else 0
+        if MAX_WRITE_BYTES and series_bytes + write_size > MAX_WRITE_BYTES:
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(target), reason="max_write_bytes")
+            if series_bytes:
+                return (f"Error: refusing to append {write_size} bytes to {target} — it "
+                        f"would hold {series_bytes + write_size} bytes written this turn, "
+                        f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Raise "
+                        f"max_write_bytes in config.txt or write a smaller file.")
             return (f"Error: refusing to write {write_size} bytes to {target} — "
                     f"over the max_write_bytes limit of {MAX_WRITE_BYTES}. Write a "
                     f"smaller file or raise max_write_bytes in config.txt.")
@@ -11454,6 +11933,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     if mode == "shell" and _hard_blocked_shell(command) and not remote_git_approved:
         _audit("tool_call", tool=name, mode=mode, decision="denied",
                detail=command[:200], reason="hard_blocked_shell")
+        if last_refusal_was_process_stop():
+            return PROCESS_STOP_REFUSAL
         return "Error: This shell operation is forbidden by Agent8088's safety policy."
 
     if mode == "shell":
@@ -11726,7 +12207,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                            f"edit the project's own file.")
             return result
         content = _structured_text_argument(args.get(content_arg, ""))
-        _turn_writes += 1
+        if not continues_series:
+            _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             old_content = _read_text_limited(target) if target.exists() else ""
@@ -11794,6 +12276,27 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if hunk:
                 result += f"\n{hunk}"
             return result
+        if write_mode == "append":
+            if content_arg not in args:
+                if not continues_series:
+                    _turn_writes -= 1  # refused before writing; must not spend the budget
+                return (f"Error: {name} mode='append' needs content, and none was given, "
+                        f"so {target} was left unchanged.")
+            with open(target, "a", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+            written = len(content.encode("utf-8"))
+            _turn_chunked[str(target)] = _turn_chunked.get(str(target), 0) + written
+            _last_write_diff = _make_diff(old_content, old_content + content, str(target))
+            try:
+                total = target.stat().st_size
+            except OSError:
+                total = len(old_content.encode("utf-8")) + written
+            result = f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+            if shadowed is not None:
+                result += (f" — NOT {shadowed}. A bare filename is stored in "
+                           f"artifacts/; pass that absolute path if you meant to "
+                           f"edit the project's own file.")
+            return result
         # Everything above returned; reaching here is a whole-file overwrite.
         # write_file marks both content and source_url optional so either can
         # carry the bytes, which makes a call supplying NEITHER schema-valid.
@@ -11812,6 +12315,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         else:
             target.write_text(content, encoding="utf-8", newline="")
         _last_write_diff = _make_diff(old_content, content, str(target))
+        if name == "write_file":
+            # A later append continues from here; an older series on this path is over.
+            _turn_chunked[str(target)] = len(content.encode("utf-8"))
         result = f"Wrote {len(content)} bytes to {target}"
         if shadowed is not None:
             result += (f" — NOT {shadowed}. A bare filename is stored in "
@@ -12010,6 +12516,52 @@ def _environment_diagnostic() -> str:
     return "\n".join(lines)
 
 
+_WRITE_FILE_PARTS_HINT = (
+    " For a long file, write the first part (about 4-6 KB) with write_file, then add "
+    "each further part with mode=\"append\".")
+
+
+def _chunk_key(name: str, args: dict) -> str:
+    """The resolved path a write_file call targets, or "" for anything else."""
+    if name != "write_file":
+        return ""
+    try:
+        return str(resolve_write_path(_tool_path(TOOL_SPECS.get(name, {}), args)))
+    except Exception:  # noqa: BLE001 -- an unresolvable path is refused by the tool itself
+        return ""
+
+
+def _appended_bytes(result: str) -> int:
+    match = re.match(r"Appended (\d+) bytes", result)
+    return int(match.group(1)) if match else 0
+
+
+def _flush_chunk_audits(depth: int, keep: str = "") -> str:
+    """Audit every file written in parts whose last part has now been seen.
+
+    Returns the text to show the model (an auditor's note, a failed verdict and
+    the revert), or "" when there is nothing to say. `keep` is a path still
+    being written, which stays pending.
+    """
+    notes = []
+    for key in [k for k in _pending_chunk_audits if k != keep]:
+        entry = _pending_chunk_audits.pop(key)
+        try:
+            size = Path(key).stat().st_size
+        except OSError:
+            size = entry["bytes"]
+        summary = (f"Appended {entry['chunks']} parts ({entry['bytes']} bytes) to {key}; "
+                   f"the file is now {size} bytes")
+        audited = _audit_tool_call(
+            "write_file", {"filename": key,
+                           "content": f"<{entry['bytes']} bytes appended in {entry['chunks']} parts>"},
+            summary, depth, entry["snapshot"])
+        extra = audited[len(summary):].strip() if audited.startswith(summary) else audited
+        if extra:
+            notes.append(f"Audit of {key} after its last part:\n{extra}")
+    return "\n".join(notes)
+
+
 def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     global _last_tool_output, _last_tool_name, _last_write_diff
     # Clear before validation too: rejected arguments must not inherit a
@@ -12035,7 +12587,22 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
     # Taken before the call runs: once it has written, the previous state is the
     # one thing that cannot be reconstructed.
     will_audit = _audit_applies(name, args, depth)
-    snapshot = _capture_write_state(name, args) if will_audit and PLAN_AUDIT_REVERT else None
+    # The parts of a file written in pieces are audited once, after the last
+    # part: at the next call that is not another part of it, or when the model
+    # finishes. A series' snapshot is taken before its first part, so a failed
+    # audit restores the original file, not the previous part.
+    chunk_key = _chunk_key(name, args)
+    appending = bool(chunk_key) and str(args.get("mode") or "").strip().lower() == "append"
+    flush_note = _flush_chunk_audits(depth, keep=chunk_key if appending else "")
+    defer_audit = will_audit and appending
+    if defer_audit:
+        will_audit = False
+    snapshot = None
+    if (will_audit or defer_audit) and PLAN_AUDIT_REVERT:
+        snapshot = (_chunk_snapshots.get(chunk_key) if appending and chunk_key in _chunk_snapshots
+                    else _capture_write_state(name, args))
+        if chunk_key and snapshot is not None:
+            _chunk_snapshots[chunk_key] = snapshot
 
     try:
         result = run_tool(name, args, depth=depth)
@@ -12064,15 +12631,31 @@ def exec_tool(name: str, arguments: str, depth: int = 0) -> str:
             'Inspect the reported cause and tool schema. Resolve the prerequisite before retrying; do not bypass permissions.',
             recoverable=validation)
 
+    if defer_audit and result.startswith("Appended "):
+        entry = _pending_chunk_audits.setdefault(
+            chunk_key, {"chunks": 0, "bytes": 0, "snapshot": snapshot})
+        entry["chunks"] += 1
+        entry["bytes"] += _appended_bytes(result)
+
     # A blocked call has not done anything yet, so there is nothing to verify —
     # it gets audited on the retry that follows approval. The prefix is
     # \x1f-delimited (a Windows path splits on ':'); matching ':' here meant the
     # check never fired, so the auditor was sent to inspect a write that had not
     # happened and its fail verdict was appended to the escalation the user still
     # had to answer.
-    if (will_audit and not result.startswith("ESCALATION_REQUEST\x1f")
+    # A passing test command already supplies verification evidence. Auditing
+    # that evidence with another agent repeats the check and can dominate the
+    # task budget. Writes bundled with a test still need their usual audit.
+    test_evidence = (name == "execute_shell"
+                     and _standalone_test_command(args.get("command", ""))
+                     and tool_output.detect_verdict(result).status == "passed")
+    if (will_audit and not test_evidence
+            and not result.startswith("ESCALATION_REQUEST\x1f")
             and not _plan_step_failed(result)):
         result = _audit_tool_call(name, args, result, depth, snapshot)
+
+    if flush_note:
+        result = f"{result}\n{flush_note}"
 
     _remember_escalation(name, args, result)
 
@@ -12446,6 +13029,20 @@ def strip_tool_json(text: str) -> str:
     text = re.sub(r'[ \t]+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _unknown_tool_call_instruction(native_tools: bool) -> str:
+    """How the unknown-tool correction tells the model to retry.
+
+    A model on a native tool-calling backend sees its tools as schemas, not as
+    text. Teaching it the text-marker syntax in the correction invites it to
+    write ✿FUNCTION✿ lines into its reply, which the marker salvage then has to
+    recover. Name the format the model is actually using.
+    """
+    if native_tools:
+        return "Either call one of those through the tool-calling interface, using its schema"
+    return ("Either call one of those with the exact format "
+            '`✿FUNCTION✿: name ✿ARGS✿: {"arg": "value"}`')
 
 
 def _attempted_tool_names(text: str) -> list:
@@ -15995,6 +16592,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     last_call_tokens = 0  # completion tokens of the last call that finished normally
     cap_hint = 0         # cap a cut-off tool call earned for its retry (0 = none)
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
+    last_cutoff_kind = ""  # what the latest cut-off was: tool_call / prose / empty
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -16220,9 +16818,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
-        # A3.2/A3.4: from the 2nd consecutive cut-off, this one call runs with
-        # thinking off; the next ordinary turn is back to normal thinking.
-        retry_kwargs = {"thinking": "length_retry"} if length_retries >= 2 else {}
+        # A3.2/A3.4: this one call runs with thinking off after an empty
+        # cut-off (the whole allowance went to reasoning, or to an unclosed tool
+        # call the runtime hides) and, for any other kind, from the 2nd
+        # consecutive cut-off; the next ordinary turn is back to normal thinking.
+        # Retrying an empty cut-off with thinking still on mostly cuts off again
+        # and costs a full call each time.
+        retry_kwargs = ({"thinking": "length_retry"}
+                        if length_retries >= 2 or length_retries and last_cutoff_kind == "empty"
+                        else {})
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",
@@ -16373,6 +16977,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     f"{warning} Retry with one complete, concise tool call; "
                     "split large work across calls if needed."
                 )
+                if "write_file" in content:
+                    retry_instruction += _WRITE_FILE_PARTS_HINT
             else:
                 # The whole budget was spent on reasoning before any answer or
                 # tool call appeared — "split work into calls" doesn't address
@@ -16400,6 +17006,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             else:
                 cutoff_kind, cap_hint = "empty", 0
                 prose_cutoffs = 0
+            last_cutoff_kind = cutoff_kind
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
@@ -16458,6 +17065,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 retry_instruction = (
                     f"{warning} The previous attempt was cut off and discarded. "
                     + ("Make one short, complete tool call; split large work across calls."
+                       + (_WRITE_FILE_PARTS_HINT if "write_file" in content else "")
                        if content else
                        "That budget went entirely to reasoning: stop reasoning and "
                        "reply in plain text or call one tool."))
@@ -16477,6 +17085,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
             length_retries = 0
         cap_hint = prose_cutoffs = 0
+        last_cutoff_kind = ""
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -16540,9 +17149,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                      if gated else
                      f"Error: the tool '{name}' does not exist. ") +
                     f"Available tools are: {available}. "
-                    "Either call one of those with the exact format "
-                    '`✿FUNCTION✿: name ✿ARGS✿: {\"arg\": \"value\"}`, '
-                    "or, if no tool fits, answer the user directly in plain text "
+                    + _unknown_tool_call_instruction(_native_tools_enabled(
+                        round_tools_def, loop_provider or "")) +
+                    ", or, if no tool fits, answer the user directly in plain text "
                     "without mentioning tools."))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
@@ -16619,6 +17228,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # back to working, so the cap must not cut that short.
                 post_check_rounds, post_check_told = None, False
                 continue
+            if gates_open and _pending_chunk_audits and depth == 0:
+                chunk_note = _flush_chunk_audits(depth)
+                if chunk_note:
+                    messages.append(_harness_turn(chunk_note))
+                    post_check_rounds = 0
+                    continue
             if gates_open:
                 nudge = _next_completion_nudge(
                     completion_budget, trajectory, reply=answer, request=request_text,
@@ -16918,8 +17533,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "inside a string value that is not escaped as \\\" (code "
                     "with \"\"\"docstrings\"\"\" or f\"...\" strings). Escape every "
                     "quote and newline inside values. For long file content, "
-                    "write a shorter first part and add the rest with further "
-                    "calls; otherwise send only the required arguments."
+                    "write the first part (about 4-6 KB) with write_file and add "
+                    "each further part with write_file mode=\"append\", in order; "
+                    "otherwise send only the required arguments."
                 )))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "tool_arg_parse_error",
@@ -17065,6 +17681,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+
+        # A successful test of changed work starts the same bounded check phase
+        # even when the model has not attempted a final answer yet. Mere reads
+        # or research do not start it. Further writes still reset the counter.
+        if (executed and post_check_rounds is None and trajectory is not None
+                and trajectory.mutation_count()
+                and trajectory.data.get("verification") == "verified"
+                and not round_changed):
+            post_check_rounds = 0
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
