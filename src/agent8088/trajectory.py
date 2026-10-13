@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import PurePath
 
+from agent8088.completion import SUBGOAL_PREFIX
 
 VERSION = 2
 MAX_OPERATIONS = 12
@@ -77,6 +78,9 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "untested_changes": [],
         "written_paths": [],
         "tests_requested": False,
+        "passed_checks": 0,
+        "subgoals_built": False,
+        "unmet_checks": [],
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
@@ -125,6 +129,7 @@ class TrajectoryState:
             # Unresolved state carries over to the next request; the reminder
             # budget is per request and must not, or the session goes silent.
             self.data["verification_requests"] = 0
+            self.data["unmet_checks"] = []
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -169,6 +174,7 @@ class TrajectoryState:
             self._set_step("Complete the requested work", "done")
             self._set_step("Verify changed work", "pending")
         if operation["verdict"] == "passed":
+            self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
             if self.needs_verification():
@@ -241,11 +247,70 @@ class TrajectoryState:
     def needs_tests(self) -> bool:
         return bool(self.data.get("untested_changes"))
 
-    def request_tests(self) -> bool:
+    def request_tests(self, relevant=None) -> bool:
+        """Arm the one-shot tests reminder, for the changed files `relevant` accepts.
+
+        `relevant(path) -> bool` narrows the reminder to files worth a unit test;
+        with none left it does not fire and is not spent.
+        """
         if not self.needs_tests() or self.data.get("tests_requested"):
+            return False
+        if relevant is not None and not self.relevant_untested(relevant):
             return False
         self.data["tests_requested"] = True
         return True
+
+    def relevant_untested(self, relevant) -> list[str]:
+        return [p for p in self.untested_paths() if relevant(p)]
+
+    # --- completion checks -------------------------------------------------
+
+    def set_subgoals(self, items: list[str]) -> None:
+        """Record the parts of a multi-part request, once per request."""
+        if self.data.get("subgoals_built"):
+            return
+        self.data["subgoals_built"] = True
+        checklist = self.data.setdefault("checklist", [])
+        for item in items:
+            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending"})
+
+    def subgoals_built(self) -> bool:
+        return bool(self.data.get("subgoals_built"))
+
+    def subgoals(self) -> list[dict]:
+        return [step for step in self.data.get("checklist", [])
+                if str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
+
+    def open_subgoals(self) -> list[str]:
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") != "done"]
+
+    def mark_subgoals(self, still_open: list[str]) -> None:
+        """Everything not in `still_open` is done; what is in it stays pending."""
+        keep = set(still_open)
+        for step in self.subgoals():
+            name = step["name"][len(SUBGOAL_PREFIX):]
+            step["status"] = "pending" if name in keep else "done"
+
+    def unresolved_tools(self) -> list[str]:
+        latest = {}
+        for operation in self.data.get("operations", []):
+            latest[operation.get("tool", "tool")] = operation
+        return [tool for tool, op in latest.items()
+                if op.get("status") in {"blocked", "failed", "unknown"}]
+
+    def has_open_items(self) -> bool:
+        """Work the run itself shows is not finished: pending verification, a failed
+        or blocked tool, or a part of the request nobody has addressed."""
+        return bool(self.needs_verification() or self.unresolved_tools() or self.open_subgoals())
+
+    def progress_mark(self) -> tuple:
+        """A value that changes when the run makes real progress."""
+        return (int(self.data.get("mutation_count") or 0),
+                int(self.data.get("passed_checks") or 0),
+                len(self.open_subgoals()))
+
+    def note_unmet(self, reasons: list[str]) -> None:
+        self.data["unmet_checks"] = [_text(r) for r in reasons][:6]
 
     def _set_step(self, name: str, status: str) -> None:
         for step in self.data.get("checklist", []):
@@ -283,8 +348,13 @@ class TrajectoryState:
         verification are separate facts, and reporting only the first one hides
         the other from the user for the rest of the run.
         """
-        notes = [note for note in (self._progress_review(), self._tests_review()) if note]
+        notes = [note for note in (self._progress_review(), self._tests_review(),
+                                   self.unmet_review()) if note]
         return " ".join(notes)
+
+    def unmet_review(self) -> str:
+        unmet = self.data.get("unmet_checks") or []
+        return ("Not completed: " + "; ".join(unmet) + ".") if unmet else ""
 
     def _tests_review(self) -> str:
         if not self.needs_tests():
