@@ -9917,7 +9917,7 @@ def _playwright_chromium_executable() -> str | None:
 _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
 
 
-def _native_sandbox_shell_argv(command: str) -> list:
+def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
     """Return argv for a shell command without nesting cmd.exe quotes.
 
     The Windows ACL runner accepts a real argv and quotes each element using
@@ -9932,16 +9932,23 @@ def _native_sandbox_shell_argv(command: str) -> list:
     platform shell from *inside the restricted token*.  This preserves cmd.exe
     operators and output while keeping all quote boundaries out of the ACL
     runner's command line.
+
+    The runner's --workspace is the folder the child may write to; it does not make
+    it the child's working directory. `cwd` starts the command there.
     """
     import base64
 
     bridge = (
         "import base64, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
-        "raise SystemExit(subprocess.run(command, shell=True).returncode)\n"
+        "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
+        "raise SystemExit(subprocess.run(command, shell=True, cwd=cwd).returncode)\n"
     )
     payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
-    return [sys.executable, "-c", bridge, payload]
+    argv = [sys.executable, "-c", bridge, payload]
+    if cwd:
+        argv.append(base64.b64encode(str(cwd).encode("utf-8")).decode("ascii"))
+    return argv
 
 
 def _dsh_runner_path() -> Path:
@@ -10635,7 +10642,13 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         if env_prefix:
             command = f"{env_prefix} && {command}"
         mode = "read-only" if readonly else "workspace-write"
-        wrapped = _native_sandbox_shell_argv(command)
+        # Start in the workspace, as the macOS/Linux branch below and the Docker mount
+        # do. Without it the command started in the folder the agent was launched from,
+        # so `dir` showed the project folder while the tool rewrites "artifacts" in a
+        # command to "." (the workspace): a model checking its folder got answers that
+        # contradicted each other and stalled. A read-only run works on a temporary
+        # copy the restricted child cannot read, so it keeps the old start.
+        wrapped = _native_sandbox_shell_argv(command, cwd=None if readonly else cwd)
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
                             "--mode", mode, "--"] + wrapped
         return _exec_process(full_argv, timeout=timeout)
