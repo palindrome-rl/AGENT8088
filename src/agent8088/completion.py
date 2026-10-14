@@ -417,6 +417,61 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     return open_items
 
 
+# --- 4b. A request that depends on facts the model may not have ------------------------------
+
+_BUILD_VERB = re.compile(
+    r"\b(?:build|create|make|implement|develop|write|generate|design|code|produce|simulate|recreate|"
+    r"replicate|clone|set\s+up)\b", re.IGNORECASE)
+_STRONG_CUE = re.compile(
+    r"\b(?:valid(?:\s+and\s+available)?\s+(?:in|for|on)|available\s+in|official(?:ly)?|actual|authentic|"
+    r"accurate(?:ly)?|real[- ]world|faithful(?:ly)?|(?:full|complete|entire)\s+(?:roster|list|set|"
+    r"catalog(?:ue)?|database|dataset|line-?up)|all\s+(?:of\s+)?the\s+(?:valid|available|official|real)|"
+    r"as\s+in\s+the\s+(?:real|actual|official))\b", re.IGNORECASE)
+# The user supplied the facts: a URL, a named file, an attachment, "the dataset".
+_LOCAL_SOURCE = re.compile(
+    r"https?://|\bwww\.|[\w./\\-]+\.(?:csv|json|txt|md|pdf|xlsx?|docx?|py|js|html|yaml|yml)\b|"
+    r"\battached\b|\bprovided\b|\bgiven\s+(?:file|data|dataset|text|document)s?\b|"
+    r"\bthe\s+(?:file|folder|repo|repository|codebase|dataset)\b", re.IGNORECASE)
+_NAMED_SUBJECT = re.compile(r"\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)+)\b")
+_NOT_A_SUBJECT = frozenset({
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january",
+    "february", "march", "april", "june", "july", "august", "september", "october", "november",
+    "december"})
+
+
+def grounding_subject(request: str) -> str:
+    """The named subject of a build request that depends on facts from outside, or "".
+
+    True only for a request that asks for something to be built, asks for it to follow
+    real rules or data ("valid and available in X", "official", "full roster"), names a
+    subject (two or more capitalised words, not at the start of a sentence), and does not
+    supply the facts itself (a URL, a file, an attachment). It is a signal that the model
+    may be relying on facts it does not have, not proof that it is.
+    """
+    text = _prose(request or "")
+    if len(text) < 80 or not _BUILD_VERB.search(text) or not _STRONG_CUE.search(text):
+        return ""
+    if _LOCAL_SOURCE.search(text):
+        return ""
+    for match in _NAMED_SUBJECT.finditer(text):
+        phrase = match.group(1)
+        before = text[:match.start()].rstrip()
+        if not before or before[-1] in ".!?":
+            continue
+        if phrase.split()[0].lower() in _NOT_A_SUBJECT:
+            continue
+        return phrase
+    return ""
+
+
+def grounding_nudge(subject: str) -> "Nudge":
+    return Nudge("grounding", continue_text(
+        f"This request depends on real facts about {subject}, and you wrote files without looking anything up.",
+        "Use web_search to check the rules or data you relied on, fix whatever differs, and name the sources "
+        "you used in your reply. If search is unavailable, say which facts you could not check."),
+        unmet=f"the request depends on facts about {subject} and nothing was looked up")
+
+
 # --- 5. Which changed files deserve a "write tests" reminder ----------------------------
 
 _SCRATCH_DIRS = frozenset({"scratch", "tmp", "temp", "sandbox-tmp", ".scratch", "experiments", "playground"})

@@ -17,6 +17,8 @@ MAX_EVIDENCE = 6
 MAX_WRITTEN = 50
 MAX_UNTESTED = 8
 MAX_VERIFICATION_REQUESTS = 2
+# Tools that look something up outside the workspace.
+RESEARCH_TOOLS = frozenset({"web_search", "browse_page"})
 
 # Suffixes worth a test. Config, data, docs and markup are excluded because a
 # generated test for them asserts that a file parses, which nobody needed.
@@ -126,6 +128,8 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "subgoals_built": False,
         "unmet_checks": [],
         "partial_files": [],
+        "research_used": False,
+        "grounding_asked": False,
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
@@ -187,6 +191,7 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -203,6 +208,10 @@ class TrajectoryState:
                    path: str = "", command: str = "", existed: bool = False,
                    partial_path: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
+        if operation["status"] == "done" and (
+                operation["tool"] in RESEARCH_TOOLS
+                or (operation["tool"] == "execute_shell" and re.search(r"https?://", command or ""))):
+            self.data["research_used"] = True
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
         if operation["status"] == "done":
@@ -463,6 +472,16 @@ class TrajectoryState:
         del notes[:-4]
         if failed:
             self.data["smoke_failures"] = int(self.data.get("smoke_failures") or 0) + 1
+
+    def research_used(self) -> bool:
+        """Did this session look anything up (a search, a browsed page, a fetch from the shell)?"""
+        return bool(self.data.get("research_used"))
+
+    def grounding_asked(self) -> bool:
+        return bool(self.data.get("grounding_asked"))
+
+    def mark_grounding_asked(self) -> None:
+        self.data["grounding_asked"] = True
 
     def smoke_failures(self) -> int:
         return int(self.data.get("smoke_failures") or 0)
