@@ -17574,6 +17574,21 @@ _CHANGE_REQUEST = re.compile(
     r"install|develop|code|produce)\b", re.IGNORECASE)
 
 
+def _smoke_cd_prefix(directory: Path, relative: Path, windows_native: bool) -> str:
+    """The `cd` that puts a smoke-test command next to the script it starts.
+
+    The native Windows runner starts commands in the folder the agent was launched
+    from, not in the workspace it is given, and it cannot read the temporary copy
+    a read-only run is normally made on. There the script is read in place, which
+    the read-only mode makes safe, so the prefix is the script's real folder. The
+    forward slashes keep the read-only copy mapping from rewriting it and are
+    accepted by `cd /d`. Everywhere else the command already starts in the copy.
+    """
+    if windows_native:
+        return f'cd /d "{Path(directory).resolve().as_posix()}" && '
+    return f"cd {shlex.quote(Path(relative).as_posix())} && " if str(relative) != "." else ""
+
+
 def _smoke_script_runner(target):
     """A runner that starts a script in the read-only sandbox, or None.
 
@@ -17585,15 +17600,18 @@ def _smoke_script_runner(target):
         inside = ARTIFACTS_ROOT in Path(target).resolve().parents
     except OSError:
         inside = False
-    if not inside or _resolve_sandbox_backend() == "unavailable":
+    backend = _resolve_sandbox_backend()
+    if not inside or backend == "unavailable":
         return None
 
     def run(command: str, timeout: int) -> str:
         global _sandbox_readonly
         previous, _sandbox_readonly = _sandbox_readonly, True
         try:
-            relative = Path(target).resolve().parent.relative_to(ARTIFACTS_ROOT)
-            prefix = f"cd {shlex.quote(relative.as_posix())} && " if str(relative) != "." else ""
+            here = Path(target).resolve().parent
+            prefix = _smoke_cd_prefix(here, here.relative_to(ARTIFACTS_ROOT),
+                                      sys.platform == "win32" and backend == "native"
+                                      and _native_sandbox_ready(ARTIFACTS_ROOT, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous

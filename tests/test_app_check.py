@@ -365,3 +365,43 @@ def test_timed_out_check_shuts_its_server_down(monkeypatch):
                             "server_close": lambda self: stopped.append("close")})()
     app_check._abandon({"server": server}, 0.0)
     assert stopped == ["shutdown", "close"]
+
+
+def test_the_models_throwaway_helpers_are_not_deliverables(tmp_path):
+    names = ("index.html", "app.py", "_clean.py", "_fix.js", "_tmp_poke.js", "tmp_check.py",
+             "scratch.py", "debug_dump.js", "__init__.py", "temperature.py")
+    for name in names:
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    targets = app_check.deliverable_targets(list(names), [tmp_path], limit=10)
+    assert [p.name for p in targets] == ["index.html", "app.py", "__init__.py", "temperature.py"]
+
+
+def test_a_crashing_helper_does_not_fail_the_smoke_test(tmp_path):
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "_clean.py").write_text("import sys\nsys.exit(2)\n", encoding="utf-8")
+    targets = app_check.deliverable_targets(["app.py", "_clean.py"], [tmp_path])
+    assert [p.name for p in targets] == ["app.py"]
+
+
+def test_a_browser_script_run_under_node_is_not_a_crash(tmp_path):
+    script = tmp_path / "app.js"
+    script.write_text("window.addEventListener('load', () => {});\n", encoding="utf-8")
+    seen = "ReferenceError: window is not defined\nCommand exited with status 1."
+    assert app_check._run_briefly(script, lambda command, timeout: seen) == []
+
+
+def test_browser_context_is_unavailable_not_verified_startup(tmp_path):
+    script = tmp_path / "browser.js"
+    script.write_text("window.addEventListener('load', () => {});", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda command, timeout:
+        "ReferenceError: window is not defined\nCommand exited with status 1.")
+    assert report.status == app_check.UNAVAILABLE
+    assert "startup was not verified" in report.note
+    assert not report.failures
+
+
+def test_a_real_node_crash_still_counts(tmp_path):
+    script = tmp_path / "server.js"
+    script.write_text("x\n", encoding="utf-8")
+    seen = "ReferenceError: config is not defined\nCommand exited with status 1."
+    assert app_check._run_briefly(script, lambda command, timeout: seen)
