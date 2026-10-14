@@ -442,9 +442,16 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
 _CRASH = re.compile(r"Traceback \(most recent call last\)|SyntaxError|ReferenceError|"
                     r"Cannot find module|ModuleNotFoundError|ImportError", re.IGNORECASE)
 _EXIT_NONZERO = re.compile(r"Command exited with status ([1-9]\d*)")
+# A script meant for a page (loaded by a <script> tag) fails under Node the moment it
+# touches a browser global. That says nothing about the script, so it is not a crash.
+_BROWSER_GLOBAL = re.compile(
+    r"ReferenceError: (?:window|document|navigator|localStorage|sessionStorage|location|alert|"
+    r"requestAnimationFrame|cancelAnimationFrame|HTMLElement|Image|Audio|AudioContext|Element|"
+    r"customElements|screen|history) is not defined")
 
 
-def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
+def _run_briefly(path: Path, run: Callable[[str, int], str],
+                 unavailable: list[str] | None = None) -> list[str]:
     """Start the script with --help in the sandbox; return crash findings.
 
     Only a crash on startup counts. Printing usage, finishing, or still running
@@ -453,6 +460,10 @@ def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
     program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
     output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
     if "timed out" in output.lower():
+        return []
+    if program == "node" and _BROWSER_GLOBAL.search(output):
+        if unavailable is not None:
+            unavailable.append("parses; browser context is required; startup was not verified")
         return []
     crashed = _CRASH.search(output)
     exited = _EXIT_NONZERO.search(output)
@@ -491,9 +502,12 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             first = (done.stderr or done.stdout).strip().splitlines()
             return Report("script", str(path), FAIL, [f"syntax error: {first[-1][:160] if first else 'node --check failed'}"])
         if run is not None:
-            crash = _run_briefly(path, run)
+            unavailable = []
+            crash = _run_briefly(path, run, unavailable)
             if crash:
                 return Report("script", str(path), FAIL, crash)
+            if unavailable:
+                return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
             return Report("script", str(path), PASS, note="parses and starts without crashing")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")
@@ -519,10 +533,28 @@ def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
 
 # --- which files a run produced are worth checking -----------------------------------------------
 
+_HELPER_NAME = re.compile(r"^(?:tmp|temp|scratch|debug)(?:[_-].*)?$")
+
+
+def is_helper_script(path: Path) -> bool:
+    """A throwaway script the model wrote to inspect or patch its own work.
+
+    A single leading underscore (_clean.py, _fix.js), or a name that is tmp, temp,
+    scratch or debug alone or followed by _ or -, marks a helper (temperature.py does not). __init__.py and other dunder names are not helpers.
+    Starting one with --help or syntax-checking it says nothing about the deliverable,
+    and a helper that exits non-zero used to fail the run's smoke test.
+    """
+    stem = Path(path).stem.lower()
+    if stem.startswith("__"):
+        return False
+    return (stem.startswith("_") and len(stem) > 1) or bool(_HELPER_NAME.match(stem))
+
+
 def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3) -> list[Path]:
     """Pages and runnable scripts this run wrote that exist, pages first, newest last.
 
-    Tests, files under node_modules or a virtualenv, and scratch dirs are skipped.
+    Tests, files under node_modules or a virtualenv, scratch dirs, and the model's own
+    throwaway helpers (_fix.py, tmp_check.js) are skipped.
     """
     roots = [Path(r) for r in roots]
     found: list[Path] = []
@@ -536,6 +568,8 @@ def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: in
             continue
         stem = path.stem.lower()
         if stem.startswith("test_") or stem.endswith("_test") or ".test" in path.name.lower():
+            continue
+        if is_helper_script(path):
             continue
         if path.suffix.lower() in WEB_SUFFIXES | PYTHON_SUFFIXES | NODE_SUFFIXES:
             found.append(path)

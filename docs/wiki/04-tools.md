@@ -211,6 +211,9 @@ A deterministic smoke test of something the agent built; no model call.
   --check`). Scripts inside the artifact workspace also get a brief `--help`
   startup check in a disposable read-only sandbox when available. Without that
   sandbox the result explicitly says it was not executed.
+- Browser-only JavaScript that requires globals such as `window` cannot be
+  startup-verified under Node. It reports `unavailable`, not a successful startup;
+  check the containing HTML page to verify it in a browser context.
 - Without Chromium (`playwright install chromium`) it reports "unavailable"
   instead of failing the task.
 

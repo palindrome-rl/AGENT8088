@@ -134,3 +134,37 @@ def test_rejected_request_body_timeout_still_returns_405(tmp_path):
     handler.send_error = statuses.append
     handler.do_POST()
     assert statuses == [405] and timeouts[-1] is None
+
+
+def test_new_recovery_and_write_safety_settings_are_documented():
+    page = (ROOT / "docs/wiki/02-configuration.md").read_text(encoding="utf-8")
+    for name in ("thinking_off_sticky_calls", "salvage_cutoff_writes", "block_secrets_in_writes"):
+        assert f"| `{name}` |" in page
+
+
+def test_partial_file_identity_does_not_confuse_directories():
+    from agent8088.trajectory import TrajectoryState
+    state = TrajectoryState(None)
+    state.note_partial("first/index.js", 1200)
+    state.after_tool(state.before_tool("write_file"), "Wrote bytes",
+        failed=False, blocked=False, mutated=True, path="second/index.js")
+    assert state.partial_files() == ["first/index.js"]
+
+
+def test_configured_credential_append_boundary_is_blocked(tmp_path, monkeypatch):
+    from agent8088 import engine
+    value = "fake-public-regression-credential"
+    monkeypatch.setattr(engine, "BLOCK_SECRETS_IN_WRITES", True)
+    monkeypatch.setattr(engine, "_SECRET_VALUES", {value})
+    path = tmp_path / "example.txt"
+    path.write_text(value[:-5], encoding="utf-8")
+    result = engine._file_append_secret_check(path, value[-5:])
+    assert result and "credential" in result and value not in result
+    assert path.read_text(encoding="utf-8") == value[:-5]
+
+
+def test_truncated_argument_diagnostic_is_distinct_from_bad_quoting():
+    from agent8088 import engine
+    assert engine._parse_error_args('{"filename": "example.js", "content": "unfinished').get(
+        "__parse_error_cut_off__") is True
+    assert not engine._parse_error_args('{"content": "say "hi" now"}').get("__parse_error_cut_off__")

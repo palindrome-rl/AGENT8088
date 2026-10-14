@@ -8,6 +8,14 @@ All notable changes to Agent8088 are recorded here. The format follows
 
 ### Improved
 
+- Reasoning-only cutoffs temporarily disable thinking for a configurable number
+  of following calls. Truncated tool arguments receive smaller-chunk guidance.
+- Safe partial text writes can be recovered through normal permission and backup
+  guards, with unfinished files tracked by full path until continued.
+- Configured credentials are blocked in file content, append boundaries, final
+  edited text and downloaded UTF-8 content; denial messages do not reveal values.
+- Smoke checks skip scratch helpers, use the correct native Windows directory,
+  and report browser-only JavaScript startup as unverified rather than passed.
 - Verification uses recorded evidence and confirms failed audits before rollback;
   inconclusive results preserve changes and clearly report what remains unchecked.
 - Browser smoke checks stop only their own browser processes and distinguish
