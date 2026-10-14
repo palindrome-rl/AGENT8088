@@ -61,7 +61,10 @@ def _run(body: str, *functions: str) -> str:
     expanded = []
     for function in functions:
         if function == "Install-WebUI":
-            expanded.append("Test-WebUIDist")
+            # Get/Set-WebSourceStamp are the source-hash gate that stops a
+            # dist/ built from older web/ sources being served as current.
+            expanded.extend(("Get-WebSourceStamp", "Set-WebSourceStamp",
+                             "Test-WebUIDist"))
         if function == "Install-Node-Bridge":
             expanded.extend(("Invoke-DependencyProbe", "Test-NodeModules"))
         expanded.append(function)
@@ -120,6 +123,9 @@ Write-Host "FLAG:WebUIReady=$script:WebUIReady"
         assert "SKIPPED:" not in out
 
     def test_existing_dist_is_not_rebuilt(self, tmp_path):
+        # No git repo here, so Get-WebSourceStamp returns "" and the stamp
+        # gate is skipped: an unverifiable-but-present dist is still not
+        # rebuilt, which is install.sh's rule too.
         web_dir = tmp_path / "web"
         web_dir.mkdir()
         (web_dir / "package.json").write_text("{}", encoding="utf-8")
@@ -140,6 +146,48 @@ Write-Host "FLAG:WebUIReady=$script:WebUIReady"
         assert "already built" in out
         assert "RUN:" not in out
         assert "FLAG:WebUIReady=True" in out
+
+    def test_a_dist_built_from_other_sources_is_rebuilt(self, tmp_path):
+        """The S42 regression: a stamp naming a different web/ tree is stale.
+
+        Clone-Repo fetched new sources; the old bundle used to be served
+        anyway because Test-WebUIDist only checked that dist existed.
+        """
+        npm_exe = tmp_path / "npm.cmd"
+        npm_exe.write_text("@echo off", encoding="utf-8")
+        web_dir = tmp_path / "web"
+        web_dir.mkdir()
+        (web_dir / "package.json").write_text("{}", encoding="utf-8")
+        (web_dir / "dist").mkdir()
+        (web_dir / "dist" / "assets").mkdir()
+        (web_dir / "dist" / "index.html").write_text(
+            '<script type="module" src="/assets/app.js"></script>', encoding="utf-8"
+        )
+        (web_dir / "dist" / "assets" / "app.js").write_text("old bundle", encoding="utf-8")
+        (web_dir / "dist" / ".agent8088-build-stamp").write_text(
+            "0000000000000000000000000000000000000000", encoding="utf-8")
+        body = f"""
+$InstallDir = "{tmp_path}"
+$script:NpmExe = "{npm_exe}"
+$script:NodeInstalled = $true
+function Invoke-WithTimeout {{ param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSec, [string]$Activity, [string]$WorkingDirectory, [switch]$CaptureOutput)
+    Write-Host "RUN:$FilePath $($Arguments -join [char]32)"
+    if ($Arguments -contains "build") {{
+        Set-Content -Path "{web_dir}\\dist\\index.html" -Value '<script type="module" src="/assets/app.js"></script>'
+        Set-Content -Path "{web_dir}\\dist\\assets\\app.js" -Value 'console.log("fresh")'
+    }}
+    return @{{ ExitCode = 0 }} }}
+function Get-WebSourceStamp {{ return "1111111111111111111111111111111111111111" }}
+Install-WebUI
+Write-Host "FLAG:WebUIReady=$script:WebUIReady"
+"""
+        out = _run(body, "Install-WebUI")
+        assert "already built" not in out
+        assert "run build" in out
+        assert "FLAG:WebUIReady=True" in out
+        # The build recorded the tree it now corresponds to.
+        assert (web_dir / "dist" / ".agent8088-build-stamp").read_text(
+            encoding="utf-8").strip() == "1111111111111111111111111111111111111111"
 
     def test_missing_package_json_skips_cleanly(self, tmp_path):
         # no web/ at all → skipped stage, flag False

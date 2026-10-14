@@ -2931,7 +2931,12 @@ $WebUIReady = $false
 function Get-WebSourceStamp {
     # The tree hash of web/ at HEAD. A dist/ built from different sources is a
     # stale bundle, and without this the installer kept serving it after a pull.
-    try { return (& git -C $script:InstallDir rev-parse "HEAD:web" 2>$null) } catch { return "" }
+    # git rev-parse echoes an unresolvable argument back on stdout, so the exit
+    # code - not the output - is what decides success: returning that echo
+    # made every existing dist look stale.
+    $out = & git -C $script:InstallDir rev-parse "HEAD:web" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return "" }
+    return "$out"
 }
 
 function Set-WebSourceStamp {
@@ -2939,8 +2944,10 @@ function Set-WebSourceStamp {
     $tree = Get-WebSourceStamp
     if (-not $tree) { return }
     try {
+        # ASCII, not UTF8: Windows PowerShell 5.1 writes a BOM for UTF8, and
+        # the stamp is a hex hash, so the BOM would break the comparison.
         Set-Content -LiteralPath (Join-Path (Join-Path $WebDir "dist") ".agent8088-build-stamp") `
-            -Value $tree -Encoding UTF8 -ErrorAction Stop
+            -Value $tree -Encoding Ascii -ErrorAction Stop
     } catch {
         Write-Warn "could not record the web build stamp: $($_.Exception.Message)"
     }
@@ -2957,7 +2964,9 @@ function Test-WebUIDist {
         $stampFile = Join-Path (Join-Path $WebDir "dist") ".agent8088-build-stamp"
         if (Test-Path -LiteralPath $stampFile) {
             $recorded = (Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue)
-            if ($recorded -and $recorded.Trim() -ne $WebTree) { return $false }
+            # Strip a BOM and any whitespace: the stamp is one bare hash.
+            if ($recorded) { $recorded = $recorded.Trim([char]0xFEFF).Trim() }
+            if ($recorded -and $recorded -ne $WebTree) { return $false }
         } else {
             # No stamp at all: the bundle predates stamping, so it cannot be
             # shown to match these sources.
