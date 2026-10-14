@@ -7692,6 +7692,52 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     return message
 
 
+def _plan_step_profile(tool_name: str, tool_args: dict) -> str:
+    """The sub-agent profile that runs this plan step, or "" to run it inline.
+
+    Why: plan steps always ran inline, so the explore and coder profiles in
+    agents/ were unreachable and only the auditor and test-writer ever ran as
+    sub-agents. The split uses _tool_call_mutates, the same question the audit
+    asks: a step that only reads goes to explore, one that changes state goes
+    to coder. A profile is chosen only when it actually holds the tool, so the
+    verifier and test-writer profiles are never reached from a plan step.
+    """
+    mutating = _tool_call_mutates(tool_name, tool_args)
+    for profile, wants_mutation in (("explore", False), ("coder", True)):
+        spec = SUBAGENT_SPECS.get(profile)
+        if spec and mutating == wants_mutation and tool_name in spec.get("tools", ()):
+            return profile
+    return ""
+
+
+def _run_plan_step(tool_name: str, tool_args: dict, step_text: str, depth: int) -> str:
+    """Run one plan step in its matching sub-agent, falling back to inline.
+
+    Why the fallback: a sub-agent that errors, times out or reports a failure
+    marker must not lose the step, so it then runs exactly as it always did.
+    Re-running a coder step inline is safe because write_file replaces the
+    whole file, so a half-finished sub-run is overwritten rather than doubled.
+    """
+    profile = _plan_step_profile(tool_name, tool_args)
+    if profile:
+        task = (f"{step_text}\n\nDo this with the {tool_name} tool, using exactly these "
+                f"arguments: {json.dumps(tool_args, default=str)}")
+        try:
+            answer = _exec_subagent({"agent_type": profile, "task": task}, depth=depth)
+        except Exception:
+            answer = ""
+        # A sub-run whose model could not be reached returns a friendly
+        # "I could not answer:" text rather than raising, so it is checked by
+        # its wording too; _plan_step_failed only knows the tool error forms.
+        failed = not answer or _plan_step_failed(answer) or "I could not answer:" in answer[:200]
+        if not failed:
+            return answer
+    try:
+        return run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
     global _plan_execution_grant, _plan_tool_ran
     _plan_tool_ran = True
@@ -7788,10 +7834,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
                                                               tool_args)
         if will_audit and PLAN_AUDIT_REVERT:
             snapshot = _capture_write_state(tool_name, tool_args)
-        try:
-            result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
-        except Exception as exc:
-            result = f"Error: {exc}"
+        result = _run_plan_step(tool_name, tool_args, step_text, depth)
         if will_audit and _audit_is_redundant(tool_name, tool_args, result, acceptance):
             will_audit = False
         _remember_escalation(tool_name, tool_args, result)
