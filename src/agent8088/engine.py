@@ -585,6 +585,12 @@ REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
 # reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
 # tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
 THINKING_OFF_MAX_TOKENS = 4096
+# A reasoning-only cut-off (the model drafted a large file inside its thinking) tends
+# to repeat on the next calls: in our runs these cost 10-17 minutes per run, about 60%
+# of all cut-off time. After one, this many following ordinary calls also run with
+# thinking off, at the normal cap, so a file the model writes next goes straight into
+# the tool call. Thinking is back to normal afterwards. 0 = only the one retry.
+THINKING_OFF_STICKY_CALLS = max(0, _config_int("thinking_off_sticky_calls", 3))
 # Consecutive prose-only cut-offs (no tool call in progress: the model is looping
 # in plain text) tolerated before the final no-tools round.
 PROSE_CUTOFF_MAX = 2
@@ -11170,6 +11176,9 @@ def _parse_error_args(raw: str) -> dict:
         if pos is not None:
             args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
                                           f"{raw[max(0, pos - 60):pos + 20]!r}")
+            # The text simply stops: the reply was cut short, nothing in it is quoted wrongly.
+            if "Unterminated string" in error.msg or pos >= len(raw.rstrip()):
+                args["__parse_error_cut_off__"] = True
     return args
 
 
@@ -17896,6 +17905,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
     thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
     last_cutoff_kind = ""       # kind of the last cut-off
+    thinking_sticky_left = 0    # ordinary calls still to run with thinking off after a reasoning-only cut-off
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -18136,7 +18146,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         # thinking off; the next ordinary turn is back to normal thinking.
         retry_kwargs = ({"thinking": "length_retry"}
                         if length_retries >= 2 or thinking_off_retry else {})
-        if retry_kwargs and last_cutoff_kind != "tool_call":
+        # After a reasoning-only cut-off, the next few ordinary calls also run with
+        # thinking off. They keep the normal cap: this is where the model writes the
+        # file it was drafting, which needs room.
+        sticky_only = bool(thinking_sticky_left) and not retry_kwargs
+        if sticky_only:
+            retry_kwargs = {"thinking": "length_retry"}
+            if trace is not None:
+                trace.append({"turn": turn, "type": "retry_mode", "mode": "sticky_thinking_off",
+                              "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
+        if retry_kwargs and not sticky_only and last_cutoff_kind != "tool_call":
             # Thinking is off for this call, so it only has to write a short answer
             # or one call: cap it at 4096 (or a lower initial_completion_cap).
             turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
@@ -18331,6 +18350,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             thinking_off_retry = cutoff_kind != "tool_call" and (
                 cutoff_kind == "empty" or reasoning_chars >= 0.9 * 4 * turn_max_tokens)
             last_cutoff_kind = cutoff_kind
+            if cutoff_kind == "empty":
+                thinking_sticky_left = THINKING_OFF_STICKY_CALLS
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
@@ -18422,6 +18443,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             length_retries = 0
         cap_hint = prose_cutoffs = 0
         thinking_off_retry, last_cutoff_kind = False, ""
+        if sticky_only:
+            thinking_sticky_left -= 1
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -18918,6 +18941,21 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 malformed_round = True
                 parse_error_retries += 1
                 where = args.get("__parse_error_at__")
+                if args.get("__parse_error_cut_off__"):
+                    # The arguments stop mid-way (a long file's content never arrived):
+                    # a reply that ran out, not a quoting mistake. Telling the model
+                    # to escape quotes sent it to rewrite the same call three times.
+                    messages.append(_harness_turn(
+                        f"The arguments for '{name}' arrived incomplete: they stop "
+                        f"({where}) with nothing after, so the reply was cut short. "
+                        "Quoting is not the problem; do not re-send the same call. "
+                        "Send a smaller one: for a long file, write the first part "
+                        "(about 4-6 KB) with write_file and add each further part with "
+                        "write_file mode=\"append\", in order."))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "tool_arg_cut_off",
+                                      "tool": name, "count": parse_error_retries})
+                    continue
                 messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON"
                     + (f" ({where})" if where else "") + ". Do not re-send the "
