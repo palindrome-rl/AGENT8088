@@ -17795,26 +17795,36 @@ def _smoke_cd_prefix(directory: Path, relative: Path, windows_native: bool) -> s
 def _smoke_script_runner(target):
     """A runner that starts a script in the read-only sandbox, or None.
 
-    Only scripts inside the sandbox workspace qualify: that is the one place the
-    sandboxed shell can see them, and the run happens on a disposable read-only
-    copy, so a script cannot change the project by being started.
+    Only scripts the sandboxed shell can actually see qualify. That workspace
+    is _shell_workspace_root when this run writes to a path the user named --
+    which mounts the project itself -- and ARTIFACTS_ROOT otherwise. The run
+    happens on a disposable read-only copy, so a script cannot change the
+    project by being started.
+
+    This used to accept only files under ARTIFACTS_ROOT, so a script written at
+    a path the user named in their own request got no runner and the check
+    reported "compiles; not executed" as a pass. Visibility, not location
+    under artifacts, is what the sandbox actually cares about.
     """
     try:
-        inside = ARTIFACTS_ROOT in Path(target).resolve().parents
-    except OSError:
-        inside = False
+        resolved = Path(target).resolve()
+        root = Path(_shell_workspace_root).resolve() if _shell_workspace_root \
+            else ARTIFACTS_ROOT
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
     backend = _resolve_sandbox_backend()
-    if not inside or backend == "unavailable":
+    if backend == "unavailable":
         return None
 
     def run(command: str, timeout: int) -> str:
         global _sandbox_readonly
         previous, _sandbox_readonly = _sandbox_readonly, True
         try:
-            here = Path(target).resolve().parent
-            prefix = _smoke_cd_prefix(here, here.relative_to(ARTIFACTS_ROOT),
+            here = resolved.parent
+            prefix = _smoke_cd_prefix(here, relative,
                                       sys.platform == "win32" and backend == "native"
-                                      and _native_sandbox_ready(ARTIFACTS_ROOT, readonly=True))
+                                      and _native_sandbox_ready(root, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous
