@@ -170,6 +170,23 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `calc`, `eval`, `math` | `calculate` |
 | `last`, `prev_output` | `last_output` |
 
+## Backups of overwritten files
+
+Before the first change to a file that already exists (`write_file`, `edit_file`,
+a downloaded file, an Office document), its original bytes are copied to
+`<data dir>/backups/<session>/` (`%LOCALAPPDATA%\agent8088` on Windows,
+`~/.agent8088` elsewhere). Each session folder has an `index.jsonl` listing the
+original path, the backup path, size and time. To undo a bad overwrite, copy the
+backup back over the file. It is once per file per session, so the copy is the
+file as it was when the session first touched it.
+
+This is invisible to the model: the tool result is unchanged, so it costs no
+tokens and nothing for the model to act on. New files get no backup. A file over
+`file_backup_max_file_mb` (10) is skipped, a session stops at `file_backup_max_mb`
+(200) in total, and session folders older than `file_backup_keep_days` (14) are
+deleted. A failed backup is logged and never blocks the write. It is off in a
+disposable container, and `file_backups=0` turns it off.
+
 ## `check_app`
 
 A deterministic smoke test of something the agent built; no model call.

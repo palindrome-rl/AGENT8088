@@ -17,7 +17,11 @@ def _load_engine():
     os.environ["AGENT8088_SANDBOX"] = "local"
     sys.path.insert(0, str(ROOT / "src"))
     from agent8088 import engine as mod
-    return importlib.reload(mod)
+    mod = importlib.reload(mod)
+    # Tests that overwrite files must not drop backups in the developer's real data
+    # directory; the backup tests switch this back on and point it at a tmp path.
+    mod.FILE_BACKUPS = False
+    return mod
 
 
 @pytest.fixture
