@@ -10,13 +10,18 @@ first control whose click changes nothing. A request to an external host
 (hotlinked fonts, images, CDN scripts) is only a warning.
 
 A script must compile (Python) or parse (Node). When a read-only sandbox runner
-is supplied it also gets a brief startup check there. Without Chromium the page
-check reports "unavailable" instead of failing the task. Dependency errors from
-blocked external scripts are inconclusive, never proof that the page passed.
+is supplied it also gets a brief startup check there. A script whose source
+actually listens for connections is a server: it is started in that sandbox and
+must accept a connection on the port its own source declares; a server whose
+port cannot be determined is reported as unverified, not guessed. Without
+Chromium the page check reports "unavailable" instead of failing the task.
+Dependency errors from blocked external scripts are inconclusive, never proof
+that the page passed.
 """
 
 from __future__ import annotations
 
+import base64
 import functools
 import re
 import shlex
@@ -35,6 +40,11 @@ WEB_SUFFIXES = frozenset({".html", ".htm"})
 PYTHON_SUFFIXES = frozenset({".py"})
 NODE_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
 DEFAULT_TIMEOUT = 20.0
+# How long a started server gets to open its port, and the sandbox clock for the
+# whole probe (spawn overhead plus the wait). A refused port costs the full
+# window; serving or crashing returns as soon as it happens.
+BOOT_WAIT = 10.0
+BOOT_RUN_TIMEOUT = 15
 MAX_ITEMS = 5
 MAX_REPORT_CHARS = 1800
 
@@ -453,21 +463,224 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
     return []
 
 
+# --- servers: does it actually come up --------------------------------------------------
+
+# Patterns that LISTEN. Only these (plus a declared port, below) justify
+# starting a script in the background: a framework import or a --port flag alone
+# says "probably a server" but a client utility can carry either, and a false
+# positive here means the harness starts a process it was never asked to start.
+_LISTENS = re.compile(
+    r"serve_forever\s*\("
+    r"|\.listen\s*\("
+    r"|\bapp\.run\s*\("
+    r"|\buvicorn\.run\s*\("
+    r"|\bgunicorn\b"
+    r"|\b(?:HTTPServer|TCPServer|ThreadingHTTPServer|ThreadingTCPServer|UDPServer)\s*\("
+    r"|\bcreateServer\s*\(", re.IGNORECASE)
+
+# Weaker "this is meant to serve" signals: a server framework, or a --port
+# argument. Worth reporting a server as unverified for, never worth starting it.
+_SERVER_FRAMEWORKS = re.compile(
+    r"\b(?:import|from)\s+(?:flask|fastapi|uvicorn|gunicorn|tornado|bottle|sanic|"
+    r"cherrypy|aiohttp|starlette)\b"
+    r"|\brequire\s*\(\s*['\"](?:express|koa|fastify|hono|polka|restify)['\"]"
+    r"|\bfrom\s+['\"](?:express|koa|fastify|hono|polka|restify)['\"]"
+    r"|\bimport\s+(?:express|koa|fastify|hono|polka|restify)\b"
+    r"|add_argument\(\s*['\"]--port['\"]", re.IGNORECASE)
+
+# Where a port number can hide in server source. Every alternative still has to
+# land on a literal number: a port read from argv or the environment with no
+# visible default stays unknown rather than guessed.
+_PORT_HINTS = (
+    re.compile(r"\bport\s*[=:]\s*(\d{2,5})\b", re.IGNORECASE),          # port=8000, PORT = 3000
+    re.compile(r"\.listen\s*\(\s*(\d{2,5})\b"),                          # app.listen(3000)
+    re.compile(r"['\"]--port['\"][^)\n]{0,80}?default\s*=\s*(\d{2,5})"),  # argparse --port default=8000
+    re.compile(r"get(?:env)?\(\s*['\"]PORT['\"]\s*,\s*['\"]?(\d{2,5})", re.IGNORECASE),  # environ.get("PORT", 5000)
+    re.compile(r"env\.PORT\b[^|\n]{0,20}\|\|\s*(\d{2,5})\b", re.IGNORECASE),            # process.env.PORT || 3000
+    re.compile(r"\(\s*['\"][^'\"]*['\"]\s*,\s*(\d{2,5})\s*\)"),           # ("127.0.0.1", 8000), ('', 8000)
+)
+
+
+def looks_like_server(source: str) -> bool:
+    """Whether the source is meant to serve connections somehow.
+
+    A listening call, a server framework, or a declared --port argument
+    counts. A file merely named serve.py does not: names are the model's to
+    choose and prove nothing about the code.
+    """
+    return bool(_LISTENS.search(source) or _SERVER_FRAMEWORKS.search(source))
+
+
+def server_port(source: str) -> int | None:
+    """The port this source will listen on, or None when it cannot be known.
+
+    The boot probe runs only when both a listening call and a concrete port
+    number are visible in the source. A framework entry point that reads its
+    port from an environment variable with no default, or .listen() with no
+    number, gets None -- starting it would prove nothing about a port we
+    could not name, so it is reported as unverified instead.
+    """
+    if not _LISTENS.search(source):
+        return None
+    for hint in _PORT_HINTS:
+        found = hint.search(source)
+        if found:
+            port = int(found.group(1))
+            if 1 <= port <= 65535:
+                return port
+    return None
+
+
+# The probe itself: one program, run by the sandbox's own python, that starts
+# the app, waits for the declared port, and stops the app. It travels
+# base64-encoded because cmd.exe ends a command at its first newline and
+# neither shell survives quoting a multi-line program -- the same trick the
+# engine uses for its sandbox snippets. %r/%d are filled in by _boot_command;
+# the snippet must therefore contain no other % character.
+_BOOT_SNIPPET = """import os, signal, socket, subprocess, sys, threading, time
+program, script, port, wait = %r, %r, %d, %r
+try:
+    proc = subprocess.Popen([program, script], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            **({"start_new_session": True}
+                                if sys.platform != "win32" else {}))
+except OSError as error:
+    print("BOOT:NOTSTARTED " + str(error)[:160])
+    raise SystemExit(0)
+log = []
+try:
+    def _drain():
+        # read1, not read: read(n) blocks until n bytes arrive, and a chatty
+        # server would block on a full pipe instead of serving.
+        try:
+            while True:
+                chunk = proc.stderr.read1(4096)
+                if not chunk:
+                    break
+                log.append(chunk)
+        except Exception:
+            pass
+    threading.Thread(target=_drain, daemon=True).start()
+    verdict = "REFUSED"
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            verdict = "DIED"
+            break
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            verdict = "SERVING"
+            break
+        except OSError:
+            time.sleep(0.25)
+finally:
+    # Whatever path got here -- serving, refused, dead, or an exception in
+    # between -- the process this probe started must not survive it.
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    try:
+        proc.stderr.close()
+    except Exception:
+        pass
+tail = b"".join(log)[-400:].decode("utf-8", "replace").strip().splitlines()
+print("BOOT:" + verdict + (": " + tail[-1][:160] if verdict == "DIED" and tail else ""))
+"""
+
+
+def _boot_command(program: str, script: str, port: int, wait: float) -> str:
+    """One sandbox command that starts the app, waits for its port, and stops it.
+
+    The stop is inside the command, in a finally, so the app cannot outlive the
+    probe on any path the command itself can take; a timeout or cancellation on
+    this side kills the command's whole process tree through the sandbox
+    runner. That is why app_check holds no process of its own to leak.
+    """
+    code = _BOOT_SNIPPET % (program, script, port, wait)
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    loader = ("import base64;exec(compile(base64.b64decode("
+              f"'{encoded}').decode('utf-8'),'<boot>','exec'))")
+    return f'python -c "{loader}"'
+
+
+def _boot_report(path: Path, program: str, port: int,
+                 run: Callable[[str, int], str]) -> Report:
+    """Start the script as a server in the sandbox and report whether it came up.
+
+    Serving is a pass; a port that never opens, or a process that exits before
+    serving, is a failure -- the run claimed to build a working server. A probe
+    that could not run, timed out, or produced no verdict is "unavailable":
+    serving was simply not verified, which is never the same as verified.
+    """
+    command = _boot_command(program, path.name, port, BOOT_WAIT)
+    try:
+        output = str(run(command, BOOT_RUN_TIMEOUT) or "")
+    except Exception as error:  # noqa: BLE001 -- a broken runner is a probe limit, not the app's
+        return Report("script", str(path), UNAVAILABLE,
+                      note=f"the boot probe could not run: {str(error)[:120]}")
+    if "BOOT:" in output:
+        # A verdict is printed only after the finally, so cleanup already
+        # happened; trust it over the runner's own timeout wording.
+        line = output[output.index("BOOT:"):].splitlines()[0].strip()
+    elif "timed out" in output.lower():
+        return Report("script", str(path), UNAVAILABLE,
+                      note="the boot probe did not finish; serving was not verified")
+    else:
+        line = ""
+    if line.startswith("BOOT:SERVING"):
+        return Report("script", str(path), PASS,
+                      note=f"starts and accepts connections on 127.0.0.1:{port}")
+    if line.startswith("BOOT:REFUSED"):
+        return Report("script", str(path), FAIL,
+                      [f"started but port {port} never accepted a connection "
+                       f"within {BOOT_WAIT:.0f}s"])
+    if line.startswith("BOOT:DIED"):
+        detail = line[len("BOOT:DIED"):].strip(" :")
+        return Report("script", str(path), FAIL,
+                      ["the server exited before accepting connections on port "
+                       f"{port}" + (f": {detail}" if detail else "")])
+    if line.startswith("BOOT:NOTSTARTED"):
+        detail = line[len("BOOT:NOTSTARTED"):].strip(" :")
+        return Report("script", str(path), UNAVAILABLE,
+                      note="the sandbox could not start it" + (f": {detail[:120]}" if detail else ""))
+    return Report("script", str(path), UNAVAILABLE,
+                  note="the boot probe produced no verdict; serving was not verified")
+
+
 def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
         return Report("script", str(path), FAIL, ["the file does not exist"])
     suffix = path.suffix.lower()
     if suffix in PYTHON_SUFFIXES:
+        source = path.read_text(encoding="utf-8", errors="replace")
         try:
-            compile(path.read_text(encoding="utf-8", errors="replace"), str(path), "exec")
+            compile(source, str(path), "exec")
         except SyntaxError as error:
             return Report("script", str(path), FAIL,
                           [f"syntax error on line {error.lineno}: {error.msg}"])
         if run is not None:
+            port = server_port(source)
+            if port is not None:
+                # A server is verified by booting it, not by asking it for
+                # --help: the boot probe answers the question --help never could.
+                return _boot_report(path, "python", port, run)
             crash = _run_briefly(path, run)
             if crash:
                 return Report("script", str(path), FAIL, crash)
+            if looks_like_server(source):
+                return Report("script", str(path), UNAVAILABLE,
+                              note="looks like a server but the port it will listen on "
+                                   "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="compiles and starts without crashing")
         return Report("script", str(path), PASS, note="compiles; not executed")
     if suffix in NODE_SUFFIXES:
@@ -482,12 +695,20 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             first = (done.stderr or done.stdout).strip().splitlines()
             return Report("script", str(path), FAIL, [f"syntax error: {first[-1][:160] if first else 'node --check failed'}"])
         if run is not None:
+            source = path.read_text(encoding="utf-8", errors="replace")
+            port = server_port(source)
+            if port is not None:
+                return _boot_report(path, "node", port, run)
             unavailable = []
             crash = _run_briefly(path, run, unavailable)
             if crash:
                 return Report("script", str(path), FAIL, crash)
             if unavailable:
                 return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
+            if looks_like_server(source):
+                return Report("script", str(path), UNAVAILABLE,
+                              note="looks like a server but the port it will listen on "
+                                   "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="parses and starts without crashing")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")
