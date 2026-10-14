@@ -17475,6 +17475,55 @@ def _smoke_test_step(trajectory, written: list):
     return None
 
 
+def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
+    """The reply says the work is unfinished AND the run shows it (or promised work)."""
+    if not completion_checks.admits_unfinished_work(reply):
+        return False
+    promised = (bool(_CHANGE_REQUEST.search(request))
+                and not completion_checks.is_advice_request(request)
+                and not trajectory.mutation_count())
+    return bool(trajectory.has_open_items() or promised)
+
+
+def _missing_required_files(trajectory, reply: str, request: str) -> list:
+    return completion_checks.missing_outputs(
+        request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
+        mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [])
+
+
+def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth: int) -> list:
+    """Name what a reply accepted WITHOUT the completion checks leaves undone.
+
+    When the post-check cap or backstop ends a run, the checks are skipped on
+    purpose (they are what the cap exists to stop), so nothing used to record
+    that a named file was missing or a part of the request never addressed, and
+    the answer read as complete. This looks at the same facts, read-only: it
+    spends none of the continuation budget, arms no one-shot reminder, and does
+    not run the browser smoke test. What it finds goes into the answer's
+    "Not completed" note.
+    """
+    if trajectory is None or not budget.enabled:
+        return []
+    reasons = []
+    if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
+        reasons.append("the reply says the work is unfinished")
+    if depth == 0:
+        missing = _missing_required_files(trajectory, reply, request)
+        if missing:
+            reasons.append("missing or empty files: " + ", ".join(missing[:6]))
+        pending = trajectory.open_subgoals()
+        if pending:
+            unaddressed = completion_checks.unaddressed_subgoals(
+                pending, reply, trajectory.written_paths())
+            # What the reply did cover is done; the rest stays open and is listed by
+            # _with_task_notes as "Not completed: ...", so it is not repeated here.
+            trajectory.mark_subgoals(unaddressed)
+    if reasons:
+        trajectory.note_unmet(list(dict.fromkeys([*(trajectory.data.get("unmet_checks") or []),
+                                                  *reasons])))
+    return reasons
+
+
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
                            deliverables_due: bool = False):
     """The first completion check a text reply fails, or None to accept it.
@@ -17490,20 +17539,14 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
     budget.observe(mark)
     written = trajectory.written_paths()
     nudge = None
-    if depth == 0 and completion_checks.admits_unfinished_work(reply):
-        promised = (bool(_CHANGE_REQUEST.search(request))
-                    and not completion_checks.is_advice_request(request)
-                    and not trajectory.mutation_count())
-        if trajectory.has_open_items() or promised:
-            nudge = completion_checks.Nudge(
-                "unfinished",
-                completion_checks.continue_text(
-                    "Your reply says the work is not finished.", completion_checks.UNFINISHED_ASK),
-                unmet="the reply says the work is unfinished")
+    if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
+        nudge = completion_checks.Nudge(
+            "unfinished",
+            completion_checks.continue_text(
+                "Your reply says the work is not finished.", completion_checks.UNFINISHED_ASK),
+            unmet="the reply says the work is unfinished")
     if nudge is None and depth == 0:
-        missing = completion_checks.missing_outputs(
-            request, reply, written, [PROJECT_ROOT, Path.cwd()],
-            mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [])
+        missing = _missing_required_files(trajectory, reply, request)
         if missing:
             nudge = completion_checks.outputs_nudge(missing)
     if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":
@@ -18366,6 +18409,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                       "spent": completion_budget.spent})
                     post_check_rounds = 0
                     continue
+            if not gates_open:
+                # The cap told the model to answer, so no completion check ran. Say
+                # what that left undone instead of letting the answer look complete.
+                unmet = _record_unmet_checks(completion_budget, trajectory, reply=answer,
+                                             request=request_text, depth=depth)
+                if unmet and trace is not None:
+                    trace.append({"turn": turn, "type": "unmet_after_cap", "unmet": unmet})
             answer = _with_task_notes(_guard_answer(answer), trajectory)
             if on_answer:
                 on_answer(answer)
@@ -18874,9 +18924,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         interrupt_check=interrupt_check, trace=trace, turn=turn,
                         client=client, provider_name=provider_name, model_name=model_name)
                     fresh = strip_tool_json(fresh or "").strip()
-                    answer = _with_task_notes(_guard_answer(
-                        fresh or last_text_answer
-                        or "Stopped after repeated checks with no further changes."), trajectory)
+                    backstop_reply = (fresh or last_text_answer
+                                      or "Stopped after repeated checks with no further changes.")
+                    unmet = _record_unmet_checks(completion_budget, trajectory,
+                                                 reply=backstop_reply, request=request_text,
+                                                 depth=depth)
+                    if unmet and trace is not None:
+                        trace.append({"turn": turn, "type": "unmet_after_cap", "unmet": unmet})
+                    answer = _with_task_notes(_guard_answer(backstop_reply), trajectory)
                     if on_answer:
                         on_answer(answer)
                     if trace is not None:

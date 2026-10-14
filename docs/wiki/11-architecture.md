@@ -142,6 +142,13 @@ budget; `max_post_check_rounds` still bounds tool rounds after a follow-up. Set
 the budget to `0` to turn the checks off. In a disposable container the old
 deliverables re-check still runs, as one of these follow-ups.
 
+A run that ends because `max_post_check_rounds` told the model to answer (or the
+hard backstop returned its best reply) skips these checks by design. It still
+looks, read-only, at the cheap facts they would have checked (a named file missing
+or empty, a reply that admits unfinished work, parts of a multi-part request the
+reply never covered) and puts what it finds in the same "Not completed" note. That
+look spends none of the budget and starts no browser.
+
 ## Plans stop at the first failed step
 
 `execute_plan` runs its steps in order and **halts on the first failure**, rather
