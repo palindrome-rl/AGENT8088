@@ -13085,6 +13085,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if name in ("write_file", "edit_file") and args.get("_private") is not True:
             content, cleaned_code = _clean_generated_code(
                 content, target, fences=name == "write_file")
+        if args.get("_private") is not True:
+            leak = _file_write_secret_check(content)
+            if leak:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=str(target)[:200], reason="secret_in_file")
+                return leak
         if not continues_series:
             _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -14258,6 +14264,28 @@ def _outbound_secret_check(payload):
             return ("Error: Blocked — this request contains a credential from your "
                     "configuration. Sending secrets to an external service is never "
                     "permitted, in any permission mode.")
+    return None
+
+
+# A file the agent writes can carry a credential out just as a request can: a model
+# that copies a harness config into the deliverable (an app with the API key in its
+# source) ships the key with it. On by default; 0 allows it.
+BLOCK_SECRETS_IN_WRITES = str(APP_CONFIG.get("block_secrets_in_writes", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _file_write_secret_check(content):
+    """Refuse file content that carries a known credential, same rule as _outbound_secret_check.
+
+    Exact match against configured secret values of _MIN_EXFIL_SECRET_LEN characters or
+    more, so ordinary text is not caught. The reply never quotes the value.
+    """
+    if not BLOCK_SECRETS_IN_WRITES:
+        return None
+    if _outbound_secret_check(content):
+        return ("Error: Blocked — this file's content contains a credential from your "
+                "configuration. Write the file without it (read the value from an environment "
+                "variable at run time) and do not copy configuration or .env values into it.")
     return None
 
 
