@@ -575,6 +575,13 @@ ADAPTIVE_COMPLETION_CAP = str(APP_CONFIG.get("adaptive_completion_cap", "1")).st
     "1", "true", "yes", "on")
 ADAPTIVE_CAP_MIN_SAMPLES = 3
 ADAPTIVE_CAP_WINDOW = 5
+# A text write_file call cut off mid-content loses everything the model had written. With
+# this on, the content up to its last whole line is saved when that is safe (a new file, or
+# an append), the file is marked unfinished so the run cannot end on it, and the retry asks
+# for the rest with mode="append". 0 keeps the discard-and-retry behaviour.
+SALVAGE_CUTOFF_WRITES = str(APP_CONFIG.get("salvage_cutoff_writes", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+SALVAGE_MIN_CHARS = 1000
 # The largest cap a cut-off tool call (a file being written) may earn on its retry.
 # Doubling alone would climb to the provider's whole limit; 0 = no ceiling beyond it.
 WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
@@ -585,6 +592,12 @@ REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
 # reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
 # tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
 THINKING_OFF_MAX_TOKENS = 4096
+# A reasoning-only cut-off (the model drafted a large file inside its thinking) tends
+# to repeat on the next calls: in our runs these cost 10-17 minutes per run, about 60%
+# of all cut-off time. After one, this many following ordinary calls also run with
+# thinking off, at the normal cap, so a file the model writes next goes straight into
+# the tool call. Thinking is back to normal afterwards. 0 = only the one retry.
+THINKING_OFF_STICKY_CALLS = max(0, _config_int("thinking_off_sticky_calls", 3))
 # Consecutive prose-only cut-offs (no tool call in progress: the model is looping
 # in plain text) tolerated before the final no-tools round.
 PROSE_CUTOFF_MAX = 2
@@ -11181,6 +11194,9 @@ def _parse_error_args(raw: str) -> dict:
         if pos is not None:
             args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
                                           f"{raw[max(0, pos - 60):pos + 20]!r}")
+            # The text simply stops: the reply was cut short, nothing in it is quoted wrongly.
+            if "Unterminated string" in error.msg or pos >= len(raw.rstrip()):
+                args["__parse_error_cut_off__"] = True
     return args
 
 
@@ -13082,6 +13098,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if not target.suffix:
                 target = _target_with_derived_extension(
                     target, source_url, fetch_content_type)
+            if args.get("_private") is not True:
+                leak = _file_write_secret_check(fetched.decode("utf-8", errors="replace"))
+                if leak:
+                    _audit("tool_call", tool=name, mode=mode, decision="denied",
+                           detail=str(target)[:200], reason="secret_in_file")
+                    return leak
             target.parent.mkdir(parents=True, exist_ok=True)
             _backup_original(target)
             target.write_bytes(fetched)
@@ -13103,6 +13125,14 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if name in ("write_file", "edit_file") and args.get("_private") is not True:
             content, cleaned_code = _clean_generated_code(
                 content, target, fences=name == "write_file")
+        if args.get("_private") is not True:
+            leak = _file_write_secret_check(content)
+            if not leak and write_mode == "append":
+                leak = _file_append_secret_check(target, content)
+            if leak:
+                _audit("tool_call", tool=name, mode=mode, decision="denied",
+                       detail=str(target)[:200], reason="secret_in_file")
+                return leak
         if not continues_series:
             _turn_writes += 1
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -13158,6 +13188,13 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 # budget -- otherwise three bad guesses lock out the real edit.
                 _turn_writes -= 1
                 return edit.error
+            if args.get("_private") is not True:
+                leak = _file_write_secret_check(edit.text)
+                if leak:
+                    _turn_writes -= 1
+                    _audit("tool_call", tool=name, mode=mode, decision="denied",
+                           detail=str(target)[:200], reason="secret_in_file")
+                    return leak
             target.write_text(edit.text, encoding="utf-8", newline="")
             _last_write_diff = _make_diff(original, edit.text, str(target))
             added, removed = diffview.diff_counts(_last_write_diff)
@@ -13518,6 +13555,130 @@ _NO_DRAFTING_HINT = (
     " If you were about to write a large file, do not draft its contents in your "
     "reasoning: call write_file with only the first part (about 4-6 KB), then add each "
     "further part with mode=\"append\".")
+
+
+_PARTIAL_WRITE_CALL = re.compile(r"✿FUNCTION✿:\s*write_file\s*✿ARGS✿:\s*")
+_JSON_SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+                        "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _decode_open_json_string(text: str):
+    """Decode a JSON string whose opening quote is just before text[0].
+
+    Returns (value, closed). A string cut off mid-way gives what arrived, without a
+    trailing half escape.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            return "".join(out), True
+        if ch == "\\":
+            if i + 1 >= n:
+                break
+            nxt = text[i + 1]
+            if nxt in _JSON_SIMPLE_ESCAPES:
+                out.append(_JSON_SIMPLE_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt == "u" and len(text[i + 2:i + 6]) == 4:
+                try:
+                    code = int(text[i + 2:i + 6], 16)
+                except ValueError:
+                    break
+                if 0xD800 <= code <= 0xDFFF:
+                    break
+                out.append(chr(code))
+                i += 6
+                continue
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out), False
+
+
+def _truncated_write_call(content: str):
+    """The write_file call a cut-off reply was in the middle of, or None.
+
+    Returns {"filename", "mode", "content"}: the arguments that had arrived, with the
+    content cut back to its last whole line. None when the call is not a write_file,
+    its filename had not arrived, its content had already finished (so the cut-off came
+    after it), or too little of it arrived to be worth saving.
+    """
+    matches = list(_PARTIAL_WRITE_CALL.finditer(content or ""))
+    if not matches:
+        return None
+    body = content[matches[-1].end():]
+    key = re.search(r'"content"\s*:\s*"', body)
+    if not key:
+        return None
+    head = body[:key.start()]
+    name = re.search(r'"filename"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+    if not name:
+        return None
+    mode = re.search(r'"mode"\s*:\s*"(\w+)"', head)
+    value, closed = _decode_open_json_string(body[key.end():])
+    if closed:
+        return None
+    cut = value.rfind("\n") + 1
+    kept = value[:cut]
+    if len(kept) < SALVAGE_MIN_CHARS:
+        return None
+    try:
+        filename = json.loads('"' + name.group(1) + '"')
+    except ValueError:
+        return None
+    return {"filename": filename, "mode": (mode.group(1) if mode else "overwrite"), "content": kept}
+
+
+def _salvage_cutoff_write(content: str, trajectory, turn: int, trace) -> str:
+    """Save what a cut-off write_file call had written; returns the retry instruction or "".
+
+    Only where saving is safe: the path is new, or the call was an append (one part of a
+    file written in parts). A whole-file overwrite of an existing file is left alone,
+    and so is a .json file, which is invalid until it is complete. Once per file. The
+    write goes through exec_tool, so every guard a normal write has still applies.
+    """
+    if not SALVAGE_CUTOFF_WRITES or trajectory is None:
+        return ""
+    call = _truncated_write_call(content)
+    if call is None:
+        return ""
+    filename, mode = call["filename"], call["mode"]
+    if mode not in ("overwrite", "append") or filename.lower().endswith(".json"):
+        return ""
+    args = {"filename": filename, "content": call["content"], "mode": mode}
+    try:
+        partial_path = str(resolve_write_path(filename).resolve())
+    except (ValueError, OSError):
+        return ""
+    if trajectory.salvaged_before(partial_path):
+        return ""
+    existed = _write_target_existed("write_file", args)
+    if existed and mode != "append":
+        return ""
+    sequence_before = _MUTATION_SEQ
+    operation = trajectory.before_tool("write_file")
+    result = exec_tool("write_file", json.dumps(args))
+    saved = isinstance(result, str) and result.startswith(("Wrote ", "Appended "))
+    trajectory.after_tool(operation, result, failed=not saved, blocked=False,
+                          mutated=saved and _MUTATION_SEQ != sequence_before,
+                          verdict="unknown", path=filename, existed=existed, partial_path=partial_path)
+    if not saved:
+        return ""
+    trajectory.mark_salvaged(partial_path)
+    size = len(call["content"].encode("utf-8"))
+    trajectory.note_partial(partial_path, size)
+    if trace is not None:
+        trace.append({"turn": turn, "type": "cutoff_write_salvaged", "path": filename,
+                      "bytes": size, "mode": mode})
+    lines = call["content"].splitlines()
+    tail = "\n".join(line[:120] for line in lines[-3:])
+    return (f"The reply was cut off while writing {filename}. The first {len(lines)} lines "
+            f"({size} bytes) were saved and the rest was discarded. The file now ends with:\n"
+            f"{tail}\n"
+            f'Continue it with write_file mode="append", starting right after that last line; '
+            "do not resend what is saved. Write the next part in a few KB, not the whole rest.")
 
 
 def _has_partial_native_call(message) -> bool:
@@ -14277,6 +14438,50 @@ def _outbound_secret_check(payload):
                     "configuration. Sending secrets to an external service is never "
                     "permitted, in any permission mode.")
     return None
+
+
+# A file the agent writes can carry a credential out just as a request can: a model
+# that copies a harness config into the deliverable (an app with the API key in its
+# source) ships the key with it. On by default; 0 allows it.
+BLOCK_SECRETS_IN_WRITES = str(APP_CONFIG.get("block_secrets_in_writes", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _file_write_secret_check(content):
+    """Refuse file content that carries a known credential, same rule as _outbound_secret_check.
+
+    Exact match against configured secret values of _MIN_EXFIL_SECRET_LEN characters or
+    more, so ordinary text is not caught. The reply never quotes the value.
+    """
+    if not BLOCK_SECRETS_IN_WRITES:
+        return None
+    if _outbound_secret_check(content):
+        return ("Error: Blocked — this file's content contains a credential from your "
+                "configuration. Write the file without it (read the value from an environment "
+                "variable at run time) and do not copy configuration or .env values into it.")
+    return None
+
+
+def _file_append_secret_check(target: Path, content: str):
+    """Check a credential split between existing bytes and an appended part.
+
+    Only the longest known credential's UTF-8 tail is needed, so checking a
+    large existing file does not load it into memory. Never echo those bytes.
+    """
+    if not BLOCK_SECRETS_IN_WRITES:
+        return None
+    longest = max((len(value.encode("utf-8")) for value in _SECRET_VALUES
+                   if len(value) >= _MIN_EXFIL_SECRET_LEN), default=0)
+    if not longest or not target.exists():
+        return None
+    try:
+        with target.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - longest))
+            tail = handle.read(longest).decode("utf-8", errors="replace")
+    except OSError:
+        return "Error: Existing file could not be checked safely for credentials; nothing was appended."
+    return _file_write_secret_check(tail + content)
 
 
 # ---------------------------------------------------------------------------
@@ -17583,6 +17788,21 @@ _CHANGE_REQUEST = re.compile(
     r"install|develop|code|produce)\b", re.IGNORECASE)
 
 
+def _smoke_cd_prefix(directory: Path, relative: Path, windows_native: bool) -> str:
+    """The `cd` that puts a smoke-test command next to the script it starts.
+
+    The native Windows runner starts commands in the folder the agent was launched
+    from, not in the workspace it is given, and it cannot read the temporary copy
+    a read-only run is normally made on. There the script is read in place, which
+    the read-only mode makes safe, so the prefix is the script's real folder. The
+    forward slashes keep the read-only copy mapping from rewriting it and are
+    accepted by `cd /d`. Everywhere else the command already starts in the copy.
+    """
+    if windows_native:
+        return f'cd /d "{Path(directory).resolve().as_posix()}" && '
+    return f"cd {shlex.quote(Path(relative).as_posix())} && " if str(relative) != "." else ""
+
+
 def _smoke_script_runner(target):
     """A runner that starts a script in the read-only sandbox, or None.
 
@@ -17594,15 +17814,18 @@ def _smoke_script_runner(target):
         inside = ARTIFACTS_ROOT in Path(target).resolve().parents
     except OSError:
         inside = False
-    if not inside or _resolve_sandbox_backend() == "unavailable":
+    backend = _resolve_sandbox_backend()
+    if not inside or backend == "unavailable":
         return None
 
     def run(command: str, timeout: int) -> str:
         global _sandbox_readonly
         previous, _sandbox_readonly = _sandbox_readonly, True
         try:
-            relative = Path(target).resolve().parent.relative_to(ARTIFACTS_ROOT)
-            prefix = f"cd {shlex.quote(relative.as_posix())} && " if str(relative) != "." else ""
+            here = Path(target).resolve().parent
+            prefix = _smoke_cd_prefix(here, here.relative_to(ARTIFACTS_ROOT),
+                                      sys.platform == "win32" and backend == "native"
+                                      and _native_sandbox_ready(ARTIFACTS_ROOT, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous
@@ -17673,6 +17896,9 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
+    if depth == 0 and trajectory.partial_files():
+        reasons.append("a file was cut off and not completed: "
+                       + ", ".join(trajectory.partial_files()[:4]))
     if depth == 0:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
@@ -17711,6 +17937,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             completion_checks.continue_text(
                 "Your reply says the work is not finished.", completion_checks.UNFINISHED_ASK),
             unmet="the reply says the work is unfinished")
+    if nudge is None and depth == 0 and trajectory.partial_files():
+        nudge = completion_checks.partial_files_nudge(trajectory.partial_files())
     if nudge is None and depth == 0:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
@@ -17886,6 +18114,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     prose_cutoffs = 0    # consecutive cut-offs that were plain-text loops
     thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
     last_cutoff_kind = ""       # kind of the last cut-off
+    thinking_sticky_left = 0    # ordinary calls still to run with thinking off after a reasoning-only cut-off
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -18126,7 +18355,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         # thinking off; the next ordinary turn is back to normal thinking.
         retry_kwargs = ({"thinking": "length_retry"}
                         if length_retries >= 2 or thinking_off_retry else {})
-        if retry_kwargs and last_cutoff_kind != "tool_call":
+        # After a reasoning-only cut-off, the next few ordinary calls also run with
+        # thinking off. They keep the normal cap: this is where the model writes the
+        # file it was drafting, which needs room.
+        sticky_only = bool(thinking_sticky_left) and not retry_kwargs
+        if sticky_only:
+            retry_kwargs = {"thinking": "length_retry"}
+            if trace is not None:
+                trace.append({"turn": turn, "type": "retry_mode", "mode": "sticky_thinking_off",
+                              "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
+        if retry_kwargs and not sticky_only and last_cutoff_kind != "tool_call":
             # Thinking is off for this call, so it only has to write a short answer
             # or one call: cap it at 4096 (or a lower initial_completion_cap).
             turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
@@ -18321,6 +18559,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             thinking_off_retry = cutoff_kind != "tool_call" and (
                 cutoff_kind == "empty" or reasoning_chars >= 0.9 * 4 * turn_max_tokens)
             last_cutoff_kind = cutoff_kind
+            if cutoff_kind == "empty":
+                thinking_sticky_left = THINKING_OFF_STICKY_CALLS
             if trace is not None:
                 trace.append({"turn": turn, "type": "max_tokens", "content": warning})
                 trace.append({"turn": turn, "type": "length_cutoff",
@@ -18394,6 +18634,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "final answer. Do not include analysis or thinking.")
             if thinking_off_retry and length_retries == 1:
                 retry_instruction += " Call one tool or answer right away."
+            salvage_note = _salvage_cutoff_write(content, trajectory, turn, trace)
+            if salvage_note:
+                retry_instruction = f"{warning} {salvage_note}"
             messages.append(_harness_turn(retry_instruction))
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
@@ -18412,6 +18655,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             length_retries = 0
         cap_hint = prose_cutoffs = 0
         thinking_off_retry, last_cutoff_kind = False, ""
+        if sticky_only:
+            thinking_sticky_left -= 1
         if calls:
             _log.info("model tool calls (turn %d): %s", turn,
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
@@ -18850,6 +19095,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
+                                  if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                 )
@@ -18908,6 +19155,21 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 malformed_round = True
                 parse_error_retries += 1
                 where = args.get("__parse_error_at__")
+                if args.get("__parse_error_cut_off__"):
+                    # The arguments stop mid-way (a long file's content never arrived):
+                    # a reply that ran out, not a quoting mistake. Telling the model
+                    # to escape quotes sent it to rewrite the same call three times.
+                    messages.append(_harness_turn(
+                        f"The arguments for '{name}' arrived incomplete: they stop "
+                        f"({where}) with nothing after, so the reply was cut short. "
+                        "Quoting is not the problem; do not re-send the same call. "
+                        "Send a smaller one: for a long file, write the first part "
+                        "(about 4-6 KB) with write_file and add each further part with "
+                        "write_file mode=\"append\", in order."))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "tool_arg_cut_off",
+                                      "tool": name, "count": parse_error_retries})
+                    continue
                 messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON"
                     + (f" ({where})" if where else "") + ". Do not re-send the "

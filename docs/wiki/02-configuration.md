@@ -115,6 +115,7 @@ provider. Details in [Model Providers](05-model-providers.md).
 | `max_command_chars` | `16384` | Commands longer than this are refused rather than analysed. |
 | `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
 | `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
+| `block_secrets_in_writes` | `1` | Refuse to write a file whose content contains a credential from your configuration (an exact match of a configured key, token, secret or password of 12 or more characters), the same rule outbound requests follow. Append boundaries, final edited text, and downloaded UTF-8 content are checked too. The reply names no value. `0` allows it. |
 | `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
 | `model_telemetry` | `0` | `1` records local metadata-only model-call health events. |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local telemetry path (mode 0600). |
@@ -302,11 +303,13 @@ number of rounds. All default to `0`, meaning disabled.
 | `completion_smoke_timeout_seconds` | `20` | Time allowed for one page check. |
 | `completion_smoke_max_failures` | `2` | Failed smoke tests per request that `enforce` sends back to the model before accepting the answer with a note. |
 | `initial_completion_cap` | `8192` | Ceiling for the completion-token cap of an ordinary call, bounded by the provider's limit. A call that runs away (an unclosed tool call, a text loop) stops here instead of using the full limit. A cut-off tool call earns a larger cap on its retry (up to `write_output_cap`); plain-text loops go to the final no-tools round after two cut-offs. `0` always uses the provider's full limit. |
+| `salvage_cutoff_writes` | `1` | When a `write_file` call is cut off mid-content, save the content up to its last whole line if that is safe (a new file, or an append part; never an overwrite of an existing file, never `.json`), once per resolved file, through the normal write path. The file is marked unfinished: completion checks request continuation or report it as incomplete if the run reaches its limits. Only a successful write to that same file clears the marker. The retry asks for the rest with `mode="append"`. `0` discards the partial call as before. |
 | `adaptive_completion_cap` | `1` | With the ceiling above, cap an ordinary call at twice the median size of the last five normal replies (reasoning included), never below `main_llm_min_tokens` (4096). A runaway call then stops after a few minutes instead of the full ceiling. `0` keeps the fixed ceiling. |
 | `main_llm_min_tokens` | `4096` | Floor for the adaptive completion cap and for the cap earned by a cut-off retry, bounded by the provider's limit. |
 | `length_retry_max_tokens` | `0` | Additional ceiling for a cut-off retry's completion cap. `0` leaves the other configured and provider limits in effect. |
 | `length_cutoff_max_retries` | `4` | Consecutive length cut-offs before one final no-tools round reports the incomplete output. `0` disables this retry-count stop; other budgets still apply. |
 | `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
+| `thinking_off_sticky_calls` | `3` | After a cut-off whose whole budget went to reasoning (no answer, no tool call), this many following ordinary calls also run with thinking off, at the normal cap, so a file the model drafted in its thinking is written straight into the tool call. Thinking returns to normal afterwards. `0` keeps only the one retry. |
 | `reasoning_budget_tokens` | `0` | Tokens a model may spend thinking on an ordinary turn, where the provider can be told (see `provider.<name>.reasoning_budget_extra_body`). `0` leaves the provider's default. Prefer this to raising the output cap: a larger cap makes every runaway call proportionally longer without making an answer more likely. |
 | `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
 | `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
