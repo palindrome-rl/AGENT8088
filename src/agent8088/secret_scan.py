@@ -123,7 +123,10 @@ def looks_like_opaque_credential(value: str) -> bool:
         return False
     if len(value) >= _MIN_HEX and _HEX_RE.fullmatch(value):
         return True
-    if len(value) >= _MIN_BLOB and _BLOB_RE.fullmatch(value):
+    # A long run of letters alone is an identifier (BaseHTTPRequestHandler), not a
+    # key: every real blob of this length carries a digit or base64 punctuation.
+    if (len(value) >= _MIN_BLOB and _BLOB_RE.fullmatch(value)
+            and re.search(r"[0-9+/=]", value)):
         return True
     if len(value) < _MIN_MIXED:
         return False

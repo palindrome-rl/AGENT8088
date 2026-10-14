@@ -44,6 +44,9 @@ def test_flags_credentials(text, kind):
     "Version 1.2.3 released",
     "2026-10-14T09:32:11Z",
     "1234567890123456789012345",
+    "class SimpleHandler(BaseHTTPRequestHandler):",
+    "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer",
+    "AbstractBaseClassFactory",
 ])
 def test_ignores_ordinary_text(text):
     assert secret_scan.find_secrets(text) == [], text
