@@ -108,6 +108,7 @@ provider. Details in [Model Providers](05-model-providers.md).
 | `max_command_chars` | `16384` | Commands longer than this are refused rather than analysed. |
 | `audit_log` | `0` | `1` appends one redacted JSON line per gated tool decision. Turn this on for any gateway deployment. |
 | `audit_log_path` | `<data dir>/audit.jsonl` | Where the audit trail is written (mode 0600). |
+| `block_secrets_in_writes` | `1` | Refuse to write a file whose content contains a credential from your configuration (an exact match of a configured key, token, secret or password of 12 or more characters), the same rule outbound requests follow. Append boundaries, final edited text, and downloaded UTF-8 content are checked too. The reply names no value. `0` allows it. |
 | `audit_max_detail` | `512` | Truncation length for the audit `detail` field. |
 | `model_telemetry` | `0` | `1` records local metadata-only model-call health events. |
 | `model_telemetry_path` | `<data dir>/model-telemetry.jsonl` | Local telemetry path (mode 0600). |
