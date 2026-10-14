@@ -29,6 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
+from agent8088 import secret_scan
+
 log = logging.getLogger("agent8088.web")
 _SESSION_VIEW_LOCK = threading.Lock()
 
@@ -2613,6 +2615,10 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
     _turn_interrupts[id(ws)] = interrupt
     handed_off = [False]  # set the moment the agent thread owns the lock
     try:
+        # Advisory only: the turn runs either way. Same scan as the CLI's do_chat.
+        notice = _credential_notice(text, msg["_session_id"])
+        if notice:
+            await ws.send_json(notice)
         await _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C, S)
     finally:
         if not handed_off[0]:
@@ -2621,6 +2627,19 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
             _running.clear()
             _TURN_LOCK.release()
 
+
+def _credential_notice(text: str, session_id: str):
+    """A notice frame warning that the user's message looks like a credential,
+    or None. Carries the masked warning only, never the matched text."""
+    try:
+        findings = secret_scan.find_secrets(text)
+    except Exception:
+        log.exception("credential scan failed; sending the turn without a notice")
+        return None
+    if not findings:
+        return None
+    return {"type": "notice", "level": "warning", "session_id": session_id,
+            "text": secret_scan.warning(findings, "Your message")}
 
 def _record_turn_trace(C, S, query, trace, elapsed, interrupted=False):
     """cli._record_trace for the turn's own Session (that one reads the global,
