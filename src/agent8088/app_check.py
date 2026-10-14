@@ -430,7 +430,8 @@ _BROWSER_GLOBAL = re.compile(
     r"customElements|screen|history) is not defined")
 
 
-def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
+def _run_briefly(path: Path, run: Callable[[str, int], str],
+                 unavailable: list[str] | None = None) -> list[str]:
     """Start the script with --help in the sandbox; return crash findings.
 
     Only a crash on startup counts. Printing usage, finishing, or still running
@@ -441,6 +442,8 @@ def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
     if "timed out" in output.lower():
         return []
     if program == "node" and _BROWSER_GLOBAL.search(output):
+        if unavailable is not None:
+            unavailable.append("parses; browser context is required; startup was not verified")
         return []
     crashed = _CRASH.search(output)
     exited = _EXIT_NONZERO.search(output)
@@ -479,9 +482,12 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             first = (done.stderr or done.stdout).strip().splitlines()
             return Report("script", str(path), FAIL, [f"syntax error: {first[-1][:160] if first else 'node --check failed'}"])
         if run is not None:
-            crash = _run_briefly(path, run)
+            unavailable = []
+            crash = _run_briefly(path, run, unavailable)
             if crash:
                 return Report("script", str(path), FAIL, crash)
+            if unavailable:
+                return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
             return Report("script", str(path), PASS, note="parses and starts without crashing")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")

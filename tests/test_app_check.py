@@ -390,6 +390,16 @@ def test_a_browser_script_run_under_node_is_not_a_crash(tmp_path):
     assert app_check._run_briefly(script, lambda command, timeout: seen) == []
 
 
+def test_browser_context_is_unavailable_not_verified_startup(tmp_path):
+    script = tmp_path / "browser.js"
+    script.write_text("window.addEventListener('load', () => {});", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda command, timeout:
+        "ReferenceError: window is not defined\nCommand exited with status 1.")
+    assert report.status == app_check.UNAVAILABLE
+    assert "startup was not verified" in report.note
+    assert not report.failures
+
+
 def test_a_real_node_crash_still_counts(tmp_path):
     script = tmp_path / "server.js"
     script.write_text("x\n", encoding="utf-8")
