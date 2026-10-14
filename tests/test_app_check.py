@@ -381,3 +381,17 @@ def test_a_crashing_helper_does_not_fail_the_smoke_test(tmp_path):
     (tmp_path / "_clean.py").write_text("import sys\nsys.exit(2)\n", encoding="utf-8")
     targets = app_check.deliverable_targets(["app.py", "_clean.py"], [tmp_path])
     assert [p.name for p in targets] == ["app.py"]
+
+
+def test_a_browser_script_run_under_node_is_not_a_crash(tmp_path):
+    script = tmp_path / "app.js"
+    script.write_text("window.addEventListener('load', () => {});\n", encoding="utf-8")
+    seen = "ReferenceError: window is not defined\nCommand exited with status 1."
+    assert app_check._run_briefly(script, lambda command, timeout: seen) == []
+
+
+def test_a_real_node_crash_still_counts(tmp_path):
+    script = tmp_path / "server.js"
+    script.write_text("x\n", encoding="utf-8")
+    seen = "ReferenceError: config is not defined\nCommand exited with status 1."
+    assert app_check._run_briefly(script, lambda command, timeout: seen)

@@ -422,6 +422,12 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
 _CRASH = re.compile(r"Traceback \(most recent call last\)|SyntaxError|ReferenceError|"
                     r"Cannot find module|ModuleNotFoundError|ImportError", re.IGNORECASE)
 _EXIT_NONZERO = re.compile(r"Command exited with status ([1-9]\d*)")
+# A script meant for a page (loaded by a <script> tag) fails under Node the moment it
+# touches a browser global. That says nothing about the script, so it is not a crash.
+_BROWSER_GLOBAL = re.compile(
+    r"ReferenceError: (?:window|document|navigator|localStorage|sessionStorage|location|alert|"
+    r"requestAnimationFrame|cancelAnimationFrame|HTMLElement|Image|Audio|AudioContext|Element|"
+    r"customElements|screen|history) is not defined")
 
 
 def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
@@ -433,6 +439,8 @@ def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
     program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
     output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
     if "timed out" in output.lower():
+        return []
+    if program == "node" and _BROWSER_GLOBAL.search(output):
         return []
     crashed = _CRASH.search(output)
     exited = _EXIT_NONZERO.search(output)
