@@ -555,6 +555,9 @@ COMPLETION_SMOKE_TEST = str(APP_CONFIG.get("completion_smoke_test", "report")).s
 if COMPLETION_SMOKE_TEST not in ("off", "report", "enforce"):
     COMPLETION_SMOKE_TEST = "report"
 COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds", 20))
+# After the first control, the page check clicks this many more visible controls (within
+# half the timeout) and fails on a page error they raise. 0 = only the first control.
+SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
 COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
@@ -13063,7 +13066,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 return f"Error: {read_target} does not exist, so there is nothing to check."
             return app_check.check_target(
                 read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
-                run=_smoke_script_runner(read_target)).text()
+                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS).text()
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()
@@ -17908,7 +17911,7 @@ def _smoke_test_step(trajectory, written: list):
         if str(target) not in pending:
             continue
         report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
-                                        run=_smoke_script_runner(target))
+                                        run=_smoke_script_runner(target), click_steps=SMOKE_CLICK_STEPS)
         if report.status == app_check.SKIPPED:
             continue
         trajectory.record_smoke(str(target), report.summary(), report.failed)
