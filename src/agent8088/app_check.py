@@ -9,19 +9,24 @@ missing or failing own-origin asset, a first control that an overlay blocks, or 
 first control whose click changes nothing. A request to an external host
 (hotlinked fonts, images, CDN scripts) is only a warning.
 
-A script gets a static check: it must compile (Python) or parse (Node). Nothing
-is executed. Without Chromium the check reports "unavailable" instead of failing
-the task.
+A script must compile (Python) or parse (Node). When a read-only sandbox runner
+is supplied it also gets a brief startup check there. Without Chromium the page
+check reports "unavailable" instead of failing the task. Dependency errors from
+blocked external scripts are inconclusive, never proof that the page passed.
 """
 
 from __future__ import annotations
 
 import functools
+import re
+import shlex
+import time
 import http.server
 import os
 import shutil
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,12 +89,23 @@ def chromium_available() -> bool:
     PLAYWRIGHT_BROWSERS_PATH, so it is cached per value of that variable rather
     than once per process.
     """
-    return _chromium_available(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+    key = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if key in _CHROMIUM_ANSWERS:
+        return _CHROMIUM_ANSWERS[key]
+    answer = _chromium_available(key)
+    # A probe that timed out says nothing about the install: ask again next time
+    # instead of switching smoke tests off for the rest of the session.
+    if answer is not None:
+        _CHROMIUM_ANSWERS[key] = answer
+    return bool(answer)
 
 
-@functools.lru_cache(maxsize=4)
-def _chromium_available(browsers_path: str) -> bool:
-    """Probed on its own thread: the sync API starts an event loop, which must not
+_CHROMIUM_ANSWERS: dict = {}
+
+
+def _chromium_available(browsers_path: str):
+    """True/False when known, None when the probe did not finish in time.
+    Probed on its own thread: the sync API starts an event loop, which must not
     be the caller's."""
     try:
         import playwright.sync_api  # noqa: F401
@@ -108,7 +124,31 @@ def _chromium_available(browsers_path: str) -> bool:
     thread = threading.Thread(target=probe, daemon=True)
     thread.start()
     thread.join(30)
-    return bool(found and found[0])
+    return found[0] if found else None
+
+
+_PARENT_REF = re.compile(r"""(?:src|href)\s*=\s*["']((?:\.\./)+)""", re.IGNORECASE)
+
+
+def serve_root(page: Path) -> Path:
+    """The folder to serve: the page's own, or the ancestor its `../` links reach.
+
+    A page in docs/ that loads ../style.css needs the folder above it, or every
+    correct site with a shared stylesheet is reported broken. Bounded to three
+    levels and never above the filesystem root.
+    """
+    page = Path(page)
+    try:
+        text = page.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return page.parent
+    depth = max((len(m.group(1)) // 3 for m in _PARENT_REF.finditer(text)), default=0)
+    root = page.parent
+    for _ in range(min(depth, 3)):
+        if root.parent == root:
+            break
+        root = root.parent
+    return root
 
 
 # --- the static server -------------------------------------------------------------------------
@@ -139,6 +179,26 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
             return None
 
         def do_POST(self):  # GET and HEAD only
+            # Closing with an unread request body can discard the 405 response
+            # as a TCP reset on Windows. Drain only a small, time-bounded body;
+            # never execute the request or wait indefinitely for its sender.
+            try:
+                remaining = min(65536, max(0, int(self.headers.get("Content-Length", "0"))))
+            except (ValueError, OverflowError):
+                remaining = 0
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + 0.2
+            try:
+                while remaining and time.monotonic() < deadline:
+                    self.connection.settimeout(min(0.2, max(0.001, deadline - time.monotonic())))
+                    chunk = self.rfile.read1(min(8192, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.connection.settimeout(previous_timeout)
             self.send_error(405)
 
         do_PUT = do_DELETE = do_PATCH = do_POST
@@ -174,22 +234,48 @@ _STATE_JS = """() => {
 }"""
 
 
+_EXTERNAL_SYMPTOM = re.compile(
+    r"is not defined|Cannot read propert(?:y|ies) of undefined|is not a function|"
+    r"Failed to load resource|\$ is not|jQuery", re.IGNORECASE)
+
+
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
     external: list[str] = []
+    external_scripts: list[str] = []
+    dialogs: list[str] = []
+    cancelled = out.setdefault("cancelled", threading.Event())
+    if cancelled.is_set():
+        return
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _handler(root, deny))
     port = server.server_address[1]
     origin = f"http://127.0.0.1:{port}"
     serving = threading.Thread(target=server.serve_forever, daemon=True)
     serving.start()
+    out["server"] = server   # so a timed-out check can still shut it down
     browser = None
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            if cancelled.is_set():
+                return
+            # A unique command-line marker identifies only this check's browser
+            # tree, including a browser still starting when the timeout fires.
+            out["browser_marker"] = f"--agent8088-smoke-check={uuid.uuid4().hex}"
+            browser = p.chromium.launch(args=[out["browser_marker"]])
+            out["browser_started"] = True
+            if cancelled.is_set():
+                return
             context = browser.new_context(accept_downloads=False, permissions=[],
+                                          service_workers="block",
                                           viewport={"width": 1280, "height": 800})
+            # WebSockets are not HTTP requests, so the route below cannot stop
+            # them; close each one before it connects.
+            block_websockets = getattr(context, "route_web_socket", None)
+            if not callable(block_websockets):
+                raise RuntimeError("Playwright lacks WebSocket interception; upgrade Playwright before checking pages")
+            block_websockets("**/*", lambda ws: ws.close())
 
             def route(request_route):
                 url = request_route.request.url
@@ -198,11 +284,16 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                 else:
                     if url not in external:
                         external.append(url)
+                    if request_route.request.resource_type == "script" and url not in external_scripts:
+                        external_scripts.append(url)
                     request_route.abort()
 
             context.route("**/*", route)
             tab = context.new_page()
             tab.set_default_timeout(timeout * 1000)
+            # alert()/confirm() is a visible effect of a click; dismiss it so the
+            # page does not hang waiting for an answer.
+            tab.on("dialog", lambda dialog: (dialogs.append(dialog.message[:80]), dialog.dismiss()))
 
             def own(url: str) -> bool:
                 return not url or url.startswith((origin, "data:", "blob:", "about:"))
@@ -249,11 +340,28 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                         after = tab.evaluate(_STATE_JS)
                     except Exception:  # noqa: BLE001 -- the click navigated away: that is a change
                         after = None
-                    if after == before:
+                    if after == before and dialogs:
+                        warnings.append(f"the first control opened a popup: \"{dialogs[0]}\"")
+                    elif after == before:
                         failures.append(
                             f"clicking the first control ({control['label']}"
                             + (f" \"{control['text']}\"" if control['text'] else "")
                             + ") changed nothing on the page")
+            if external_scripts:
+                # A blocked script may explain a missing global, but cannot
+                # prove that the application is correct. Fonts/images alone
+                # never excuse a local JavaScript error.
+                keep = []
+                uncertain = []
+                for item in failures:
+                    if item.startswith(("page error", "console error")) and _EXTERNAL_SYMPTOM.search(item):
+                        uncertain.append(item)
+                        warnings.append(f"{item} (possibly caused by a blocked external script; not verified)")
+                    else:
+                        keep.append(item)
+                failures[:] = keep
+                if uncertain and not failures:
+                    out["unavailable"] = "blocked external scripts prevented verification of JavaScript behavior"
             for url in external[:MAX_ITEMS]:
                 warnings.append(f"blocked request to an external host: {url[:120]}")
             if len(external) > MAX_ITEMS:
@@ -271,6 +379,36 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
         server.server_close()
 
 
+def _abandon(out: dict, started: float) -> None:
+    """A check that timed out must not leave its server or browser behind."""
+    cancelled = out.get("cancelled")
+    if cancelled is not None:
+        cancelled.set()
+    server = out.get("server")
+    if server is not None:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+    marker = out.get("browser_marker")
+    if not marker:
+        return
+    try:
+        import psutil
+        me = psutil.Process()
+        for child in me.children(recursive=True):
+            try:
+                if marker in child.cmdline():
+                    for sub_proc in child.children(recursive=True):
+                        sub_proc.kill()
+                    child.kill()
+            except psutil.Error:
+                continue
+    except ImportError:
+        pass
+
+
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
                    deny: Callable[[str], bool] | None = None) -> Report:
     path = Path(path)
@@ -279,24 +417,52 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     if not chromium_available():
         return Report("web", str(path), UNAVAILABLE,
                       note="Chromium is not installed; run `playwright install chromium`")
-    out: dict = {}
+    out: dict = {"cancelled": threading.Event()}
     # A fresh thread: Playwright's sync API refuses to run inside a running event loop.
-    worker = threading.Thread(target=_web_worker, args=(path.parent, path.name, timeout, deny, out),
+    root = serve_root(path)
+    page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
+    started = time.time()
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)
     if worker.is_alive():
+        _abandon(out, started)
         return Report("web", str(path), UNAVAILABLE, note=f"the browser check did not finish in {timeout + 15:.0f}s")
     if "error" in out:
         return Report("web", str(path), UNAVAILABLE, note=f"the browser could not run: {out['error']}")
     failures = list(dict.fromkeys(out.get("failures", [])))
-    status = FAIL if failures else PASS
-    return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []))
+    status = FAIL if failures else UNAVAILABLE if out.get("unavailable") else PASS
+    return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []),
+                  note=out.get("unavailable", ""))
 
 
 # --- scripts: static only --------------------------------------------------------------------------
 
-def check_script(path: Path) -> Report:
+_CRASH = re.compile(r"Traceback \(most recent call last\)|SyntaxError|ReferenceError|"
+                    r"Cannot find module|ModuleNotFoundError|ImportError", re.IGNORECASE)
+_EXIT_NONZERO = re.compile(r"Command exited with status ([1-9]\d*)")
+
+
+def _run_briefly(path: Path, run: Callable[[str, int], str]) -> list[str]:
+    """Start the script with --help in the sandbox; return crash findings.
+
+    Only a crash on startup counts. Printing usage, finishing, or still running
+    when the short clock ends are all fine, and a missing sandbox is no finding.
+    """
+    program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
+    output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
+    if "timed out" in output.lower():
+        return []
+    crashed = _CRASH.search(output)
+    exited = _EXIT_NONZERO.search(output)
+    if crashed or (exited and "usage" not in output.lower()):
+        last = [line for line in output.strip().splitlines() if line.strip()]
+        return [f"the script crashed when started: {last[-1][:160] if last else 'non-zero exit'}"]
+    return []
+
+
+def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
         return Report("script", str(path), FAIL, ["the file does not exist"])
@@ -307,6 +473,11 @@ def check_script(path: Path) -> Report:
         except SyntaxError as error:
             return Report("script", str(path), FAIL,
                           [f"syntax error on line {error.lineno}: {error.msg}"])
+        if run is not None:
+            crash = _run_briefly(path, run)
+            if crash:
+                return Report("script", str(path), FAIL, crash)
+            return Report("script", str(path), PASS, note="compiles and starts without crashing")
         return Report("script", str(path), PASS, note="compiles; not executed")
     if suffix in NODE_SUFFIXES:
         node = shutil.which("node")
@@ -319,12 +490,18 @@ def check_script(path: Path) -> Report:
         if done.returncode != 0:
             first = (done.stderr or done.stdout).strip().splitlines()
             return Report("script", str(path), FAIL, [f"syntax error: {first[-1][:160] if first else 'node --check failed'}"])
+        if run is not None:
+            crash = _run_briefly(path, run)
+            if crash:
+                return Report("script", str(path), FAIL, crash)
+            return Report("script", str(path), PASS, note="parses and starts without crashing")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")
 
 
 def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
-                 deny: Callable[[str], bool] | None = None) -> Report:
+                 deny: Callable[[str], bool] | None = None,
+                 run: Callable[[str, int], str] | None = None) -> Report:
     """Pick the check from what the path is: a page, a folder with an index page, a script."""
     path = Path(path)
     if path.is_dir():
@@ -336,7 +513,7 @@ def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
     if suffix in WEB_SUFFIXES:
         return check_web_page(path, timeout, deny)
     if suffix in PYTHON_SUFFIXES | NODE_SUFFIXES:
-        return check_script(path)
+        return check_script(path, run)
     return Report("script", str(path), SKIPPED, note="not a page or script")
 
 

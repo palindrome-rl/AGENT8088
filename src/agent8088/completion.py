@@ -59,10 +59,46 @@ _UNFINISHED = tuple(re.compile(p, re.IGNORECASE) for p in (
 ))
 
 
+# Phrases that contain an "unfinished" word but say the opposite or something
+# else: "nothing left to do", "no remaining steps", advice to the user ("if you
+# haven't installed it yet"), a summary announcement ("I will now explain"), and
+# a file name (TODO.md).
+_NOT_UNFINISHED = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\b(?:no|nothing|none|not\s+any|without|zero)\b[^.\n]{0,30}\b(?:remaining|left|outstanding|"
+    r"to[- ]?do|unfinished|pending|more\s+to)\b",
+    r"\bif\s+(?:you|your)\b[^.\n]*",
+    r"\bi(?:['’]ll|\s+will)\s+now\s+(?:explain|summari[sz]e|describe|walk|show|list|recap|outline|present)\b",
+    r"\blet\s+me\s+(?:now\s+)?(?:explain|summari[sz]e|describe|walk|show|list|recap|outline)\b",
+    r"\bto[- ]?do(?:s)?(?=\.\w|[-_]list\b|\.md\b)",
+    r"\bto[- ]?do\.\w+",
+))
+
+
 def admits_unfinished_work(reply: str) -> bool:
     """True if the reply says, in plain words, that the work is not finished."""
     text = _prose(reply)
+    for pattern in _NOT_UNFINISHED:
+        text = pattern.sub(" ", text)
     return any(pattern.search(text) for pattern in _UNFINISHED)
+
+
+_ADVICE_START = re.compile(
+    r"^\W*(?:how|why|what|which|where|when|who|is|are|does|do|did|should|explain|describe|"
+    r"tell\s+me|show\s+me\s+how|walk\s+me|what['’]s)\b", re.IGNORECASE)
+_ACTION_ASK = re.compile(r"^\W*(?:please\s+)?(?:can|could|would|will)\s+you\b", re.IGNORECASE)
+
+
+def is_advice_request(request: str) -> bool:
+    """A question or an "explain" request: the user wants an answer, not an edit.
+
+    "how do I fix X?" asks for advice; "can you fix X?" and "fix X" ask for the
+    change.
+    """
+    text = (request or "").strip()
+    first = _SENTENCE_SPLIT.split(_prose(text))[0] if text else ""
+    if _ACTION_ASK.match(first):
+        return False
+    return bool(_ADVICE_START.match(first))
 
 
 # --- 2. Files the request named ------------------------------------------------------
@@ -261,6 +297,15 @@ _SCRIPT_WORDS = ("scrape", "scraper", "download", "downloader", "inspect", "insp
                  "fetch", "crawl", "probe", "debug", "tmp", "scratch", "demo", "example")
 
 
+_LIBRARY_STEM = re.compile(
+    r"(?:^|[_-])(?:utils?|helpers?|lib|library|client|core|common|api|service|services|"
+    r"module|base|models?|config|parser|parsers)$")
+
+
+def is_library_stem(stem: str) -> bool:
+    return bool(_LIBRARY_STEM.search(stem.lower()))
+
+
 def is_scratch(path: str, temp_dir: str = "", root: str = "") -> bool:
     """A throwaway script: a scratch directory, the system temp dir, or a one-off tool name.
 
@@ -280,6 +325,8 @@ def is_scratch(path: str, temp_dir: str = "", root: str = "") -> bool:
     if temp_dir and str(path).startswith(temp_dir):
         return True
     stem = p.stem.lower()
+    if _LIBRARY_STEM.search(stem):
+        return False   # fetch_utils.py is a library, not a throwaway fetch script
     return any(stem == w or stem.startswith(w + "_") or stem.endswith("_" + w) for w in _SCRIPT_WORDS)
 
 
@@ -377,6 +424,38 @@ EMPTY_REPLY_ASK = ("Your last reply was empty. Continue the task: call the next 
                    "in plain text if you are finished.")
 VERIFY_ASK = ("Continue, and also run what you changed: inspect or test the changed result with one "
               "suitable command, fix anything that fails, then reply. If it cannot be run here, say so plainly.")
+
+
+def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
+    """The verification reminder with the files and the exact command named.
+
+    Small models do the check when told precisely what to run; a bare "inspect
+    or test the result" is often skipped or answered with an unrelated command.
+    """
+    names = []
+    for path in changed:
+        name = PurePath(str(path)).name
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return VERIFY_ASK
+    shown = ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
+    first = names[0]
+    suffix = PurePath(first).suffix.lower()
+    if has_tests:
+        command = "run_tests"
+    elif suffix == ".py":
+        command = f"python {first}"
+    elif suffix in {".js", ".mjs", ".cjs"}:
+        command = f"node {first}"
+    elif suffix in {".html", ".htm"}:
+        command = "check_app on the page"
+    elif suffix in {".sh", ".bash"}:
+        command = f"bash {first}"
+    else:
+        command = f"read_text on {first}"
+    return (f"Continue, and also run what you changed ({shown}) with `{command}` now, "
+            "fix anything that fails, then reply. If it cannot be run here, say so plainly.")
 
 
 def outputs_nudge(missing: list[str]) -> Nudge:

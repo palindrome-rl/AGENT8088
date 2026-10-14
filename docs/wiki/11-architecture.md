@@ -107,7 +107,10 @@ says to *continue*, never to give a final answer:
 
 0. **Empty reply.** With work pending (a failed tool, an unverified change, a part
    of the request not done) the follow-up is "Your last reply was empty. Continue
-   the task". With nothing pending it is the single legacy retry.
+   the task". With nothing pending it is the single legacy retry. Either way the
+   retry runs with thinking off (one call only): a reply that finished with nothing
+   to act on usually spent its budget reasoning, and repeating it with thinking on
+   tends to repeat the result.
 1. **Admits unfinished work.** The reply says, in plain words, that it is not
    done ("not finished yet", "still need to", "remaining steps", "I'll now",
    `TODO` outside code) *and* the run shows open items, or the request asked for
@@ -138,6 +141,13 @@ unmet. Re-planning after two failed actions stays separate and does not use the
 budget; `max_post_check_rounds` still bounds tool rounds after a follow-up. Set
 the budget to `0` to turn the checks off. In a disposable container the old
 deliverables re-check still runs, as one of these follow-ups.
+
+A run that ends because `max_post_check_rounds` told the model to answer (or the
+hard backstop returned its best reply) skips these checks by design. It still
+looks, read-only, at the cheap facts they would have checked (a named file missing
+or empty, a reply that admits unfinished work, parts of a multi-part request the
+reply never covered) and puts what it finds in the same "Not completed" note. That
+look spends none of the budget and starts no browser.
 
 ## Plans stop at the first failed step
 

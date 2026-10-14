@@ -118,6 +118,12 @@ timeout_seconds=120
 # disagree or embeddings are unavailable. `full` always sends every schema.
 # `auto` enables hybrid only for the explicitly measured provider:model entries.
 tool_selection=hybrid
+# With no keyword matches, offer semantic tools only above this similarity.
+# tool_selection_min_similarity=0.35
+# Opt in to native-only tool instructions when the provider supports native tools.
+# tool_call_format=native
+# Seconds without a chunk after streaming begins before recovery; 0 disables.
+# stream_idle_seconds=120
 # tool_selection_models=custom:your-model-name
 # max_tool_timeout_seconds=600
 # browser_max_steps=25
@@ -238,6 +244,9 @@ sandbox_runtime_version=0.0.73
 # Files larger than this are not snapshotted, so they are not reverted — the plan
 # output says so rather than implying otherwise.
 # plan_audit_revert_max_bytes=1048576
+# Confirm a tool or plan-step audit failure with a second auditor before reverting.
+# Disagreement is inconclusive and preserves the change for inspection.
+# plan_audit_confirm_fail=1
 #
 # What gets verified: calls that CHANGE something. A tool's permission mode is
 # not the test — `shell` is the gate 13 read-only tools go through, so

@@ -2,6 +2,14 @@
 from pathlib import Path
 import importlib
 import re
+import io
+import http.server
+import threading
+from types import SimpleNamespace
+import urllib.error
+import urllib.request
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,3 +54,83 @@ def test_doctor_has_a_bounded_deadline_longer_than_individual_live_probes():
     page = (ROOT / "web/src/pages/DoctorPage.tsx").read_text(encoding="utf-8")
     assert "fetchJSON<DoctorReport>('/api/doctor', 120_000)" in page
     assert "{ action: 'run diagnostics', timeoutMs }" in page
+
+
+def test_recovery_and_audit_settings_are_documented_on_the_public_release():
+    page = (ROOT / "docs/wiki/02-configuration.md").read_text(encoding="utf-8")
+    for name in ("stream_idle_seconds", "plan_audit_confirm_fail",
+                 "tool_call_format", "tool_selection_min_similarity",
+                 "compaction_cooldown_turns", "compaction_summary_max_chars"):
+        assert f"| `{name}` |" in page
+
+
+def test_file_backup_limits_and_restore_instructions_are_documented():
+    configuration = (ROOT / "docs/wiki/02-configuration.md").read_text(encoding="utf-8")
+    tools = (ROOT / "docs/wiki/04-tools.md").read_text(encoding="utf-8")
+    for name in ("file_backups", "file_backup_max_file_mb",
+                 "file_backup_max_mb", "file_backup_keep_days"):
+        assert f"| `{name}` |" in configuration
+    assert "## Backups of overwritten files" in tools
+    assert "index.jsonl" in tools
+    assert "copy the\nbackup back over the file" in tools
+
+
+def test_new_settings_preserve_native_memory_and_generic_model_examples():
+    config = (ROOT / "src/agent8088/config.txt").read_text(encoding="utf-8")
+    assert "\nmemory_engine=native\n" in config
+    assert "# tool_selection_models=custom:your-model-name" in config
+    for setting in ("stream_idle_seconds=120", "plan_audit_confirm_fail=1",
+                    "tool_selection_min_similarity=0.35", "tool_call_format=native"):
+        assert "# " + setting in config
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_static_smoke_server_rejects_request_bodies_without_writing(tmp_path, method):
+    from agent8088.app_check import _handler
+    page = tmp_path / "index.html"
+    page.write_text("unchanged", encoding="utf-8")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _handler(tmp_path, None))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for _ in range(10):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/index.html",
+                data=b"not authorized to write", method=method,
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 405
+        assert page.read_text(encoding="utf-8") == "unchanged"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rejected_request_body_drain_is_size_limited(tmp_path):
+    from agent8088.app_check import _handler
+    handler_type = _handler(tmp_path, None)
+    handler = handler_type.__new__(handler_type)
+    timeouts, statuses = [], []
+    handler.headers = {"Content-Length": "1000000000"}
+    handler.connection = SimpleNamespace(gettimeout=lambda: None, settimeout=timeouts.append)
+    handler.rfile = io.BytesIO(b"x" * 100000)
+    handler.send_error = statuses.append
+    handler.do_POST()
+    assert handler.rfile.tell() == 65536
+    assert statuses == [405] and timeouts[-1] is None
+    assert all(0 < timeout <= 0.2 for timeout in timeouts[:-1])
+
+
+def test_rejected_request_body_timeout_still_returns_405(tmp_path):
+    from agent8088.app_check import _handler
+    handler_type = _handler(tmp_path, None)
+    handler = handler_type.__new__(handler_type)
+    timeouts, statuses = [], []
+    handler.headers = {"Content-Length": "10"}
+    handler.connection = SimpleNamespace(gettimeout=lambda: None, settimeout=timeouts.append)
+    def stalled_read(size):
+        raise TimeoutError("sender did not finish the request body")
+    handler.rfile = SimpleNamespace(read1=stalled_read)
+    handler.send_error = statuses.append
+    handler.do_POST()
+    assert statuses == [405] and timeouts[-1] is None

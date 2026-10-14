@@ -43,6 +43,8 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.api_key` | Literal key. Legacy — migrated to `.env` on first run. |
 | `provider.<name>.api_mode` | `openai` (default) or `litellm`. |
 | `provider.<name>.native_tools` | Use the provider's native function-calling API. Defaults to `1` for every provider except `ollama`, which uses the prompt-based convention. |
+| `tool_call_format` | `markers` by default; opt-in `native` omits text-marker lessons when native tool calling is active. |
+| `tool_selection_min_similarity` | `0.35`: semantic similarity required to offer a tool when keyword ranking has no matches. |
 | `provider.<name>.context_window` | Context window for this provider profile. Overrides the global value. |
 | `provider.<name>.max_completion_tokens` | Maximum output tokens for this provider profile. Overrides the global value. |
 | `provider.<name>.temperature` | Sampling temperature for one provider; overrides the session value, including `/temp`, on that provider's requests. Useful when a server expects a particular sampling setting. |
@@ -70,6 +72,7 @@ takes over:
 | `api_retry_initial_delay_ms` | `1000` | First backoff delay. |
 | `api_retry_max_delay_ms` | `30000` | Ceiling for the exponential backoff. |
 | `api_retry_jitter_ratio` | `0.1` | Random jitter added to each delay (0-1), so parallel retries do not sync up. |
+| `stream_idle_seconds` | `120` | Maximum silence after streaming starts before a retryable idle error. Works with OpenAI and LiteLLM streams; `0` disables it. SDK request timeouts still bound the initial response wait. |
 
 ### Fusion
 
@@ -227,6 +230,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
 | `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
+| `compaction_cooldown_turns` | `6` | Turns to wait after a successful automatic compaction before looking again, unless the context is already above 90% of the window. `0` removes the wait. |
+| `compaction_summary_max_chars` | `16000` | Longest the carried-over conversation summary may grow. Compaction keeps an earlier summary exactly as written and summarizes only what came after it, so a long run's first facts are not blurred by repeated rewriting; past this size the oldest summary sections are dropped whole, never rephrased. Each summary ends with a short harness record the model does not write (files written this run, verified checks), rebuilt from live state at every compaction. |
 | `diagnostic_after_failures` | `2` | After this many identical failures in a row (same tool, same error code), the model is shown a read-only check of where commands run: the working-directory status, a short listing, the user, free disk space and which interpreters exist. The same check is shown before the agent accepts an answer that says the environment is unavailable. Minimum `2`. |
 | `max_image_bytes` | `20 MB` | Cap on an image attachment. |
 | `document_process_concurrency` | `4` | Document chunks `document_read action=process` keeps in flight (clamped 1-16). Chunk requests are independent, so this multiplies throughput almost linearly until the provider rate-limits. |
@@ -331,6 +336,10 @@ is a plausible accident that the permission gate does not catch. Both default to
 | Key | Default | Purpose |
 |---|---|---|
 | `max_writes_per_turn` | `0` | Files one request may write. The parts of one file written with `write_file mode=append` count as one. |
+| `file_backups` | `1` | Copy a file's original bytes aside before the first change to it in a session. See [Backups of overwritten files](04-tools.md#backups-of-overwritten-files). |
+| `file_backup_max_file_mb` | `10` | Largest single file that is backed up (larger files are skipped). |
+| `file_backup_max_mb` | `200` | Total backed up per session; past it, further backups are skipped. |
+| `file_backup_keep_days` | `14` | Backup sessions older than this are deleted (`0` keeps them all). |
 | `max_write_bytes` | `0` | Bytes a single write may contain. For a file written in parts, the bytes of all its parts this request. |
 
 Checked *before* the permission gate, so the refusal is not something a user can
@@ -350,6 +359,7 @@ where a silently half-done plan does damage.
 |---|---|---|
 | `plan_audit` | `0` | `1` turns on step verification. `/audit` shows and toggles it. |
 | `plan_audit_revert` | `1` | With auditing on, a write that **fails** verification is restored to its exact pre-step bytes: only verified state persists. |
+| `plan_audit_confirm_fail` | `1` | A tool or plan-step audit failure needs a second failing auditor before rollback. Disagreement is reported as inconclusive and leaves the change in place. |
 | `plan_audit_revert_max_bytes` | `1048576` | Files larger than this are not snapshotted, so they are not reverted — the plan output says so rather than implying otherwise. |
 | `plan_audit_max_per_turn` | `12` | Verification calls one top-level turn may spend. `0` stops verifying without turning the feature off. |
 | `plan_audit_timeout_seconds` | `120` | Wall clock for one auditor sub-run. |

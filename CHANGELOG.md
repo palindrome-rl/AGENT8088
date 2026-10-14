@@ -4,6 +4,28 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.2 branch maintenance - 2026-10-14
+
+### Improved
+
+- Verification uses recorded evidence and confirms failed audits before rollback;
+  inconclusive results preserve changes and clearly report what remains unchecked.
+- Browser smoke checks stop only their own browser processes and distinguish
+  blocked external dependencies from real application errors.
+- The local smoke-test server reliably rejects write requests on Windows,
+  draining only a size- and time-limited request body before returning HTTP 405.
+- Idle stream recovery works with OpenAI and LiteLLM; empty and reasoning-only
+  cutoffs receive bounded recovery, with unfinished work reported at run limits.
+- Conversation compaction preserves earlier summaries and carries forward verified
+  checks and changed-file records instead of repeatedly rewriting the same facts.
+- Existing files receive recoverable, size-limited backups before their first
+  overwrite in a session, with configurable retention and storage limits.
+- Nullable tool arguments and MCP schemas are validated consistently; semantic
+  tool retrieval and native tool instructions remain configurable.
+
+Public installation commands, update channel, version 1.2.0, MIT licensing and
+existing public-specific diagnostics and Web UI fixes remain preserved.
+
 ## v1.2 branch maintenance - 2026-10-13
 
 ### Improved
