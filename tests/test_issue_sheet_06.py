@@ -33,6 +33,7 @@ def plan_env(engine, monkeypatch, tmp_path):
     ('read_text', {'filename': 'a.py'}, 'explore'),
     ('write_file', {'filename': 'a.py', 'content': 'x'}, 'coder'),
     ('calculate', {'expression': '1+1'}, ''),
+    ('execute_shell', {'command': 'rm -rf build && mkdir build'}, ''),
 ])
 def test_plan_step_profile_follows_whether_the_step_mutates(engine, tool, args, expected):
     assert engine._plan_step_profile(tool, args) == expected

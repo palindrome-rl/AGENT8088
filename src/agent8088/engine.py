@@ -7703,8 +7703,13 @@ def _plan_step_profile(tool_name: str, tool_args: dict) -> str:
     verifier and test-writer profiles are never reached from a plan step.
     """
     mutating = _tool_call_mutates(tool_name, tool_args)
+    # Only write_file goes to coder: it replaces the whole file, so the inline
+    # fallback after a half-finished sub-run is idempotent. A mutating shell
+    # command is not, and stays inline.
     for profile, wants_mutation in (("explore", False), ("coder", True)):
         spec = SUBAGENT_SPECS.get(profile)
+        if profile == "coder" and tool_name != "write_file":
+            continue
         if spec and mutating == wants_mutation and tool_name in spec.get("tools", ()):
             return profile
     return ""
