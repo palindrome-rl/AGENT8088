@@ -296,3 +296,21 @@ def test_server_detection_is_conservative():
     assert app_check.looks_like_server(
         "import argparse\nparser.add_argument('--port', type=int)\n")
     assert not app_check.looks_like_server("x = 1\nprint('serve.py is just a name')\n")
+
+def test_a_server_with_no_sandbox_is_unverified_not_passed(tmp_path):
+    """No sandbox means no runner. A server that was never started must not read
+    as a pass; the summary has to say it was not executed."""
+    script = tmp_path / "server.py"
+    script.write_text("from http.server import HTTPServer, SimpleHTTPRequestHandler\n"
+                      "HTTPServer(('', 8765), SimpleHTTPRequestHandler).serve_forever()\n")
+    report = app_check.check_script(script, run=None)
+    assert report.status == app_check.UNAVAILABLE
+    assert "not executed" in report.summary()
+
+
+def test_a_plain_script_with_no_sandbox_still_says_not_executed(tmp_path):
+    script = tmp_path / "tool.py"
+    script.write_text("print('hi')\n")
+    report = app_check.check_script(script, run=None)
+    assert report.status == app_check.PASS
+    assert "not executed" in report.summary()

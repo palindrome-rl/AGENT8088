@@ -69,7 +69,10 @@ class Report:
         name = Path(self.target).name or self.target
         if self.status == PASS:
             tail = f" ({len(self.warnings)} warning{'s' if len(self.warnings) != 1 else ''})" if self.warnings else ""
-            return f"{name}: smoke test passed{tail}"
+            # "compiles; not executed" is a pass only in status; say so, or the
+            # summary reads as if the script had been run.
+            ran = f" - {self.note}" if "not executed" in self.note else ""
+            return f"{name}: smoke test passed{tail}{ran}"
         if self.status == FAIL:
             return f"{name}: smoke test FAILED - " + "; ".join(self.failures[:2])
         return f"{name}: smoke test {self.status}" + (f" ({self.note})" if self.note else "")
@@ -682,6 +685,10 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                               note="looks like a server but the port it will listen on "
                                    "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="compiles and starts without crashing")
+        if server_port(source) is not None or looks_like_server(source):
+            # No sandbox, so nothing was started: serving is unverified, not passed.
+            return Report("script", str(path), UNAVAILABLE,
+                          note="no sandbox available; the server was not executed")
         return Report("script", str(path), PASS, note="compiles; not executed")
     if suffix in NODE_SUFFIXES:
         node = shutil.which("node")
@@ -710,6 +717,9 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                               note="looks like a server but the port it will listen on "
                                    "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="parses and starts without crashing")
+        if run is None and (server_port(path.read_text(encoding="utf-8", errors="replace")) is not None):
+            return Report("script", str(path), UNAVAILABLE,
+                          note="no sandbox available; the server was not executed")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")
 
