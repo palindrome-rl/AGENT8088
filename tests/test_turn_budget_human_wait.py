@@ -78,7 +78,7 @@ def test_human_wait_is_safe_with_no_active_budget(engine, monkeypatch):
         pass
 
 
-def test_plan_approval_wait_is_not_charged_to_the_budget(engine, monkeypatch):
+def test_plan_approval_wait_is_not_charged_to_the_budget(engine, monkeypatch, tmp_path):
     """The end-to-end defect: waiting on the plan prompt must not spend budget."""
     budget = engine._TurnBudget(max_seconds=5)
     monkeypatch.setattr(engine, "_active_budget", budget)
@@ -90,6 +90,7 @@ def test_plan_approval_wait_is_not_charged_to_the_budget(engine, monkeypatch):
         return "full-auto"
 
     monkeypatch.setattr(engine, "_plan_on_approval", slow_human)
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)  # present_plan writes PLAN.md there
 
     result = engine._exec_present_plan({"plan": "1. do the thing"})
 
