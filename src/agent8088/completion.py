@@ -641,6 +641,27 @@ def subgoals_nudge(items: list[str], evidence: bool = False) -> Nudge:
         unmet="parts of the request not addressed: " + "; ".join(items[:6]))
 
 
+_SUCCESS_CLAIM = re.compile(
+    r"\b(?:all|every)\s+(?:checks?|tests?)\s+(?:pass|passed|passing)|everything\s+(?:works|is working|passes)|"
+    r"fully\s+(?:working|functional|implemented)|successfully\s+(?:completed|implemented|built)|"
+    r"\ball\s+done\b|\bis\s+(?:now\s+)?complete\b|\bwork(?:s|ing)\s+as\s+(?:expected|intended)\b", re.IGNORECASE)
+
+
+def claims_success(reply: str) -> bool:
+    return bool(_SUCCESS_CLAIM.search(_prose(reply or "")))
+
+
+def failing_check_nudge(detail: str, reply: str = "") -> Nudge:
+    lead = ("Your reply says the work is done, but the latest automated check failed and has not passed since: "
+            if claims_success(reply) else
+            "The latest automated check failed and has not passed since: ")
+    return Nudge("failing_check", continue_text(
+        f"{lead}{detail}.",
+        "Fix the cause and run the check again. If it cannot be fixed, say plainly in your reply that it still "
+        "fails and why, instead of reporting the work as done."),
+        unmet="the latest check failed: " + detail[:120])
+
+
 def tests_nudge(paths: list[str]) -> Nudge:
     return Nudge("tests", continue_text(
         "This project has a test suite, and these library files changed without tests: "
