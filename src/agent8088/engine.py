@@ -13227,10 +13227,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"given, so {target} was left unchanged. Pass content to write "
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
-        if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
-                and (syntax_error := _python_syntax_error(content))):
+        if target.suffix.lower() == ".py" and (syntax_error := _python_syntax_error(content)):
             # Writing this would break collection of the whole suite. Leave the
-            # file as it was and let the author correct and resend.
+            # file as it was and let the author correct and resend. Every
+            # .py is checked, not just test-shaped ones: the leaked-markup case
+            # the audit reported landed in a generated helper, and a file that
+            # will not import is as broken wherever it is called from.
             _turn_writes -= 1
             return efficiency.tool_error(
                 "invalid_python", f"{target} was NOT written: the content is not valid "
@@ -17711,7 +17713,12 @@ DELIVERABLES_CHECK_NUDGE = (
     "leftovers you created that the task did not ask for. Check each item once with "
     "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
-POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+# The cap fired with no failing verdict recorded. "Checks are complete" is a
+# claim the harness cannot support here -- it stopped the model, it did not
+# watch it pass -- and a model that believes it stops on a broken run.
+POST_CHECK_CAP_NUDGE = ("Checks are complete. Fix anything that failed, or say plainly "
+                        "what is left unfinished, then give your final answer. Do not "
+                        "claim the work is verified if you did not see it pass.")
 # The newest check failed: never tell the model it passed.
 POST_CHECK_FAILED_NUDGE = (
     "The latest check FAILED and is still unfixed. Fix the failure now if you can. "
@@ -18822,8 +18829,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 on_answer(answer)
             if trace is not None:
                 trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                              "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                              "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
             return answer
 
         if on_calls:
@@ -19354,8 +19366,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         on_answer(answer)
                     if trace is not None:
                         trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                                      "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                                      "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
