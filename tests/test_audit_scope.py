@@ -75,12 +75,15 @@ def test_subagent_mutations_are_not_recursively_audited(engine, tmp_path):
     assert seen == []
 
 
-def test_approved_plan_mutations_still_use_the_plan_as_context(engine, tmp_path):
+def test_approved_plan_mutations_still_use_the_plan_as_context(engine, tmp_path, monkeypatch):
     seen = _enable_audit(engine, tmp_path)
     engine.PERMISSION_MODE = "readonly"
     engine.enter_plan_mode()
     engine._plan_on_approval = lambda text: "full-auto"
-    engine.run_tool("present_plan", {"plan": "write planned.txt"})
+    # present_plan writes PLAN.md to the project root; keep that out of the repo.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(engine, "PROJECT_ROOT", tmp_path)
+        engine.run_tool("present_plan", {"plan": "write planned.txt"})
 
     _write(engine, tmp_path / "planned.txt")
 
