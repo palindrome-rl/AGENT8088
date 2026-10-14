@@ -95,6 +95,10 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+def _base_name(path: str) -> str:
+    return str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+
+
 def _blank(goal: str = "", workspace: str = "") -> dict:
     return {
         "version": VERSION,
@@ -118,6 +122,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "check_failing": False,
         "subgoals_built": False,
         "unmet_checks": [],
+        "partial_files": [],
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
@@ -207,6 +212,12 @@ class TrajectoryState:
             if path not in changed:
                 changed.append(path)
                 del changed[:-MAX_UNTESTED]
+        if (mutated and path and operation["status"] == "done"
+                and operation.get("tool") == "write_file" and self.data.get("partial_files")):
+            # A later write to a file saved part-way is the continuation it was waiting for.
+            name = _base_name(path)
+            self.data["partial_files"] = [p for p in self.data["partial_files"]
+                                          if _base_name(p.get("path", "")) != name]
         if mutated and path and operation["status"] == "done":
             # Where the work actually landed. The answer quotes this, because a
             # run whose writes were redirected into the sandbox workspace reads
@@ -406,7 +417,28 @@ class TrajectoryState:
     def has_open_items(self) -> bool:
         """Work the run itself shows is not finished: pending verification, a failed
         or blocked tool, or a part of the request nobody has addressed."""
-        return bool(self.needs_verification() or self.unresolved_tools() or self.open_subgoals())
+        return bool(self.needs_verification() or self.unresolved_tools() or self.open_subgoals()
+                    or self.partial_files())
+
+    def note_partial(self, path: str, size: int) -> None:
+        """A file whose write was cut off and saved only up to its last whole line."""
+        files = [p for p in self.data.setdefault("partial_files", [])
+                 if _base_name(p.get("path", "")) != _base_name(path)]
+        files.append({"path": _text(path), "bytes": int(size)})
+        self.data["partial_files"] = files[-6:]
+
+    def partial_files(self) -> list[str]:
+        return [str(p.get("path", "")) for p in self.data.get("partial_files") or []]
+
+    def salvaged_before(self, path: str) -> bool:
+        """Was a cut-off write to this file already saved once this run?"""
+        return _base_name(path) in (self.data.get("salvaged_once") or [])
+
+    def mark_salvaged(self, path: str) -> None:
+        done = self.data.setdefault("salvaged_once", [])
+        if _base_name(path) not in done:
+            done.append(_base_name(path))
+            del done[:-20]
 
     def progress_mark(self) -> tuple:
         """A value that changes when the run makes real progress."""
