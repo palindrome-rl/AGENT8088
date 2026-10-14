@@ -13073,6 +13073,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if not target.suffix:
                 target = _target_with_derived_extension(
                     target, source_url, fetch_content_type)
+            if args.get("_private") is not True:
+                leak = _file_write_secret_check(fetched.decode("utf-8", errors="replace"))
+                if leak:
+                    _audit("tool_call", tool=name, mode=mode, decision="denied",
+                           detail=str(target)[:200], reason="secret_in_file")
+                    return leak
             target.parent.mkdir(parents=True, exist_ok=True)
             _backup_original(target)
             target.write_bytes(fetched)
@@ -13096,6 +13102,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 content, target, fences=name == "write_file")
         if args.get("_private") is not True:
             leak = _file_write_secret_check(content)
+            if not leak and write_mode == "append":
+                leak = _file_append_secret_check(target, content)
             if leak:
                 _audit("tool_call", tool=name, mode=mode, decision="denied",
                        detail=str(target)[:200], reason="secret_in_file")
@@ -13155,6 +13163,13 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 # budget -- otherwise three bad guesses lock out the real edit.
                 _turn_writes -= 1
                 return edit.error
+            if args.get("_private") is not True:
+                leak = _file_write_secret_check(edit.text)
+                if leak:
+                    _turn_writes -= 1
+                    _audit("tool_call", tool=name, mode=mode, decision="denied",
+                           detail=str(target)[:200], reason="secret_in_file")
+                    return leak
             target.write_text(edit.text, encoding="utf-8", newline="")
             _last_write_diff = _make_diff(original, edit.text, str(target))
             added, removed = diffview.diff_counts(_last_write_diff)
@@ -14296,6 +14311,28 @@ def _file_write_secret_check(content):
                 "configuration. Write the file without it (read the value from an environment "
                 "variable at run time) and do not copy configuration or .env values into it.")
     return None
+
+
+def _file_append_secret_check(target: Path, content: str):
+    """Check a credential split between existing bytes and an appended part.
+
+    Only the longest known credential's UTF-8 tail is needed, so checking a
+    large existing file does not load it into memory. Never echo those bytes.
+    """
+    if not BLOCK_SECRETS_IN_WRITES:
+        return None
+    longest = max((len(value.encode("utf-8")) for value in _SECRET_VALUES
+                   if len(value) >= _MIN_EXFIL_SECRET_LEN), default=0)
+    if not longest or not target.exists():
+        return None
+    try:
+        with target.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - longest))
+            tail = handle.read(longest).decode("utf-8", errors="replace")
+    except OSError:
+        return "Error: Existing file could not be checked safely for credentials; nothing was appended."
+    return _file_write_secret_check(tail + content)
 
 
 # ---------------------------------------------------------------------------
