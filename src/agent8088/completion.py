@@ -268,13 +268,24 @@ _STOPWORDS = frozenset(
     "using use when where which what have has had been being not only just than more most".split())
 
 
-def extract_subgoals(request: str) -> list[str]:
+# A request written as a paragraph often states its parts as separate "it should ... /
+# players must be able to ..." sentences. Three or more of them are a checklist.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+_REQUIREMENT_SENTENCE = re.compile(
+    r"\b(?:should|must|need(?:s)? to|has to|have to|allow(?:s)?|let(?:s)?|able to|support(?:s)?|"
+    r"include(?:s)?|provide(?:s)?|display(?:s)?|show(?:s)?|consider(?:s)?|ensure(?:s)?|"
+    r"make sure|require(?:s|d)?)\b", re.IGNORECASE)
+MIN_REQUIREMENT_SENTENCES = 3
+
+
+def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     """The separate parts of a multi-part request, or [] when it is a single ask.
 
-    Built from a numbered or bulleted list, or from explicit "and also / then"
-    clauses; fewer than two items is not a checklist, so a plain request costs
-    nothing. A request written as one paragraph with no such structure builds no
-    checklist, and its completion relies on the other checks.
+    Built from a numbered or bulleted list, from explicit "and also / then" clauses,
+    or (``sentences``) from three or more sentences that each state a requirement
+    ("it should ...", "players must be able to ..."). Fewer than two items is not a
+    checklist, so a plain request costs nothing. A request with none of that
+    structure builds no checklist, and its completion relies on the other checks.
     """
     text = _prose(request).strip()
     if not text:
@@ -285,7 +296,13 @@ def extract_subgoals(request: str) -> list[str]:
         parts = [p.strip(" ,;.") for p in _CLAUSE_SPLIT.split(text)]
         items = [p for p in parts if len(p.split()) >= 3]
         if len(items) < 2:
-            return []
+            items = []
+    if not items and sentences:
+        flat = " ".join(text.split())
+        marked = [s.strip(" ,;.") for s in _SENTENCE_SPLIT.split(flat)
+                  if len(s.split()) >= 4 and _REQUIREMENT_SENTENCE.search(s)]
+        if len(marked) >= MIN_REQUIREMENT_SENTENCES:
+            items = marked
     return [i[:160] for i in items[:MAX_SUBGOALS]]
 
 
@@ -300,19 +317,100 @@ def _keywords(text: str) -> set[str]:
     return {_stem(w) for w in re.findall(r"[a-z0-9_]{4,}", text.lower()) if w not in _STOPWORDS}
 
 
-def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str]) -> list[str]:
+_NO_TEXT_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".7z",
+    ".sqlite", ".db", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".wav", ".docx", ".xlsx",
+    ".pptx", ".pyc", ".exe", ".dll", ".so", ".bin", ".lock"})
+_NO_TEXT_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".git", "dist", "build"})
+
+
+def deliverable_text(written: Iterable[str], roots: Iterable[Path],
+                     per_file: int = 200_000, total: int = 600_000) -> str:
+    """The text of the readable files a run wrote, capped, or "" when there is none.
+
+    This is the evidence that a part of the request was built: what the files say,
+    not what the reply says about them. Binary files, dependency folders and very
+    large files are skipped, and the total is bounded.
+    """
+    roots = [Path(r) for r in roots]
+    chunks, used, seen = [], 0, set()
+    for raw in written:
+        for candidate in _candidates(raw, roots):
+            try:
+                resolved = candidate.resolve()
+                if (not candidate.is_file() or resolved in seen
+                        or candidate.suffix.lower() in _NO_TEXT_SUFFIXES
+                        or _NO_TEXT_DIRS & {p.lower() for p in resolved.parts}):
+                    continue
+                seen.add(resolved)
+                with open(candidate, "r", encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read(per_file)
+            except OSError:
+                continue
+            chunks.append(text)
+            used += len(text)
+            break
+        if used >= total:
+            break
+    return "\n".join(chunks)[:total]
+
+
+def _words_for_evidence(text: str) -> str:
+    """Lower-case text with camelCase, snake_case and kebab-case split into words."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
+    return re.sub(r"[_\-]+", " ", spaced).lower()
+
+
+def _root(word: str) -> str:
+    """The start of a word that its inflections share ("remove" and "removing" -> "remo")."""
+    return word[: max(4, len(word) - 2)] if len(word) >= 6 else word
+
+
+# A part that asks the agent to tell the user something is done by the reply itself.
+_COMMUNICATION = re.compile(
+    r"^\W*(?:and\s+|also\s+)?(?:explain|tell|describe|summari[sz]e|report|say|mention|answer|state|"
+    r"outline|walk|document|list)\b", re.IGNORECASE)
+
+
+def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
+                         evidence: str | None = None) -> list[str]:
     """Items whose key words the reply and the written files never mention.
 
     A part counts as addressed when at least half of its key words appear in the
     reply or in a written file's name. This is deliberately loose: it exists to
     catch a part that was forgotten, and a part done but described in other
     words costs one continuation, not a failure.
+
+    With ``evidence`` (the text of the files the run wrote, see ``deliverable_text``)
+    the reply alone no longer counts for a part that asks for something to be built:
+    its key words must appear in the delivered files (camelCase and snake_case are
+    split, and a key word matches the start of a longer word, so "random" finds
+    ``randomizeTeam`` and "remove" finds "removing"). A part that only asks the agent to tell the user something
+    ("explain", "list", "summarize") is still met by the reply. This catches a reply
+    that claims a part without the files showing it; it cannot tell a part built
+    wrongly from one built right.
     """
-    haystack = _keywords(reply or "") | _keywords(" ".join(PurePath(w).name for w in written))
+    names = " ".join(PurePath(w).name for w in written)
+    if evidence is None:
+        haystack = _keywords(reply or "") | _keywords(names)
+        open_items = []
+        for item in items:
+            words = _keywords(item)
+            if words and len(words & haystack) * 2 < len(words):
+                open_items.append(item)
+        return open_items
+    in_files = " " + _words_for_evidence(evidence + " " + names) + " "
+    reply_words = _keywords(reply or "")
     open_items = []
     for item in items:
         words = _keywords(item)
-        if words and len(words & haystack) * 2 < len(words):
+        if not words:
+            continue
+        if _COMMUNICATION.match(item):
+            found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
+        else:
+            found = sum(1 for w in words if (" " + _root(w)) in in_files)
+        if found * 2 < len(words):
             open_items.append(item)
     return open_items
 
@@ -504,8 +602,14 @@ def partial_files_nudge(paths: list[str]) -> Nudge:
         unmet=f"a file was cut off and not completed: {listed}")
 
 
-def subgoals_nudge(items: list[str]) -> Nudge:
+def subgoals_nudge(items: list[str], evidence: bool = False) -> Nudge:
     listed = "; ".join(f"({n}) {item}" for n, item in enumerate(items[:6], 1))
+    if evidence:
+        return Nudge("subgoals", continue_text(
+            f"These parts of the request do not show up in anything you wrote: {listed}.",
+            "Continue with those parts, or point to the file and function that already does each one. "
+            "If a part cannot be done, say so in your reply."),
+            unmet="parts of the request not found in the delivered files: " + "; ".join(items[:6]))
     return Nudge("subgoals", continue_text(
         f"Some parts of the request have not been addressed yet: {listed}.",
         "Continue with those parts. When a part is done, or cannot be done, say so in your reply."),
