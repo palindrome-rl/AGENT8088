@@ -11176,6 +11176,9 @@ def _parse_error_args(raw: str) -> dict:
         if pos is not None:
             args["__parse_error_at__"] = (f"{error.msg} at char {pos}, near "
                                           f"{raw[max(0, pos - 60):pos + 20]!r}")
+            # The text simply stops: the reply was cut short, nothing in it is quoted wrongly.
+            if "Unterminated string" in error.msg or pos >= len(raw.rstrip()):
+                args["__parse_error_cut_off__"] = True
     return args
 
 
@@ -18910,6 +18913,21 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 malformed_round = True
                 parse_error_retries += 1
                 where = args.get("__parse_error_at__")
+                if args.get("__parse_error_cut_off__"):
+                    # The arguments stop mid-way (a long file's content never arrived):
+                    # a reply that ran out, not a quoting mistake. Telling the model
+                    # to escape quotes sent it to rewrite the same call three times.
+                    messages.append(_harness_turn(
+                        f"The arguments for '{name}' arrived incomplete: they stop "
+                        f"({where}) with nothing after, so the reply was cut short. "
+                        "Quoting is not the problem; do not re-send the same call. "
+                        "Send a smaller one: for a long file, write the first part "
+                        "(about 4-6 KB) with write_file and add each further part with "
+                        "write_file mode=\"append\", in order."))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "tool_arg_cut_off",
+                                      "tool": name, "count": parse_error_retries})
+                    continue
                 messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON"
                     + (f" ({where})" if where else "") + ". Do not re-send the "
