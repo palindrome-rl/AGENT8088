@@ -93,3 +93,28 @@ def test_the_sh_installer_is_the_reference_and_still_has_its_stamp():
     sh = (ROOT / "install.sh").read_text(encoding="utf-8")
     assert ".agent8088-build-stamp" in sh
     assert "rev-parse HEAD:web" in sh
+
+def test_a_headless_run_stopped_by_the_cap_exits_nonzero_without_show_trace(tmp_path, monkeypatch):
+    """The incomplete flag travels in the trace, so a headless run must record
+    one even with show_trace off, or the end reason is "unknown" and exit is 0."""
+    from agent8088 import cli
+    task = tmp_path / "task.txt"
+    task.write_text("do the thing", encoding="utf-8")
+
+    def fake_do_chat(query):
+        # What do_chat leaves behind: a trace only if one was being collected.
+        cli.S.last_trace = ([{"type": "final_answer", "incomplete": True}]
+                            if cli.S.record_end_reason else None)
+
+    monkeypatch.setattr(cli, "do_chat", fake_do_chat)
+    monkeypatch.setattr(cli, "_save_trace_on_sigterm", lambda: None)
+    monkeypatch.setattr(cli, "_restore_sigterm", lambda prev: None)
+    monkeypatch.setattr(cli, "_flush_memory_capture", lambda: None)
+    monkeypatch.setattr(cli.A, "verify_sandbox_backend", lambda: None)
+    monkeypatch.setattr(cli, "_session_path", lambda name: tmp_path / f"{name}.json")
+    monkeypatch.setattr(cli, "SESSIONS_DIR", tmp_path)
+    monkeypatch.setattr(cli.S, "show_trace", False)
+    monkeypatch.setattr(cli.S, "record_end_reason", False)
+    monkeypatch.setattr(cli.S, "last_trace", None)  # restored afterwards
+
+    assert cli._run_prompt_file(str(task)) == 1

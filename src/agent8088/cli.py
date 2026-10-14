@@ -297,6 +297,10 @@ class Session:
         A.SHOW_REASONING = self.show_reasoning
         self.reasoning_full = False  # /reasoning full|collapse: print every line of each thought
         self.last_trace = None
+        # A headless run needs the in-memory trace to say how it ended, even with
+        # show_trace off; otherwise the end reason is unknown and a cap-stopped
+        # run exits 0.
+        self.record_end_reason = False
         self.conversation_trace = []
         self.trace_path = ""
         # The turn in progress while a trace export is open, so the export can
@@ -2419,7 +2423,7 @@ def do_chat(query):
     if S.show_trace and S.trace_path:
         trace = _start_live_turn(query)
     else:
-        trace = [] if S.show_trace else None
+        trace = [] if (S.show_trace or S.record_end_reason) else None
     reasoning_parts = []
     _last_thoughts.clear()  # /thoughts shows the latest turn's
     stream = _StreamFilter()
@@ -9747,6 +9751,7 @@ def _run_prompt_file(path: str) -> int:
             S.show_trace = False
             print(f"agent8088 --prompt-file: could not enable trace export: {exc}",
                   file=sys.stderr)
+    S.record_end_reason = True
     previous_sigterm = _save_trace_on_sigterm()
     try:
         do_chat(query)
