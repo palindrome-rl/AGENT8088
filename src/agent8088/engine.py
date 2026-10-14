@@ -13608,24 +13608,28 @@ def _salvage_cutoff_write(content: str, trajectory, turn: int, trace) -> str:
     filename, mode = call["filename"], call["mode"]
     if mode not in ("overwrite", "append") or filename.lower().endswith(".json"):
         return ""
-    if trajectory.salvaged_before(filename):
-        return ""
     args = {"filename": filename, "content": call["content"], "mode": mode}
+    try:
+        partial_path = str(resolve_write_path(filename).resolve())
+    except (ValueError, OSError):
+        return ""
+    if trajectory.salvaged_before(partial_path):
+        return ""
     existed = _write_target_existed("write_file", args)
     if existed and mode != "append":
         return ""
-    trajectory.mark_salvaged(filename)
     sequence_before = _MUTATION_SEQ
     operation = trajectory.before_tool("write_file")
     result = exec_tool("write_file", json.dumps(args))
     saved = isinstance(result, str) and result.startswith(("Wrote ", "Appended "))
     trajectory.after_tool(operation, result, failed=not saved, blocked=False,
                           mutated=saved and _MUTATION_SEQ != sequence_before,
-                          verdict="unknown", path=filename, existed=existed)
+                          verdict="unknown", path=filename, existed=existed, partial_path=partial_path)
     if not saved:
         return ""
+    trajectory.mark_salvaged(partial_path)
     size = len(call["content"].encode("utf-8"))
-    trajectory.note_partial(filename, size)
+    trajectory.note_partial(partial_path, size)
     if trace is not None:
         trace.append({"turn": turn, "type": "cutoff_write_salvaged", "path": filename,
                       "bytes": size, "mode": mode})
@@ -18990,6 +18994,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
+                                  if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                 )

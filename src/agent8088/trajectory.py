@@ -95,8 +95,11 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
-def _base_name(path: str) -> str:
-    return str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+def _file_key(path: str) -> str:
+    import os
+    import posixpath
+    key = posixpath.normpath(str(path).replace("\\", "/"))
+    return key.lower() if os.name == "nt" or (len(key) > 1 and key[1] == ":") else key
 
 
 def _blank(goal: str = "", workspace: str = "") -> dict:
@@ -197,7 +200,8 @@ class TrajectoryState:
 
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
-                   path: str = "", command: str = "", existed: bool = False) -> None:
+                   path: str = "", command: str = "", existed: bool = False,
+                   partial_path: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
@@ -215,9 +219,9 @@ class TrajectoryState:
         if (mutated and path and operation["status"] == "done"
                 and operation.get("tool") == "write_file" and self.data.get("partial_files")):
             # A later write to a file saved part-way is the continuation it was waiting for.
-            name = _base_name(path)
+            name = _file_key(partial_path or path)
             self.data["partial_files"] = [p for p in self.data["partial_files"]
-                                          if _base_name(p.get("path", "")) != name]
+                                          if p.get("key", _file_key(p.get("path", ""))) != name]
         if mutated and path and operation["status"] == "done":
             # Where the work actually landed. The answer quotes this, because a
             # run whose writes were redirected into the sandbox workspace reads
@@ -423,8 +427,8 @@ class TrajectoryState:
     def note_partial(self, path: str, size: int) -> None:
         """A file whose write was cut off and saved only up to its last whole line."""
         files = [p for p in self.data.setdefault("partial_files", [])
-                 if _base_name(p.get("path", "")) != _base_name(path)]
-        files.append({"path": _text(path), "bytes": int(size)})
+                 if p.get("key", _file_key(p.get("path", ""))) != _file_key(path)]
+        files.append({"path": _text(path), "key": _file_key(path), "bytes": int(size)})
         self.data["partial_files"] = files[-6:]
 
     def partial_files(self) -> list[str]:
@@ -432,12 +436,12 @@ class TrajectoryState:
 
     def salvaged_before(self, path: str) -> bool:
         """Was a cut-off write to this file already saved once this run?"""
-        return _base_name(path) in (self.data.get("salvaged_once") or [])
+        return _file_key(path) in (self.data.get("salvaged_once") or [])
 
     def mark_salvaged(self, path: str) -> None:
         done = self.data.setdefault("salvaged_once", [])
-        if _base_name(path) not in done:
-            done.append(_base_name(path))
+        if _file_key(path) not in done:
+            done.append(_file_key(path))
             del done[:-20]
 
     def progress_mark(self) -> tuple:
