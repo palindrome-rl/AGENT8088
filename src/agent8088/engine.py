@@ -559,6 +559,11 @@ COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds"
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
 COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
+# A request to build something that must follow real rules or data ("valid in X", "official",
+# "full roster") and names its subject, finished without a single lookup, gets one follow-up
+# asking the model to check its facts and name its sources. 0 turns it off.
+GROUNDING_CHECK = str(APP_CONFIG.get("grounding_check", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
 # Ceiling for the larger request a length cut-off earns (the retry otherwise
 # doubles the completion limit). 0 = no ceiling. A benchmark comparing agents
 # at one output limit sets it to that limit.
@@ -17991,7 +17996,7 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
 
 
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
-                           deliverables_due: bool = False):
+                           deliverables_due: bool = False, can_search: bool = False):
     """The first completion check a text reply fails, or None to accept it.
 
     Order: unfinished work admitted, named files missing, (benchmark) deliverables
@@ -18013,6 +18018,13 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             unmet="the reply says the work is unfinished")
     if nudge is None and depth == 0 and trajectory.partial_files():
         nudge = completion_checks.partial_files_nudge(trajectory.partial_files())
+    if (nudge is None and depth == 0 and GROUNDING_CHECK and can_search
+            and trajectory.mutation_count() and not trajectory.research_used()
+            and not trajectory.grounding_asked()):
+        subject = completion_checks.grounding_subject(request)
+        if subject:
+            trajectory.mark_grounding_asked()
+            nudge = completion_checks.grounding_nudge(subject)
     if nudge is None and depth == 0:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
@@ -18892,7 +18904,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     completion_budget, trajectory, reply=answer, request=request_text,
                     depth=depth,
                     deliverables_due=(DISPOSABLE_CONTAINER and not deliverables_checked
-                                      and bool(seen_signatures)))
+                                      and bool(seen_signatures)),
+                    can_search="web_search" in round_allowed_tools)
                 if nudge is not None:
                     if on_trajectory_state:
                         on_trajectory_state()
