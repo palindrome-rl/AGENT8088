@@ -17873,6 +17873,24 @@ def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
     return bool(trajectory.has_open_items() or promised)
 
 
+def _reply_hands_back(trajectory, reply: str, request: str) -> bool:
+    """The reply hands the work to the user AND the run shows it is not done.
+
+    The prompt already says to act on a tool's suggested action yourself, but
+    nothing stops a reply from ending the run with "please install Node and run
+    npm start" as if that finished the task. Wording alone is not proof: a
+    finished answer often ends with setup or usage instructions, and an advice
+    request wants exactly those, so both gates must pass.
+    """
+    if not completion_checks.hands_work_back(reply):
+        return False
+    if completion_checks.is_advice_request(request):
+        return False
+    work_due = (bool(_CHANGE_REQUEST.search(request))
+                and not trajectory.mutation_count())
+    return bool(trajectory.has_open_items() or work_due)
+
+
 def _missing_required_files(trajectory, reply: str, request: str) -> list:
     return completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
@@ -17895,6 +17913,8 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
+    if depth == 0 and _reply_hands_back(trajectory, reply, request):
+        reasons.append("the reply hands the work back to the user")
     if depth == 0 and trajectory.partial_files():
         reasons.append("a file was cut off and not completed: "
                        + ", ".join(trajectory.partial_files()[:4]))
@@ -17971,6 +17991,15 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         if (completion_checks.project_has_tests(PROJECT_ROOT)
                 and trajectory.request_tests(relevant)):
             nudge = completion_checks.tests_nudge(trajectory.relevant_untested(relevant))
+    if nudge is None and depth == 0 and _reply_hands_back(trajectory, reply, request):
+        nudge = completion_checks.Nudge(
+            "hands_back",
+            completion_checks.continue_text(
+                "Your reply hands a step back to the user that your own tools can do.",
+                "Continue: do that install, setup or run step yourself now, then reply. "
+                "Ask the user only for what only they can do; if you are blocked, "
+                "say exactly what is missing."),
+            unmet="the reply hands the work back to the user instead of doing it")
     if nudge is None:
         return None
     if budget.spend(mark, nudge.unmet):
