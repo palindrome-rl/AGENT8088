@@ -6,8 +6,11 @@ other host are intercepted and aborted, so untrusted page code cannot reach the
 network, and nothing here loosens the SSRF rules or the browse_page gating. The
 page fails the check on a page error, a console error from its own code, a
 missing or failing own-origin asset, a first control that an overlay blocks, or a
-first control whose click changes nothing. A request to an external host
-(hotlinked fonts, images, CDN scripts) is only a warning.
+first control whose click changes nothing. After that first click it keeps
+clicking the next visible controls (a bounded number, a bounded time) and fails on
+any page error those clicks raise, so a screen that only breaks on the third click
+is found too. A request to an external host (hotlinked fonts, images, CDN scripts)
+is only a warning.
 
 A script must compile (Python) or parse (Node). When a read-only sandbox runner
 is supplied it also gets a brief startup check there. Without Chromium the page
@@ -35,6 +38,7 @@ WEB_SUFFIXES = frozenset({".html", ".htm"})
 PYTHON_SUFFIXES = frozenset({".py"})
 NODE_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
 DEFAULT_TIMEOUT = 20.0
+CLICK_THROUGH_STEPS = 12   # further controls clicked after the first; 0 = only the first
 MAX_ITEMS = 5
 MAX_REPORT_CHARS = 1800
 
@@ -206,6 +210,38 @@ _FIRST_CONTROL_JS = """() => {
           blocked: !(top && (top === el || el.contains(top))), blocker: name(top)};
 }"""
 
+# The next visible, unblocked control not clicked yet. Outermost elements only (a card and
+# every child that inherits its pointer cursor are one control), and controls that lead
+# away from the work (back, quit, close, reset, delete) come last so a click-through
+# gets deeper before it backs out.
+_NEXT_CONTROL_JS = """(seen) => {
+  const selector = 'button, input[type=button], input[type=submit], [role=button], [onclick], summary, a[href^="#"], [tabindex]:not([tabindex="-1"])';
+  const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && !el.disabled;
+  };
+  const candidates = [...document.querySelectorAll('body *')].slice(0, 3000)
+    .filter(el => visible(el) && (el.matches(selector) || getComputedStyle(el).cursor === 'pointer'));
+  const set = new Set(candidates);
+  const outer = candidates.filter(el => { for (let p = el.parentElement; p; p = p.parentElement) if (set.has(p)) return false; return true; });
+  const away = /\\b(back|quit|exit|forfeit|close|cancel|reset|clear|delete|remove all|new teams?)\\b/i;
+  const info = el => {
+    el.scrollIntoView({block: 'center', inline: 'center'});
+    const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const top = document.elementFromPoint(x, y);
+    const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+    const name = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')
+      + (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/)[0] : '');
+    return {x, y, text, label: name, sig: name + '|' + text + '|' + Math.round(x / 40) + ',' + Math.round(y / 40),
+            blocked: !(top && (top === el || el.contains(top)))};
+  };
+  const fresh = outer.map(info).filter(i => !seen.includes(i.sig));
+  const open = fresh.filter(i => !i.blocked);
+  const first = open.find(i => !away.test(i.text)) || open[0];
+  if (first) return first;
+  return fresh.length ? {sig: fresh[0].sig, skipped: true} : null;
+}"""
+
 _STATE_JS = """() => {
   const h = s => { let a = 0; for (let i = 0; i < s.length; i++) a = (a * 31 + s.charCodeAt(i)) | 0; return a; };
   const canvases = [...document.querySelectorAll('canvas')].map(c => { try { return h(c.toDataURL()); } catch (e) { return 'x'; } });
@@ -219,7 +255,45 @@ _EXTERNAL_SYMPTOM = re.compile(
     r"Failed to load resource|\$ is not|jQuery", re.IGNORECASE)
 
 
-def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
+def _click_through(tab, steps: int, budget: float, failures: list, seen: list) -> int:
+    """Click up to ``steps`` further controls; returns how many were clicked.
+
+    Stops when the page leaves its own address, when no new control is visible, or when
+    the time budget is spent. A page error raised by a click is annotated with the
+    control that caused it. Whatever the clicks break is collected by the page's own
+    error listeners, so this only drives the page.
+    """
+    deadline = time.monotonic() + budget
+    start = tab.url.split("#")[0]
+    clicked = 0
+    while clicked < steps and time.monotonic() < deadline:
+        try:
+            nxt = tab.evaluate(_NEXT_CONTROL_JS, seen)
+        except Exception:  # noqa: BLE001 -- the page navigated or closed
+            break
+        if not nxt:
+            break
+        seen.append(nxt["sig"])
+        if nxt.get("skipped"):
+            continue   # covered by something else; not a control to click
+        known = len(failures)
+        try:
+            tab.mouse.click(nxt["x"], nxt["y"])
+            tab.wait_for_timeout(150)
+        except Exception:  # noqa: BLE001
+            break
+        clicked += 1
+        cause = f" (after clicking {nxt['label']}" + (f" \"{nxt['text']}\"" if nxt["text"] else "") + ")"
+        for i in range(known, len(failures)):
+            if failures[i].startswith(("page error", "console error")):
+                failures[i] += cause
+        if tab.url.split("#")[0] != start:
+            break
+    return clicked
+
+
+def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
+                click_steps: int = CLICK_THROUGH_STEPS) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
@@ -327,6 +401,10 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                             f"clicking the first control ({control['label']}"
                             + (f" \"{control['text']}\"" if control['text'] else "")
                             + ") changed nothing on the page")
+                    if after is not None and click_steps > 0:
+                        _click_through(tab, click_steps, min(timeout * 0.5, 12.0), failures,
+                                       [f"{control['label']}|{control['text']}|"
+                                        f"{round(control['x'] / 40)},{round(control['y'] / 40)}"])
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -390,7 +468,8 @@ def _abandon(out: dict, started: float) -> None:
 
 
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
-                   deny: Callable[[str], bool] | None = None) -> Report:
+                   deny: Callable[[str], bool] | None = None,
+                   click_steps: int | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
         return Report("web", str(path), FAIL, ["the file does not exist"])
@@ -402,7 +481,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     root = serve_root(path)
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
     started = time.time()
-    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out),
+    steps = CLICK_THROUGH_STEPS if click_steps is None else max(0, click_steps)
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)
@@ -495,17 +575,18 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
 
 def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
                  deny: Callable[[str], bool] | None = None,
-                 run: Callable[[str, int], str] | None = None) -> Report:
+                 run: Callable[[str, int], str] | None = None,
+                 click_steps: int | None = None) -> Report:
     """Pick the check from what the path is: a page, a folder with an index page, a script."""
     path = Path(path)
     if path.is_dir():
         for name in ("index.html", "index.htm"):
             if (path / name).is_file():
-                return check_web_page(path / name, timeout, deny)
+                return check_web_page(path / name, timeout, deny, click_steps)
         return Report("web", str(path), SKIPPED, note="no index.html in this folder")
     suffix = path.suffix.lower()
     if suffix in WEB_SUFFIXES:
-        return check_web_page(path, timeout, deny)
+        return check_web_page(path, timeout, deny, click_steps)
     if suffix in PYTHON_SUFFIXES | NODE_SUFFIXES:
         return check_script(path, run)
     return Report("script", str(path), SKIPPED, note="not a page or script")
