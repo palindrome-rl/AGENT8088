@@ -540,6 +540,13 @@ REWRITE_NUDGE_AFTER = 4
 # them; a follow-up that makes progress hands its slot back. 0 turns the checks off.
 MAX_COMPLETION_CONTINUATIONS = max(0, _config_int(
     "max_completion_continuations", completion_checks.DEFAULT_CONTINUATIONS))
+# The parts of a request are checked against what the run delivered. With this on, a
+# paragraph that states three or more requirements builds a checklist too, and a part
+# that asks for something to be built counts as done only when the delivered files show
+# it, not when the reply says so. 0 restores the reply-only check and the list-only
+# checklist.
+REQUIREMENT_EVIDENCE = str(APP_CONFIG.get("requirement_evidence", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
 # The smoke test of what a run built (a web page loaded in headless Chromium, a
 # script syntax-checked), run before the reply is accepted. `report` shows the
 # result in the answer and never blocks; `enforce` also asks the model to fix a
@@ -17911,6 +17918,14 @@ def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
     return bool(trajectory.has_open_items() or promised)
 
 
+def _delivered_evidence(written) -> str | None:
+    """The text of the files this run wrote, or None when the check is off or nothing is readable."""
+    if not REQUIREMENT_EVIDENCE or not written:
+        return None
+    text = completion_checks.deliverable_text(written, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()])
+    return text or None
+
+
 def _missing_required_files(trajectory, reply: str, request: str) -> list:
     return completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
@@ -17949,7 +17964,8 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         pending = trajectory.open_subgoals()
         if pending:
             unaddressed = completion_checks.unaddressed_subgoals(
-                pending, reply, trajectory.written_paths())
+                pending, reply, trajectory.written_paths(),
+                evidence=_delivered_evidence(trajectory.written_paths()))
             # What the reply did cover is done; the rest stays open and is listed by
             # _with_task_notes as "Not completed: ...", so it is not repeated here.
             trajectory.mark_subgoals(unaddressed)
@@ -17995,13 +18011,16 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                                         unmet="the deliverables re-check was not completed")
     if nudge is None and depth == 0:
         if not trajectory.subgoals_built():
-            trajectory.set_subgoals(completion_checks.extract_subgoals(request))
+            trajectory.set_subgoals(
+                completion_checks.extract_subgoals(request, sentences=REQUIREMENT_EVIDENCE))
         pending = trajectory.open_subgoals()
         if pending:
-            open_items = completion_checks.unaddressed_subgoals(pending, reply, written)
+            evidence = _delivered_evidence(written)
+            open_items = completion_checks.unaddressed_subgoals(
+                pending, reply, written, evidence=evidence)
             trajectory.mark_subgoals(open_items)
             if open_items:
-                nudge = completion_checks.subgoals_nudge(open_items)
+                nudge = completion_checks.subgoals_nudge(open_items, evidence=evidence is not None)
     if nudge is None and trajectory.request_verification():
         nudge = completion_checks.Nudge(
             "verify",
