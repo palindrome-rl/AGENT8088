@@ -17734,7 +17734,10 @@ def _redirected_write_locations(trajectory) -> list[str]:
     if trajectory is None or ARTIFACTS_ROOT == PROJECT_ROOT:
         return []
     artifacts, seen = str(ARTIFACTS_ROOT), []
-    for raw in trajectory.written_paths():
+    # Landed paths, not the requested ones: a bare filename is recorded as written
+    # by its name alone, whose parent is "." and never looks redirected.
+    landed = [*trajectory.written_paths(), *(p for _, p in trajectory.redirected_writes())]
+    for raw in landed:
         try:
             parent = str(Path(raw).parent)
         except (OSError, ValueError):
@@ -17742,6 +17745,74 @@ def _redirected_write_locations(trajectory) -> list[str]:
         if (parent == artifacts or parent.startswith(artifacts + os.sep)) and parent not in seen:
             seen.append(parent)
     return seen
+
+
+def _write_landing(name: str, args: dict) -> str:
+    """Where a write_file was actually stored when the sandbox moved it, else "".
+
+    Only a write that landed under ARTIFACTS_ROOT counts: anything else was written
+    where it was asked for and has nothing to mirror.
+    """
+    if name != "write_file" or not args.get("filename"):
+        return ""
+    try:
+        landed = resolve_write_path(str(args["filename"]))
+    except (ValueError, OSError):
+        return ""
+    return str(landed) if ARTIFACTS_ROOT in landed.parents else ""
+
+
+def _mirror_redirected_writes(trajectory) -> str:
+    """Copy each diverted file back to the path the person named, or return "".
+
+    A write to a bare or invented path lands in artifacts/, so the path the user
+    asked for holds nothing and a grader looking there finds nothing. The copy is
+    made only when the person's own message names that exact path: an unnamed
+    path is the agent's invention, and it stays in artifacts/. The copy is created
+    exclusively, so an existing file there is never overwritten, and the artifacts
+    copy is kept. Any failure is reported in the note and never raised; the
+    workspace disclosure still names where the file really is.
+    """
+    if trajectory is None or ARTIFACTS_ROOT == PROJECT_ROOT:
+        return ""
+    mirrored, failed = [], []
+    for requested_raw, landed_raw in trajectory.redirected_writes():
+        requested = Path(_from_container_path(requested_raw)).expanduser()
+        try:
+            if not requested.is_absolute():
+                requested = PROJECT_ROOT / requested
+            requested = requested.resolve()
+            if (ARTIFACTS_ROOT in requested.parents or requested == ARTIFACTS_ROOT
+                    or not _user_named_path(str(requested), requested)
+                    or not _path_is_allowed(requested) or _is_sensitive_path(str(requested))
+                    or _is_shell_startup_file(str(requested))
+                    or _check_path_zone(requested) == "blocked"):
+                continue
+            created = False
+            try:
+                requested.parent.mkdir(parents=True, exist_ok=True)
+                with open(landed_raw, "rb") as src, open(requested, "xb") as dst:
+                    created = True
+                    shutil.copyfileobj(src, dst)
+                mirrored.append(str(requested))
+            except FileExistsError:
+                continue  # the user's own file is already there: leave it alone
+            except OSError:
+                if created:
+                    try:
+                        requested.unlink()  # drop a partial copy we just made
+                    except OSError:
+                        pass
+                failed.append(str(requested))
+        except (OSError, ValueError):
+            failed.append(requested_raw)
+    parts = []
+    if mirrored:
+        parts.append("Also copied to the path you named: " + ", ".join(mirrored[:3]) + ".")
+    if failed:
+        parts.append("Could not copy to the path you named: " + ", ".join(failed[:3])
+                     + "; the file is only in the sandbox workspace.")
+    return " ".join(parts)
 
 
 def _workspace_note(trajectory) -> str:
@@ -17995,6 +18066,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
                      "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
         notes.append(CHECKS_FAILED_NOTE)
+    if mirror_note := _mirror_redirected_writes(trajectory):
+        notes.append(mirror_note)
     if location_note := _workspace_note(trajectory):
         notes.append(location_note)
     for note in notes:
@@ -19081,6 +19154,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
+                    written_to=_write_landing(name, args),
                 )
                 if on_trajectory_state:
                     on_trajectory_state()
