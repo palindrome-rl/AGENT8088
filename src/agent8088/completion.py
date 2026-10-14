@@ -466,6 +466,14 @@ def outputs_nudge(missing: list[str]) -> Nudge:
         unmet=f"missing or empty files: {listed}")
 
 
+def partial_files_nudge(paths: list[str]) -> Nudge:
+    listed = ", ".join(paths[:4])
+    return Nudge("partial_file", continue_text(
+        f"{listed} was cut off while being written and holds only the part that was saved.",
+        'Continue: add the rest with write_file mode="append", then check the whole file.'),
+        unmet=f"a file was cut off and not completed: {listed}")
+
+
 def subgoals_nudge(items: list[str]) -> Nudge:
     listed = "; ".join(f"({n}) {item}" for n, item in enumerate(items[:6], 1))
     return Nudge("subgoals", continue_text(

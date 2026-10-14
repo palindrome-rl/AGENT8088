@@ -575,6 +575,13 @@ ADAPTIVE_COMPLETION_CAP = str(APP_CONFIG.get("adaptive_completion_cap", "1")).st
     "1", "true", "yes", "on")
 ADAPTIVE_CAP_MIN_SAMPLES = 3
 ADAPTIVE_CAP_WINDOW = 5
+# A text write_file call cut off mid-content loses everything the model had written. With
+# this on, the content up to its last whole line is saved when that is safe (a new file, or
+# an append), the file is marked unfinished so the run cannot end on it, and the retry asks
+# for the rest with mode="append". 0 keeps the discard-and-retry behaviour.
+SALVAGE_CUTOFF_WRITES = str(APP_CONFIG.get("salvage_cutoff_writes", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+SALVAGE_MIN_CHARS = 1000
 # The largest cap a cut-off tool call (a file being written) may earn on its retry.
 # Doubling alone would climb to the provider's whole limit; 0 = no ceiling beyond it.
 WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
@@ -13532,6 +13539,130 @@ _NO_DRAFTING_HINT = (
     "further part with mode=\"append\".")
 
 
+_PARTIAL_WRITE_CALL = re.compile(r"✿FUNCTION✿:\s*write_file\s*✿ARGS✿:\s*")
+_JSON_SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+                        "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _decode_open_json_string(text: str):
+    """Decode a JSON string whose opening quote is just before text[0].
+
+    Returns (value, closed). A string cut off mid-way gives what arrived, without a
+    trailing half escape.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            return "".join(out), True
+        if ch == "\\":
+            if i + 1 >= n:
+                break
+            nxt = text[i + 1]
+            if nxt in _JSON_SIMPLE_ESCAPES:
+                out.append(_JSON_SIMPLE_ESCAPES[nxt])
+                i += 2
+                continue
+            if nxt == "u" and len(text[i + 2:i + 6]) == 4:
+                try:
+                    code = int(text[i + 2:i + 6], 16)
+                except ValueError:
+                    break
+                if 0xD800 <= code <= 0xDFFF:
+                    break
+                out.append(chr(code))
+                i += 6
+                continue
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out), False
+
+
+def _truncated_write_call(content: str):
+    """The write_file call a cut-off reply was in the middle of, or None.
+
+    Returns {"filename", "mode", "content"}: the arguments that had arrived, with the
+    content cut back to its last whole line. None when the call is not a write_file,
+    its filename had not arrived, its content had already finished (so the cut-off came
+    after it), or too little of it arrived to be worth saving.
+    """
+    matches = list(_PARTIAL_WRITE_CALL.finditer(content or ""))
+    if not matches:
+        return None
+    body = content[matches[-1].end():]
+    key = re.search(r'"content"\s*:\s*"', body)
+    if not key:
+        return None
+    head = body[:key.start()]
+    name = re.search(r'"filename"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+    if not name:
+        return None
+    mode = re.search(r'"mode"\s*:\s*"(\w+)"', head)
+    value, closed = _decode_open_json_string(body[key.end():])
+    if closed:
+        return None
+    cut = value.rfind("\n") + 1
+    kept = value[:cut]
+    if len(kept) < SALVAGE_MIN_CHARS:
+        return None
+    try:
+        filename = json.loads('"' + name.group(1) + '"')
+    except ValueError:
+        return None
+    return {"filename": filename, "mode": (mode.group(1) if mode else "overwrite"), "content": kept}
+
+
+def _salvage_cutoff_write(content: str, trajectory, turn: int, trace) -> str:
+    """Save what a cut-off write_file call had written; returns the retry instruction or "".
+
+    Only where saving is safe: the path is new, or the call was an append (one part of a
+    file written in parts). A whole-file overwrite of an existing file is left alone,
+    and so is a .json file, which is invalid until it is complete. Once per file. The
+    write goes through exec_tool, so every guard a normal write has still applies.
+    """
+    if not SALVAGE_CUTOFF_WRITES or trajectory is None:
+        return ""
+    call = _truncated_write_call(content)
+    if call is None:
+        return ""
+    filename, mode = call["filename"], call["mode"]
+    if mode not in ("overwrite", "append") or filename.lower().endswith(".json"):
+        return ""
+    args = {"filename": filename, "content": call["content"], "mode": mode}
+    try:
+        partial_path = str(resolve_write_path(filename).resolve())
+    except (ValueError, OSError):
+        return ""
+    if trajectory.salvaged_before(partial_path):
+        return ""
+    existed = _write_target_existed("write_file", args)
+    if existed and mode != "append":
+        return ""
+    sequence_before = _MUTATION_SEQ
+    operation = trajectory.before_tool("write_file")
+    result = exec_tool("write_file", json.dumps(args))
+    saved = isinstance(result, str) and result.startswith(("Wrote ", "Appended "))
+    trajectory.after_tool(operation, result, failed=not saved, blocked=False,
+                          mutated=saved and _MUTATION_SEQ != sequence_before,
+                          verdict="unknown", path=filename, existed=existed, partial_path=partial_path)
+    if not saved:
+        return ""
+    trajectory.mark_salvaged(partial_path)
+    size = len(call["content"].encode("utf-8"))
+    trajectory.note_partial(partial_path, size)
+    if trace is not None:
+        trace.append({"turn": turn, "type": "cutoff_write_salvaged", "path": filename,
+                      "bytes": size, "mode": mode})
+    lines = call["content"].splitlines()
+    tail = "\n".join(line[:120] for line in lines[-3:])
+    return (f"The reply was cut off while writing {filename}. The first {len(lines)} lines "
+            f"({size} bytes) were saved and the rest was discarded. The file now ends with:\n"
+            f"{tail}\n"
+            f'Continue it with write_file mode="append", starting right after that last line; '
+            "do not resend what is saved. Write the next part in a few KB, not the whole rest.")
+
+
 def _has_partial_native_call(message) -> bool:
     """A native tool call was still streaming when the output ran out.
 
@@ -17747,6 +17878,9 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
+    if depth == 0 and trajectory.partial_files():
+        reasons.append("a file was cut off and not completed: "
+                       + ", ".join(trajectory.partial_files()[:4]))
     if depth == 0:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
@@ -17785,6 +17919,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             completion_checks.continue_text(
                 "Your reply says the work is not finished.", completion_checks.UNFINISHED_ASK),
             unmet="the reply says the work is unfinished")
+    if nudge is None and depth == 0 and trajectory.partial_files():
+        nudge = completion_checks.partial_files_nudge(trajectory.partial_files())
     if nudge is None and depth == 0:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
@@ -18480,6 +18616,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     "final answer. Do not include analysis or thinking.")
             if thinking_off_retry and length_retries == 1:
                 retry_instruction += " Call one tool or answer right away."
+            salvage_note = _salvage_cutoff_write(content, trajectory, turn, trace)
+            if salvage_note:
+                retry_instruction = f"{warning} {salvage_note}"
             messages.append(_harness_turn(retry_instruction))
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
@@ -18938,6 +19077,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
                     path=str(args.get("filename") or ""),
+                    partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
+                                  if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                 )
