@@ -218,7 +218,37 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
         if name.lower() in lowered and not _exists_somewhere(path, roots + mirrors) and path not in missing:
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
+    missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
     return missing
+
+
+# A test file is named in the reply but was never written. Narrow on purpose:
+# only conventional test filenames, because any reply mentioning any filename
+# would otherwise trip this and a check that fires on ordinary prose is worse
+# than no check at all.
+_TEST_FILE_RE = re.compile(
+    r"(?<![\w/.-])((?:[\w.-]+[\\/])*(?:test[_-][\w.-]+|[\w.-]+[_-]test|"
+    r"[\w.-]+\.(?:spec|test)\.[a-z]{2,5}))(?![\w.-])", re.IGNORECASE)
+
+
+def _claimed_but_unwritten(lowered_reply: str, written, search_roots) -> list[str]:
+    """Test files the answer claims but that are nowhere on disk.
+
+    missing_outputs already covers files this run wrote and then lost; this
+    covers the opposite order - the model asserts a test exists that it never
+    created, which is how "I added three tests" reaches the user as fact.
+    """
+    known = {PurePath(str(p).replace("\\", "/")).name.lower() for p in written}
+    out: list[str] = []
+    for match in _TEST_FILE_RE.finditer(lowered_reply):
+        name = match.group(1)
+        base = PurePath(name.replace("\\", "/")).name
+        if base in known or base in out:
+            continue
+        if any(_nonempty_file(c) for c in _candidates(name, search_roots)):
+            continue
+        out.append(base)
+    return out
 
 
 def _exists_somewhere(path: str, roots: Iterable[Path]) -> bool:

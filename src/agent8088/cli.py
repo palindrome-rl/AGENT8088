@@ -9714,14 +9714,24 @@ def _run_gateway_setup():
         print("No platform enabled. Run: agent8088 --gateway-setup")
 
 
-def _run_prompt_file(path: str) -> int:
+def _run_prompt_file(path: str, resume: str = None) -> int:
     """One headless turn with the whole file as the query, then exit.
 
     Piped stdin is read one line per turn, so a multi-line task instruction
     arrived as several turns, and a line such as `reset` or `/help` ran as a
     command. An evaluation harness hands over one instruction; this delivers
     it intact. Nobody is at the terminal, so the run is full-auto.
+
+    The turn is saved under a session name, and `--resume <name>` loads that
+    session before running, so a run that died halfway can be picked up
+    rather than restarted. Previously nothing was written and no flag
+    existed, so a failed headless run was unrecoverable.
     """
+    if resume:
+        # cmd_resume owns loading a session and printing why it could not.
+        cmd_resume(resume)
+        if S.name != resume:
+            return 2
     try:
         query = Path(path).read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -9731,6 +9741,11 @@ def _run_prompt_file(path: str) -> int:
         print("agent8088 --prompt-file: the file is empty", file=sys.stderr)
         return 2
     A.PERMISSION_MODE = "full-auto"
+    # Saved so --resume has something to load. cmd_resume names the session
+    # itself; without it this run would claim a name and leave nothing to
+    # come back to.
+    if not resume:
+        S.autosave = True
     # Inside a disposable task container the container is the sandbox and
     # execute_shell runs on it directly; probing native/Docker would only
     # announce a backend the run never uses.
@@ -9901,7 +9916,10 @@ def main():
                         help="with --logs: emit raw JSONL instead of human format")
     parser.add_argument("--prompt-file", default=None, metavar="PATH",
                         help="run one headless turn with this file's full text, then exit "
-                             "(for evaluation harnesses; implies full-auto)")
+                             "(for evaluation harnesses; implies full-auto; the turn is saved "
+                             "under a session name so --resume can continue it)")
+    parser.add_argument("--resume", default=None, metavar="NAME",
+                        help="with --prompt-file: load this saved session first and continue it")
     args = parser.parse_args()
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
@@ -9948,8 +9966,11 @@ def main():
         return 0 if A.native_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
+    if args.resume and not args.prompt_file:
+        print("agent8088: --resume is only meaningful with --prompt-file", file=sys.stderr)
+        return 2
     if args.prompt_file:
-        return _run_prompt_file(args.prompt_file)
+        return _run_prompt_file(args.prompt_file, args.resume)
     # Resolve web_search_provider=auto once, here: every path below this line
     # (gateway, MCP server, REPL) can search, and every path above it exits
     # without searching, so a setup or uninstall run never pays for the probe.

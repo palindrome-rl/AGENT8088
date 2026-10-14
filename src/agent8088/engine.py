@@ -7661,6 +7661,16 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
         return ("Plan not approved: this session has no way to ask the user "
                 "(non-interactive). Nothing was written or run. Report the plan "
                 "to the user as your answer instead.")
+    # The plan was chat text and nothing else: it existed only until the
+    # transcript scrolled away, so an approved plan had no file behind it and
+    # a teammate had nothing to read. Written before the approval prompt, so
+    # it is on disk whether the plan is approved, revised or rejected.
+    plan_path = PROJECT_ROOT / "PLAN.md"
+    try:
+        plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not write %s: %s", plan_path, exc)
+        plan_path = None
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
     if not chosen:
@@ -7677,6 +7687,8 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
         message += (" Every mutating step will be verified against the real environment "
                     "by a read-only auditor, and a step that fails verification is put "
                     "back — so make each one do exactly what the plan said.")
+    if plan_path is not None:
+        message += f" The plan is also saved at {plan_path}."
     return message
 
 

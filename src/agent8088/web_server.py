@@ -2637,6 +2637,16 @@ def _record_turn_trace(C, S, query, trace, elapsed, interrupted=False):
         "interrupted": interrupted,
         "usage": C.A.turn_usage(),
     })
+    # A web turn used to leave no trace file at all: the writer below was live
+    # but S.trace_path was initialised to "" and nothing ever set it, so a web
+    # run's trace lived in memory only and died with the server. Give the chat
+    # the same default path the CLI uses, once, so each turn overwrites one
+    # accumulating file instead of making a fresh one per turn.
+    if not S.trace_path:
+        try:
+            S.trace_path = str(C._default_trace_path())
+        except OSError as exc:
+            log.warning("could not open a web trace export: %s", exc)
     if S.trace_path:
         try:
             C._write_private_text(S.trace_path, json.dumps({
