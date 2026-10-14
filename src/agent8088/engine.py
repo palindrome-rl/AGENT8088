@@ -17755,6 +17755,11 @@ POST_CHECK_FAILED_NUDGE = (
 )
 CHECKS_FAILED_NOTE = ("Incomplete: the latest automated check failed and was not "
                       "fixed. Treat the result as unfinished.")
+# A reply that ends the work while the latest automated check (tests, an audit) is still
+# failing used to get only a note at the end. With this on it gets up to two follow-ups
+# per request, each naming the failing command: fix it, or say plainly that it still fails.
+FAILING_CHECK_FOLLOW_UP = str(APP_CONFIG.get("failing_check_follow_up", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
 
 
 def _redirected_write_locations(trajectory) -> list[str]:
@@ -18031,6 +18036,9 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                 completion_checks.verify_ask(
                     trajectory.written_paths(), completion_checks.project_has_tests(PROJECT_ROOT))),
             unmet="changed work has no passing check")
+    if (nudge is None and depth == 0 and FAILING_CHECK_FOLLOW_UP
+            and trajectory.request_failing_follow_up()):
+        nudge = completion_checks.failing_check_nudge(trajectory.failing_check_detail(), reply)
     if nudge is None and not DISPOSABLE_CONTAINER and not trajectory.smoke_failures():
         temp_dir, project = tempfile.gettempdir(), str(PROJECT_ROOT)
         # The system temp dir is scratch space, unless the project itself lives there.
