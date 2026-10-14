@@ -16,6 +16,7 @@ MAX_EVIDENCE = 6
 
 MAX_WRITTEN = 50
 MAX_UNTESTED = 8
+MAX_FAILING_NUDGES = 2   # follow-ups per request about a check that is still failing
 MAX_VERIFICATION_REQUESTS = 2
 
 # Suffixes worth a test. Config, data, docs and markup are excluded because a
@@ -123,6 +124,8 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "tests_requested": False,
         "passed_checks": 0,
         "check_failing": False,
+        "failing_check": "",
+        "failing_nudges": 0,
         "subgoals_built": False,
         "unmet_checks": [],
         "partial_files": [],
@@ -179,6 +182,7 @@ class TrajectoryState:
             self.data["verification_requests"] = 0
             self.data["unmet_checks"] = []
             self.data["smoke_failures"] = 0
+            self.data["failing_nudges"] = 0
             # The old request's parts and smoke notes describe work the person
             # has moved on from: carrying them over nudges the new request about
             # the old one and stamps stale notes on its answer.
@@ -236,8 +240,11 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["verdict"] == "failed":
             self.data["check_failing"] = True
+            what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
+            self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
+            self.data["failing_check"] = ""
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self._set_step("Complete the requested work", "done")
@@ -495,6 +502,20 @@ class TrajectoryState:
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
         return bool(self.data.get("check_failing"))
+
+    def failing_check_detail(self) -> str:
+        """The command (or tool) of the latest failing check and how it failed, shortened."""
+        return str(self.data.get("failing_check") or "")
+
+    def request_failing_follow_up(self) -> bool:
+        """Ask once per failure (at most MAX_FAILING_NUDGES a request) to fix or disclose it."""
+        detail = self.failing_check_detail()
+        if (not self.check_failing() or not detail or detail == self.data.get("failing_nudged_for")
+                or int(self.data.get("failing_nudges") or 0) >= MAX_FAILING_NUDGES):
+            return False
+        self.data["failing_nudged_for"] = detail
+        self.data["failing_nudges"] = int(self.data.get("failing_nudges") or 0) + 1
+        return True
 
     def request_verification(self) -> bool:
         # Each write re-arms the reminder, and a model that answers it by
