@@ -215,6 +215,12 @@ sandbox_runtime_version=0.0.73
 # Files larger than this are not snapshotted, so they are not reverted — the plan
 # output says so rather than implying otherwise.
 # plan_audit_revert_max_bytes=1048576
+# A small model’s "fail" verdicts are often wrong, and a wrong one destroys
+# correct work. With this on, an unconfirmed fail costs one more independent
+# auditor sample and only reverts when that one fails too; when the two
+# disagree the result is inconclusive and the change is left in place.
+# Turning it off restores the old behaviour: one fail reverts.
+# plan_audit_confirm_fail=1
 
 # --- persistent memory ---
 # On by default. With memory=1 the agent does two extra things per turn:

@@ -171,13 +171,31 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `calc`, `eval`, `math` | `calculate` |
 | `last`, `prev_output` | `last_output` |
 
+## Backups of overwritten files
+
+Before the first change to a file that already exists (`write_file`, `edit_file`,
+a downloaded file, an Office document), its original bytes are copied to
+`<data dir>/backups/<session>/` (`%LOCALAPPDATA%\agent8088` on Windows,
+`~/.agent8088` elsewhere). Each session folder has an `index.jsonl` listing the
+original path, the backup path, size and time. To undo a bad overwrite, copy the
+backup back over the file. It is once per file per session, so the copy is the
+file as it was when the session first touched it.
+
+This is invisible to the model: the tool result is unchanged, so it costs no
+tokens and nothing for the model to act on. New files get no backup. A file over
+`file_backup_max_file_mb` (10) is skipped, a session stops at `file_backup_max_mb`
+(200) in total, and session folders older than `file_backup_keep_days` (14) are
+deleted. A failed backup is logged and never blocks the write. It is off in a
+disposable container, and `file_backups=0` turns it off.
+
 ## `check_app`
 
 A deterministic smoke test of something the agent built; no model call.
 
 - **Web page** (`.html`, or a folder with `index.html`): loaded in headless
   Chromium from a throwaway static server on `127.0.0.1` that serves only the
-  page's own folder (no folder listings, no credential files, GET only). Every
+  page's folder, or the ancestor needed by its relative asset links (no folder
+  listings, no credential files, GET only). Every
   request to another host is aborted, so page code cannot reach the network; the
   SSRF rules and `browse_page` gating are not involved or loosened.
 - **Fails on:** an uncaught page error, a console error from the page's own code,
@@ -186,8 +204,13 @@ A deterministic smoke test of something the agent built; no model call.
   canvas pixels and form values are compared).
 - **Only warns on:** blocked requests to external hosts (hotlinked fonts, images,
   CDN scripts) and a page with no control to click.
+- A JavaScript dependency error alongside a blocked CDN script is inconclusive
+  (`unavailable`), not a pass. Blocked fonts/images never excuse local script errors.
+  Timed-out checks stop only their own marked browser process tree.
 - **Script** (`.py`, `.js`/`.mjs`/`.cjs`): syntax-checked (`compile`, `node
-  --check`); never executed.
+  --check`). Scripts inside the artifact workspace also get a brief `--help`
+  startup check in a disposable read-only sandbox when available. Without that
+  sandbox the result explicitly says it was not executed.
 - Without Chromium (`playwright install chromium`) it reports "unavailable"
   instead of failing the task.
 
@@ -224,7 +247,10 @@ schema and are not checked here.
 written as a first part (default mode) followed by parts with `mode="append"`,
 in order, about 4-6 KB each. Large single calls are where argument JSON fails
 to parse or the reply is cut off at the output limit; the error messages for
-both point here.
+both point here. So does the retry after a cut-off that was all reasoning: in
+practice that is usually the model drafting a large file inside its thinking, so
+the retry tells it not to, and to write the first part now. (The hint is only
+given to a run that has `write_file`.)
 
 Parts of one file are treated as one write: they count once toward
 `max_writes_per_turn` (every byte counts toward `max_write_bytes`), and with

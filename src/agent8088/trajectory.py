@@ -47,6 +47,11 @@ def _is_code_path(path: str) -> bool:
     return PurePath(path).suffix.lower() in CODE_SUFFIXES
 
 
+_LIBRARY_STEM = re.compile(
+    r"(?:^|[_-])(?:utils?|helpers?|lib|library|client|core|common|api|service|services|"
+    r"module|base|models?|config|parser|parsers)$")
+
+
 def _is_scratch_path(path: str, workspace: str = "") -> bool:
     p = PurePath(path)
     if workspace:
@@ -56,6 +61,8 @@ def _is_scratch_path(path: str, workspace: str = "") -> bool:
             p = p.relative_to(workspace)
         except ValueError:
             pass
+    if _LIBRARY_STEM.search(p.stem.lower()):
+        return False
     return (any(part.lower() in SCRATCH_DIRS for part in p.parts[:-1])
             or p.name.lower().startswith(SCRATCH_PREFIXES))
 
@@ -164,6 +171,14 @@ class TrajectoryState:
             self.data["verification_requests"] = 0
             self.data["unmet_checks"] = []
             self.data["smoke_failures"] = 0
+            # The old request's parts and smoke notes describe work the person
+            # has moved on from: carrying them over nudges the new request about
+            # the old one and stamps stale notes on its answer.
+            self.data["subgoals_built"] = False
+            self.data["checklist"] = [step for step in self.data.get("checklist", [])
+                                      if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
+            self.data["smoke_notes"] = []
+            self.data["smoke_checked"] = {}
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -177,7 +192,7 @@ class TrajectoryState:
 
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
-                   path: str = "", command: str = "") -> None:
+                   path: str = "", command: str = "", existed: bool = False) -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
@@ -210,10 +225,12 @@ class TrajectoryState:
             self.data["check_failing"] = False
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
-            self.data["verification"] = "pending"
-            self.data["verification_requested"] = False
             self._set_step("Complete the requested work", "done")
-            self._set_step("Verify changed work", "pending")
+            scratch = bool(path) and _is_scratch_path(path, self.data.get("workspace", ""))
+            if not scratch:
+                self.data["verification"] = "pending"
+                self.data["verification_requested"] = False
+                self._set_step("Verify changed work", "pending")
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
@@ -222,14 +239,51 @@ class TrajectoryState:
                 self.data["verification"] = "verified"
                 self._set_step("Verify changed work", "done")
         elif (self.needs_verification() and operation["status"] == "done"
-              and not mutated and operation["tool"] in {"read_text", "execute_shell", "git_diff"}):
+              and not mutated and operation["tool"] in {"read_text", "execute_shell", "git_diff"}
+              and self._touches_changed_work(operation["tool"], path, command)):
             self.data["verification"] = "inspected"
             self._set_step("Verify changed work", "inspected")
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
+        if mutated and path and operation["status"] == "done":
+            self._note_test_edit(path, existed)
         if self.data["consecutive_setbacks"] >= 2:
             self.data["stalled"] = True
         self._track_tests(operation, path, mutated=mutated, command=command)
+
+    def _touches_changed_work(self, tool: str, path: str, command: str) -> bool:
+        """Is this read/run about a file this run changed? An unrelated `ls` or
+        read is not a check. With no recorded writes (changes made through the
+        shell) there is nothing to match against, so any inspection counts."""
+        if tool == "git_diff":
+            return True
+        written = self.data.get("written_paths") or []
+        if not written:
+            return True
+        for changed in written:
+            if tool == "read_text" and path and PurePath(path).name == PurePath(changed).name:
+                return True
+            if tool == "execute_shell" and command and _names_run(command, changed):
+                return True
+        return False
+
+    def _note_test_edit(self, path: str, existed: bool) -> None:
+        """Remember test files that already existed and were changed: the usual
+        way a weak model makes a failing suite pass is to edit the test."""
+        created = self.data.setdefault("created_files", [])
+        if not existed:
+            if path not in created:
+                created.append(path)
+                del created[:-MAX_WRITTEN]
+            return
+        if _is_test_path(path) and path not in created:
+            edited = self.data.setdefault("edited_existing_tests", [])
+            if path not in edited:
+                edited.append(path)
+                del edited[:-MAX_WRITTEN]
+
+    def edited_existing_tests(self) -> list[str]:
+        return list(self.data.get("edited_existing_tests") or [])
 
     def _track_tests(self, operation: dict, path: str, *, mutated: bool, command: str = "") -> None:
         """Maintain the list of code files changed this run with no test written.
@@ -358,7 +412,7 @@ class TrajectoryState:
         """A value that changes when the run makes real progress."""
         return (int(self.data.get("mutation_count") or 0),
                 int(self.data.get("passed_checks") or 0),
-                len(self.open_subgoals()))
+                sum(1 for step in self.subgoals() if step.get("status") == "done"))
 
     def smoke_unchecked(self, paths: list[str]) -> list[str]:
         """Deliverables not yet smoke-tested at the current state of the work."""
