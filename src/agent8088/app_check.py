@@ -499,10 +499,28 @@ def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
 
 # --- which files a run produced are worth checking -----------------------------------------------
 
+_HELPER_NAME = re.compile(r"^(?:tmp|temp|scratch|debug)(?:[_-].*)?$")
+
+
+def is_helper_script(path: Path) -> bool:
+    """A throwaway script the model wrote to inspect or patch its own work.
+
+    A single leading underscore (_clean.py, _fix.js), or a name that is tmp, temp,
+    scratch or debug alone or followed by _ or -, marks a helper (temperature.py does not). __init__.py and other dunder names are not helpers.
+    Starting one with --help or syntax-checking it says nothing about the deliverable,
+    and a helper that exits non-zero used to fail the run's smoke test.
+    """
+    stem = Path(path).stem.lower()
+    if stem.startswith("__"):
+        return False
+    return (stem.startswith("_") and len(stem) > 1) or bool(_HELPER_NAME.match(stem))
+
+
 def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3) -> list[Path]:
     """Pages and runnable scripts this run wrote that exist, pages first, newest last.
 
-    Tests, files under node_modules or a virtualenv, and scratch dirs are skipped.
+    Tests, files under node_modules or a virtualenv, scratch dirs, and the model's own
+    throwaway helpers (_fix.py, tmp_check.js) are skipped.
     """
     roots = [Path(r) for r in roots]
     found: list[Path] = []
@@ -516,6 +534,8 @@ def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: in
             continue
         stem = path.stem.lower()
         if stem.startswith("test_") or stem.endswith("_test") or ".test" in path.name.lower():
+            continue
+        if is_helper_script(path):
             continue
         if path.suffix.lower() in WEB_SUFFIXES | PYTHON_SUFFIXES | NODE_SUFFIXES:
             found.append(path)
