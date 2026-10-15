@@ -8648,7 +8648,7 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "staging-1.2"
+UPDATE_BRANCH = "staging-1.3"
 
 
 def _git(install_dir, *args):

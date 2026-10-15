@@ -20,7 +20,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/palindrome-rl/AGENT8088/tree/staging-1.2"><img src="https://img.shields.io/badge/branch-staging--1.2-f59e0b" alt="Staging 1.2 branch"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/tree/staging-1.3"><img src="https://img.shields.io/badge/branch-staging--1.3-f59e0b" alt="Staging 1.3 branch"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
   <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
@@ -75,28 +75,28 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 
 ## Quick start
 
-### Install the staging-1.2 branch
+### Install the staging-1.3 branch
 
 This is the v2 staging channel. The commands below install it and keep it
-on it: `agent8088 --update` stays on `staging-1.2` rather than moving you
+on it: `agent8088 --update` stays on `staging-1.3` rather than moving you
 to `development`.
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | AGENT8088_BRANCH=staging-1.2 bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.sh | AGENT8088_BRANCH=staging-1.3 bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "staging-1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
+$env:AGENT8088_BRANCH = "staging-1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1)
 ```
 
 These staging commands intentionally fetch the branch-specific installers;
 the Pages installer URL serves the development channel.
 
-Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
+Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
@@ -253,7 +253,7 @@ Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
 GitIngest-backed repository overviews, search and source reads.
 
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
-The hosted wiki also has a dedicated [Staging 1.2 section](https://github.com/palindrome-rl/AGENT8088/wiki/Staging-1.2-Home), so staging instructions do not overwrite the repository's shared documentation.
+The hosted wiki also has a dedicated [Staging 1.3 section](https://github.com/palindrome-rl/AGENT8088/wiki/Staging-1.3-Home), so staging instructions do not overwrite the repository's shared documentation.
 
 | Read this | To learn about |
 | --- | --- |

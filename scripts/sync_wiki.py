@@ -32,8 +32,8 @@ from pathlib import Path
 REPO = "palindrome-rl/AGENT8088"
 # The branch these pages are generated from. Source links must point at the
 # branch that produced them, or a reader follows them to different text.
-SOURCE_BRANCH = "staging-1.2"
-WIKI_PREFIX = "Staging-1.2-"
+SOURCE_BRANCH = "staging-1.3"
+WIKI_PREFIX = "Staging-1.3-"
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
 # source filename -> wiki page name (no .md). Order defines the sidebar.
@@ -89,8 +89,8 @@ BANNER = (
     "     the next sync — change the source file and open a PR instead. -->\n\n"
 )
 
-SIDEBAR_START = "<!-- agent8088-staging-1.2:start -->"
-SIDEBAR_END = "<!-- agent8088-staging-1.2:end -->"
+SIDEBAR_START = "<!-- agent8088-staging-1.3:start -->"
+SIDEBAR_END = "<!-- agent8088-staging-1.3:end -->"
 
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
@@ -123,7 +123,7 @@ def build_sidebar() -> str:
     if unknown:
         raise SystemExit(f"sync_wiki: sidebar references unknown page(s): {sorted(unknown)}")
 
-    lines = [SIDEBAR_START, "", "### Staging 1.2", ""]
+    lines = [SIDEBAR_START, "", "### Staging 1.3", ""]
     for section, pages in SIDEBAR_SECTIONS:
         lines.append(f"**{section}**")
         lines.append("")

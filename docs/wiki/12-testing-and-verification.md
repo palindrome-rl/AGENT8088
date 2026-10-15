@@ -15,7 +15,7 @@ Three layers, all runnable offline with no model backend.
 | Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
 | Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
 
-The optional [Terminal-Bench 2.1 adapter](https://github.com/palindrome-rl/AGENT8088/blob/staging-1.2/test-mode-setting/README.md)
+The optional [Terminal-Bench 2.1 adapter](https://github.com/palindrome-rl/AGENT8088/blob/staging-1.3/test-mode-setting/README.md)
 is a separate evaluation profile. It installs into disposable task containers,
 uses `--prompt-file` for one unattended turn, and deliberately relaxes some
 ordinary workstation safeguards only when `AGENT8088_DISPOSABLE_CONTAINER=1`.
@@ -37,7 +37,7 @@ checks that exercise shell and permission behaviour cannot complete without it.
 
 ## 1. Unit tests
 
-Clone `development` before running this section. A fresh `staging-1.2`
+Clone `development` before running this section. A fresh `staging-1.3`
 checkout has no root `tests/` directory.
 
 ```sh

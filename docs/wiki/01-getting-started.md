@@ -29,13 +29,13 @@ requests. No admin rights are needed for the base install.
 
 ## Install
 
-These commands install the **staging-1.2** channel and keep it there:
-`agent8088 --update` follows `staging-1.2`, not `development`.
+These commands install the **staging-1.3** channel and keep it there:
+`agent8088 --update` follows `staging-1.3`, not `development`.
 
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.sh | AGENT8088_BRANCH=staging-1.2 bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.sh | AGENT8088_BRANCH=staging-1.3 bash
 ```
 
 Run it as your normal user, **not** with `sudo` — the installer asks for sudo
@@ -45,15 +45,15 @@ itself for the few system packages it needs, and refuses to run under `sudo`
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = 'staging-1.2'
-iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1)
+$env:AGENT8088_BRANCH = 'staging-1.3'
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1)
 ```
 
 Run this in **PowerShell**, not `cmd.exe`. From `cmd.exe`, or where the
 execution policy blocks scripts, use:
 
 ```bat
-powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.2/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1 | iex"
 ```
 
 Run it from a normal (non-admin) window: an elevated one installs for the
@@ -75,7 +75,7 @@ DLLs, browser files, or executables are repaired automatically. Optional stages
 that still fail are listed at the end with the exact repair command.
 
 **From a clone, to work on the code.** Contributions are branched from
-`development`, so this deliberately clones that rather than `staging-1.2`:
+`development`, so this deliberately clones that rather than `staging-1.3`:
 
 Needs Python **3.10 or newer** (3.11/3.12 recommended) — check with
 `python3 --version` first; an older `python` gives a confusing resolver error

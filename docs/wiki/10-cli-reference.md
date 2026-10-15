@@ -86,7 +86,7 @@ entered them. Only one task runs at a time. Stop or failure pauses the queue
 for your review. The sidebar identifies the running chat. You cannot rename,
 delete, reset or compact that chat while its task is running.
 
-### Images and attachments on staging 1.2
+### Images and attachments on staging 1.3
 
 Use **+ → Image analysis** to choose images, paste a screenshot into the
 message box, or drop a file onto the composer. The clipboard button also
