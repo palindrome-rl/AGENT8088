@@ -559,6 +559,12 @@ COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds"
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
 COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
+# Rounds in a row that bring nothing new before the model is asked to decide: finish with what it
+# has, or change approach. Twice that many ends the run with a summary. 0 turns the watch off.
+STALL_ROUNDS = max(0, _config_int("stall_rounds", 6))
+# Rounds in a row that change no file or finished part, once the work is built and its checks
+# pass, before the model is told that finishing is the next step. 0 turns it off.
+VERIFICATION_LOOP_ROUNDS = max(0, _config_int("verification_loop_rounds", 8))
 # A request to build something that must follow real rules or data ("valid in X", "official",
 # "full roster") and names its subject, finished without a single lookup, gets one follow-up
 # asking the model to check its facts and name its sources. 0 turns it off.
@@ -17710,6 +17716,80 @@ def _turn_limit_for_messages(messages: list[dict], max_turns: int) -> int:
 _FIXED_BUDGET_ROLES = frozenset({"subagent:auditor"})
 
 
+_UNSET = object()
+
+
+class _StallWatch:
+    """Counts rounds that did nothing new, and says when to speak up.
+
+    Two different stalls. A run that keeps trying without result (every call a repeat or a
+    failure, no file changed, no check newly passing) is told once to finish or change
+    approach, and ended with a summary if a second stretch of the same length brings
+    nothing either. A run that is already built and passing its checks, and just keeps
+    looking at its own work, is told once that finishing is the next step; that never ends
+    the run. A round with a call the run had not made before that worked, a changed file,
+    a newly passing check or a newly finished part always counts as progress, so reading
+    many new files before the first write is not a stall.
+    """
+
+    def __init__(self, churn_rounds: int, settled_rounds: int, mark=None, build_mark=None):
+        """`mark` and `build_mark` are where the run stands when the watch starts; without them the
+        first round sets the baseline instead."""
+        self.churn_rounds, self.settled_rounds = churn_rounds, settled_rounds
+        self.quiet = 0           # rounds in a row with no progress of any kind
+        self.told_at = None      # quiet count when the model was asked to decide
+        self.mark = _UNSET if mark is None else mark
+        self.build_mark = _UNSET if build_mark is None else build_mark
+        self.still = 0           # rounds in a row that changed no file or finished part
+        self.settled_told = 0
+
+    def record(self, *, productive: bool, mark: tuple, build_mark: tuple, settled: bool):
+        """One executed round. Returns "churn", "churn_stop", "settled" or None."""
+        if self.mark is _UNSET:
+            self.mark = mark
+        if self.build_mark is _UNSET:
+            self.build_mark = build_mark
+        if productive or mark != self.mark:
+            self.quiet, self.told_at, self.mark = 0, None, mark
+        else:
+            self.quiet += 1
+        if build_mark != self.build_mark:
+            self.still, self.build_mark = 0, build_mark
+        else:
+            self.still += 1
+        if self.churn_rounds and self.quiet >= self.churn_rounds:
+            if self.told_at is None:
+                self.told_at = self.quiet
+                return "churn"
+            if self.quiet >= self.told_at + self.churn_rounds:
+                return "churn_stop"
+        if (self.settled_rounds and settled and self.still >= self.settled_rounds
+                and self.settled_told < 2):
+            self.settled_told += 1
+            self.still = 0
+            return "settled"
+        return None
+
+
+def _build_mark(trajectory) -> tuple:
+    """What building the work has produced so far: files changed and parts finished."""
+    if trajectory is None:
+        return ()
+    return (trajectory.mutation_count(), len(trajectory.subgoals()) - len(trajectory.open_subgoals()))
+
+
+def _stall_message(rounds: int) -> str:
+    return (f"Nothing new has come out of your last {rounds} rounds: no call that worked and "
+            "was new, no file changed, no check newly passing. Either finish now with the best "
+            "result you have and say plainly what is missing, or take a clearly different approach. "
+            "Do not repeat what already failed.")
+
+
+SETTLED_MESSAGE = ("The requested files exist and the latest checks pass, and your last rounds changed "
+                   "nothing. Unless you know a specific defect to fix, finish now with your summary: "
+                   "what you built, what you checked, and anything you could not verify.")
+
+
 class _TurnPolicy:
     """How many rounds this run starts with, and how many it may still earn.
 
@@ -18443,6 +18523,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     compaction_cooldown_turn = 0  # a successful one waits COMPACTION_COOLDOWN_TURNS turns
     plan_mutation_retries = 0
+    stall_watch = (_StallWatch(
+        STALL_ROUNDS, VERIFICATION_LOOP_ROUNDS,
+        mark=trajectory.progress_mark() if trajectory is not None else (),
+        build_mark=_build_mark(trajectory)) if depth == 0 else None)
     # Current rung on the `auto` ladder. Sticky for the rest of this turn once
     # escalated -- climbing back down mid-turn would oscillate between a model
     # that just failed and the one that rescued it. A new user turn starts fresh
@@ -19182,6 +19266,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -19197,6 +19282,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 tool_outputs.append(result)
                 executed = True
                 round_fresh |= bool(loaded)
+                round_productive |= bool(loaded)
                 if on_result:
                     on_result(name, result)
                 if turn_tools is not None:
@@ -19522,6 +19608,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   "tool": name, "count": parse_error_retries})
                 continue
             executed = executed or not no_progress
+            if (not no_progress and not _plan_step_failed(result)
+                    and (sig not in seen_signatures or _is_wait_command(name, args))):
+                round_productive = True
             if not no_progress and sig not in seen_signatures:
                 round_fresh = True
             seen_signatures.add(sig)
@@ -19727,6 +19816,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                       "rounds": post_check_rounds})
         if executed:
             forcing = False
+            # A round that ran a tool is progress, so the allowance for malformed calls is for
+            # failures in a row. Counted over the whole run it was used up after a few cut-off
+            # writes spread over an hour, and the next one forced a final answer on work that was
+            # half written.
+            parse_error_retries = missing_args_retries = 0
             policy.record_round(
                 fresh=round_fresh,
                 output=tool_outputs[-1] if tool_outputs else None)
@@ -19734,6 +19828,28 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if granted and trace is not None:
                 trace.append({"turn": turn, "type": "turn_extension",
                               "from": granted[0], "to": granted[1]})
+            if stall_watch is not None:
+                settled = (trajectory is not None and trajectory.mutation_count() > 0
+                           and trajectory.data.get("verification") == "verified"
+                           and not trajectory.check_failing() and not trajectory.open_subgoals())
+                said = stall_watch.record(
+                    productive=round_productive,
+                    mark=trajectory.progress_mark() if trajectory is not None else (),
+                    build_mark=_build_mark(trajectory),
+                    settled=settled)
+                if said == "churn":
+                    messages.append(_harness_turn(_stall_message(stall_watch.quiet)))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "stall_warning", "rounds": stall_watch.quiet})
+                elif said == "settled":
+                    messages.append(_harness_turn(SETTLED_MESSAGE))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "settled_warning"})
+                elif said == "churn_stop":
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "stall_stop", "rounds": stall_watch.quiet})
+                    forced_stop = True
+                    break
         elif malformed_round and parse_error_retries + missing_args_retries <= MALFORMED_CALL_RETRIES:
             # The round's only failure was an unparseable call and the
             # correction is already queued: let the model retry. One typo must
