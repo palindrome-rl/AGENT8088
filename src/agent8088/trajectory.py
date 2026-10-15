@@ -358,11 +358,26 @@ class TrajectoryState:
                 created.append(path)
                 del created[:-MAX_WRITTEN]
             return
-        if _is_test_path(path) and path not in created:
+        if _is_test_path(path) and not self._created_here(path):
             edited = self.data.setdefault("edited_existing_tests", [])
             if path not in edited:
                 edited.append(path)
                 del edited[:-MAX_WRITTEN]
+
+    def _created_here(self, path: str) -> bool:
+        """Whether this run created `path`, under the name it was asked for or where it landed.
+
+        A file the sandbox diverted is recorded when it is created under the path that was asked for,
+        and a later edit may name where it landed; the two are one file.
+        """
+        keys = {_file_key(p) for p in self.data.get("created_files") or []}
+        if _file_key(path) in keys:
+            return True
+        for requested, landed in self.redirected_writes():
+            pair = {_file_key(requested), _file_key(landed)}
+            if _file_key(path) in pair and pair & keys:
+                return True
+        return False
 
     def edited_existing_tests(self) -> list[str]:
         return list(self.data.get("edited_existing_tests") or [])

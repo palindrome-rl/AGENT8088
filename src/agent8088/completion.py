@@ -410,9 +410,11 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
 # only conventional test filenames, because any reply mentioning any filename
 # would otherwise trip this and a check that fires on ordinary prose is worse
 # than no check at all.
+# A name needs an extension to be a file: "test-hook" and "test-assertion" are words in prose or in a
+# page's data attributes ("data-test-hook"), and "test_board.py" is a file.
 _TEST_FILE_RE = re.compile(
-    r"(?<![\w/.-])((?:[\w.-]+[\\/])*(?:test[_-][\w.-]+|[\w.-]+[_-]test|"
-    r"[\w.-]+\.(?:spec|test)\.[a-z]{2,5}))(?![\w.-])", re.IGNORECASE)
+    r"(?<![\w/.-])((?:[\w.-]+[\\/])*(?:test[_-][\w-]+\.[a-z]{1,5}|[\w-]+[_-]test\.[a-z]{1,5}|"
+    r"[\w.-]+\.(?:spec|test)\.[a-z]{2,5}))(?![\w-]|\.\w)", re.IGNORECASE)
 
 
 def _claimed_but_unwritten(lowered_reply: str, written, search_roots) -> list[str]:
