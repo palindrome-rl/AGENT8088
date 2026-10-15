@@ -151,6 +151,21 @@ def _is_check_run(command: str) -> bool:
     return not (command or "").strip() or bool(_CHECK_COMMAND.search(command))
 
 
+# Running the program the run itself wrote is the plainest way to see whether it works, whatever the
+# command is called: `python main.py` crashing is a failed check, `type main.py` failing is not.
+_RUNNER = (r"(?:python[\d.]*|py|node|nodejs|deno|bun|ruby|php|perl|bash|sh|pwsh|powershell|java|dotnet|"
+           r"go\s+run|cargo\s+run|ts-node|tsx)")
+
+
+def _runs_a_written_file(command: str, written) -> bool:
+    for path in written or []:
+        name = PurePath(str(path)).name
+        if name and re.search(rf"(?<![\w.-]){_RUNNER}(?![\w-])[^&|;\n]*?(?<![\w.-]){re.escape(name)}(?![\w-])",
+                              command or "", re.IGNORECASE):
+            return True
+    return False
+
+
 def _same_command(a: str, b: str) -> bool:
     return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
 
@@ -321,7 +336,8 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
-        if (operation["verdict"] == "failed" and _is_check_run(command)
+        if (operation["verdict"] == "failed"
+                and (_is_check_run(command) or _runs_a_written_file(command, self.data.get("written_paths")))
                 and not _SANDBOX_BLOCKED.search(str(result))):
             self.data["check_failing"] = True
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]

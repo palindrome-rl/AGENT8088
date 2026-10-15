@@ -227,3 +227,21 @@ def test_a_check_the_sandbox_stopped_did_not_fail_it_never_ran_to_a_result():
     state.after_tool(op, "Traceback ...\nAssertionError\nCommand exited with status 1.", failed=False, blocked=False,
                      mutated=False, verdict="failed", command="python test_app.py")
     assert state.check_failing(), "the same kind of command failing without the sandbox note is still a failed check"
+
+
+def test_running_a_program_the_run_wrote_and_failing_is_a_failed_check_whatever_the_command_is_called():
+    for command in ("python main.py", "cd /d C:\\w && node server.js --port 8080", "python3 -u src/main.py",
+                    'python "C:\\w\\artifacts\\main.py" input.csv'):
+        state = TrajectoryState({}, goal="g", message_count=1)
+        state.data["written_paths"] = ["C:\\w\\main.py", "C:\\w\\server.js"]
+        _ran(state, command, "failed")
+        assert state.check_failing(), command
+
+
+def test_a_command_that_only_names_a_written_file_or_runs_something_else_is_not_a_failed_check():
+    for command in ("type main.py", "copy main.py outputs\\main.py", "dir main.py", "python other.py", "python -c \"print(1)\"",
+                    "echo main.py"):
+        state = TrajectoryState({}, goal="g", message_count=1)
+        state.data["written_paths"] = ["C:\\w\\main.py"]
+        _ran(state, command, "failed")
+        assert not state.check_failing(), command
