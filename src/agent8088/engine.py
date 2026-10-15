@@ -18114,7 +18114,8 @@ def _missing_required_files(trajectory, reply: str, request: str) -> list:
     return completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
         mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [],
-        start_files=trajectory.start_files)
+        start_files=trajectory.start_files,
+        landed=trajectory.data.get("redirected_writes") or [])
 
 
 def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth: int) -> list:
