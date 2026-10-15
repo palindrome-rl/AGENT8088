@@ -210,7 +210,7 @@ class TrajectoryState:
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
                    path: str = "", command: str = "", existed: bool = False,
-                   partial_path: str = "") -> None:
+                   partial_path: str = "", written_to: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         if operation["status"] == "done" and (
                 operation["tool"] in RESEARCH_TOOLS
@@ -244,6 +244,13 @@ class TrajectoryState:
             if path not in written:
                 written.append(path)
                 del written[:-MAX_WRITTEN]
+            if written_to and written_to != path:
+                # The path the agent asked for is not where the file is. Keep both,
+                # so the end of the run can put a copy back where the user named.
+                landed = self.data.setdefault("redirected_writes", [])
+                if [path, written_to] not in landed:
+                    landed.append([path, written_to])
+                    del landed[:-MAX_WRITTEN]
         # Changing a file is not evidence that the failed check is fixed.
         # Keep the failure visible until a subsequent check actually passes,
         # including failures from checks that also modify the workspace.
@@ -372,6 +379,10 @@ class TrajectoryState:
     def written_paths(self) -> list[str]:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
+
+    def redirected_writes(self) -> list[tuple[str, str]]:
+        """(requested, landed) pairs for writes the sandbox routed elsewhere."""
+        return [(req, landed) for req, landed in self.data.get("redirected_writes") or []]
 
     def changed_code_paths(self) -> list[str]:
         """Code files this run wrote, newest last."""
