@@ -423,3 +423,47 @@ def test_a_long_start_output_is_clipped_from_the_middle():
     assert clipped.startswith("a" * 400) and clipped.endswith("z" * 400)
     assert "MIDDLE" not in clipped and "[...]" in clipped
     assert app_check.clip_output("short") == "short"
+
+
+# --- a start that cannot show whether the script works is "not verified", not a crash ---------------
+
+@pytest.mark.parametrize("printed", [
+    "Command exited with status 1.",
+    "Traceback (most recent call last):\n  File \"build.py\", line 9, in <module>\n"
+    "PermissionError: [Errno 13] Permission denied: 'out/report.xlsx'\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nOSError: [Errno 30] Read-only file system: 'out.pdf'\n"
+    "Command exited with status 1.",
+    "Traceback (most recent call last):\nFileNotFoundError: [Errno 2] No such file or directory: 'data.csv'\n"
+    "Command exited with status 1.",
+])
+def test_a_start_that_fails_for_the_place_it_ran_in_is_not_verified_rather_than_crashed(tmp_path, printed):
+    script = tmp_path / "build.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.status == app_check.UNAVAILABLE and report.ask is True
+    assert "not verified" in report.note and report.output
+
+
+@pytest.mark.parametrize("printed", [
+    "Traceback (most recent call last):\nModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nNameError: name 'rows' is not defined\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nTypeError: 'NoneType' object is not iterable\nCommand exited with status 1.",
+])
+def test_an_error_about_the_code_itself_is_still_a_crash(tmp_path, printed):
+    script = tmp_path / "build.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.failed and "crashed" in report.failures[0]
+
+
+def test_a_node_start_that_cannot_open_a_path_is_not_verified_and_a_missing_module_is_a_crash(tmp_path, monkeypatch):
+    import shutil
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    script = tmp_path / "build.js"
+    script.write_text("console.log('x')\n", encoding="utf-8")
+    soft = app_check.check_script(script, run=lambda c, t: "Error: ENOENT: no such file or directory, open 'a.json'\n"
+                                                           "Command exited with status 1.")
+    assert soft.status == app_check.UNAVAILABLE and soft.ask is True
+    hard = app_check.check_script(script, run=lambda c, t: "Error: Cannot find module './data'\nCommand exited with status 1.")
+    assert hard.failed
