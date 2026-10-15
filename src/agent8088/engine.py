@@ -17443,6 +17443,9 @@ def estimate_prompt_tokens(messages, system_prompt: str = "", provider_name: str
 _SUMMARY_PREFIX = "Conversation summary:\n"
 _SUMMARY_SEPARATOR = "\n\n---\n"
 _HARNESS_RECORD_HEADING = "## Harness record (kept exactly; not written by the model)"
+_CONSTRAINTS_HEADING = "## Constraints stated earlier (copied word for word; not written by the model)"
+# Room for the constraints in a summary. The newest are kept when they do not all fit.
+COMPACTION_CONSTRAINT_CHARS = max(200, _config_int("compaction_constraint_chars", 1500))
 _DROPPED_SECTIONS_RE = re.compile(r"^\[(\d+) earlier summary section\(s\) dropped to fit\]\n")
 
 
@@ -17458,7 +17461,8 @@ def _split_prior_summary(older: list) -> tuple:
     for message in older:
         text = message.get("content") if isinstance(message.get("content"), str) else ""
         if message.get("role") == "system" and text.startswith(_SUMMARY_PREFIX):
-            body = text[len(_SUMMARY_PREFIX):].split("\n\n" + _HARNESS_RECORD_HEADING)[0]
+            body = text[len(_SUMMARY_PREFIX):].split("\n\n" + _CONSTRAINTS_HEADING)[0]
+            body = body.split("\n\n" + _HARNESS_RECORD_HEADING)[0]
             marker = _DROPPED_SECTIONS_RE.match(body)
             if marker:
                 dropped += int(marker.group(1))
@@ -17485,9 +17489,107 @@ def _harness_record() -> str:
     return ("\n\n" + _HARNESS_RECORD_HEADING + "\n" + "\n".join(lines)) if lines else ""
 
 
-def _build_summary_message(sections: list, dropped: int) -> str:
+_CONSTRAINT_CUE = re.compile(
+    r"\b(?:must|never|do not|don't|dont|only|cannot|can't|should not|shouldn't|always|before|until|"
+    r"required|exactly|no more than|at most|at least|forbidden|not allowed|irreversible|undone)\b",
+    re.IGNORECASE)
+# Files a person points to for the rules of the job. Anything else the task reads (receipts, pages,
+# data, a file of credentials) is material to work on, not instructions, and is never copied.
+_RULE_FILE_STEM = re.compile(
+    r"rules?|policy|policies|instructions?|guidelines?|requirements?|constraints?|conventions?|"
+    r"readme|spec(?:ification)?", re.IGNORECASE)
+_RULE_FILE_SUFFIXES = (".md", ".txt", ".rst")
+_CONSTRAINT_SENTENCE_MAX = 300
+_RULE_FILE_READ_CHARS = 20000
+
+
+def _constraint_sentences(text: str) -> list:
+    """Sentences and list lines that state a rule, copied as written."""
+    found = []
+    for line in str(text or "").splitlines():
+        for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
+            sentence = sentence.strip().lstrip("-*• ").strip()
+            if (8 <= len(sentence) <= _CONSTRAINT_SENTENCE_MAX and _CONSTRAINT_CUE.search(sentence)
+                    and sentence not in found):
+                found.append(sentence)
+    return found
+
+
+def _named_rule_files(user_texts) -> list:
+    """Existing rule-like text files that the person's own messages point to."""
+    roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
+    files = []
+    for text in user_texts:
+        for match in completion_checks._PATH_TOKEN.finditer(text):
+            name = match.group(1).rstrip(".")
+            stem, suffix = Path(name).stem, Path(name).suffix.lower()
+            if suffix not in _RULE_FILE_SUFFIXES or not _RULE_FILE_STEM.search(stem):
+                continue
+            for candidate in completion_checks._candidates(name, roots):
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                inside = any(resolved == r.resolve() or r.resolve() in resolved.parents for r in roots)
+                if (inside and resolved.is_file() and not _is_sensitive_path(str(resolved))
+                        and resolved not in files):
+                    files.append(resolved)
+                    break
+    return files
+
+
+_POINTER = " is a file you were pointed to for the rules"
+
+
+def _fresh_constraint_lines(older: list, messages: list, pointed: list | None = None) -> list:
+    """Rules to carry past a compaction: sentences from the person's messages being summarized
+    and from the rule files they pointed to. Tool output, web pages and documents the task is
+    about are not the person speaking and are never copied. `pointed` names rule files an earlier
+    compaction recorded, for when the message that named them is no longer there."""
+    user_texts = [_message_text(m) for m in _genuine_user_turns(messages)] + list(pointed or [])
+    lines = []
+    for message in _genuine_user_turns(older):
+        lines += [f"- {s}" for s in _constraint_sentences(_message_text(message))]
+    for path in _named_rule_files(user_texts):
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore")[:_RULE_FILE_READ_CHARS]
+        except OSError:
+            continue
+        lines += [f"- ({path.name}) {s}" for s in _constraint_sentences(body)]
+        lines.append(f"- {path.name}{_POINTER}; re-read it if unsure.")
+    return list(dict.fromkeys(lines))
+
+
+def _prior_constraint_lines(older: list) -> list:
+    """The constraint lines an earlier compaction wrote into its summary."""
+    lines = []
+    for message in older:
+        text = message.get("content") if isinstance(message.get("content"), str) else ""
+        if message.get("role") == "system" and text.startswith(_SUMMARY_PREFIX) and _CONSTRAINTS_HEADING in text:
+            block = text.split(_CONSTRAINTS_HEADING + "\n", 1)[1].split("\n\n## ")[0]
+            lines += [line for line in block.splitlines() if line.startswith("- ")]
+    return lines
+
+
+def _constraints_block(lines: list) -> str:
+    """The constraint section of a summary, newest lines kept when they do not all fit."""
+    if not lines:
+        return ""
+    kept, size = [], 0
+    for line in reversed(lines):
+        if size + len(line) + 1 > COMPACTION_CONSTRAINT_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    kept.reverse()
+    omitted = len(lines) - len(kept)
+    note = [f"- [{omitted} earlier line(s) left out to fit; re-read the rule files if unsure]"] if omitted else []
+    return "\n\n" + _CONSTRAINTS_HEADING + "\n" + "\n".join(note + kept)
+
+
+def _build_summary_message(sections: list, dropped: int, constraints: list | None = None) -> str:
     """The summary system message, shrunk oldest-section-first if it is too long."""
-    record = _harness_record()
+    record = _constraints_block(constraints or []) + _harness_record()
 
     def render() -> str:
         note = f"[{dropped} earlier summary section(s) dropped to fit]\n" if dropped else ""
@@ -17539,9 +17641,17 @@ def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
         older = [m for m in older if m is not human_turns[0]]
     # An earlier summary is carried over as written; only what came after it is
     # summarized now. With nothing new to summarize there is nothing to do.
+    prior_lines = _prior_constraint_lines(older)
+    # What a rule file says is read from the file again; only the person's own sentences are carried
+    # over, plus the names of the files, so a rule file stays followed after the message that named it
+    # has been summarized away.
+    prior_constraints = [line for line in prior_lines if not line.startswith("- (") and _POINTER not in line]
+    pointed = [line[2:].split(_POINTER)[0] for line in prior_lines if _POINTER in line]
     prior_sections, prior_dropped, older = _split_prior_summary(older)
     if not older:
         return False
+    constraint_lines = list(dict.fromkeys(
+        prior_constraints + _fresh_constraint_lines(older, messages, pointed)))
     transcript = "\n\n".join(f"{message.get('role', 'unknown')}: {_message_text(message)}" for message in older)
     prompt = ("Summarize this completed conversation as concise context for the next agent turn. "
               "Preserve the user goal, decisions, facts, files changed, constraints, and unresolved work. "
@@ -17570,7 +17680,8 @@ def compact_messages(messages: list[dict], keep: int = COMPACTION_KEEP_MESSAGES,
     if not summary:
         return False
     messages[:] = [{"role": "system",
-                    "content": _build_summary_message([*prior_sections, summary], prior_dropped)},
+                    "content": _build_summary_message([*prior_sections, summary], prior_dropped,
+                                                      constraint_lines)},
                    *pinned, *recent]
     return True
 
