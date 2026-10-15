@@ -195,6 +195,7 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["smoke_output"] = {}
             self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
@@ -482,8 +483,17 @@ class TrajectoryState:
         checked = self.data.setdefault("smoke_checked", {})
         return [p for p in paths if checked.get(p) != self.mutation_count()]
 
-    def record_smoke(self, path: str, summary: str, failed: bool) -> None:
+    def record_smoke(self, path: str, summary: str, failed: bool, output: str = "") -> None:
         self.data.setdefault("smoke_checked", {})[path] = self.mutation_count()
+        if output:
+            # Raw start-up output of a failed script check, for diagnosis. Kept out of
+            # the notes the model and the person read; bounded to the last few files.
+            kept = self.data.setdefault("smoke_output", {})
+            # _text is for one-line notes and cuts at 240 characters. This is
+            # already clipped diagnostic output: preserve its traceback tail.
+            kept[path] = str(output)[:900]
+            for old in list(kept)[:-4]:
+                del kept[old]
         notes = self.data.setdefault("smoke_notes", [])
         notes[:] = [n for n in notes if not n.startswith(summary.split(":", 1)[0] + ":")]
         notes.append(_text(summary))

@@ -198,3 +198,31 @@ def test_the_tool_refuses_paths_outside_the_allowed_workspace(eng, tmp_path):
 
 def test_the_tool_needs_a_path(eng):
     assert "was called with no arguments" in eng.exec_tool("check_app", "{}")
+
+
+def test_the_output_of_a_failed_script_start_is_kept_for_diagnosis_and_bounded():
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    state.record_smoke("/w/a.py", "a.py: smoke test FAILED - x", True, "Traceback\n" + "x" * 2000)
+    kept = state.data["smoke_output"]
+    assert kept["/w/a.py"].startswith("Traceback") and len(kept["/w/a.py"]) <= 900
+    for name in "bcdef":
+        state.record_smoke(f"/w/{name}.py", f"{name}.py: smoke test FAILED - x", True, "out " + name)
+    assert len(state.data["smoke_output"]) == 4 and "/w/a.py" not in state.data["smoke_output"]
+
+
+def test_a_passing_check_stores_no_output_and_the_next_request_clears_it():
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    state.record_smoke("/w/a.html", "a.html: smoke test passed", False)
+    assert not state.data.get("smoke_output")
+    state.record_smoke("/w/a.py", "a.py: smoke test FAILED - x", True, "boom")
+    state.data["verification"] = "pending"
+    again = trajectory.TrajectoryState(state.data, goal="h", message_count=2)
+    assert again.data["smoke_output"] == {}
+
+
+def test_saved_diagnostics_preserve_the_clipped_error_tail():
+    output = "starting\n" + "setup detail\n" * 100 + "RuntimeError: synthetic root cause"
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    clipped = app_check.clip_output(output)
+    state.record_smoke("/w/app.py", "app.py: smoke test FAILED", True, clipped)
+    assert state.data["smoke_output"]["/w/app.py"] == clipped

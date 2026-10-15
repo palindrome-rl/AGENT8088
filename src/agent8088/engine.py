@@ -11263,7 +11263,8 @@ def _parse_error_args(raw: str) -> dict:
     The position matters: a large write whose content has one unescaped quote
     is fixable by the model only if it is told where the JSON stopped parsing.
     """
-    args = {"__parse_error__": raw[:400]}
+    args = {"__parse_error__": raw[:400], "__parse_error_chars__": len(raw),
+            "__parse_error_tail__": raw[-80:]}
     try:
         json.loads(raw)
     except ValueError as error:
@@ -18012,7 +18013,7 @@ def _smoke_test_step(trajectory, written: list):
                                         run=_smoke_script_runner(target), click_steps=SMOKE_CLICK_STEPS)
         if report.status == app_check.SKIPPED:
             continue
-        trajectory.record_smoke(str(target), report.summary(), report.failed)
+        trajectory.record_smoke(str(target), report.summary(), report.failed, report.output)
         if report.failed:
             failures.append(report)
     if (failures and COMPLETION_SMOKE_TEST == "enforce"
@@ -19436,12 +19437,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         f"The arguments for '{name}' arrived incomplete: they stop "
                         f"({where}) with nothing after, so the reply was cut short. "
                         "Quoting is not the problem; do not re-send the same call. "
+                        f"About {args.get('__parse_error_chars__', 0)} characters arrived "
+                        "before it stopped. "
                         "Send a smaller one: for a long file, write the first part "
                         "(about 4-6 KB) with write_file and add each further part with "
                         "write_file mode=\"append\", in order."))
                     if trace is not None:
                         trace.append({"turn": turn, "type": "tool_arg_cut_off",
-                                      "tool": name, "count": parse_error_retries})
+                                      "tool": name, "count": parse_error_retries,
+                                      "chars": args.get("__parse_error_chars__", 0),
+                                      "tail": str(args.get("__parse_error_tail__", ""))})
                     continue
                 messages.append(_harness_turn((
                     f"The arguments for '{name}' could not be parsed as JSON"

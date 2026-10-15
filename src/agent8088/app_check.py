@@ -66,6 +66,7 @@ class Report:
     warnings: list[str] = field(default_factory=list)
     console: list[str] = field(default_factory=list)
     note: str = ""
+    output: str = ""              # what a script printed when started (clipped); for diagnosis only
 
     @property
     def failed(self) -> bool:
@@ -525,12 +526,26 @@ _BROWSER_GLOBAL = re.compile(
     r"customElements|screen|history) is not defined")
 
 
+OUTPUT_CLIP = 400   # characters kept from each end of a script's start-up output
+
+
+def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
+    """The first and last `limit` characters of an output, so a long one stays readable."""
+    text = (output or "").strip()
+    if len(text) <= 2 * limit:
+        return text
+    return text[:limit] + "\n[...]\n" + text[-limit:]
+
+
 def _run_briefly(path: Path, run: Callable[[str, int], str],
-                 unavailable: list[str] | None = None) -> list[str]:
+                 unavailable: list[str] | None = None,
+                 captured: list[str] | None = None) -> list[str]:
     """Start the script with --help in the sandbox; return crash findings.
 
     Only a crash on startup counts. Printing usage, finishing, or still running
     when the short clock ends are all fine, and a missing sandbox is no finding.
+    `captured`, when given, receives the clipped output of a start that reported
+    a crash, so a failure can be diagnosed from what the script actually printed.
     """
     program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
     output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
@@ -544,6 +559,8 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
     exited = _EXIT_NONZERO.search(output)
     if crashed or (exited and "usage" not in output.lower()):
         last = [line for line in output.strip().splitlines() if line.strip()]
+        if captured is not None:
+            captured.append(clip_output(output))
         return [f"the script crashed when started: {last[-1][:160] if last else 'non-zero exit'}"]
     return []
 
@@ -759,9 +776,10 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                 # A server is verified by booting it, not by asking it for
                 # --help: the boot probe answers the question --help never could.
                 return _boot_report(path, "python", port, run)
-            crash = _run_briefly(path, run)
+            captured: list[str] = []
+            crash = _run_briefly(path, run, captured=captured)
             if crash:
-                return Report("script", str(path), FAIL, crash)
+                return Report("script", str(path), FAIL, crash, output="".join(captured))
             if looks_like_server(source):
                 return Report("script", str(path), UNAVAILABLE,
                               note="looks like a server but the port it will listen on "
@@ -789,9 +807,10 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             if port is not None:
                 return _boot_report(path, "node", port, run)
             unavailable = []
-            crash = _run_briefly(path, run, unavailable)
+            captured: list[str] = []
+            crash = _run_briefly(path, run, unavailable, captured)
             if crash:
-                return Report("script", str(path), FAIL, crash)
+                return Report("script", str(path), FAIL, crash, output="".join(captured))
             if unavailable:
                 return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
             if looks_like_server(source):
