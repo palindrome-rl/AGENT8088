@@ -18428,6 +18428,15 @@ def _secrets_step(trajectory, written: list):
             trajectory.record_secret_scan(path)
     if not hits:
         return None
+    weak_only = all(finding.weak for _p, _l, finding in hits)
+    if weak_only:
+        # Strings that only look like a key. Ask once; after that they are taken as the model's answer
+        # (it can say they are words or placeholders) and they never reach the "Not completed" note.
+        if trajectory.weak_secret_asked():
+            for path in pending:
+                trajectory.record_secret_scan(path)
+            return None
+        trajectory.mark_weak_secret_asked()
     detail = "\n".join(
         "%s:%s  %s  %s" % (Path(path).name, line, finding.kind, finding.masked)
         for path, line, finding in hits[:8])
@@ -18440,7 +18449,7 @@ def _secrets_step(trajectory, written: list):
             "If any is real, remove it from the file and read it from an environment "
             "variable or a .env file that is not committed instead.",
             "Continue: remove the credential, or state that it is a placeholder."),
-        unmet="a credential is written in clear text in: " + ", ".join(names[:6]))
+        unmet="" if weak_only else "a credential is written in clear text in: " + ", ".join(names[:6]))
 
 
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:

@@ -130,3 +130,67 @@ def test_a_product_and_version_is_not_a_credential(line):
 def test_a_real_looking_key_is_still_reported(line):
     from agent8088 import secret_scan
     assert secret_scan.find_secrets(line)
+
+
+@pytest.mark.parametrize("line", [
+    "// teammates/EV spreads, and the top 20 moves/items/partners per Pokemon",
+    "see strategies/archetypes for the full list",
+    "headers = {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9'}",
+    "//  atkMult/defMult/spaMult/spdMult/speMult : passive multipliers on the holder's stats",
+    "html = get('https://bulbapedia.bulbagarden.net/wiki/List_of_Pok%C3%A9mon_in_Pok%C3%A9mon_Champions')",
+    "lead with service-and-stock-and-turnaround rather than price",
+])
+def test_ordinary_text_is_not_reported_as_a_credential(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line) == []
+
+
+@pytest.mark.parametrize("line", [
+    'token = "Kx9fQ2mPz7Lr4Tw8YbN3/vH6"',
+    'blob = "aB3dE5gH7jK9mN1pQ3sT/5.0"',
+    'key = "aBcDeFgHiJ/kLmNoPqRsTu"',
+    'k = "sk-live-AbCdEf0123456789xyz"',
+    'a = "AKIAABCDEFGHIJKLMNOP"',
+    'h = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"',
+    "url = postgres://admin:s3cretpass@db.example.com/app",
+])
+def test_key_shapes_are_still_reported(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line)
+
+
+def test_only_an_opaque_string_with_no_digit_is_weak():
+    from agent8088 import secret_scan
+    weak = secret_scan.find_secrets('key = "aBcDeFgHiJ/kLmNoPqRsTu"')
+    with_digits = secret_scan.find_secrets('blob = "aB3dE5gH7jK9mN1pQ3sT/5.0"')
+    vendor = secret_scan.find_secrets('k = "sk-live-AbCdEf0123456789xyz"')
+    assert weak and all(f.weak for f in weak)
+    assert with_digits and not any(f.weak for f in with_digits)
+    assert vendor and not any(f.weak for f in vendor)
+
+
+def _step_state(engine, tmp_path, monkeypatch, text):
+    from agent8088 import trajectory
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    page = tmp_path / "notes.md"
+    page.write_text(text, encoding="utf-8")
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    state.data["mutation_count"] = 1
+    return state, str(page)
+
+
+def test_a_finding_that_only_looks_like_a_key_is_asked_about_once_and_never_recorded_as_unmet(engine, tmp_path, monkeypatch):
+    state, page = _step_state(engine, tmp_path, monkeypatch, 'key = "aBcDeFgHiJ/kLmNoPqRsTu"\n')
+    first = engine._secrets_step(state, [page])
+    assert first is not None and first.unmet == ""
+    state.data["mutation_count"] = 2       # the file changed, so it is scanned again
+    assert engine._secrets_step(state, [page]) is None
+
+
+def test_a_vendor_key_is_asked_about_every_time_and_recorded_when_the_budget_runs_out(engine, tmp_path, monkeypatch):
+    state, page = _step_state(engine, tmp_path, monkeypatch, 'k = "sk-live-AbCdEf0123456789xyz"\n')
+    first = engine._secrets_step(state, [page])
+    state.data["mutation_count"] = 2
+    second = engine._secrets_step(state, [page])
+    assert first is not None and "credential" in first.unmet
+    assert second is not None and "credential" in second.unmet
