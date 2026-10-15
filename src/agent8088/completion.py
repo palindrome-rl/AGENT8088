@@ -249,7 +249,12 @@ def inventory(roots: Iterable[Path]) -> dict[str, list[int]]:
         while stack and len(found) < INVENTORY_LIMIT and visited < INVENTORY_VISIT_LIMIT:
             folder, depth = stack.pop()
             try:
-                entries = list(os.scandir(folder))
+                # Consume at most the remaining budget, rather than eagerly
+                # materialising every entry of a potentially enormous folder.
+                from itertools import islice
+                remaining = min(INVENTORY_LIMIT - len(found), INVENTORY_VISIT_LIMIT - visited)
+                with os.scandir(folder) as scan:
+                    entries = list(islice(scan, remaining))
             except OSError:
                 continue
             for entry in entries:

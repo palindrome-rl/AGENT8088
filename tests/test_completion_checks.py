@@ -438,3 +438,27 @@ def test_a_file_the_request_names_or_with_an_ordinary_name_is_not_a_helper(tmp_p
     plain.write_text("x = 1", encoding="utf-8")
     assert c.is_throwaway_helper(str(named), "write probe.py that checks ports", [str(named)], [tmp_path]) is False
     assert c.is_throwaway_helper(str(plain), "build it", [str(plain)], [tmp_path]) is False
+
+
+def test_inventory_stops_consuming_entries_at_visit_limit(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    consumed = []
+
+    class Scan:
+        def __enter__(self):
+            return iter(self)
+
+        def __exit__(self, *args):
+            pass
+
+        def __iter__(self):
+            for i in range(100):
+                consumed.append(i)
+                yield SimpleNamespace(path=str(tmp_path / f"f{i}.txt"),
+                                      is_dir=lambda **k: False, is_file=lambda **k: True,
+                                      stat=lambda: SimpleNamespace(st_size=1, st_mtime_ns=1))
+
+    monkeypatch.setattr(c, "INVENTORY_VISIT_LIMIT", 3)
+    monkeypatch.setattr(c.os, "scandir", lambda folder: Scan())
+    c.inventory([tmp_path])
+    assert len(consumed) <= 3
