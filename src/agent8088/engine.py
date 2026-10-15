@@ -19223,6 +19223,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 tool_outputs.append(result)
                 executed = True
                 round_fresh |= bool(loaded)
+                round_productive |= bool(loaded)
                 if on_result:
                     on_result(name, result)
                 if turn_tools is not None:
