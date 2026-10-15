@@ -34,3 +34,16 @@ def test_the_model_is_told_the_reply_was_cut_short_not_to_escape_quotes(engine, 
     assert "double quote" not in note
     assert 'mode=\"append\"' in note or 'mode="append"' in note
     assert any(t.get("type") == "tool_arg_cut_off" for t in trace)
+
+
+def test_the_cut_off_message_and_trace_say_how_much_arrived(engine, monkeypatch):
+    first = _reply("", "tool_calls", tool_calls=[_call("write_file", CUT)])
+    real = engine.exec_tool
+    model = Model(engine, monkeypatch, [first, _reply("done")])
+    monkeypatch.setattr(engine, "exec_tool", real)
+    trace = []
+    engine.run_agent([{"role": "user", "content": "build"}], max_turns=4, tools_def=[],
+                     allowed_tools={"write_file"}, trace=trace)
+    assert f"About {len(CUT)} characters arrived" in model.sent[1]
+    event = next(t for t in trace if t.get("type") == "tool_arg_cut_off")
+    assert event["chars"] == len(CUT) and event["tail"] == CUT[-80:]

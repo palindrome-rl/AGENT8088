@@ -405,3 +405,21 @@ def test_a_real_node_crash_still_counts(tmp_path):
     script.write_text("x\n", encoding="utf-8")
     seen = "ReferenceError: config is not defined\nCommand exited with status 1."
     assert app_check._run_briefly(script, lambda command, timeout: seen)
+
+
+def test_a_failed_script_start_keeps_what_the_script_printed(tmp_path):
+    script = tmp_path / "tool.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    printed = ("Traceback (most recent call last):\n  File \"tool.py\", line 3\n"
+               "ModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.failed and "ModuleNotFoundError" in report.output
+    assert app_check.check_script(script, run=lambda c, t: "usage: tool.py [-h]").output == ""
+
+
+def test_a_long_start_output_is_clipped_from_the_middle():
+    long = "a" * 1000 + "MIDDLE" + "z" * 1000
+    clipped = app_check.clip_output(long)
+    assert clipped.startswith("a" * 400) and clipped.endswith("z" * 400)
+    assert "MIDDLE" not in clipped and "[...]" in clipped
+    assert app_check.clip_output("short") == "short"
