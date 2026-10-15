@@ -67,6 +67,7 @@ class Report:
     console: list[str] = field(default_factory=list)
     note: str = ""
     output: str = ""              # what a script printed when started (clipped); for diagnosis only
+    ask: bool = False             # not verified, and worth asking the model to run it itself
 
     @property
     def failed(self) -> bool:
@@ -613,15 +614,42 @@ def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
     return text[:limit] + "\n[...]\n" + text[-limit:]
 
 
+# The last line of a traceback or error that is about the place the script was started in
+# (a read-only copy, an input or output path, a missing argument) and not about the script.
+_ENVIRONMENT_FINAL = re.compile(
+    r"^(?:PermissionError|FileNotFoundError|IsADirectoryError|NotADirectoryError|EOFError"
+    r"|OSError: \[(?:Errno (?:1|2|13|30)|WinError (?:2|3|5|19|32))\]|Error: (?:EROFS|EACCES|ENOENT|EPERM))"
+    r"|read-only file system|no such file or directory|permission denied|access is denied"
+    r"|\[winerror (?:2|3|5|19|32)\]",
+    re.IGNORECASE)
+# The note the sandbox appends when a command tried to write where it may not. It is about the
+# place the command ran in, never about the script, so it is not part of the error to judge.
+_SANDBOX_NOTE = re.compile(r"\n?\[sandbox\][\s\S]*$")
+
+
+def _final_line(output: str) -> str:
+    lines = [line.strip() for line in output.strip().splitlines()
+             if line.strip() and not line.strip().startswith("Command exited")]
+    return lines[-1] if lines else ""
+
+
 def _run_briefly(path: Path, run: Callable[[str, int], str],
                  unavailable: list[str] | None = None,
-                 captured: list[str] | None = None) -> list[str]:
+                 captured: list[str] | None = None,
+                 soft: list[str] | None = None) -> list[str]:
     """Start the script with --help in the sandbox; return crash findings.
 
     Only a crash on startup counts. Printing usage, finishing, or still running
     when the short clock ends are all fine, and a missing sandbox is no finding.
     `captured`, when given, receives the clipped output of a start that reported
     a crash, so a failure can be diagnosed from what the script actually printed.
+
+    The start happens in a read-only copy with no arguments, so a script that does its
+    work when started (builds a file, reads an input) can fail there for reasons that say
+    nothing about it. With `soft` given, such a start (a bare non-zero exit with no
+    error text, or an error about a path, permission or read-only file system) is
+    reported there as "not verified" instead of as a crash. An error about the code itself
+    (a syntax, import, name or type error) is a crash either way.
     """
     program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
     output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
@@ -637,6 +665,12 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
         last = [line for line in output.strip().splitlines() if line.strip()]
         if captured is not None:
             captured.append(clip_output(output))
+        final = _final_line(_SANDBOX_NOTE.sub("", output))
+        if soft is not None and ((not crashed) or _ENVIRONMENT_FINAL.search(final)):
+            status = exited.group(1) if exited else "?"
+            soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
+                        + (f" ({final[:100]})" if crashed else "") + "; whether it works was not verified")
+            return []
         return [f"the script crashed when started: {last[-1][:160] if last else 'non-zero exit'}"]
     return []
 
@@ -853,9 +887,12 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                 # --help: the boot probe answers the question --help never could.
                 return _boot_report(path, "python", port, run)
             captured: list[str] = []
-            crash = _run_briefly(path, run, captured=captured)
+            soft: list[str] = []
+            crash = _run_briefly(path, run, captured=captured, soft=soft)
             if crash:
                 return Report("script", str(path), FAIL, crash, output="".join(captured))
+            if soft:
+                return Report("script", str(path), UNAVAILABLE, note=soft[0], output="".join(captured), ask=True)
             if looks_like_server(source):
                 return Report("script", str(path), UNAVAILABLE,
                               note="looks like a server but the port it will listen on "
@@ -884,9 +921,12 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                 return _boot_report(path, "node", port, run)
             unavailable = []
             captured: list[str] = []
-            crash = _run_briefly(path, run, unavailable, captured)
+            soft: list[str] = []
+            crash = _run_briefly(path, run, unavailable, captured, soft)
             if crash:
                 return Report("script", str(path), FAIL, crash, output="".join(captured))
+            if soft:
+                return Report("script", str(path), UNAVAILABLE, note=soft[0], output="".join(captured), ask=True)
             if unavailable:
                 return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
             if looks_like_server(source):

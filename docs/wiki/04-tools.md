@@ -216,7 +216,14 @@ A deterministic smoke test of something the agent built; no model call.
 - **Script** (`.py`, `.js`/`.mjs`/`.cjs`): syntax-checked (`compile`, `node
   --check`). Scripts inside the artifact workspace also get a brief `--help`
   startup check in a disposable read-only sandbox when available. Without that
-  sandbox the result explicitly says it was not executed.
+  sandbox the result explicitly says it was not executed. A start that exits
+  non-zero with no error text, or whose last error line is about a path,
+  permission or read-only file system (a script that builds a file or reads an
+  input when started), is reported as `unavailable` ("not verified"), not as a
+  crash; an error about the code itself (syntax, import, name, type, missing
+  module) is still a crash. A script that could not be verified is asked about
+  once: run it yourself and look at its output, or say that you did not. A later
+  successful command that runs it settles it.
 - Browser-only JavaScript that requires globals such as `window` cannot be
   startup-verified under Node. It reports `unavailable`, not a successful startup;
   check the containing HTML page to verify it in a browser context.

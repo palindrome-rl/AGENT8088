@@ -18011,6 +18011,7 @@ def _smoke_test_step(trajectory, written: list):
     targets = app_check.deliverable_targets(written, roots)
     pending = trajectory.smoke_unchecked([str(t) for t in targets])
     failures = []
+    unverified = []
     for target in targets:
         if str(target) not in pending:
             continue
@@ -18018,9 +18019,13 @@ def _smoke_test_step(trajectory, written: list):
                                         run=_smoke_script_runner(target), click_steps=SMOKE_CLICK_STEPS)
         if report.status == app_check.SKIPPED:
             continue
-        trajectory.record_smoke(str(target), report.summary(), report.failed, report.output)
+        trajectory.record_smoke(str(target), report.summary(), report.failed, report.output,
+                                passed=report.status == app_check.PASS,
+                                unverified=report.status == app_check.UNAVAILABLE and report.ask)
         if report.failed:
             failures.append(report)
+        elif report.ask:
+            unverified.append(report)
     if (failures and COMPLETION_SMOKE_TEST == "enforce"
             and trajectory.smoke_failures() <= COMPLETION_SMOKE_MAX_FAILURES):
         detail = "\n".join(r.text(900) for r in failures)
@@ -18030,6 +18035,20 @@ def _smoke_test_step(trajectory, written: list):
                 f"The smoke test of what you built failed:\n{detail}",
                 "Continue: fix these problems, then check again with check_app."),
             unmet="the smoke test failed: " + "; ".join(Path(r.target).name for r in failures))
+    if unverified and not failures and COMPLETION_SMOKE_TEST == "enforce":
+        # Starting these in a read-only copy told nothing either way. Ask once for the one
+        # thing that can settle it: the model running the script itself.
+        asked = trajectory.ask_to_verify([str(r.target) for r in unverified])
+        if asked:
+            listed = "\n".join(f"- {Path(t).name}" for t in asked)
+            return completion_checks.Nudge(
+                "unverified",
+                completion_checks.continue_text(
+                    "These could not be checked automatically (starting them in a read-only copy "
+                    f"did not show whether they work):\n{listed}",
+                    "Continue: run each one yourself from the project folder and look at what it "
+                    "prints, or say plainly in your reply that you did not run it."),
+                unmet="not verified: " + "; ".join(Path(t).name for t in asked))
     return None
 
 
