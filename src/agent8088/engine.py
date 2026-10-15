@@ -17015,14 +17015,31 @@ _LOOP_PREFIXES = (_TOOL_RESULT_PREFIX, _HARNESS_PREFIX)
 # is told how much time is left. Without them the model explores until the
 # budget kills it, often before any deliverable exists.
 TIME_LEFT_NUDGE_AT = (0.6, 0.85)
+# The same two warnings for rounds, measured against the bound the run can never pass: a run
+# that keeps making progress is granted more rounds, so a warning against the starting
+# allowance would be taken back at the boundary and repeat with every grant.
+ROUND_LEFT_NUDGE_AT = (0.8, 0.95)
+ROUND_NUDGE_MIN_BOUND = 20   # below this a warning is noise
 
 
-def _time_left_nudge(seconds_left: float) -> str:
+def _wrap_up_ask(final: bool) -> str:
+    return (" In your final reply say what is done, what is not done and what you could not verify."
+            if final else "")
+
+
+def _time_left_nudge(seconds_left: float, final: bool = False) -> str:
     minutes = max(0, int(seconds_left)) // 60
     left = f"about {minutes} min" if minutes else "under a minute"
     return (f"Time check: {left} left before this run is stopped. Make sure every "
             "required output exists now, even if imperfect; stop exploring and "
-            "finish the most important remaining step first.")
+            "finish the most important remaining step first." + _wrap_up_ask(final))
+
+
+def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
+    left = f"about {rounds_left} rounds" if rounds_left > 1 else "one round"
+    return (f"Round check: {left} left before this run is stopped. Make sure every "
+            "required output exists now, even if imperfect; stop exploring and "
+            "finish the most important remaining step first." + _wrap_up_ask(final))
 
 
 def _harness_turn(text: str) -> dict:
@@ -18392,6 +18409,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
+    round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     compaction_cooldown_turn = 0  # a successful one waits COMPACTION_COOLDOWN_TURNS turns
     plan_mutation_retries = 0
@@ -18469,14 +18487,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
             return answer
-        if DISPOSABLE_CONTAINER and budget and budget.max_seconds:
+        # Only when a clock was configured: with no limit set there is nothing to announce.
+        # A sub-agent's clock is its parent's remainder, so only the main run is told.
+        if (DISPOSABLE_CONTAINER or depth == 0) and budget and budget.max_seconds:
             left = budget.seconds_left()
             crossed = sum(1 - left / budget.max_seconds >= at for at in TIME_LEFT_NUDGE_AT)
             if crossed > time_nudges:
                 time_nudges = crossed
-                messages.append(_harness_turn(_time_left_nudge(left)))
+                messages.append(_harness_turn(
+                    _time_left_nudge(left, final=crossed >= len(TIME_LEFT_NUDGE_AT))))
                 if trace is not None:
                     trace.append({"turn": turn, "type": "time_left", "content": int(left)})
+        if depth == 0 and policy.ceiling >= ROUND_NUDGE_MIN_BOUND:
+            crossed = sum(turn / policy.ceiling >= at for at in ROUND_LEFT_NUDGE_AT)
+            if crossed > round_nudges:
+                round_nudges = crossed
+                messages.append(_harness_turn(_rounds_left_nudge(
+                    policy.ceiling - turn, final=crossed >= len(ROUND_LEFT_NUDGE_AT))))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "rounds_left", "content": policy.ceiling - turn})
         # After a length cutoff, first allow a larger retry, then force one
         # short answer/tool-call attempt for models with a low output ceiling.
         # The limits are the active model's, not the module constants, so a
