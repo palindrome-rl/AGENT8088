@@ -141,6 +141,11 @@ _CHECK_COMMAND = re.compile(
     r"make|cmake|cargo|e2e|smoke)(?![a-z])", re.IGNORECASE)
 
 
+# The note the sandbox appends when a command tried to write where it may not. A check that ends with
+# it was stopped by the sandbox: it never ran to a result, so it did not fail.
+_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
+
+
 def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
     return not (command or "").strip() or bool(_CHECK_COMMAND.search(command))
@@ -316,7 +321,8 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
-        if operation["verdict"] == "failed" and _is_check_run(command):
+        if (operation["verdict"] == "failed" and _is_check_run(command)
+                and not _SANDBOX_BLOCKED.search(str(result))):
             self.data["check_failing"] = True
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]

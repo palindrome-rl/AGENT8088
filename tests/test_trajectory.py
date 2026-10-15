@@ -212,3 +212,18 @@ def test_the_command_that_failed_running_cleanly_later_settles_it_and_another_co
     assert state.check_failing(), "a different command says nothing about the failed one"
     _ran(state, "python  test_board.py", "unknown")
     assert not state.check_failing() and state.failing_check_detail() == ""
+
+
+def test_a_check_the_sandbox_stopped_did_not_fail_it_never_ran_to_a_result():
+    blocked = ("[WinError 5] Access is denied: '__pycache__'\nCommand exited with status 1.\n"
+               "[sandbox] Shell commands may write only to C:\\w\\artifacts and the sandbox temp folder; "
+               "everything else is read-only to them.")
+    state = TrajectoryState({}, goal="g", message_count=1)
+    op = {"tool": "execute_shell", "status": "running"}
+    state.after_tool(op, blocked, failed=False, blocked=False, mutated=False, verdict="failed",
+                     command="python -m py_compile app.py")
+    assert not state.check_failing()
+    op = {"tool": "execute_shell", "status": "running"}
+    state.after_tool(op, "Traceback ...\nAssertionError\nCommand exited with status 1.", failed=False, blocked=False,
+                     mutated=False, verdict="failed", command="python test_app.py")
+    assert state.check_failing(), "the same kind of command failing without the sandbox note is still a failed check"
