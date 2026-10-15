@@ -75,3 +75,26 @@ def test_a_passing_built_run_that_keeps_looking_is_told_to_finish(eng, monkeypat
     eng.run_agent([{"role": "user", "content": "write app.py"}], max_turns=30,
                   tools_def=[], allowed_tools={"write_file", "execute_shell"})
     assert len(script.nudges("the latest checks pass")) == 1
+
+
+def test_explicit_waits_do_not_count_as_churn(eng, monkeypatch):
+    monkeypatch.setattr(eng, "STALL_ROUNDS", 3)
+    replies = [_call("execute_shell", command="sleep 1") for _ in range(9)] + ["Finished waiting."]
+    script = Script(eng, monkeypatch, replies, tool=failing_then_ok(["waited"] * 9))
+    trace = []
+    answer = eng.run_agent([{"role": "user", "content": "Wait for nine polling rounds."}],
+                           max_turns=30, tools_def=[], allowed_tools={"execute_shell"}, trace=trace)
+    assert not any(t.get("type") == "stall_stop" for t in trace)
+    assert answer.startswith("Finished waiting.")
+
+
+def test_successful_new_read_is_progress_even_if_last_call_in_round_fails(eng, monkeypatch):
+    monkeypatch.setattr(eng, "STALL_ROUNDS", 2)
+    replies = [(_call("execute_shell", command=f"cat note{i}.txt") + "\n"
+                + _call("execute_shell", command=f"broken{i}")) for i in range(7)] + ["Read all notes."]
+    script = Script(eng, monkeypatch, replies, tool=failing_then_ok(["text", "Error: unavailable"] * 7))
+    trace = []
+    answer = eng.run_agent([{"role": "user", "content": "Read the notes and try the optional tools."}],
+                           max_turns=30, tools_def=[], allowed_tools={"execute_shell"}, trace=trace)
+    assert not any(t.get("type") == "stall_stop" for t in trace)
+    assert answer.startswith("Read all notes.")

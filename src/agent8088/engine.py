@@ -19207,6 +19207,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
         for call in calls:
             name = call["name"]
@@ -19543,6 +19544,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   "tool": name, "count": parse_error_retries})
                 continue
             executed = executed or not no_progress
+            if (not no_progress and not _plan_step_failed(result)
+                    and (sig not in seen_signatures or _is_wait_command(name, args))):
+                round_productive = True
             if not no_progress and sig not in seen_signatures:
                 round_fresh = True
             seen_signatures.add(sig)
@@ -19756,13 +19760,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 trace.append({"turn": turn, "type": "turn_extension",
                               "from": granted[0], "to": granted[1]})
             if stall_watch is not None:
-                last_output = tool_outputs[-1] if tool_outputs else None
                 settled = (trajectory is not None and trajectory.mutation_count() > 0
                            and trajectory.data.get("verification") == "verified"
                            and not trajectory.check_failing() and not trajectory.open_subgoals())
                 said = stall_watch.record(
-                    productive=bool(round_fresh and last_output is not None
-                                    and not _plan_step_failed(last_output)),
+                    productive=round_productive,
                     mark=trajectory.progress_mark() if trajectory is not None else (),
                     build_mark=_build_mark(trajectory),
                     settled=settled)
