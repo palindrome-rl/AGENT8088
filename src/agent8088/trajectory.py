@@ -424,6 +424,21 @@ class TrajectoryState:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
 
+    def landed_paths(self) -> list[str]:
+        """The files this run wrote, each at the place it actually is.
+
+        A write the sandbox diverted is recorded under the path that was asked for, but the file
+        is where it landed. Checks that open the files (the smoke test, the credential scan) need
+        that place, or they find nothing there and silently skip the file.
+        """
+        moved = {_file_key(req): landed for req, landed in self.redirected_writes()}
+        paths: list[str] = []
+        for path in self.written_paths():
+            actual = moved.get(_file_key(path), path)
+            if actual not in paths:
+                paths.append(actual)
+        return paths
+
     def redirected_writes(self) -> list[tuple[str, str]]:
         """(requested, landed) pairs for writes the sandbox routed elsewhere."""
         return [(req, landed) for req, landed in self.data.get("redirected_writes") or []]

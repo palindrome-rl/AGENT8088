@@ -176,3 +176,11 @@ def test_main_loop_requests_one_different_approach_after_repeated_failures(monke
     assert "correct paths next" in answer
     assert any("Do not repeat them" in str(message["content"]) for message in messages)
     assert "Unresolved tool work remains" in answer
+
+
+def test_landed_paths_name_the_place_a_diverted_write_actually_is():
+    state = TrajectoryState({}, goal="g", message_count=1)
+    state.data["written_paths"] = ["/w/outputs/watch.py", "/w/artifacts/notes.md"]
+    state.data["redirected_writes"] = [["/w/outputs/watch.py", "/w/artifacts/outputs/watch.py"]]
+    assert state.landed_paths() == ["/w/artifacts/outputs/watch.py", "/w/artifacts/notes.md"]
+    assert state.written_paths() == ["/w/outputs/watch.py", "/w/artifacts/notes.md"], "the record itself is unchanged"

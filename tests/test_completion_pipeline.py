@@ -227,6 +227,7 @@ def test_a_scratch_script_gets_no_tests_reminder_even_in_a_project_with_tests(en
 
 
 def test_library_code_in_a_project_with_tests_gets_the_reminder(eng, monkeypatch, tmp_path):
+    monkeypatch.setattr(eng, "COMPLETION_SMOKE_TEST", "off")   # the file is not run here; the reminder is the subject
     (tmp_path / "tests").mkdir()
     script = Script(eng, monkeypatch, [
         _call("write_file", filename=str(tmp_path / "src" / "parser.py"), content="x = 1"),
@@ -330,3 +331,22 @@ def test_a_file_the_real_write_tool_diverted_is_not_demanded_again(eng, monkeypa
     assert (tmp_path / "artifacts" / "outputs" / "watch.py").is_file() and not asked.exists()
     assert not script.nudges("missing or empty"), script.sent
     assert answer.startswith("I wrote watch.py")
+
+
+def test_a_diverted_file_still_gets_the_end_of_run_smoke_test(eng, monkeypatch, tmp_path):
+    """The checks that open the written files must look where the file landed, not where it was asked for."""
+    import shutil
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    monkeypatch.setattr(eng, "COMPLETION_SMOKE_TEST", "enforce")
+    monkeypatch.setattr(eng, "_smoke_script_runner", lambda target: None)   # syntax check only
+    asked = tmp_path / "outputs" / "broken.js"
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename=str(asked), content="function broken( {\n"),
+        "I wrote the script.",
+        _call("write_file", filename=str(asked), content="function fixed() { return 1; }\n"),
+        "I fixed the script.",
+    ])
+    answer = run(eng, "Write a script that does something.", script)
+    assert script.nudges("smoke test of what you built failed"), script.sent
+    assert "syntax error" in " ".join(script.sent)
