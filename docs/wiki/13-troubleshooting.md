@@ -75,7 +75,7 @@ live state is shown.
 Read the named stage and the last command output before retrying. The full
 installation log is `%LOCALAPPDATA%\agent8088\install.log` on Windows or
 `~/.agent8088/install.log` on macOS/Linux, under `AGENT8088_HOME` if configured.
-Re-run the [same public v1.2 installation command](01-getting-started.md#install)
+Re-run the [same public v1.3 installation command](01-getting-started.md#install)
 to resume. Do not delete your configuration, memory, or entire installation home.
 
 The installer checks that the installed command can run `--version` before
@@ -93,8 +93,8 @@ cannot be installed or launched, use the current PowerShell window:
 
 ```powershell
 $env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
-$env:AGENT8088_BRANCH = "AGENT8088-v1.2"
-iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+$env:AGENT8088_BRANCH = "AGENT8088-v1.3"
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 ```
 
 The override only bypasses the terminal-host check, not antivirus or Windows

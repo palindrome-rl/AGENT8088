@@ -81,8 +81,8 @@ def test_display_keeps_evidence_but_removes_internal_markers(runtime):
 
 def test_public_cli_version_and_update_channel(runtime):
     from agent8088 import __version__, cli
-    assert __version__ == "1.2.0"
-    assert cli.UPDATE_BRANCH == "AGENT8088-v1.2"
+    assert __version__ == "1.3.0"
+    assert cli.UPDATE_BRANCH == "AGENT8088-v1.3"
 
 
 def test_doctor_shortens_both_path_styles_without_shortening_another_user(runtime, monkeypatch):
@@ -117,4 +117,4 @@ def test_public_wiki_sync_preserves_unrelated_navigation():
     second = module.update_sidebar(first)
     assert other.strip() in second
     assert second.count(module.SIDEBAR_START) == 1
-    assert module.REPO == "palindrome-rl/AGENT8088" and module.SOURCE_BRANCH == "AGENT8088-v1.2"
+    assert module.REPO == "palindrome-rl/AGENT8088" and module.SOURCE_BRANCH == "AGENT8088-v1.3"

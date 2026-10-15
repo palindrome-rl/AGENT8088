@@ -75,7 +75,7 @@ Nothing here is authenticated and `POST /api/tool/{name}` runs any tool,
 
 ## 1:1 CLI Surface Mapping
 
-On `AGENT8088-v1.2`, **+ → Image analysis**, image paste/drop, and the clipboard
+On `AGENT8088-v1.3`, **+ → Image analysis**, image paste/drop, and the clipboard
 button all use session attachments. Wait for the **Ready** chip, type a
 question, and send it as normal chat (not a slash command). Vision chat models
 receive real image parts; other models use local OCR when installed. Unknown

@@ -1,7 +1,7 @@
 # Agent8088 Wiki
 
-> **Agent8088 v1.2 documentation.** These pages describe the public
-> `AGENT8088-v1.2` branch and are published to its repository wiki.
+> **Agent8088 v1.3 documentation.** These pages describe the public
+> `AGENT8088-v1.3` branch and are published to its repository wiki.
 
 Complete reference for Agent8088 — a local-first AI agent with fine-tuned tool
 calling, an enforced permission layer, OS-level sandboxing, MCP in both

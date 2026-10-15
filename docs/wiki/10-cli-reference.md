@@ -48,7 +48,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |
 | `--subsystem SUBSYSTEM` | With `--logs`: substring filter on subsystem name |
 | `--json` | With `--logs`: emit raw JSONL instead of the human-formatted view |
-| `--update` | Update from the public `AGENT8088-v1.2` branch and reinstall, then exit |
+| `--update` | Update from the public `AGENT8088-v1.3` branch and reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
 | `--workspace` | With `--uninstall`: also remove trace logs and the WhatsApp session directory |
@@ -87,7 +87,7 @@ entered them. Only one task runs at a time. Stop or failure pauses the queue
 for your review. The sidebar identifies the running chat. You cannot rename,
 delete, reset or compact that chat while its task is running.
 
-### Images and attachments in Agent8088 v1.2
+### Images and attachments in Agent8088 v1.3
 
 Use **+ → Image analysis** to choose images, paste a screenshot into the
 message box, or drop a file onto the composer. The clipboard button also

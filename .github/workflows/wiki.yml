@@ -2,7 +2,7 @@ name: Sync wiki
 
 on:
   push:
-    branches: [AGENT8088-v1.2]
+    branches: [AGENT8088-v1.3]
     paths:
       - "docs/wiki/**"
       - "scripts/sync_wiki.py"

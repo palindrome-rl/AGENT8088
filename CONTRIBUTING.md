@@ -14,7 +14,7 @@ Thanks for helping improve Agent8088. This page is the short version; the
 ## Get set up
 
 ```sh
-git clone --branch AGENT8088-v1.2 https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 uv sync --all-extras
 ```
@@ -29,7 +29,7 @@ uv run agent8088 --version
 
 ## Make a change
 
-1. Branch from `AGENT8088-v1.2` and open your pull request against it.
+1. Branch from `AGENT8088-v1.3` and open your pull request against it.
 2. Keep each pull request focused on one change.
 3. Update the docs in `docs/wiki/` when behaviour changes. The GitHub wiki is
    generated from those files automatically, so do not edit it directly.
@@ -46,7 +46,7 @@ bash scripts/check_installer_portability.sh
 ```
 
 For behaviour changes, also run the feature checks in a throwaway home and
-compare the result with the same run on `AGENT8088-v1.2`:
+compare the result with the same run on `AGENT8088-v1.3`:
 
 ```sh
 HOME="$(mktemp -d)" AGENT8088_HOME="$(mktemp -d)" uv run python scripts/verify_features.py

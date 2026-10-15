@@ -32,7 +32,7 @@ from pathlib import Path
 REPO = "palindrome-rl/AGENT8088"
 # The branch these pages are generated from. Source links must point at the
 # branch that produced them, or a reader follows them to different text.
-SOURCE_BRANCH = "AGENT8088-v1.2"
+SOURCE_BRANCH = "AGENT8088-v1.3"
 WIKI_PREFIX = ""
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
@@ -123,7 +123,7 @@ def build_sidebar() -> str:
     if unknown:
         raise SystemExit(f"sync_wiki: sidebar references unknown page(s): {sorted(unknown)}")
 
-    lines = [SIDEBAR_START, "", "### Agent8088 v1.2", ""]
+    lines = [SIDEBAR_START, "", "### Agent8088 v1.3", ""]
     for section, pages in SIDEBAR_SECTIONS:
         lines.append(f"**{section}**")
         lines.append("")
@@ -179,7 +179,7 @@ def main() -> int:
     if args.dry_run:
         for name in converted:
             print(f"  would write {name}")
-        print("  would replace _Sidebar.md with the v1.2 navigation")
+        print("  would replace _Sidebar.md with the v1.3 navigation")
         return 0
 
     workdir = Path(tempfile.mkdtemp(prefix="agent8088-wiki-"))

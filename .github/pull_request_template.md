@@ -16,9 +16,9 @@
 
 ## Checklist
 
-- [ ] The pull request targets `AGENT8088-v1.2`.
+- [ ] The pull request targets `AGENT8088-v1.3`.
 - [ ] The title follows Conventional Commits (`feat:`, `fix:`, `docs:` …).
-- [ ] The CI checks from [CONTRIBUTING.md](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.2/CONTRIBUTING.md) pass locally.
+- [ ] The CI checks from [CONTRIBUTING.md](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/CONTRIBUTING.md) pass locally.
 - [ ] Docs in `docs/wiki/` are updated if behaviour changed.
 - [ ] No secrets, tokens or personal data are included.
 - [ ] Behaviour changes that could affect existing setups are called out below.

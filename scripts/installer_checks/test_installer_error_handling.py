@@ -26,7 +26,7 @@ STUB_LOGS = (
     'log_warn() { echo "WARN:$1"; }\n'
     'log_error() { echo "ERR:$1"; }\n'
     'log_success() { echo "OK:$1"; }\n'
-    'INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash"\n'
+    'INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash"\n'
 )
 
 
@@ -87,7 +87,7 @@ def test_sudo_invocation_is_refused_with_the_rerun_command(tmp_path):
     )
     assert result.returncode == 1
     assert "Don't run the installer with sudo" in result.stdout
-    assert "palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash" in result.stdout
+    assert "palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" in result.stdout
     assert "REACHED" not in result.stdout
 
 
@@ -141,7 +141,7 @@ def test_branch_with_a_value_passes(tmp_path):
 
 def test_branch_and_memory_options_validate_their_value():
     source = _sh_source()
-    assert '_require_option_value "$1" "${2:-}" "AGENT8088-v1.2"' in source
+    assert '_require_option_value "$1" "${2:-}" "AGENT8088-v1.3"' in source
     assert '_require_option_value "$1" "${2:-}" "native"' in source
 
 
@@ -585,7 +585,7 @@ def test_piped_to_dash_prints_the_bash_hint_without_bad_substitution(tmp_path):
     assert result.returncode == 1
     assert "Bad substitution" not in result.stderr
     assert "This installer needs bash" in result.stderr
-    assert "palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | bash" in result.stderr
+    assert "palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" in result.stderr
     assert "CRLF" not in result.stderr
 
 

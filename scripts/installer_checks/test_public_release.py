@@ -1,4 +1,4 @@
-"""Compatibility boundaries for the public v1.2 release."""
+"""Compatibility boundaries for the public v1.3 release."""
 import os
 from pathlib import Path
 import re
@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC = "palindrome-rl/AGENT8088"
-BRANCH = "AGENT8088-v1.2"
+BRANCH = "AGENT8088-v1.3"
 # Third-party repositories the Windows installer legitimately downloads from.
 VENDOR = {"astral-sh/uv", "git-for-windows/git", "microsoft/terminal"}
 _SLUG = re.compile(r"(?:github\.com|githubusercontent\.com)/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)")
@@ -33,10 +33,10 @@ def test_install_and_recovery_stay_on_the_public_release(name):
 
 def test_release_version_license_and_update_channel_are_preserved():
     metadata = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "1.2.0"' in metadata
+    assert 'version = "1.3.0"' in metadata
     assert 'license = "MIT"' in metadata
     cli = (ROOT / "src/agent8088/cli.py").read_text(encoding="utf-8")
-    assert 'UPDATE_BRANCH = "AGENT8088-v1.2"' in cli
+    assert 'UPDATE_BRANCH = "AGENT8088-v1.3"' in cli
 
 
 def test_windows_config_acl_uses_absolute_system_binary():
@@ -76,5 +76,5 @@ def test_diagnostics_have_their_shipped_runtime_modules():
 
 def test_linux_retry_command_uses_the_public_default_branch():
     source = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'REPO_BRANCH="${AGENT8088_BRANCH:-AGENT8088-v1.2}"' in source
-    assert 'if [ "$BRANCH" = "AGENT8088-v1.2" ]; then' in source
+    assert 'REPO_BRANCH="${AGENT8088_BRANCH:-AGENT8088-v1.3}"' in source
+    assert 'if [ "$BRANCH" = "AGENT8088-v1.3" ]; then' in source

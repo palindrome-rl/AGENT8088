@@ -4,10 +4,10 @@
 
 ## Setup
 
-Start from the v1.2 branch:
+Start from the v1.3 branch:
 
 ```sh
-git clone --branch AGENT8088-v1.2 https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
@@ -107,13 +107,13 @@ run them locally too.
 
 ## Branch and PR conventions
 
-- Branch from `AGENT8088-v1.2`, not `main`.
-- **Never push to `main` or `AGENT8088-v1.2` directly.** Open a PR. (There is no
+- Branch from `AGENT8088-v1.3`, not `main`.
+- **Never push to `main` or `AGENT8088-v1.3` directly.** Open a PR. (There is no
   repo-level hook enforcing this — it's discipline, backed by whatever branch
   protection is configured on GitHub.)
 - Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
   `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:` or `chore:`, then a
-  short imperative summary. See [CONTRIBUTING.md](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.2/CONTRIBUTING.md).
+  short imperative summary. See [CONTRIBUTING.md](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/CONTRIBUTING.md).
 - In the PR body, state: what changed, the repro that proves it, verification
   output, and anything you deliberately left out.
 - Flag behaviour changes that could break an existing setup. A security

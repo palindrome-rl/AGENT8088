@@ -2,7 +2,7 @@ name: Publish Docker image
 
 on:
   push:
-    branches: [AGENT8088-v1.2]
+    branches: [AGENT8088-v1.3]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -28,7 +28,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=1.2.0,enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=1.3.0,enable=${{ github.ref_type == 'branch' }}
             type=raw,value=latest,enable=${{ github.ref_type == 'branch' }}
       - uses: docker/build-push-action@v6
         with:

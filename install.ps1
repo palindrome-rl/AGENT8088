@@ -2,7 +2,7 @@
 # Agent8088 Installer - Windows (native PowerShell)
 # ============================================================================
 # Usage:
-#   $env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+#   $env:AGENT8088_BRANCH = "AGENT8088-v1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, PortableGit install, repo clone,
@@ -21,7 +21,7 @@ param(
     [switch]$SkipLibreOffice,
     [switch]$WithMem0,
     [switch]$SkipMem0,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "AGENT8088-v1.2" }),
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "AGENT8088-v1.3" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
     [string]$InstallerSourceUrl = ""
@@ -261,7 +261,7 @@ function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -Fore
 # comfortably.
 #
 # Scale them all for a slow connection:
-#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 $TimeoutScale = 1
 if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
     $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
@@ -2136,7 +2136,7 @@ function Write-RepoAccessHelp {
     switch ($Kind) {
         "branch" {
             Write-Err "Branch '$Branch' does not exist in $RepoUrl."
-            Write-Info "Use an existing branch:  `$env:AGENT8088_BRANCH = 'AGENT8088-v1.2'; then re-run."
+            Write-Info "Use an existing branch:  `$env:AGENT8088_BRANCH = 'AGENT8088-v1.3'; then re-run."
         }
         "access" {
             Write-Err "GitHub could not find the public repository at $RepoUrl."
@@ -3486,7 +3486,7 @@ function Verify-Install {
             Write-Err "The executable is missing: $agentExe"
         }
         Write-Info "See the error directly:  & `"$InstallDir\venv\Scripts\python.exe`" -m agent8088.cli --version"
-        Write-Info "Fix: re-run the installer:  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)"
+        Write-Info "Fix: re-run the installer:  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)"
         Write-Info "If that fails too, delete $InstallDir\venv and re-run."
         if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
     }

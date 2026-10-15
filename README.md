@@ -18,10 +18,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml"><img src="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml/badge.svg?branch=AGENT8088-v1.2" alt="CI status"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml"><img src="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml/badge.svg?branch=AGENT8088-v1.3" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.2"><img src="https://img.shields.io/badge/release-v1.2-f59e0b" alt="Agent8088 v1.2 branch"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.3"><img src="https://img.shields.io/badge/release-v1.3-f59e0b" alt="Agent8088 v1.3 branch"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
   <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
@@ -97,7 +97,7 @@ analysis, academic research and community pain-points.
 
 ---
 
-## Reliability updates on the v1.2 branch
+## Reliability updates on the v1.3 branch
 
 This branch includes clearer CLI and Web UI health reporting, automatic search
 fallback notices, scanned-document OCR improvements, working-directory recovery,
@@ -109,24 +109,24 @@ transient network failures. Existing configuration and memory are preserved.
 
 ## Quick start
 
-### Install Agent8088 v1.2
+### Install Agent8088 v1.3
 
-The commands below install the public v1.2 branch. `agent8088 --update`
+The commands below install the public v1.3 branch. `agent8088 --update`
 continues to use this branch.
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.sh | AGENT8088_BRANCH=AGENT8088-v1.2 bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | AGENT8088_BRANCH=AGENT8088-v1.3 bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
+$env:AGENT8088_BRANCH = "AGENT8088-v1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 ```
 
-Use these branch-specific installers for v1.2; the generic Pages installer
+Use these branch-specific installers for v1.3; the generic Pages installer
 may track a different release.
 
 Run the Windows command in PowerShell, not Command Prompt. On macOS/Linux,
@@ -346,7 +346,7 @@ Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
 GitIngest-backed repository overviews, search and source reads.
 
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
-The [hosted v1.2 wiki](https://github.com/palindrome-rl/AGENT8088/wiki) mirrors
+The [hosted v1.3 wiki](https://github.com/palindrome-rl/AGENT8088/wiki) mirrors
 these versioned pages.
 
 | Read this | To learn about |
@@ -370,7 +370,7 @@ these versioned pages.
 To inspect this release or propose a change, clone its public branch:
 
 ```sh
-git clone --branch AGENT8088-v1.2 https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 uv sync --all-extras
 ```

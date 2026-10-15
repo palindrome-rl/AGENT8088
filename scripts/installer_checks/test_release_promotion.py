@@ -47,7 +47,7 @@ def test_documented_install_commands_use_the_public_release_channel():
         text = path.read_text(encoding="utf-8")
         urls = re.findall(r"https://raw\.githubusercontent\.com/([^\s)]+/install\.(?:sh|ps1))", text)
         for url in urls:
-            assert url == "palindrome-rl/AGENT8088/AGENT8088-v1.2/" + url.rsplit("/", 1)[1]
+            assert url == "palindrome-rl/AGENT8088/AGENT8088-v1.3/" + url.rsplit("/", 1)[1]
 
 
 def test_doctor_has_a_bounded_deadline_longer_than_individual_live_probes():

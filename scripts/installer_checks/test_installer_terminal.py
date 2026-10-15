@@ -196,7 +196,7 @@ def test_terminal_relaunch_preserves_installer_parameters(tmp_path):
         f"""
 $env:TEMP = '{str(tmp_path).replace("'", "''")}'
 $env:TMP = $env:TEMP
-$Branch = 'AGENT8088-v1.2'
+$Branch = 'AGENT8088-v1.3'
 $RepoSlug = 'palindrome-rl/AGENT8088'
 $Agent8088Home = "C:\\Users\\O'Brien\\Agent Home"
 $InstallDir = 'C:\\Agent Install'
@@ -230,7 +230,7 @@ Write-Output ([IO.File]::ReadAllText($file))
     assert ";" not in head.split("|")[-1]                      # wt.exe would split on it
     assert "ReadAllText" in head
     assert launcher.index("Tls12") < launcher.index("Invoke-RestMethod")
-    assert "palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1" in launcher
+    assert "palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1" in launcher
     assert "-Agent8088Home 'C:\\Users\\O''Brien\\Agent Home'" in launcher
     assert "-InstallDir 'C:\\Agent Install'" in launcher
     assert "-SkipSetup:$true" in launcher
@@ -244,7 +244,7 @@ def test_terminal_upgrade_runs_in_visible_external_bootstrap(tmp_path):
 $env:TEMP = '{str(tmp_path).replace("'", "''")}'
 $env:TMP = $env:TEMP
 $env:SystemRoot = 'C:\\Windows'
-$Branch = 'AGENT8088-v1.2'
+$Branch = 'AGENT8088-v1.3'
 $RepoSlug = 'palindrome-rl/AGENT8088'
 $Agent8088Home = 'C:\\Users\\User\\AppData\\Local\\agent8088'
 $InstallDir = ''

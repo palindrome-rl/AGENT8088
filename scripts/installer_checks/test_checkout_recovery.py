@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-BRANCH = "AGENT8088-v1.2"
+BRANCH = "AGENT8088-v1.3"
 pytestmark = pytest.mark.skipif(
     os.name == "nt" or not shutil.which("git") or not shutil.which("bash"),
     reason="real POSIX checkout tests",
