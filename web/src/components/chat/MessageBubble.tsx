@@ -5,12 +5,24 @@ import { ThinkingTrace } from './ThinkingTrace'
 import { ToolChip } from './ToolChip'
 import { ToolDiffStrip } from './ToolDiffStrip'
 import { scrubMarkup } from '@/lib/scrub'
-import { FileText } from 'lucide-react'
+import { AlertTriangle, FileText } from 'lucide-react'
 
 import type { ChatMessage } from '@/types/api'
 
 export function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user'
+
+  if (message.role === 'system') {
+    // Notices (e.g. a pasted credential): a visible amber line, not a bubble.
+    return (
+      <div role="status" className="mx-auto flex max-w-3xl justify-start px-6 py-1">
+        <div className="flex items-start gap-2 text-[12.5px] leading-relaxed text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 break-words">{message.content}</span>
+        </div>
+      </div>
+    )
+  }
 
   if (isUser) {
     // User messages — right-aligned bubble with slide-in animation

@@ -22,7 +22,7 @@ from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
 from agent8088 import (app_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
-                       memory, patching, providers, routing, testing_support,
+                       memory, patching, providers, routing, secret_scan, testing_support,
                        tool_output,
                        trajectory, web_search)
 
@@ -13315,10 +13315,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"given, so {target} was left unchanged. Pass content to write "
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
-        if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
-                and (syntax_error := _python_syntax_error(content))):
+        if target.suffix.lower() == ".py" and (syntax_error := _python_syntax_error(content)):
             # Writing this would break collection of the whole suite. Leave the
-            # file as it was and let the author correct and resend.
+            # file as it was and let the author correct and resend. Every
+            # .py is checked, not just test-shaped ones: the leaked-markup case
+            # the audit reported landed in a generated helper, and a file that
+            # will not import is as broken wherever it is called from.
             _turn_writes -= 1
             return efficiency.tool_error(
                 "invalid_python", f"{target} was NOT written: the content is not valid "
@@ -17799,7 +17801,12 @@ DELIVERABLES_CHECK_NUDGE = (
     "leftovers you created that the task did not ask for. Check each item once with "
     "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
-POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+# The cap fired with no failing verdict recorded. "Checks are complete" is a
+# claim the harness cannot support here -- it stopped the model, it did not
+# watch it pass -- and a model that believes it stops on a broken run.
+POST_CHECK_CAP_NUDGE = ("Checks are complete. Fix anything that failed, or say plainly "
+                        "what is left unfinished, then give your final answer. Do not "
+                        "claim the work is verified if you did not see it pass.")
 # The newest check failed: never tell the model it passed.
 POST_CHECK_FAILED_NUDGE = (
     "The latest check FAILED and is still unfixed. Fix the failure now if you can. "
@@ -17881,26 +17888,36 @@ def _smoke_cd_prefix(directory: Path, relative: Path, windows_native: bool) -> s
 def _smoke_script_runner(target):
     """A runner that starts a script in the read-only sandbox, or None.
 
-    Only scripts inside the sandbox workspace qualify: that is the one place the
-    sandboxed shell can see them, and the run happens on a disposable read-only
-    copy, so a script cannot change the project by being started.
+    Only scripts the sandboxed shell can actually see qualify. That workspace
+    is _shell_workspace_root when this run writes to a path the user named --
+    which mounts the project itself -- and ARTIFACTS_ROOT otherwise. The run
+    happens on a disposable read-only copy, so a script cannot change the
+    project by being started.
+
+    This used to accept only files under ARTIFACTS_ROOT, so a script written at
+    a path the user named in their own request got no runner and the check
+    reported "compiles; not executed" as a pass. Visibility, not location
+    under artifacts, is what the sandbox actually cares about.
     """
     try:
-        inside = ARTIFACTS_ROOT in Path(target).resolve().parents
-    except OSError:
-        inside = False
+        resolved = Path(target).resolve()
+        root = Path(_shell_workspace_root).resolve() if _shell_workspace_root \
+            else ARTIFACTS_ROOT
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
     backend = _resolve_sandbox_backend()
-    if not inside or backend == "unavailable":
+    if backend == "unavailable":
         return None
 
     def run(command: str, timeout: int) -> str:
         global _sandbox_readonly
         previous, _sandbox_readonly = _sandbox_readonly, True
         try:
-            here = Path(target).resolve().parent
-            prefix = _smoke_cd_prefix(here, here.relative_to(ARTIFACTS_ROOT),
+            here = resolved.parent
+            prefix = _smoke_cd_prefix(here, relative,
                                       sys.platform == "win32" and backend == "native"
-                                      and _native_sandbox_ready(ARTIFACTS_ROOT, readonly=True))
+                                      and _native_sandbox_ready(root, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous
@@ -17939,6 +17956,48 @@ def _smoke_test_step(trajectory, written: list):
     return None
 
 
+def _secrets_step(trajectory, written: list):
+    """Scan the files this run wrote for credentials before calling the work done.
+
+    _redact_secrets protects values the harness already holds (this app's own
+    configured keys). It cannot see a credential the run invented or was handed:
+    a key pasted into chat, a token read out of some file, a hash the user
+    quoted. Nothing else looked, so the value was written to disk in clear and
+    the run reported success. This is that missing look.
+
+    Reports, never rewrites. The file is the model's to fix -- the remediation is
+    to move the value into an environment variable, which only it can choose.
+    Each file is scanned once per state of the work, so a rewrite is rescanned
+    but an unchanged file is not re-reported every round.
+    """
+    pending = trajectory.secrets_unchecked([str(p) for p in written])
+    hits = secret_scan.scan_files(pending)
+    dirty = {path for path, _line, _finding in hits}
+    # Only a file that came back clean is retired. Retiring one that still
+    # holds a credential is what let a real leak disappear: the first pass
+    # flagged it, the model ignored the nudge, and the next pass saw a
+    # pending list with the file already ticked off, so nothing was reported
+    # and the run ended as a plain success.
+    for path in pending:
+        if path not in dirty:
+            trajectory.record_secret_scan(path)
+    if not hits:
+        return None
+    detail = "\n".join(
+        "%s:%s  %s  %s" % (Path(path).name, line, finding.kind, finding.masked)
+        for path, line, finding in hits[:8])
+    names = sorted({Path(path).name for path, _l, _f in hits})
+    return completion_checks.Nudge(
+        "secrets",
+        completion_checks.continue_text(
+            f"A credential is written in clear text in what you produced:\n{detail}\n\n"
+            "These may be placeholders rather than live keys, in which case say so. "
+            "If any is real, remove it from the file and read it from an environment "
+            "variable or a .env file that is not committed instead.",
+            "Continue: remove the credential, or state that it is a placeholder."),
+        unmet="a credential is written in clear text in: " + ", ".join(names[:6]))
+
+
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
     """The reply says the work is unfinished AND the run shows it (or promised work)."""
     if not completion_checks.admits_unfinished_work(reply):
@@ -17947,6 +18006,24 @@ def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
                 and not completion_checks.is_advice_request(request)
                 and not trajectory.mutation_count())
     return bool(trajectory.has_open_items() or promised)
+
+
+def _reply_hands_back(trajectory, reply: str, request: str) -> bool:
+    """The reply hands the work to the user AND the run shows it is not done.
+
+    The prompt already says to act on a tool's suggested action yourself, but
+    nothing stops a reply from ending the run with "please install Node and run
+    npm start" as if that finished the task. Wording alone is not proof: a
+    finished answer often ends with setup or usage instructions, and an advice
+    request wants exactly those, so both gates must pass.
+    """
+    if not completion_checks.hands_work_back(reply):
+        return False
+    if completion_checks.is_advice_request(request):
+        return False
+    work_due = (bool(_CHANGE_REQUEST.search(request))
+                and not trajectory.mutation_count())
+    return bool(trajectory.has_open_items() or work_due)
 
 
 def _delivered_evidence(written) -> str | None:
@@ -17979,6 +18056,8 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
+    if depth == 0 and _reply_hands_back(trajectory, reply, request):
+        reasons.append("the reply hands the work back to the user")
     if depth == 0 and trajectory.partial_files():
         reasons.append("a file was cut off and not completed: "
                        + ", ".join(trajectory.partial_files()[:4]))
@@ -17986,6 +18065,12 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
             reasons.append("missing or empty files: " + ", ".join(missing[:6]))
+        leaked = secret_scan.scan_files(trajectory.secrets_unchecked(
+            [str(p) for p in trajectory.written_paths()]))
+        if leaked:
+            names = sorted({Path(path).name for path, _l, _f in leaked})
+            reasons.append("a credential is written in clear text in: "
+                           + ", ".join(names[:6]))
         pending = trajectory.open_subgoals()
         if pending:
             unaddressed = completion_checks.unaddressed_subgoals(
@@ -18036,6 +18121,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             nudge = completion_checks.outputs_nudge(missing)
     if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":
         nudge = _smoke_test_step(trajectory, written)
+    if nudge is None and depth == 0:
+        nudge = _secrets_step(trajectory, written)
     if nudge is None and deliverables_due:
         nudge = completion_checks.Nudge("deliverables", DELIVERABLES_CHECK_NUDGE,
                                         unmet="the deliverables re-check was not completed")
@@ -18069,6 +18156,15 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         if (completion_checks.project_has_tests(PROJECT_ROOT)
                 and trajectory.request_tests(relevant)):
             nudge = completion_checks.tests_nudge(trajectory.relevant_untested(relevant))
+    if nudge is None and depth == 0 and _reply_hands_back(trajectory, reply, request):
+        nudge = completion_checks.Nudge(
+            "hands_back",
+            completion_checks.continue_text(
+                "Your reply hands a step back to the user that your own tools can do.",
+                "Continue: do that install, setup or run step yourself now, then reply. "
+                "Ask the user only for what only they can do; if you are blocked, "
+                "say exactly what is missing."),
+            unmet="the reply hands the work back to the user instead of doing it")
     if nudge is None:
         return None
     if budget.spend(mark, nudge.unmet):
@@ -18938,8 +19034,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 on_answer(answer)
             if trace is not None:
                 trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                              "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                              "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
             return answer
 
         if on_calls:
@@ -19470,8 +19571,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         on_answer(answer)
                     if trace is not None:
                         trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                                      "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                                      "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True

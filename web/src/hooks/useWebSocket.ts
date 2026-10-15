@@ -151,6 +151,10 @@ function wireSocket(ws: WebSocket) {
       case 'interrupted':
         if (visible) stopLocally()
         break
+      case 'notice':
+        // Advisory (e.g. a pasted credential): a system line in the chat it came from.
+        if (visible) addMessage({ role: 'system', content: scrubMarkup(data.text) })
+        break
       case 'error':
         console.error('Agent error:', data.message)
         if (!visible) {
