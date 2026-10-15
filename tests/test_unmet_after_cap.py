@@ -63,7 +63,7 @@ def _stalls_then_answers(final):
 def test_a_named_file_still_missing_when_the_cap_ends_the_run_is_reported(eng, monkeypatch):
     answer, _, trace = _run(eng, monkeypatch, "Compute it and save the result to out.txt",
                             _stalls_then_answers("I am done."))
-    assert answer.startswith("I am done.")
+    assert answer.startswith("NOT VERIFIED:") and "I am done." in answer.split("\n\n")[1]
     assert "Not completed" in answer and "out.txt" in answer
     assert any(t.get("type") == "unmet_after_cap" and "out.txt" in str(t["unmet"]) for t in trace)
 
@@ -84,7 +84,7 @@ def test_the_backstop_path_reports_it_too(eng, monkeypatch):
 
     answer, _, trace = _run(eng, monkeypatch, "Compute it and save the result to out.txt", script)
     assert any(t.get("type") == "post_check_backstop" for t in trace)
-    assert answer.startswith("Summary of what happened.")
+    assert answer.startswith("NOT VERIFIED:") and "Summary of what happened." in answer.split("\n\n")[1]
     assert "Not completed" in answer and "out.txt" in answer
 
 
