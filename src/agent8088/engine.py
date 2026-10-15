@@ -20073,6 +20073,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # writes spread over an hour, and the next one forced a final answer on work that was
             # half written.
             parse_error_retries = missing_args_retries = 0
+            # The same goes for the one correction an empty reply gets and the two an unknown tool
+            # gets: each is for a run of failures, not for the whole run.
+            empty_retries = unknown_retries = 0
             policy.record_round(
                 fresh=round_fresh,
                 output=tool_outputs[-1] if tool_outputs else None)
