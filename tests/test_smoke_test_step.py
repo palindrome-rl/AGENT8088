@@ -218,3 +218,11 @@ def test_a_passing_check_stores_no_output_and_the_next_request_clears_it():
     state.data["verification"] = "pending"
     again = trajectory.TrajectoryState(state.data, goal="h", message_count=2)
     assert again.data["smoke_output"] == {}
+
+
+def test_saved_diagnostics_preserve_the_clipped_error_tail():
+    output = "starting\n" + "setup detail\n" * 100 + "RuntimeError: synthetic root cause"
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    clipped = app_check.clip_output(output)
+    state.record_smoke("/w/app.py", "app.py: smoke test FAILED", True, clipped)
+    assert state.data["smoke_output"]["/w/app.py"] == clipped
