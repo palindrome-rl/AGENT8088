@@ -11090,8 +11090,48 @@ _ARTIFACTS_WORD_RE = re.compile(
 )
 
 
+# A command that changes directory. Everything after it runs somewhere else, so a relative path in it
+# means that place, not the artifacts workspace the command started in.
+_CWD_CHANGE_RE = re.compile(
+    r"(?i)(?<![\w./\\:~-])(?:cd|chdir|pushd|set-location)\s+(?:/d\s+)?"
+    r"(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s\"'&|;]+))")
+
+
+def _first_directory_change(command: str):
+    """The end of the first `cd` to somewhere other than the artifacts workspace, or None.
+
+    `cd .`, `cd artifacts` and `cd artifacts\\sub` stay in the workspace the command already started in.
+    """
+    for match in _CWD_CHANGE_RE.finditer(command):
+        target = (match.group("dq") or match.group("sq") or match.group("bare") or "").strip()
+        probe = target.replace("\\", "/").lstrip("./").rstrip("/").lower()
+        if target in ("", ".", "./", ".\\") or probe == "artifacts" or probe.startswith("artifacts/") \
+                or target.replace("\\", "/").rstrip("/").lower().endswith("/artifacts"):
+            continue
+        return match.end()
+    return None
+
+
 def _artifact_workspace_command(command: str) -> str:
-    """Map project-relative artifact paths into the mounted artifact directory."""
+    """Map project-relative artifact paths into the mounted artifact directory.
+
+    Only the part of the command that runs in the workspace is mapped: once the command has changed
+    directory to somewhere else (`cd <project> && python artifacts\\x.py`), `artifacts\\x.py` means the
+    folder it says, and rewriting it to `./x.py` pointed at a file that does not exist.
+    """
+    # The container alias is an absolute path, so it maps wherever it appears.
+    command = _CONTAINER_ARTIFACTS_RE.sub(
+        lambda match: match.group("workspace")
+        + ("/" if match.group("tail") in ("/", "\\") else ""),
+        command,
+    )
+    cut = _first_directory_change(command)
+    if cut is not None:
+        return _map_artifact_paths(command[:cut]) + command[cut:]
+    return _map_artifact_paths(command)
+
+
+def _map_artifact_paths(command: str) -> str:
     command = _CONTAINER_ARTIFACTS_RE.sub(
         lambda match: match.group("workspace")
         + ("/" if match.group("tail") in ("/", "\\") else ""),
