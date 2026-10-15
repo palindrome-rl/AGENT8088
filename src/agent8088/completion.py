@@ -101,6 +101,38 @@ def is_advice_request(request: str) -> bool:
     return bool(_ADVICE_START.match(first))
 
 
+# --- 1b. A reply that hands the work back to the user --------------------------------
+
+# These phrases ask the user to do, personally, a step the agent's own tools
+# cover: install, run, set up and configure are shell or file operations, so
+# "please install Node and run npm start" hands the task back. Deliberately
+# absent: what only a human can supply ("enter your API key", "log in to your
+# account") and mere suggestions ("you could also run..."). A finished answer
+# may end with usage instructions that use the same verbs, which is why the
+# engine counts a hand-off only when the run itself shows the work is not done
+# (see _reply_hands_back in engine.py).
+_HANDS_BACK = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bplease\s+(?:first\s+)?(?:install|run|execute|start|launch|set\s+up|configure|"
+    r"download|deploy)\b",
+    r"\byou\s+(?:will\s+need|need|have|must|should)(?:\s+to)?\s+(?:first\s+)?"
+    r"(?:install|run|execute|start|launch|set\s+up|configure|download|deploy)\b",
+    r"\byou(?:['’]ll| will| would|['’]d)\s+(?:need|have)\s+to\s+"
+    r"(?:install|run|execute|start|launch|set\s+up|configure|download|deploy)\b",
+    r"\binstall\b[^\n]{0,60}?\b(?:and|then)\s+(?:run|start|launch)\b",
+))
+
+
+def hands_work_back(reply: str) -> bool:
+    """True if the reply tells the user to do, themselves, work the agent could
+    have done with its own tools.
+
+    Wording alone does not decide: the engine treats a hand-off as unfinished
+    only when the run also shows the work is not done, so setup or usage
+    instructions at the end of a finished answer cost nothing.
+    """
+    return any(pattern.search(_prose(reply)) for pattern in _HANDS_BACK)
+
+
 # --- 2. Files the request named ------------------------------------------------------
 
 _EXTENSIONS = (

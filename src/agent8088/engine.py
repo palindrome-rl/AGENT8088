@@ -13255,10 +13255,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"given, so {target} was left unchanged. Pass content to write "
                     f"text, or source_url to fetch the bytes. To empty the file on "
                     f"purpose, pass content as an explicit empty string.")
-        if (target.suffix.lower() == ".py" and _looks_like_a_test(target)
-                and (syntax_error := _python_syntax_error(content))):
+        if target.suffix.lower() == ".py" and (syntax_error := _python_syntax_error(content)):
             # Writing this would break collection of the whole suite. Leave the
-            # file as it was and let the author correct and resend.
+            # file as it was and let the author correct and resend. Every
+            # .py is checked, not just test-shaped ones: the leaked-markup case
+            # the audit reported landed in a generated helper, and a file that
+            # will not import is as broken wherever it is called from.
             _turn_writes -= 1
             return efficiency.tool_error(
                 "invalid_python", f"{target} was NOT written: the content is not valid "
@@ -17739,7 +17741,12 @@ DELIVERABLES_CHECK_NUDGE = (
     "leftovers you created that the task did not ask for. Check each item once with "
     "a single command, fix anything that is wrong, then reply. Do not keep exploring."
 )
-POST_CHECK_CAP_NUDGE = "Checks are complete. Give your final answer now."
+# The cap fired with no failing verdict recorded. "Checks are complete" is a
+# claim the harness cannot support here -- it stopped the model, it did not
+# watch it pass -- and a model that believes it stops on a broken run.
+POST_CHECK_CAP_NUDGE = ("Checks are complete. Fix anything that failed, or say plainly "
+                        "what is left unfinished, then give your final answer. Do not "
+                        "claim the work is verified if you did not see it pass.")
 # The newest check failed: never tell the model it passed.
 POST_CHECK_FAILED_NUDGE = (
     "The latest check FAILED and is still unfixed. Fix the failure now if you can. "
@@ -17821,26 +17828,36 @@ def _smoke_cd_prefix(directory: Path, relative: Path, windows_native: bool) -> s
 def _smoke_script_runner(target):
     """A runner that starts a script in the read-only sandbox, or None.
 
-    Only scripts inside the sandbox workspace qualify: that is the one place the
-    sandboxed shell can see them, and the run happens on a disposable read-only
-    copy, so a script cannot change the project by being started.
+    Only scripts the sandboxed shell can actually see qualify. That workspace
+    is _shell_workspace_root when this run writes to a path the user named --
+    which mounts the project itself -- and ARTIFACTS_ROOT otherwise. The run
+    happens on a disposable read-only copy, so a script cannot change the
+    project by being started.
+
+    This used to accept only files under ARTIFACTS_ROOT, so a script written at
+    a path the user named in their own request got no runner and the check
+    reported "compiles; not executed" as a pass. Visibility, not location
+    under artifacts, is what the sandbox actually cares about.
     """
     try:
-        inside = ARTIFACTS_ROOT in Path(target).resolve().parents
-    except OSError:
-        inside = False
+        resolved = Path(target).resolve()
+        root = Path(_shell_workspace_root).resolve() if _shell_workspace_root \
+            else ARTIFACTS_ROOT
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
     backend = _resolve_sandbox_backend()
-    if not inside or backend == "unavailable":
+    if backend == "unavailable":
         return None
 
     def run(command: str, timeout: int) -> str:
         global _sandbox_readonly
         previous, _sandbox_readonly = _sandbox_readonly, True
         try:
-            here = Path(target).resolve().parent
-            prefix = _smoke_cd_prefix(here, here.relative_to(ARTIFACTS_ROOT),
+            here = resolved.parent
+            prefix = _smoke_cd_prefix(here, relative,
                                       sys.platform == "win32" and backend == "native"
-                                      and _native_sandbox_ready(ARTIFACTS_ROOT, readonly=True))
+                                      and _native_sandbox_ready(root, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous
@@ -17931,6 +17948,24 @@ def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
     return bool(trajectory.has_open_items() or promised)
 
 
+def _reply_hands_back(trajectory, reply: str, request: str) -> bool:
+    """The reply hands the work to the user AND the run shows it is not done.
+
+    The prompt already says to act on a tool's suggested action yourself, but
+    nothing stops a reply from ending the run with "please install Node and run
+    npm start" as if that finished the task. Wording alone is not proof: a
+    finished answer often ends with setup or usage instructions, and an advice
+    request wants exactly those, so both gates must pass.
+    """
+    if not completion_checks.hands_work_back(reply):
+        return False
+    if completion_checks.is_advice_request(request):
+        return False
+    work_due = (bool(_CHANGE_REQUEST.search(request))
+                and not trajectory.mutation_count())
+    return bool(trajectory.has_open_items() or work_due)
+
+
 def _delivered_evidence(written) -> str | None:
     """The text of the files this run wrote, or None when the check is off or nothing is readable."""
     if not REQUIREMENT_EVIDENCE or not written:
@@ -17961,6 +17996,8 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
+    if depth == 0 and _reply_hands_back(trajectory, reply, request):
+        reasons.append("the reply hands the work back to the user")
     if depth == 0 and trajectory.partial_files():
         reasons.append("a file was cut off and not completed: "
                        + ", ".join(trajectory.partial_files()[:4]))
@@ -18059,6 +18096,15 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         if (completion_checks.project_has_tests(PROJECT_ROOT)
                 and trajectory.request_tests(relevant)):
             nudge = completion_checks.tests_nudge(trajectory.relevant_untested(relevant))
+    if nudge is None and depth == 0 and _reply_hands_back(trajectory, reply, request):
+        nudge = completion_checks.Nudge(
+            "hands_back",
+            completion_checks.continue_text(
+                "Your reply hands a step back to the user that your own tools can do.",
+                "Continue: do that install, setup or run step yourself now, then reply. "
+                "Ask the user only for what only they can do; if you are blocked, "
+                "say exactly what is missing."),
+            unmet="the reply hands the work back to the user instead of doing it")
     if nudge is None:
         return None
     if budget.spend(mark, nudge.unmet):
@@ -18928,8 +18974,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 on_answer(answer)
             if trace is not None:
                 trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                              "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                              "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
             return answer
 
         if on_calls:
@@ -19460,8 +19511,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         on_answer(answer)
                     if trace is not None:
                         trace.append({"turn": turn, "type": "final_answer", "content": answer,
-                                      "incomplete": bool(trajectory is not None
-                                                 and trajectory.check_failing())})
+                                      "incomplete": bool(
+                                                     # A run the post-check cap stopped was never watched
+                                                     # pass, so it is not a clean success even with no failing
+                                                     # verdict recorded. Calling it one let a broken run exit 0.
+                                                     post_check_told
+                                                     or (trajectory is not None
+                                                         and trajectory.check_failing()))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
