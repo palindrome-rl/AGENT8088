@@ -405,3 +405,92 @@ def test_a_real_node_crash_still_counts(tmp_path):
     script.write_text("x\n", encoding="utf-8")
     seen = "ReferenceError: config is not defined\nCommand exited with status 1."
     assert app_check._run_briefly(script, lambda command, timeout: seen)
+
+
+def test_a_failed_script_start_keeps_what_the_script_printed(tmp_path):
+    script = tmp_path / "tool.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    printed = ("Traceback (most recent call last):\n  File \"tool.py\", line 3\n"
+               "ModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.failed and "ModuleNotFoundError" in report.output
+    assert app_check.check_script(script, run=lambda c, t: "usage: tool.py [-h]").output == ""
+
+
+def test_a_long_start_output_is_clipped_from_the_middle():
+    long = "a" * 1000 + "MIDDLE" + "z" * 1000
+    clipped = app_check.clip_output(long)
+    assert clipped.startswith("a" * 400) and clipped.endswith("z" * 400)
+    assert "MIDDLE" not in clipped and "[...]" in clipped
+    assert app_check.clip_output("short") == "short"
+
+
+# --- a start that cannot show whether the script works is "not verified", not a crash ---------------
+
+@pytest.mark.parametrize("printed", [
+    "Command exited with status 1.",
+    "Traceback (most recent call last):\n  File \"build.py\", line 9, in <module>\n"
+    "PermissionError: [Errno 13] Permission denied: 'out/report.xlsx'\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nOSError: [Errno 30] Read-only file system: 'out.pdf'\n"
+    "Command exited with status 1.",
+    "Traceback (most recent call last):\nFileNotFoundError: [Errno 2] No such file or directory: 'data.csv'\n"
+    "Command exited with status 1.",
+])
+def test_a_start_that_fails_for_the_place_it_ran_in_is_not_verified_rather_than_crashed(tmp_path, printed):
+    script = tmp_path / "build.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.status == app_check.UNAVAILABLE and report.ask is True
+    assert "not verified" in report.note and report.output
+
+
+@pytest.mark.parametrize("printed", [
+    "Traceback (most recent call last):\nModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nNameError: name 'rows' is not defined\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nTypeError: 'NoneType' object is not iterable\nCommand exited with status 1.",
+])
+def test_an_error_about_the_code_itself_is_still_a_crash(tmp_path, printed):
+    script = tmp_path / "build.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.failed and "crashed" in report.failures[0]
+
+
+def test_a_node_start_that_cannot_open_a_path_is_not_verified_and_a_missing_module_is_a_crash(tmp_path, monkeypatch):
+    import shutil
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    script = tmp_path / "build.js"
+    script.write_text("console.log('x')\n", encoding="utf-8")
+    soft = app_check.check_script(script, run=lambda c, t: "Error: ENOENT: no such file or directory, open 'a.json'\n"
+                                                           "Command exited with status 1.")
+    assert soft.status == app_check.UNAVAILABLE and soft.ask is True
+    hard = app_check.check_script(script, run=lambda c, t: "Error: Cannot find module './data'\nCommand exited with status 1.")
+    assert hard.failed
+
+
+SANDBOX_NOTE = ("[sandbox] Shell commands may write only to C:\\work\\artifacts and the sandbox temp folder; "
+                "everything else is read-only to them. To create or change a file elsewhere, use write_file.")
+
+
+@pytest.mark.parametrize("printed", [
+    "Traceback (most recent call last):\n  File \"watch.py\", line 186, in <module>\n    main()\n"
+    "PermissionError: [WinError 5] Access is denied: 'C:\\\\work\\\\outputs'\nCommand exited with status 1.\n"
+    + SANDBOX_NOTE,
+    "Traceback (most recent call last):\nFileNotFoundError: [WinError 3] The system cannot find the path "
+    "specified: 'out\\\\x.json'\nCommand exited with status 1.\n" + SANDBOX_NOTE,
+    "Access is denied.\nCommand exited with status 1.\n" + SANDBOX_NOTE,
+])
+def test_the_windows_and_sandbox_forms_of_a_blocked_write_are_not_a_crash(tmp_path, printed):
+    script = tmp_path / "watch.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    report = app_check.check_script(script, run=lambda cmd, timeout: printed)
+    assert report.status == app_check.UNAVAILABLE and report.ask is True, report.summary()
+
+
+def test_a_code_error_followed_by_the_sandbox_note_is_still_a_crash(tmp_path):
+    script = tmp_path / "watch.py"
+    script.write_text("print('x')\n", encoding="utf-8")
+    printed = ("Traceback (most recent call last):\nNameError: name 'rows' is not defined\n"
+               "Command exited with status 1.\n" + SANDBOX_NOTE)
+    assert app_check.check_script(script, run=lambda cmd, timeout: printed).failed

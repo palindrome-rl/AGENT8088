@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from copy import deepcopy
 from pathlib import PurePath
 
@@ -77,6 +78,39 @@ def _names_run(command: str, path: str) -> bool:
                for token in tokens)
 
 
+def _runs_script(command: str, path: str, workspace: str = "") -> bool:
+    """Conservative evidence of an actual script invocation, not an echo/read/compile.
+
+    Compound shell commands are ambiguous (a later success can hide an earlier
+    failure), so they leave the honest unverified note in place.
+    """
+    import posixpath
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace_split, lexer.commenters, lexer.escape = True, "", ""
+        args = list(lexer)
+    except ValueError:
+        return False
+    if len(args) < 2 or any(a and all(c in ";&|()\n" for c in a) for a in args):
+        return False
+    program = args.pop(0).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?|node(?:\.exe)?", program):
+        return False
+    while args and args[0] in {"-u", "-B", "-E", "-s", "-S"}:
+        args.pop(0)
+    if not args or args[0].startswith("-") or any(a in {"-h", "--help", "--version"} for a in args[1:]):
+        return False
+    script = args[0].replace("\\", "/")
+    if not posixpath.isabs(script) and not re.match(r"^[A-Za-z]:/", script):
+        if workspace:
+            script = posixpath.join(workspace.replace("\\", "/"), script)
+        else:
+            # Older saved trajectories have no workspace. Only a bare filename
+            # can be compared there; explicit different directories cannot.
+            return script == PurePath(path).name
+    return _file_key(script) == _file_key(path)
+
+
 def _module_key(path: str) -> str:
     """The stem a test file and its source share.
 
@@ -136,6 +170,8 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
+        "smoke_unverified": {},
+        "smoke_asked": [],
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
@@ -154,6 +190,9 @@ class TrajectoryState:
                  workspace: str = ""):
         self.data = state if isinstance(state, dict) else {}
         self._normalise(goal, message_count, workspace)
+        # Files present when this request started (path -> size, mtime). Kept on the
+        # object, not in the saved state: it describes this call only.
+        self.start_files: dict | None = None
 
     def _normalise(self, goal: str, message_count: int, workspace: str) -> None:
         if not isinstance(self.data.get("operations"), list):
@@ -195,6 +234,9 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["smoke_output"] = {}
+            self.data["smoke_unverified"] = {}
+            self.data["smoke_asked"] = []
             self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
@@ -254,6 +296,8 @@ class TrajectoryState:
         # Changing a file is not evidence that the failed check is fixed.
         # Keep the failure visible until a subsequent check actually passes,
         # including failures from checks that also modify the workspace.
+        if operation["status"] == "done" and operation["verdict"] != "failed" and command:
+            self._clear_unverified_run(command)
         if operation["verdict"] == "failed":
             self.data["check_failing"] = True
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
@@ -482,14 +526,56 @@ class TrajectoryState:
         checked = self.data.setdefault("smoke_checked", {})
         return [p for p in paths if checked.get(p) != self.mutation_count()]
 
-    def record_smoke(self, path: str, summary: str, failed: bool) -> None:
+    def record_smoke(self, path: str, summary: str, failed: bool, output: str = "",
+                     passed: bool = False, unverified: bool = False) -> None:
         self.data.setdefault("smoke_checked", {})[path] = self.mutation_count()
+        if output:
+            # Raw start-up output of a failed script check, for diagnosis. Kept out of
+            # the notes the model and the person read; bounded to the last few files.
+            kept = self.data.setdefault("smoke_output", {})
+            # _text is for one-line notes and cuts at 240 characters. This is
+            # already clipped diagnostic output: preserve its traceback tail.
+            kept[path] = str(output)[:900]
+            for old in list(kept)[:-4]:
+                del kept[old]
         notes = self.data.setdefault("smoke_notes", [])
         notes[:] = [n for n in notes if not n.startswith(summary.split(":", 1)[0] + ":")]
         notes.append(_text(summary))
         del notes[:-4]
         if failed:
             self.data["smoke_failures"] = int(self.data.get("smoke_failures") or 0) + 1
+        pending = self.data.setdefault("smoke_unverified", {})
+        if unverified:
+            pending[path] = summary.split(":", 1)[0]
+        else:
+            pending.pop(path, None)
+        if passed:
+            # The page or script passed on the latest state of the work, so an earlier failing
+            # check of that same file (its name is in the failure) no longer stands.
+            failure = str(self.data.get("failing_check") or "")
+            match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failure)
+            failed_path = match.group(1) if match else ""
+            same = (_file_key(failed_path) == _file_key(path)
+                    or (failed_path == PurePath(path).name))
+            if self.data.get("check_failing") and match and same:
+                self.data["check_failing"] = False
+                self.data["failing_check"] = ""
+
+    def ask_to_verify(self, paths: list[str]) -> list[str]:
+        """The not-yet-asked paths among `paths`, marked as asked: each is asked about once."""
+        asked = self.data.setdefault("smoke_asked", [])
+        fresh = [p for p in paths if p not in asked]
+        asked.extend(fresh)
+        del asked[:-20]
+        return fresh
+
+    def _clear_unverified_run(self, command: str) -> None:
+        """A command that ran a not-verified script and succeeded settles it."""
+        pending = self.data.get("smoke_unverified") or {}
+        for path in [p for p in pending if _runs_script(command, p, self.data.get("workspace", ""))]:
+            name = pending.pop(path)
+            notes = self.data.get("smoke_notes", [])
+            notes[:] = [n for n in notes if not n.startswith(name + ":")]
 
     def research_used(self) -> bool:
         """Did this session look anything up (a search, a browsed page, a fetch from the shell)?"""
