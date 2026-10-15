@@ -19748,6 +19748,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                       "rounds": post_check_rounds})
         if executed:
             forcing = False
+            # A round that ran a tool is progress, so the allowance for malformed calls is for
+            # failures in a row. Counted over the whole run it was used up after a few cut-off
+            # writes spread over an hour, and the next one forced a final answer on work that was
+            # half written.
+            parse_error_retries = missing_args_retries = 0
             policy.record_round(
                 fresh=round_fresh,
                 output=tool_outputs[-1] if tool_outputs else None)
