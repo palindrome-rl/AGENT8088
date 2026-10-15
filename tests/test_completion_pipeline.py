@@ -316,3 +316,17 @@ def test_a_file_the_request_asks_to_be_created_is_still_demanded(eng, monkeypatc
     ], tool=failing_then_ok([]))
     run(eng, "Build a page and save the data to example.json. Put the page in index.html.", script)
     assert script.nudges("example.json")
+
+
+def test_a_file_the_real_write_tool_diverted_is_not_demanded_again(eng, monkeypatch, tmp_path):
+    """The write tool keeps a file it was not told to put there in artifacts/; the reply that names it
+    must not be sent back to create it at the path that was asked for (which every write would divert)."""
+    asked = tmp_path / "outputs" / "watch.py"
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename=str(asked), content="print('hi')\n"),
+        "I wrote watch.py as asked.",
+    ])
+    answer = run(eng, "Write a script that prints hi.", script)
+    assert (tmp_path / "artifacts" / "outputs" / "watch.py").is_file() and not asked.exists()
+    assert not script.nudges("missing or empty"), script.sent
+    assert answer.startswith("I wrote watch.py")
