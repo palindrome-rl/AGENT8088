@@ -5708,6 +5708,15 @@ def resolve_write_path(raw_path: str) -> Path:
 _TRANSFER_TOOLS = ("copy_file", "move_file")
 
 
+def _foreign_attachment(path: Path) -> bool:
+    """A web-chat attachment uploaded in another session. read_text refuses these,
+    and so must anything that copies a file, or a copy would be the way round it."""
+    resolved = path.resolve()
+    return (_document_root is not None
+            and ".web-attachments" in [part.lower() for part in resolved.parts]
+            and not resolved.is_relative_to(_document_root))
+
+
 def _resolve_transfer_paths(args: dict) -> tuple[Path, Path]:
     """Source and destination of copy_file / move_file.
 
@@ -5761,6 +5770,10 @@ def _transfer_file(name: str, source: Path, target: Path, args: dict) -> str:
         _audit("tool_call", tool=name, mode="write_text", decision="denied",
                detail=str(source), reason="sensitive_path")
         return f"Error: Reading sensitive file denied: {source}"
+    if _foreign_attachment(source):
+        _audit("tool_call", tool=name, mode="write_text", decision="denied",
+               detail=str(source), reason="foreign_attachment")
+        return "Error: attachment does not belong to this session"
     if name == "move_file" and (PROJECT_ROOT not in source.parents
                                 or _check_path_zone(source) == "blocked"
                                 or _is_shell_startup_file(str(source))):
@@ -7793,7 +7806,7 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     try:
         plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
     except OSError as exc:
-        log.warning("could not write %s: %s", plan_path, exc)
+        _log.warning("could not write %s: %s", plan_path, exc)
         plan_path = None
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
@@ -12724,9 +12737,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             read_target = resolve_user_path(raw_path)
         except ValueError as exc:
             return f"Error: {exc}"
-        if _document_root is not None and ".web-attachments" in [part.lower() for part in read_target.resolve().parts]:
-            if not read_target.resolve().is_relative_to(_document_root):
-                return "Error: attachment does not belong to this session"
+        if _foreign_attachment(read_target):
+            return "Error: attachment does not belong to this session"
         if _is_sensitive_path(str(read_target)):
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(read_target), reason="sensitive_path")

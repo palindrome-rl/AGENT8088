@@ -107,3 +107,15 @@ def test_a_folder_the_user_named_is_created(ready):
     engine._CURRENT_RUN_MESSAGES = [{"role": "user", "content": "save the attached invoice into Drive/Finance"}]
     _call(engine, "copy_file", src, "Drive/Finance/")
     assert (root / "Drive" / "Finance" / "invoice.pdf").read_bytes() == PDF
+
+
+def test_another_sessions_attachment_cannot_be_copied(ready, monkeypatch):
+    """read_text refuses a foreign web attachment; copy_file must not be the way round it."""
+    engine, root, _ = ready
+    other = root / ".web-attachments" / "other-session" / "secret.pdf"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(PDF)
+    monkeypatch.setattr(engine, "_document_root", root / ".web-attachments" / "this-session")
+    out = _call(engine, "copy_file", other, "Drive/")
+    assert out.startswith("Error") and "session" in out
+    assert not (root / "Drive" / "secret.pdf").exists()
