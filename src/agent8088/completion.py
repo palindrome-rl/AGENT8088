@@ -101,6 +101,38 @@ def is_advice_request(request: str) -> bool:
     return bool(_ADVICE_START.match(first))
 
 
+# --- 1b. A reply that hands the work back to the user --------------------------------
+
+# These phrases ask the user to do, personally, a step the agent's own tools
+# cover: install, run, set up and configure are shell or file operations, so
+# "please install Node and run npm start" hands the task back. Deliberately
+# absent: what only a human can supply ("enter your API key", "log in to your
+# account") and mere suggestions ("you could also run..."). A finished answer
+# may end with usage instructions that use the same verbs, which is why the
+# engine counts a hand-off only when the run itself shows the work is not done
+# (see _reply_hands_back in engine.py).
+_HANDS_BACK = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"\bplease\s+(?:first\s+)?(?:install|run|execute|start|launch|set\s+up|configure|"
+    r"download|deploy)\b",
+    r"\byou\s+(?:will\s+need|need|have|must|should)(?:\s+to)?\s+(?:first\s+)?"
+    r"(?:install|run|execute|start|launch|set\s+up|configure|download|deploy)\b",
+    r"\byou(?:['’]ll| will| would|['’]d)\s+(?:need|have)\s+to\s+"
+    r"(?:install|run|execute|start|launch|set\s+up|configure|download|deploy)\b",
+    r"\binstall\b[^\n]{0,60}?\b(?:and|then)\s+(?:run|start|launch)\b",
+))
+
+
+def hands_work_back(reply: str) -> bool:
+    """True if the reply tells the user to do, themselves, work the agent could
+    have done with its own tools.
+
+    Wording alone does not decide: the engine treats a hand-off as unfinished
+    only when the run also shows the work is not done, so setup or usage
+    instructions at the end of a finished answer cost nothing.
+    """
+    return any(pattern.search(_prose(reply)) for pattern in _HANDS_BACK)
+
+
 # --- 2. Files the request named ------------------------------------------------------
 
 _EXTENSIONS = (
@@ -218,7 +250,37 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
         if name.lower() in lowered and not _exists_somewhere(path, roots + mirrors) and path not in missing:
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
+    missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
     return missing
+
+
+# A test file is named in the reply but was never written. Narrow on purpose:
+# only conventional test filenames, because any reply mentioning any filename
+# would otherwise trip this and a check that fires on ordinary prose is worse
+# than no check at all.
+_TEST_FILE_RE = re.compile(
+    r"(?<![\w/.-])((?:[\w.-]+[\\/])*(?:test[_-][\w.-]+|[\w.-]+[_-]test|"
+    r"[\w.-]+\.(?:spec|test)\.[a-z]{2,5}))(?![\w.-])", re.IGNORECASE)
+
+
+def _claimed_but_unwritten(lowered_reply: str, written, search_roots) -> list[str]:
+    """Test files the answer claims but that are nowhere on disk.
+
+    missing_outputs already covers files this run wrote and then lost; this
+    covers the opposite order - the model asserts a test exists that it never
+    created, which is how "I added three tests" reaches the user as fact.
+    """
+    known = {PurePath(str(p).replace("\\", "/")).name.lower() for p in written}
+    out: list[str] = []
+    for match in _TEST_FILE_RE.finditer(lowered_reply):
+        name = match.group(1)
+        base = PurePath(name.replace("\\", "/")).name
+        if base in known or base in out:
+            continue
+        if any(_nonempty_file(c) for c in _candidates(name, search_roots)):
+            continue
+        out.append(base)
+    return out
 
 
 def _exists_somewhere(path: str, roots: Iterable[Path]) -> bool:
@@ -238,13 +300,24 @@ _STOPWORDS = frozenset(
     "using use when where which what have has had been being not only just than more most".split())
 
 
-def extract_subgoals(request: str) -> list[str]:
+# A request written as a paragraph often states its parts as separate "it should ... /
+# players must be able to ..." sentences. Three or more of them are a checklist.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])")
+_REQUIREMENT_SENTENCE = re.compile(
+    r"\b(?:should|must|need(?:s)? to|has to|have to|allow(?:s)?|let(?:s)?|able to|support(?:s)?|"
+    r"include(?:s)?|provide(?:s)?|display(?:s)?|show(?:s)?|consider(?:s)?|ensure(?:s)?|"
+    r"make sure|require(?:s|d)?)\b", re.IGNORECASE)
+MIN_REQUIREMENT_SENTENCES = 3
+
+
+def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     """The separate parts of a multi-part request, or [] when it is a single ask.
 
-    Built from a numbered or bulleted list, or from explicit "and also / then"
-    clauses; fewer than two items is not a checklist, so a plain request costs
-    nothing. A request written as one paragraph with no such structure builds no
-    checklist, and its completion relies on the other checks.
+    Built from a numbered or bulleted list, from explicit "and also / then" clauses,
+    or (``sentences``) from three or more sentences that each state a requirement
+    ("it should ...", "players must be able to ..."). Fewer than two items is not a
+    checklist, so a plain request costs nothing. A request with none of that
+    structure builds no checklist, and its completion relies on the other checks.
     """
     text = _prose(request).strip()
     if not text:
@@ -255,7 +328,13 @@ def extract_subgoals(request: str) -> list[str]:
         parts = [p.strip(" ,;.") for p in _CLAUSE_SPLIT.split(text)]
         items = [p for p in parts if len(p.split()) >= 3]
         if len(items) < 2:
-            return []
+            items = []
+    if not items and sentences:
+        flat = " ".join(text.split())
+        marked = [s.strip(" ,;.") for s in _SENTENCE_SPLIT.split(flat)
+                  if len(s.split()) >= 4 and _REQUIREMENT_SENTENCE.search(s)]
+        if len(marked) >= MIN_REQUIREMENT_SENTENCES:
+            items = marked
     return [i[:160] for i in items[:MAX_SUBGOALS]]
 
 
@@ -270,21 +349,157 @@ def _keywords(text: str) -> set[str]:
     return {_stem(w) for w in re.findall(r"[a-z0-9_]{4,}", text.lower()) if w not in _STOPWORDS}
 
 
-def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str]) -> list[str]:
+_NO_TEXT_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".7z",
+    ".sqlite", ".db", ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".wav", ".docx", ".xlsx",
+    ".pptx", ".pyc", ".exe", ".dll", ".so", ".bin", ".lock"})
+_NO_TEXT_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".git", "dist", "build"})
+
+
+def deliverable_text(written: Iterable[str], roots: Iterable[Path],
+                     per_file: int = 200_000, total: int = 600_000) -> str:
+    """The text of the readable files a run wrote, capped, or "" when there is none.
+
+    This is the evidence that a part of the request was built: what the files say,
+    not what the reply says about them. Binary files, dependency folders and very
+    large files are skipped, and the total is bounded.
+    """
+    roots = [Path(r) for r in roots]
+    chunks, used, seen = [], 0, set()
+    for raw in written:
+        for candidate in _candidates(raw, roots):
+            try:
+                resolved = candidate.resolve()
+                if (not candidate.is_file() or resolved in seen
+                        or candidate.suffix.lower() in _NO_TEXT_SUFFIXES
+                        or _NO_TEXT_DIRS & {p.lower() for p in resolved.parts}):
+                    continue
+                seen.add(resolved)
+                with open(candidate, "r", encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read(per_file)
+            except OSError:
+                continue
+            chunks.append(text)
+            used += len(text)
+            break
+        if used >= total:
+            break
+    return "\n".join(chunks)[:total]
+
+
+def _words_for_evidence(text: str) -> str:
+    """Lower-case text with camelCase, snake_case and kebab-case split into words."""
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
+    return re.sub(r"[_\-]+", " ", spaced).lower()
+
+
+def _root(word: str) -> str:
+    """The start of a word that its inflections share ("remove" and "removing" -> "remo")."""
+    return word[: max(4, len(word) - 2)] if len(word) >= 6 else word
+
+
+# A part that asks the agent to tell the user something is done by the reply itself.
+_COMMUNICATION = re.compile(
+    r"^\W*(?:and\s+|also\s+)?(?:explain|tell|describe|summari[sz]e|report|say|mention|answer|state|"
+    r"outline|walk|document|list)\b", re.IGNORECASE)
+
+
+def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
+                         evidence: str | None = None) -> list[str]:
     """Items whose key words the reply and the written files never mention.
 
     A part counts as addressed when at least half of its key words appear in the
     reply or in a written file's name. This is deliberately loose: it exists to
     catch a part that was forgotten, and a part done but described in other
     words costs one continuation, not a failure.
+
+    With ``evidence`` (the text of the files the run wrote, see ``deliverable_text``)
+    the reply alone no longer counts for a part that asks for something to be built:
+    its key words must appear in the delivered files (camelCase and snake_case are
+    split, and a key word matches the start of a longer word, so "random" finds
+    ``randomizeTeam`` and "remove" finds "removing"). A part that only asks the agent to tell the user something
+    ("explain", "list", "summarize") is still met by the reply. This catches a reply
+    that claims a part without the files showing it; it cannot tell a part built
+    wrongly from one built right.
     """
-    haystack = _keywords(reply or "") | _keywords(" ".join(PurePath(w).name for w in written))
+    names = " ".join(PurePath(w).name for w in written)
+    if evidence is None:
+        haystack = _keywords(reply or "") | _keywords(names)
+        open_items = []
+        for item in items:
+            words = _keywords(item)
+            if words and len(words & haystack) * 2 < len(words):
+                open_items.append(item)
+        return open_items
+    in_files = " " + _words_for_evidence(evidence + " " + names) + " "
+    reply_words = _keywords(reply or "")
     open_items = []
     for item in items:
         words = _keywords(item)
-        if words and len(words & haystack) * 2 < len(words):
+        if not words:
+            continue
+        if _COMMUNICATION.match(item):
+            found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
+        else:
+            found = sum(1 for w in words if (" " + _root(w)) in in_files)
+        if found * 2 < len(words):
             open_items.append(item)
     return open_items
+
+
+# --- 4b. A request that depends on facts the model may not have ------------------------------
+
+_BUILD_VERB = re.compile(
+    r"\b(?:build|create|make|implement|develop|write|generate|design|code|produce|simulate|recreate|"
+    r"replicate|clone|set\s+up)\b", re.IGNORECASE)
+_STRONG_CUE = re.compile(
+    r"\b(?:valid(?:\s+and\s+available)?\s+(?:in|for|on)|available\s+in|official(?:ly)?|actual|authentic|"
+    r"accurate(?:ly)?|real[- ]world|faithful(?:ly)?|(?:full|complete|entire)\s+(?:roster|list|set|"
+    r"catalog(?:ue)?|database|dataset|line-?up)|all\s+(?:of\s+)?the\s+(?:valid|available|official|real)|"
+    r"as\s+in\s+the\s+(?:real|actual|official))\b", re.IGNORECASE)
+# The user supplied the facts: a URL, a named file, an attachment, "the dataset".
+_LOCAL_SOURCE = re.compile(
+    r"https?://|\bwww\.|[\w./\\-]+\.(?:csv|json|txt|md|pdf|xlsx?|docx?|py|js|html|yaml|yml)\b|"
+    r"\battached\b|\bprovided\b|\bgiven\s+(?:file|data|dataset|text|document)s?\b|"
+    r"\bthe\s+(?:file|folder|repo|repository|codebase|dataset)\b", re.IGNORECASE)
+_NAMED_SUBJECT = re.compile(r"\b([A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)+)\b")
+_NOT_A_SUBJECT = frozenset({
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january",
+    "february", "march", "april", "june", "july", "august", "september", "october", "november",
+    "december"})
+
+
+def grounding_subject(request: str) -> str:
+    """The named subject of a build request that depends on facts from outside, or "".
+
+    True only for a request that asks for something to be built, asks for it to follow
+    real rules or data ("valid and available in X", "official", "full roster"), names a
+    subject (two or more capitalised words, not at the start of a sentence), and does not
+    supply the facts itself (a URL, a file, an attachment). It is a signal that the model
+    may be relying on facts it does not have, not proof that it is.
+    """
+    text = _prose(request or "")
+    if len(text) < 80 or not _BUILD_VERB.search(text) or not _STRONG_CUE.search(text):
+        return ""
+    if _LOCAL_SOURCE.search(text):
+        return ""
+    for match in _NAMED_SUBJECT.finditer(text):
+        phrase = match.group(1)
+        before = text[:match.start()].rstrip()
+        if not before or before[-1] in ".!?":
+            continue
+        if phrase.split()[0].lower() in _NOT_A_SUBJECT:
+            continue
+        return phrase
+    return ""
+
+
+def grounding_nudge(subject: str) -> "Nudge":
+    return Nudge("grounding", continue_text(
+        f"This request depends on real facts about {subject}, and you wrote files without looking anything up.",
+        "Use web_search to check the rules or data you relied on, fix whatever differs, and name the sources "
+        "you used in your reply. If search is unavailable, say which facts you could not check."),
+        unmet=f"the request depends on facts about {subject} and nothing was looked up")
 
 
 # --- 5. Which changed files deserve a "write tests" reminder ----------------------------
@@ -474,12 +689,39 @@ def partial_files_nudge(paths: list[str]) -> Nudge:
         unmet=f"a file was cut off and not completed: {listed}")
 
 
-def subgoals_nudge(items: list[str]) -> Nudge:
+def subgoals_nudge(items: list[str], evidence: bool = False) -> Nudge:
     listed = "; ".join(f"({n}) {item}" for n, item in enumerate(items[:6], 1))
+    if evidence:
+        return Nudge("subgoals", continue_text(
+            f"These parts of the request do not show up in anything you wrote: {listed}.",
+            "Continue with those parts, or point to the file and function that already does each one. "
+            "If a part cannot be done, say so in your reply."),
+            unmet="parts of the request not found in the delivered files: " + "; ".join(items[:6]))
     return Nudge("subgoals", continue_text(
         f"Some parts of the request have not been addressed yet: {listed}.",
         "Continue with those parts. When a part is done, or cannot be done, say so in your reply."),
         unmet="parts of the request not addressed: " + "; ".join(items[:6]))
+
+
+_SUCCESS_CLAIM = re.compile(
+    r"\b(?:all|every)\s+(?:checks?|tests?)\s+(?:pass|passed|passing)|everything\s+(?:works|is working|passes)|"
+    r"fully\s+(?:working|functional|implemented)|successfully\s+(?:completed|implemented|built)|"
+    r"\ball\s+done\b|\bis\s+(?:now\s+)?complete\b|\bwork(?:s|ing)\s+as\s+(?:expected|intended)\b", re.IGNORECASE)
+
+
+def claims_success(reply: str) -> bool:
+    return bool(_SUCCESS_CLAIM.search(_prose(reply or "")))
+
+
+def failing_check_nudge(detail: str, reply: str = "") -> Nudge:
+    lead = ("Your reply says the work is done, but the latest automated check failed and has not passed since: "
+            if claims_success(reply) else
+            "The latest automated check failed and has not passed since: ")
+    return Nudge("failing_check", continue_text(
+        f"{lead}{detail}.",
+        "Fix the cause and run the check again. If it cannot be fixed, say plainly in your reply that it still "
+        "fails and why, instead of reporting the work as done."),
+        unmet="the latest check failed: " + detail[:120])
 
 
 def tests_nudge(paths: list[str]) -> Nudge:
