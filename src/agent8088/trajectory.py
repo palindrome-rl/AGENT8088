@@ -132,6 +132,24 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+# A shell command that runs something to find out whether it works. A command that only looks around
+# (a listing, a copy, a probe) and exits non-zero did not fail a check, so it must not leave the
+# run marked "the latest automated check failed" for good.
+_CHECK_COMMAND = re.compile(
+    r"(?<![a-z])(?:test|tests|spec|specs|pytest|unittest|jest|mocha|vitest|playwright|cypress|check|checks|"
+    r"verify|validate|lint|ruff|flake8|pylint|mypy|pyright|eslint|tsc|build|compile|py_compile|compileall|"
+    r"make|cmake|cargo|e2e|smoke)(?![a-z])", re.IGNORECASE)
+
+
+def _is_check_run(command: str) -> bool:
+    """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
+    return not (command or "").strip() or bool(_CHECK_COMMAND.search(command))
+
+
+def _same_command(a: str, b: str) -> bool:
+    return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
+
+
 def _file_key(path: str) -> str:
     import os
     import posixpath
@@ -298,11 +316,18 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
-        if operation["verdict"] == "failed":
+        if operation["verdict"] == "failed" and _is_check_run(command):
             self.data["check_failing"] = True
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
+            self.data["failing_command"] = " ".join(command.split())
         elif operation["verdict"] == "passed":
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+        elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
+                and self.data.get("check_failing")
+                and _same_command(self.data.get("failing_command"), command)):
+            # The very command that failed has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         if mutated:
