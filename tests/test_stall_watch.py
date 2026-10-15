@@ -1,5 +1,7 @@
 """A run that brings nothing new is asked to decide, then ended with a summary; a run that is built
 and passing is told that finishing is the next step. Reading many new files is not a stall."""
+import json
+
 from tests.test_completion_pipeline import Script, _call, eng, failing_then_ok, run  # noqa: F401
 
 
@@ -98,3 +100,35 @@ def test_successful_new_read_is_progress_even_if_last_call_in_round_fails(eng, m
                            max_turns=30, tools_def=[], allowed_tools={"execute_shell"}, trace=trace)
     assert not any(t.get("type") == "stall_stop" for t in trace)
     assert answer.startswith("Read all notes.")
+
+
+def _cut_off_aware_tool(eng):
+    """A tool that answers a call whose arguments never parsed the way the real one does."""
+    def tool(name, arguments, depth=0):
+        args = json.loads(arguments)
+        if args.get("__parse_error__"):
+            return eng._tool_arg_parse_error(name, str(args["__parse_error__"]))
+        return "ok"
+    return tool
+
+
+CUT = '✿FUNCTION✿: write_file ✿ARGS✿: {"filename": "a.txt", "content": "abc'
+
+
+def test_cut_off_calls_spread_over_a_long_run_do_not_force_an_early_final_answer(eng, monkeypatch):
+    replies = []
+    for i in range(3):                       # two cut-off calls, then a call that works, three times
+        replies += [CUT, CUT, _call("execute_shell", command=f"echo {i}")]
+    replies += ["All finished."]
+    script = Script(eng, monkeypatch, replies, tool=_cut_off_aware_tool(eng))
+    answer = eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=40,
+                           tools_def=[], allowed_tools={"write_file", "execute_shell"})
+    assert not script.nudges("You keep repeating tool calls without progress")
+    assert answer.startswith("All finished.")
+
+
+def test_cut_off_calls_in_a_row_still_end_in_a_forced_answer(eng, monkeypatch):
+    script = Script(eng, monkeypatch, [CUT] * 12 + ["Gave up."], tool=_cut_off_aware_tool(eng))
+    eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=40,
+                  tools_def=[], allowed_tools={"write_file", "execute_shell"})
+    assert script.nudges("You keep repeating tool calls without progress")
