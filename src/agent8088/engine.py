@@ -22,7 +22,7 @@ from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
 from agent8088 import (app_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
-                       memory, patching, providers, routing, testing_support,
+                       memory, patching, providers, routing, secret_scan, testing_support,
                        tool_output,
                        trajectory, web_search)
 
@@ -17896,6 +17896,48 @@ def _smoke_test_step(trajectory, written: list):
     return None
 
 
+def _secrets_step(trajectory, written: list):
+    """Scan the files this run wrote for credentials before calling the work done.
+
+    _redact_secrets protects values the harness already holds (this app's own
+    configured keys). It cannot see a credential the run invented or was handed:
+    a key pasted into chat, a token read out of some file, a hash the user
+    quoted. Nothing else looked, so the value was written to disk in clear and
+    the run reported success. This is that missing look.
+
+    Reports, never rewrites. The file is the model's to fix -- the remediation is
+    to move the value into an environment variable, which only it can choose.
+    Each file is scanned once per state of the work, so a rewrite is rescanned
+    but an unchanged file is not re-reported every round.
+    """
+    pending = trajectory.secrets_unchecked([str(p) for p in written])
+    hits = secret_scan.scan_files(pending)
+    dirty = {path for path, _line, _finding in hits}
+    # Only a file that came back clean is retired. Retiring one that still
+    # holds a credential is what let a real leak disappear: the first pass
+    # flagged it, the model ignored the nudge, and the next pass saw a
+    # pending list with the file already ticked off, so nothing was reported
+    # and the run ended as a plain success.
+    for path in pending:
+        if path not in dirty:
+            trajectory.record_secret_scan(path)
+    if not hits:
+        return None
+    detail = "\n".join(
+        "%s:%s  %s  %s" % (Path(path).name, line, finding.kind, finding.masked)
+        for path, line, finding in hits[:8])
+    names = sorted({Path(path).name for path, _l, _f in hits})
+    return completion_checks.Nudge(
+        "secrets",
+        completion_checks.continue_text(
+            f"A credential is written in clear text in what you produced:\n{detail}\n\n"
+            "These may be placeholders rather than live keys, in which case say so. "
+            "If any is real, remove it from the file and read it from an environment "
+            "variable or a .env file that is not committed instead.",
+            "Continue: remove the credential, or state that it is a placeholder."),
+        unmet="a credential is written in clear text in: " + ", ".join(names[:6]))
+
+
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
     """The reply says the work is unfinished AND the run shows it (or promised work)."""
     if not completion_checks.admits_unfinished_work(reply):
@@ -17963,6 +18005,12 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
             reasons.append("missing or empty files: " + ", ".join(missing[:6]))
+        leaked = secret_scan.scan_files(trajectory.secrets_unchecked(
+            [str(p) for p in trajectory.written_paths()]))
+        if leaked:
+            names = sorted({Path(path).name for path, _l, _f in leaked})
+            reasons.append("a credential is written in clear text in: "
+                           + ", ".join(names[:6]))
         pending = trajectory.open_subgoals()
         if pending:
             unaddressed = completion_checks.unaddressed_subgoals(
@@ -18013,6 +18061,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             nudge = completion_checks.outputs_nudge(missing)
     if nudge is None and depth == 0 and COMPLETION_SMOKE_TEST != "off":
         nudge = _smoke_test_step(trajectory, written)
+    if nudge is None and depth == 0:
+        nudge = _secrets_step(trajectory, written)
     if nudge is None and deliverables_due:
         nudge = completion_checks.Nudge("deliverables", DELIVERABLES_CHECK_NUDGE,
                                         unmet="the deliverables re-check was not completed")
