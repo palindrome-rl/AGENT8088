@@ -265,6 +265,7 @@ from agent8088 import capabilities
 from agent8088 import diffview
 from agent8088 import engine as A
 from agent8088 import fusion
+from agent8088 import secret_scan
 from agent8088 import searxng_provision
 from agent8088.logging_setup import configure_logging
 
@@ -2407,10 +2408,28 @@ def _turn_max_turns(mode, session=None):
     return max_turns
 
 
+def _warn_pasted_credential(query):
+    """Say so when what the user pasted looks like a credential, then carry on.
+
+    Advisory, never blocking: the user may be pasting a placeholder, a hash
+    they want discussed, or a redacted example, and a harness that refuses to
+    run is worse than one that warns. The mask keeps the warning safe to
+    display, and the real protection is _secrets_step, which sees the value
+    reach a file.
+    """
+    try:
+        findings = secret_scan.find_secrets(query)
+    except Exception:
+        return
+    if findings:
+        console.print("[yellow]! " + secret_scan.warning(findings, "Your message") + "[/yellow]")
+
+
 def do_chat(query):
     # Anything last turn's capture stored after its report budget ran out.
     _report_pending_capture()
     _ensure_autosave_session(query)
+    _warn_pasted_credential(query)
     S.messages.append({"role": "user", "content": query})
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []

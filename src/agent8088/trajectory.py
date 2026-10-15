@@ -496,6 +496,14 @@ class TrajectoryState:
     def smoke_review(self) -> str:
         return " ".join(self.data.get("smoke_notes") or [])
 
+    def secrets_unchecked(self, paths: list[str]) -> list[str]:
+        """Files not yet scanned for credentials at the current state of the work."""
+        checked = self.data.setdefault("secrets_checked", {})
+        return [p for p in paths if checked.get(p) != self.mutation_count()]
+
+    def record_secret_scan(self, path: str) -> None:
+        self.data.setdefault("secrets_checked", {})[path] = self.mutation_count()
+
     def note_unmet(self, reasons: list[str]) -> None:
         self.data["unmet_checks"] = [_text(r) for r in reasons][:6]
 
