@@ -6,17 +6,25 @@ other host are intercepted and aborted, so untrusted page code cannot reach the
 network, and nothing here loosens the SSRF rules or the browse_page gating. The
 page fails the check on a page error, a console error from its own code, a
 missing or failing own-origin asset, a first control that an overlay blocks, or a
-first control whose click changes nothing. A request to an external host
-(hotlinked fonts, images, CDN scripts) is only a warning.
+first control whose click changes nothing. After that first click it keeps
+clicking the next visible controls (a bounded number, a bounded time) and fails on
+any page error those clicks raise, so a screen that only breaks on the third click
+is found too. A request to an external host (hotlinked fonts, images, CDN scripts)
+is only a warning.
 
 A script must compile (Python) or parse (Node). When a read-only sandbox runner
-is supplied it also gets a brief startup check there. Without Chromium the page
-check reports "unavailable" instead of failing the task. Dependency errors from
-blocked external scripts are inconclusive, never proof that the page passed.
+is supplied it also gets a brief startup check there. A script whose source
+actually listens for connections is a server: it is started in that sandbox and
+must accept a connection on the port its own source declares; a server whose
+port cannot be determined is reported as unverified, not guessed. Without
+Chromium the page check reports "unavailable" instead of failing the task.
+Dependency errors from blocked external scripts are inconclusive, never proof
+that the page passed.
 """
 
 from __future__ import annotations
 
+import base64
 import functools
 import re
 import shlex
@@ -35,6 +43,14 @@ WEB_SUFFIXES = frozenset({".html", ".htm"})
 PYTHON_SUFFIXES = frozenset({".py"})
 NODE_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
 DEFAULT_TIMEOUT = 20.0
+# How long a started server gets to open its port, and the sandbox clock for the
+# whole probe (spawn overhead plus the wait). A refused port costs the full
+# window; serving or crashing returns as soon as it happens.
+BOOT_WAIT = 10.0
+BOOT_RUN_TIMEOUT = 15
+
+
+CLICK_THROUGH_STEPS = 12   # further controls clicked after the first; 0 = only the first
 MAX_ITEMS = 5
 MAX_REPORT_CHARS = 1800
 
@@ -59,7 +75,10 @@ class Report:
         name = Path(self.target).name or self.target
         if self.status == PASS:
             tail = f" ({len(self.warnings)} warning{'s' if len(self.warnings) != 1 else ''})" if self.warnings else ""
-            return f"{name}: smoke test passed{tail}"
+            # "compiles; not executed" is a pass only in status; say so, or the
+            # summary reads as if the script had been run.
+            ran = f" - {self.note}" if "not executed" in self.note else ""
+            return f"{name}: smoke test passed{tail}{ran}"
         if self.status == FAIL:
             return f"{name}: smoke test FAILED - " + "; ".join(self.failures[:2])
         return f"{name}: smoke test {self.status}" + (f" ({self.note})" if self.note else "")
@@ -226,6 +245,38 @@ _FIRST_CONTROL_JS = """() => {
           blocked: !(top && (top === el || el.contains(top))), blocker: name(top)};
 }"""
 
+# The next visible, unblocked control not clicked yet. Outermost elements only (a card and
+# every child that inherits its pointer cursor are one control), and controls that lead
+# away from the work (back, quit, close, reset, delete) come last so a click-through
+# gets deeper before it backs out.
+_NEXT_CONTROL_JS = """(seen) => {
+  const selector = 'button, input[type=button], input[type=submit], [role=button], [onclick], summary, a[href^="#"], [tabindex]:not([tabindex="-1"])';
+  const visible = el => {
+    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && !el.disabled;
+  };
+  const candidates = [...document.querySelectorAll('body *')].slice(0, 3000)
+    .filter(el => visible(el) && (el.matches(selector) || getComputedStyle(el).cursor === 'pointer'));
+  const set = new Set(candidates);
+  const outer = candidates.filter(el => { for (let p = el.parentElement; p; p = p.parentElement) if (set.has(p)) return false; return true; });
+  const away = /\\b(back|quit|exit|forfeit|close|cancel|reset|clear|delete|remove all|new teams?)\\b/i;
+  const info = el => {
+    el.scrollIntoView({block: 'center', inline: 'center'});
+    const r = el.getBoundingClientRect(), x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const top = document.elementFromPoint(x, y);
+    const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+    const name = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')
+      + (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/)[0] : '');
+    return {x, y, text, label: name, sig: name + '|' + text + '|' + Math.round(x / 40) + ',' + Math.round(y / 40),
+            blocked: !(top && (top === el || el.contains(top)))};
+  };
+  const fresh = outer.map(info).filter(i => !seen.includes(i.sig));
+  const open = fresh.filter(i => !i.blocked);
+  const first = open.find(i => !away.test(i.text)) || open[0];
+  if (first) return first;
+  return fresh.length ? {sig: fresh[0].sig, skipped: true} : null;
+}"""
+
 _STATE_JS = """() => {
   const h = s => { let a = 0; for (let i = 0; i < s.length; i++) a = (a * 31 + s.charCodeAt(i)) | 0; return a; };
   const canvases = [...document.querySelectorAll('canvas')].map(c => { try { return h(c.toDataURL()); } catch (e) { return 'x'; } });
@@ -239,7 +290,45 @@ _EXTERNAL_SYMPTOM = re.compile(
     r"Failed to load resource|\$ is not|jQuery", re.IGNORECASE)
 
 
-def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
+def _click_through(tab, steps: int, budget: float, failures: list, seen: list) -> int:
+    """Click up to ``steps`` further controls; returns how many were clicked.
+
+    Stops when the page leaves its own address, when no new control is visible, or when
+    the time budget is spent. A page error raised by a click is annotated with the
+    control that caused it. Whatever the clicks break is collected by the page's own
+    error listeners, so this only drives the page.
+    """
+    deadline = time.monotonic() + budget
+    start = tab.url.split("#")[0]
+    clicked = 0
+    while clicked < steps and time.monotonic() < deadline:
+        try:
+            nxt = tab.evaluate(_NEXT_CONTROL_JS, seen)
+        except Exception:  # noqa: BLE001 -- the page navigated or closed
+            break
+        if not nxt:
+            break
+        seen.append(nxt["sig"])
+        if nxt.get("skipped"):
+            continue   # covered by something else; not a control to click
+        known = len(failures)
+        try:
+            tab.mouse.click(nxt["x"], nxt["y"])
+            tab.wait_for_timeout(150)
+        except Exception:  # noqa: BLE001
+            break
+        clicked += 1
+        cause = f" (after clicking {nxt['label']}" + (f" \"{nxt['text']}\"" if nxt["text"] else "") + ")"
+        for i in range(known, len(failures)):
+            if failures[i].startswith(("page error", "console error")):
+                failures[i] += cause
+        if tab.url.split("#")[0] != start:
+            break
+    return clicked
+
+
+def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
+                click_steps: int = CLICK_THROUGH_STEPS) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
@@ -347,6 +436,10 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict) -> None:
                             f"clicking the first control ({control['label']}"
                             + (f" \"{control['text']}\"" if control['text'] else "")
                             + ") changed nothing on the page")
+                    if after is not None and click_steps > 0:
+                        _click_through(tab, click_steps, min(timeout * 0.5, 12.0), failures,
+                                       [f"{control['label']}|{control['text']}|"
+                                        f"{round(control['x'] / 40)},{round(control['y'] / 40)}"])
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -410,7 +503,8 @@ def _abandon(out: dict, started: float) -> None:
 
 
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
-                   deny: Callable[[str], bool] | None = None) -> Report:
+                   deny: Callable[[str], bool] | None = None,
+                   click_steps: int | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
         return Report("web", str(path), FAIL, ["the file does not exist"])
@@ -422,7 +516,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     root = serve_root(path)
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
     started = time.time()
-    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out),
+    steps = CLICK_THROUGH_STEPS if click_steps is None else max(0, click_steps)
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)
@@ -473,22 +568,229 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
     return []
 
 
+# --- servers: does it actually come up --------------------------------------------------
+
+# Patterns that LISTEN. Only these (plus a declared port, below) justify
+# starting a script in the background: a framework import or a --port flag alone
+# says "probably a server" but a client utility can carry either, and a false
+# positive here means the harness starts a process it was never asked to start.
+_LISTENS = re.compile(
+    r"serve_forever\s*\("
+    r"|\.listen\s*\("
+    r"|\bapp\.run\s*\("
+    r"|\buvicorn\.run\s*\("
+    r"|\bgunicorn\b"
+    r"|\b(?:HTTPServer|TCPServer|ThreadingHTTPServer|ThreadingTCPServer|UDPServer)\s*\("
+    r"|\bcreateServer\s*\(", re.IGNORECASE)
+
+# Weaker "this is meant to serve" signals: a server framework, or a --port
+# argument. Worth reporting a server as unverified for, never worth starting it.
+_SERVER_FRAMEWORKS = re.compile(
+    r"\b(?:import|from)\s+(?:flask|fastapi|uvicorn|gunicorn|tornado|bottle|sanic|"
+    r"cherrypy|aiohttp|starlette)\b"
+    r"|\brequire\s*\(\s*['\"](?:express|koa|fastify|hono|polka|restify)['\"]"
+    r"|\bfrom\s+['\"](?:express|koa|fastify|hono|polka|restify)['\"]"
+    r"|\bimport\s+(?:express|koa|fastify|hono|polka|restify)\b"
+    r"|add_argument\(\s*['\"]--port['\"]", re.IGNORECASE)
+
+# Where a port number can hide in server source. Every alternative still has to
+# land on a literal number: a port read from argv or the environment with no
+# visible default stays unknown rather than guessed.
+_PORT_HINTS = (
+    re.compile(r"\bport\s*[=:]\s*(\d{2,5})\b", re.IGNORECASE),          # port=8000, PORT = 3000
+    re.compile(r"\.listen\s*\(\s*(\d{2,5})\b"),                          # app.listen(3000)
+    re.compile(r"['\"]--port['\"][^)\n]{0,80}?default\s*=\s*(\d{2,5})"),  # argparse --port default=8000
+    re.compile(r"get(?:env)?\(\s*['\"]PORT['\"]\s*,\s*['\"]?(\d{2,5})", re.IGNORECASE),  # environ.get("PORT", 5000)
+    re.compile(r"env\.PORT\b[^|\n]{0,20}\|\|\s*(\d{2,5})\b", re.IGNORECASE),            # process.env.PORT || 3000
+    re.compile(r"\(\s*['\"][^'\"]*['\"]\s*,\s*(\d{2,5})\s*\)"),           # ("127.0.0.1", 8000), ('', 8000)
+)
+
+
+def looks_like_server(source: str) -> bool:
+    """Whether the source is meant to serve connections somehow.
+
+    A listening call, a server framework, or a declared --port argument
+    counts. A file merely named serve.py does not: names are the model's to
+    choose and prove nothing about the code.
+    """
+    return bool(_LISTENS.search(source) or _SERVER_FRAMEWORKS.search(source))
+
+
+def server_port(source: str) -> int | None:
+    """The port this source will listen on, or None when it cannot be known.
+
+    The boot probe runs only when both a listening call and a concrete port
+    number are visible in the source. A framework entry point that reads its
+    port from an environment variable with no default, or .listen() with no
+    number, gets None -- starting it would prove nothing about a port we
+    could not name, so it is reported as unverified instead.
+    """
+    if not _LISTENS.search(source):
+        return None
+    for hint in _PORT_HINTS:
+        found = hint.search(source)
+        if found:
+            port = int(found.group(1))
+            if 1 <= port <= 65535:
+                return port
+    return None
+
+
+# The probe itself: one program, run by the sandbox's own python, that starts
+# the app, waits for the declared port, and stops the app. It travels
+# base64-encoded because cmd.exe ends a command at its first newline and
+# neither shell survives quoting a multi-line program -- the same trick the
+# engine uses for its sandbox snippets. %r/%d are filled in by _boot_command;
+# the snippet must therefore contain no other % character.
+_BOOT_SNIPPET = """import os, signal, socket, subprocess, sys, threading, time
+program, script, port, wait = %r, %r, %d, %r
+try:
+    proc = subprocess.Popen([program, script], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            **({"start_new_session": True}
+                                if sys.platform != "win32" else {}))
+except OSError as error:
+    print("BOOT:NOTSTARTED " + str(error)[:160])
+    raise SystemExit(0)
+log = []
+try:
+    def _drain():
+        # read1, not read: read(n) blocks until n bytes arrive, and a chatty
+        # server would block on a full pipe instead of serving.
+        try:
+            while True:
+                chunk = proc.stderr.read1(4096)
+                if not chunk:
+                    break
+                log.append(chunk)
+        except Exception:
+            pass
+    threading.Thread(target=_drain, daemon=True).start()
+    verdict = "REFUSED"
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            verdict = "DIED"
+            break
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            verdict = "SERVING"
+            break
+        except OSError:
+            time.sleep(0.25)
+finally:
+    # Whatever path got here -- serving, refused, dead, or an exception in
+    # between -- the process this probe started must not survive it.
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    try:
+        proc.stderr.close()
+    except Exception:
+        pass
+tail = b"".join(log)[-400:].decode("utf-8", "replace").strip().splitlines()
+print("BOOT:" + verdict + (": " + tail[-1][:160] if verdict == "DIED" and tail else ""))
+"""
+
+
+def _boot_command(program: str, script: str, port: int, wait: float) -> str:
+    """One sandbox command that starts the app, waits for its port, and stops it.
+
+    The stop is inside the command, in a finally, so the app cannot outlive the
+    probe on any path the command itself can take; a timeout or cancellation on
+    this side kills the command's whole process tree through the sandbox
+    runner. That is why app_check holds no process of its own to leak.
+    """
+    code = _BOOT_SNIPPET % (program, script, port, wait)
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    loader = ("import base64;exec(compile(base64.b64decode("
+              f"'{encoded}').decode('utf-8'),'<boot>','exec'))")
+    return f'python -c "{loader}"'
+
+
+def _boot_report(path: Path, program: str, port: int,
+                 run: Callable[[str, int], str]) -> Report:
+    """Start the script as a server in the sandbox and report whether it came up.
+
+    Serving is a pass; a port that never opens, or a process that exits before
+    serving, is a failure -- the run claimed to build a working server. A probe
+    that could not run, timed out, or produced no verdict is "unavailable":
+    serving was simply not verified, which is never the same as verified.
+    """
+    command = _boot_command(program, path.name, port, BOOT_WAIT)
+    try:
+        output = str(run(command, BOOT_RUN_TIMEOUT) or "")
+    except Exception as error:  # noqa: BLE001 -- a broken runner is a probe limit, not the app's
+        return Report("script", str(path), UNAVAILABLE,
+                      note=f"the boot probe could not run: {str(error)[:120]}")
+    if "BOOT:" in output:
+        # A verdict is printed only after the finally, so cleanup already
+        # happened; trust it over the runner's own timeout wording.
+        line = output[output.index("BOOT:"):].splitlines()[0].strip()
+    elif "timed out" in output.lower():
+        return Report("script", str(path), UNAVAILABLE,
+                      note="the boot probe did not finish; serving was not verified")
+    else:
+        line = ""
+    if line.startswith("BOOT:SERVING"):
+        return Report("script", str(path), PASS,
+                      note=f"starts and accepts connections on 127.0.0.1:{port}")
+    if line.startswith("BOOT:REFUSED"):
+        return Report("script", str(path), FAIL,
+                      [f"started but port {port} never accepted a connection "
+                       f"within {BOOT_WAIT:.0f}s"])
+    if line.startswith("BOOT:DIED"):
+        detail = line[len("BOOT:DIED"):].strip(" :")
+        return Report("script", str(path), FAIL,
+                      ["the server exited before accepting connections on port "
+                       f"{port}" + (f": {detail}" if detail else "")])
+    if line.startswith("BOOT:NOTSTARTED"):
+        detail = line[len("BOOT:NOTSTARTED"):].strip(" :")
+        return Report("script", str(path), UNAVAILABLE,
+                      note="the sandbox could not start it" + (f": {detail[:120]}" if detail else ""))
+    return Report("script", str(path), UNAVAILABLE,
+                  note="the boot probe produced no verdict; serving was not verified")
+
+
 def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
         return Report("script", str(path), FAIL, ["the file does not exist"])
     suffix = path.suffix.lower()
     if suffix in PYTHON_SUFFIXES:
+        source = path.read_text(encoding="utf-8", errors="replace")
         try:
-            compile(path.read_text(encoding="utf-8", errors="replace"), str(path), "exec")
+            compile(source, str(path), "exec")
         except SyntaxError as error:
             return Report("script", str(path), FAIL,
                           [f"syntax error on line {error.lineno}: {error.msg}"])
         if run is not None:
+            port = server_port(source)
+            if port is not None:
+                # A server is verified by booting it, not by asking it for
+                # --help: the boot probe answers the question --help never could.
+                return _boot_report(path, "python", port, run)
             crash = _run_briefly(path, run)
             if crash:
                 return Report("script", str(path), FAIL, crash)
+            if looks_like_server(source):
+                return Report("script", str(path), UNAVAILABLE,
+                              note="looks like a server but the port it will listen on "
+                                   "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="compiles and starts without crashing")
+        if server_port(source) is not None or looks_like_server(source):
+            # No sandbox, so nothing was started: serving is unverified, not passed.
+            return Report("script", str(path), UNAVAILABLE,
+                          note="no sandbox available; the server was not executed")
         return Report("script", str(path), PASS, note="compiles; not executed")
     if suffix in NODE_SUFFIXES:
         node = shutil.which("node")
@@ -502,30 +804,42 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             first = (done.stderr or done.stdout).strip().splitlines()
             return Report("script", str(path), FAIL, [f"syntax error: {first[-1][:160] if first else 'node --check failed'}"])
         if run is not None:
+            source = path.read_text(encoding="utf-8", errors="replace")
+            port = server_port(source)
+            if port is not None:
+                return _boot_report(path, "node", port, run)
             unavailable = []
             crash = _run_briefly(path, run, unavailable)
             if crash:
                 return Report("script", str(path), FAIL, crash)
             if unavailable:
                 return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
+            if looks_like_server(source):
+                return Report("script", str(path), UNAVAILABLE,
+                              note="looks like a server but the port it will listen on "
+                                   "could not be determined; boot not verified")
             return Report("script", str(path), PASS, note="parses and starts without crashing")
+        if run is None and (server_port(path.read_text(encoding="utf-8", errors="replace")) is not None):
+            return Report("script", str(path), UNAVAILABLE,
+                          note="no sandbox available; the server was not executed")
         return Report("script", str(path), PASS, note="parses; not executed")
     return Report("script", str(path), SKIPPED, note="not a script this check understands")
 
 
 def check_target(path: Path, timeout: float = DEFAULT_TIMEOUT,
                  deny: Callable[[str], bool] | None = None,
-                 run: Callable[[str, int], str] | None = None) -> Report:
+                 run: Callable[[str, int], str] | None = None,
+                 click_steps: int | None = None) -> Report:
     """Pick the check from what the path is: a page, a folder with an index page, a script."""
     path = Path(path)
     if path.is_dir():
         for name in ("index.html", "index.htm"):
             if (path / name).is_file():
-                return check_web_page(path / name, timeout, deny)
+                return check_web_page(path / name, timeout, deny, click_steps)
         return Report("web", str(path), SKIPPED, note="no index.html in this folder")
     suffix = path.suffix.lower()
     if suffix in WEB_SUFFIXES:
-        return check_web_page(path, timeout, deny)
+        return check_web_page(path, timeout, deny, click_steps)
     if suffix in PYTHON_SUFFIXES | NODE_SUFFIXES:
         return check_script(path, run)
     return Report("script", str(path), SKIPPED, note="not a page or script")

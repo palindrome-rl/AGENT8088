@@ -360,6 +360,7 @@ export type WSEvent = (
   | { type: 'stream_reset' }
   | { type: 'interrupted'; elapsed: number; partial: string }
   | { type: 'error'; message: string }
+  | { type: 'notice'; level: 'warning'; text: string }
   | { type: 'session_saved'; name: string }
   | { type: 'memory_captured'; facts: string[] }
   | { type: 'command_result'; command: string; result: string; structured?: unknown; session_id?: string }

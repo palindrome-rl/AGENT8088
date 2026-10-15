@@ -2902,8 +2902,51 @@ function Install-Node-Bridge {
 # failure registers a skipped stage and names the fix; it never aborts.
 $WebUIReady = $false
 
-function Test-WebUIDist {
+function Get-WebSourceStamp {
+    # The tree hash of web/ at HEAD. A dist/ built from different sources is a
+    # stale bundle, and without this the installer kept serving it after a pull.
+    # git rev-parse echoes an unresolvable argument back on stdout, so the exit
+    # code - not the output - is what decides success: returning that echo
+    # made every existing dist look stale.
+    $out = & git -C $script:InstallDir rev-parse "HEAD:web" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return "" }
+    return "$out"
+}
+
+function Set-WebSourceStamp {
     param([Parameter(Mandatory = $true)][string]$WebDir)
+    $tree = Get-WebSourceStamp
+    if (-not $tree) { return }
+    try {
+        # ASCII, not UTF8: Windows PowerShell 5.1 writes a BOM for UTF8, and
+        # the stamp is a hex hash, so the BOM would break the comparison.
+        Set-Content -LiteralPath (Join-Path (Join-Path $WebDir "dist") ".agent8088-build-stamp") `
+            -Value $tree -Encoding Ascii -ErrorAction Stop
+    } catch {
+        Write-Warn "could not record the web build stamp: $($_.Exception.Message)"
+    }
+}
+
+function Test-WebUIDist {
+    param(
+        [Parameter(Mandatory = $true)][string]$WebDir,
+        [string]$WebTree = ""
+    )
+    # Stale check first: a dist/ present but built from an older web/ tree is
+    # exactly the case that used to short-circuit "already built and verified".
+    if ($WebTree) {
+        $stampFile = Join-Path (Join-Path $WebDir "dist") ".agent8088-build-stamp"
+        if (Test-Path -LiteralPath $stampFile) {
+            $recorded = (Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue)
+            # Strip a BOM and any whitespace: the stamp is one bare hash.
+            if ($recorded) { $recorded = $recorded.Trim([char]0xFEFF).Trim() }
+            if ($recorded -and $recorded -ne $WebTree) { return $false }
+        } else {
+            # No stamp at all: the bundle predates stamping, so it cannot be
+            # shown to match these sources.
+            return $false
+        }
+    }
     $index = Join-Path $WebDir "dist\index.html"
     try {
         $item = Get-Item -LiteralPath $index -ErrorAction Stop
@@ -2937,7 +2980,7 @@ function Install-WebUI {
     }
 
     $distDir = Join-Path $webDir "dist"
-    if (Test-WebUIDist -WebDir $webDir) {
+    if (Test-WebUIDist -WebDir $webDir -WebTree (Get-WebSourceStamp)) {
         Write-Success "Web UI frontend already built and verified ($distDir)"
         $script:WebUIReady = $true
         return
@@ -2987,6 +3030,7 @@ function Install-WebUI {
             -TimeoutSec $TNpm -Activity "Building web UI frontend"
         if ($buildResult.ExitCode -eq 0 -and (Test-WebUIDist -WebDir $webDir)) {
             $script:WebUIReady = $true
+            Set-WebSourceStamp -WebDir $webDir
             Write-Success "Web UI frontend built ($distDir)"
         } else {
             Write-StageWarning -Result $buildResult -TimeoutSec $TNpm `

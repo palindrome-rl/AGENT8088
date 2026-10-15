@@ -16,7 +16,10 @@ MAX_EVIDENCE = 6
 
 MAX_WRITTEN = 50
 MAX_UNTESTED = 8
+MAX_FAILING_NUDGES = 2   # follow-ups per request about a check that is still failing
 MAX_VERIFICATION_REQUESTS = 2
+# Tools that look something up outside the workspace.
+RESEARCH_TOOLS = frozenset({"web_search", "browse_page"})
 
 # Suffixes worth a test. Config, data, docs and markup are excluded because a
 # generated test for them asserts that a file parses, which nobody needed.
@@ -123,9 +126,13 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "tests_requested": False,
         "passed_checks": 0,
         "check_failing": False,
+        "failing_check": "",
+        "failing_nudges": 0,
         "subgoals_built": False,
         "unmet_checks": [],
         "partial_files": [],
+        "research_used": False,
+        "grounding_asked": False,
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
@@ -179,6 +186,7 @@ class TrajectoryState:
             self.data["verification_requests"] = 0
             self.data["unmet_checks"] = []
             self.data["smoke_failures"] = 0
+            self.data["failing_nudges"] = 0
             # The old request's parts and smoke notes describe work the person
             # has moved on from: carrying them over nudges the new request about
             # the old one and stamps stale notes on its answer.
@@ -187,6 +195,7 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -201,8 +210,12 @@ class TrajectoryState:
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
                    path: str = "", command: str = "", existed: bool = False,
-                   partial_path: str = "") -> None:
+                   partial_path: str = "", written_to: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
+        if operation["status"] == "done" and (
+                operation["tool"] in RESEARCH_TOOLS
+                or (operation["tool"] == "execute_shell" and re.search(r"https?://", command or ""))):
+            self.data["research_used"] = True
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
         if operation["status"] == "done":
@@ -231,13 +244,23 @@ class TrajectoryState:
             if path not in written:
                 written.append(path)
                 del written[:-MAX_WRITTEN]
+            if written_to and written_to != path:
+                # The path the agent asked for is not where the file is. Keep both,
+                # so the end of the run can put a copy back where the user named.
+                landed = self.data.setdefault("redirected_writes", [])
+                if [path, written_to] not in landed:
+                    landed.append([path, written_to])
+                    del landed[:-MAX_WRITTEN]
         # Changing a file is not evidence that the failed check is fixed.
         # Keep the failure visible until a subsequent check actually passes,
         # including failures from checks that also modify the workspace.
         if operation["verdict"] == "failed":
             self.data["check_failing"] = True
+            what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
+            self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
+            self.data["failing_check"] = ""
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self._set_step("Complete the requested work", "done")
@@ -357,6 +380,10 @@ class TrajectoryState:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
 
+    def redirected_writes(self) -> list[tuple[str, str]]:
+        """(requested, landed) pairs for writes the sandbox routed elsewhere."""
+        return [(req, landed) for req, landed in self.data.get("redirected_writes") or []]
+
     def changed_code_paths(self) -> list[str]:
         """Code files this run wrote, newest last."""
         return list(self.data.get("changed_code") or [])
@@ -464,11 +491,29 @@ class TrajectoryState:
         if failed:
             self.data["smoke_failures"] = int(self.data.get("smoke_failures") or 0) + 1
 
+    def research_used(self) -> bool:
+        """Did this session look anything up (a search, a browsed page, a fetch from the shell)?"""
+        return bool(self.data.get("research_used"))
+
+    def grounding_asked(self) -> bool:
+        return bool(self.data.get("grounding_asked"))
+
+    def mark_grounding_asked(self) -> None:
+        self.data["grounding_asked"] = True
+
     def smoke_failures(self) -> int:
         return int(self.data.get("smoke_failures") or 0)
 
     def smoke_review(self) -> str:
         return " ".join(self.data.get("smoke_notes") or [])
+
+    def secrets_unchecked(self, paths: list[str]) -> list[str]:
+        """Files not yet scanned for credentials at the current state of the work."""
+        checked = self.data.setdefault("secrets_checked", {})
+        return [p for p in paths if checked.get(p) != self.mutation_count()]
+
+    def record_secret_scan(self, path: str) -> None:
+        self.data.setdefault("secrets_checked", {})[path] = self.mutation_count()
 
     def note_unmet(self, reasons: list[str]) -> None:
         self.data["unmet_checks"] = [_text(r) for r in reasons][:6]
@@ -495,6 +540,20 @@ class TrajectoryState:
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
         return bool(self.data.get("check_failing"))
+
+    def failing_check_detail(self) -> str:
+        """The command (or tool) of the latest failing check and how it failed, shortened."""
+        return str(self.data.get("failing_check") or "")
+
+    def request_failing_follow_up(self) -> bool:
+        """Ask once per failure (at most MAX_FAILING_NUDGES a request) to fix or disclose it."""
+        detail = self.failing_check_detail()
+        if (not self.check_failing() or not detail or detail == self.data.get("failing_nudged_for")
+                or int(self.data.get("failing_nudges") or 0) >= MAX_FAILING_NUDGES):
+            return False
+        self.data["failing_nudged_for"] = detail
+        self.data["failing_nudges"] = int(self.data.get("failing_nudges") or 0) + 1
+        return True
 
     def request_verification(self) -> bool:
         # Each write re-arms the reminder, and a model that answers it by
