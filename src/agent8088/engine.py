@@ -5716,6 +5716,117 @@ def resolve_write_path(raw_path: str) -> Path:
     return resolved
 
 
+_TRANSFER_TOOLS = ("copy_file", "move_file")
+
+
+def _foreign_attachment(path: Path) -> bool:
+    """A web-chat attachment uploaded in another session. read_text refuses these,
+    and so must anything that copies a file, or a copy would be the way round it."""
+    resolved = path.resolve()
+    return (_document_root is not None
+            and ".web-attachments" in [part.lower() for part in resolved.parts]
+            and not resolved.is_relative_to(_document_root))
+
+
+def _resolve_transfer_paths(args: dict) -> tuple[Path, Path]:
+    """Source and destination of copy_file / move_file.
+
+    resolve_write_path sends a new file whose folder does not exist yet to
+    artifacts/, which is right for a file the agent invents and wrong here: the
+    agent is filing an existing file where the user asked, e.g. Drive/Finance/.
+    The destination is therefore taken as stated (project-relative, or absolute),
+    still limited to ALLOWED_PATHS; the sensitive, startup-file, zone and
+    permission gates run on it afterwards like on any other write. A bare
+    filename keeps write_file's artifacts/ rule, and a folder (existing, or
+    written with a trailing slash) receives the file under its own name.
+    """
+    raw_source = str(args.get("source") or "").strip()
+    raw_dest = str(args.get("destination") or "").strip()
+    source = resolve_user_path(raw_source)
+    p = Path(_from_container_path(raw_dest)).expanduser()
+    is_folder = raw_dest.endswith(("/", "\\"))
+    if len(p.parts) == 1 and not is_folder and not p.is_absolute():
+        dest = resolve_write_path(raw_dest)
+    else:
+        dest = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
+        if not _path_is_allowed(dest):
+            raise ValueError(f"Path not allowed: {dest}")
+    if is_folder or dest.is_dir():
+        dest = dest / source.name
+    # A folder that does not exist yet is honoured only when the person named it
+    # (or the file); one the model made up goes to artifacts/, as for write_file.
+    if not (dest.parent.exists() or _user_named_path(str(dest), dest)
+            or _user_named_path(str(dest.parent), dest.parent)):
+        dest = resolve_write_path(str(dest))
+    return source, dest
+
+
+def _transfer_file(name: str, source: Path, target: Path, args: dict) -> str:
+    """Byte-for-byte copy (or move) of one existing local file.
+
+    Runs inside exec_tool's write_text branch, so the destination has already
+    passed every write guard. The source is checked here: it must be a real file,
+    outside the sensitive floor, and a move only takes files from inside the
+    project, since it deletes the original.
+    """
+    global _turn_writes, _last_write_diff
+    verb = "move" if name == "move_file" else "copy"
+    if not source.is_file():
+        return f"Error: {source} is not an existing file, so there is nothing to {verb}."
+    if source == target:
+        return f"Error: source and destination are the same file: {source}"
+    if target.is_dir():
+        return f"Error: {target} is a folder; give the file's new path."
+    if _is_sensitive_path(str(source)):
+        _audit("tool_call", tool=name, mode="write_text", decision="denied",
+               detail=str(source), reason="sensitive_path")
+        return f"Error: Reading sensitive file denied: {source}"
+    if _foreign_attachment(source):
+        _audit("tool_call", tool=name, mode="write_text", decision="denied",
+               detail=str(source), reason="foreign_attachment")
+        return "Error: attachment does not belong to this session"
+    if name == "move_file" and (PROJECT_ROOT not in source.parents
+                                or _check_path_zone(source) == "blocked"
+                                or _is_shell_startup_file(str(source))):
+        return (f"Error: {source} cannot be moved: only files inside the project are "
+                f"moved. Copy it instead.")
+    size = source.stat().st_size
+    if MAX_WRITE_BYTES and size > MAX_WRITE_BYTES:
+        return (f"Error: refusing to {verb} {size} bytes to {target} — over the "
+                f"max_write_bytes limit of {MAX_WRITE_BYTES}.")
+    if args.get("_private") is not True and size <= MAX_READ_BYTES:
+        try:
+            text = source.read_bytes().decode("utf-8")  # only text can carry a pasted credential
+        except UnicodeDecodeError:
+            text = ""
+        leak = _file_write_secret_check(text) if text else ""
+        if leak:
+            _audit("tool_call", tool=name, mode="write_text", decision="denied",
+                   detail=str(target)[:200], reason="secret_in_file")
+            return leak
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _backup_original(target)
+        shutil.copy2(source, target)
+        if target.stat().st_size != size:
+            raise OSError("the copy is not the same size as the original")
+        if name == "move_file":
+            source.unlink()
+    except OSError as exc:
+        return f"Error: could not {verb} {source} to {target}: {exc}"
+    _turn_writes += 1
+    _last_write_diff = None  # binary-safe copy -- a text diff would be noise
+    result = (f"{'Moved' if name == 'move_file' else 'Copied'} {size} bytes from "
+              f"{source} to {target}" + _docker_shell_path_hint(target))
+    asked = Path(_from_container_path(str(args.get("destination") or ""))).expanduser()
+    asked = (asked if asked.is_absolute() else PROJECT_ROOT / asked)
+    if ARTIFACTS_ROOT in target.parents and ARTIFACTS_ROOT not in asked.parents:
+        result += (f" — NOT {asked}. That folder does not exist and the user did not "
+                   f"name it, so the file is in artifacts/. Ask the user which folder "
+                   f"they want, or use a folder that exists.")
+    return result
+
+
 def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
     """The existing project file a bare-name write was routed away from.
 
@@ -7315,7 +7426,8 @@ def _capture_write_state(tool_name: str, tool_args: dict):
     if spec.get("mode") != "write_text":
         return None
     try:
-        path = resolve_write_path(_tool_path(spec, tool_args))
+        path = (_resolve_transfer_paths(tool_args)[1] if tool_name in _TRANSFER_TOOLS
+                else resolve_write_path(_tool_path(spec, tool_args)))
     except Exception:
         return None
     try:
@@ -7496,9 +7608,13 @@ def _audit_plan_step(step_text: str, tool_name: str, tool_args: dict,
     raw_path = _tool_path(spec, tool_args)
     if raw_path:
         try:
-            resolver = (resolve_write_path if spec.get("mode") == "write_text"
-                        else resolve_user_path)
-            task += f"The step touched exactly this path: {resolver(raw_path)}\n"
+            if tool_name in _TRANSFER_TOOLS:
+                touched = _resolve_transfer_paths(tool_args)[1]
+            else:
+                resolver = (resolve_write_path if spec.get("mode") == "write_text"
+                            else resolve_user_path)
+                touched = resolver(raw_path)
+            task += f"The step touched exactly this path: {touched}\n"
         except Exception:
             pass
 
@@ -12632,9 +12748,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             read_target = resolve_user_path(raw_path)
         except ValueError as exc:
             return f"Error: {exc}"
-        if _document_root is not None and ".web-attachments" in [part.lower() for part in read_target.resolve().parts]:
-            if not read_target.resolve().is_relative_to(_document_root):
-                return "Error: attachment does not belong to this session"
+        if _foreign_attachment(read_target):
+            return "Error: attachment does not belong to this session"
         if _is_sensitive_path(str(read_target)):
             _audit("tool_call", tool=name, mode=mode, decision="denied",
                    detail=str(read_target), reason="sensitive_path")
@@ -12772,6 +12887,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     write_mode = "overwrite"
     continues_series = False  # an append to a file already written in this series
     target = None
+    source = None  # copy_file / move_file only
     path_zone = "default"
     shadowed = None
     if mode == "shell":
@@ -12802,10 +12918,15 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if not write_path:
             return _tool_arg_missing_error(name, spec.get("path_arg") or "filename")
         try:
-            target = resolve_write_path(write_path)
+            if name in _TRANSFER_TOOLS:
+                if not str(args.get("source") or "").strip():
+                    return _tool_arg_missing_error(name, "source")
+                source, target = _resolve_transfer_paths(args)
+            else:
+                target = resolve_write_path(write_path)
         except ValueError as exc:
             return f"Error: {exc}"
-        shadowed = _shadowed_project_file(write_path, target)
+        shadowed = None if source else _shadowed_project_file(write_path, target)
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
@@ -13180,6 +13301,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             blocked = _localization_required(target)
             if blocked:
                 return blocked
+        if name in _TRANSFER_TOOLS:
+            return _transfer_file(name, source, target, args)
         content_arg = spec.get("content_arg") or "content"
         if args.get("source_url") and not args.get(content_arg):
             source_url = str(args.get("source_url")).strip()
@@ -19658,7 +19781,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
-                    path=str(args.get("filename") or ""),
+                    path=str(args.get("filename") or args.get("destination") or ""),
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
