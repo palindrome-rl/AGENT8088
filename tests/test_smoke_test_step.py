@@ -324,3 +324,11 @@ def test_quoted_windows_interpreter_and_script_paths_are_recognized():
     assert trajectory._runs_script(
         '"C:\\Program Files\\Python\\python.exe" "C:\\Work Folder\\build.py"',
         "C:\\Work Folder\\build.py", "C:\\Work Folder")
+
+
+def test_saved_diagnostics_preserve_the_clipped_error_tail():
+    output = "starting\n" + "setup detail\n" * 100 + "RuntimeError: synthetic root cause"
+    state = trajectory.TrajectoryState({}, goal="g", message_count=1)
+    clipped = app_check.clip_output(output)
+    state.record_smoke("/w/app.py", "app.py: smoke test FAILED", True, clipped)
+    assert state.data["smoke_output"]["/w/app.py"] == clipped
