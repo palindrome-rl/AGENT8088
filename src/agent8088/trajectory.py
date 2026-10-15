@@ -132,6 +132,44 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+# A shell command that runs something to find out whether it works. A command that only looks around
+# (a listing, a copy, a probe) and exits non-zero did not fail a check, so it must not leave the
+# run marked "the latest automated check failed" for good.
+_CHECK_COMMAND = re.compile(
+    r"(?<![a-z])(?:test|tests|spec|specs|pytest|unittest|jest|mocha|vitest|playwright|cypress|check|checks|"
+    r"verify|validate|lint|ruff|flake8|pylint|mypy|pyright|eslint|tsc|build|compile|py_compile|compileall|"
+    r"make|cmake|cargo|e2e|smoke)(?![a-z])", re.IGNORECASE)
+
+
+# The note the sandbox appends when a command tried to write where it may not. A check that ends with
+# it was stopped by the sandbox: it never ran to a result, so it did not fail.
+_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
+
+
+def _is_check_run(command: str) -> bool:
+    """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
+    return not (command or "").strip() or bool(_CHECK_COMMAND.search(command))
+
+
+# Running the program the run itself wrote is the plainest way to see whether it works, whatever the
+# command is called: `python main.py` crashing is a failed check, `type main.py` failing is not.
+_RUNNER = (r"(?:python[\d.]*|py|node|nodejs|deno|bun|ruby|php|perl|bash|sh|pwsh|powershell|java|dotnet|"
+           r"go\s+run|cargo\s+run|ts-node|tsx)")
+
+
+def _runs_a_written_file(command: str, written) -> bool:
+    for path in written or []:
+        name = PurePath(str(path)).name
+        if name and re.search(rf"(?<![\w.-]){_RUNNER}(?![\w-])[^&|;\n]*?(?<![\w.-]){re.escape(name)}(?![\w-])",
+                              command or "", re.IGNORECASE):
+            return True
+    return False
+
+
+def _same_command(a: str, b: str) -> bool:
+    return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
+
+
 def _file_key(path: str) -> str:
     import os
     import posixpath
@@ -298,11 +336,20 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
-        if operation["verdict"] == "failed":
+        if (operation["verdict"] == "failed"
+                and (_is_check_run(command) or _runs_a_written_file(command, self.data.get("written_paths")))
+                and not _SANDBOX_BLOCKED.search(str(result))):
             self.data["check_failing"] = True
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
+            self.data["failing_command"] = " ".join(command.split())
         elif operation["verdict"] == "passed":
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+        elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
+                and self.data.get("check_failing")
+                and _same_command(self.data.get("failing_command"), command)):
+            # The very command that failed has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         if mutated:
@@ -358,11 +405,26 @@ class TrajectoryState:
                 created.append(path)
                 del created[:-MAX_WRITTEN]
             return
-        if _is_test_path(path) and path not in created:
+        if _is_test_path(path) and not self._created_here(path):
             edited = self.data.setdefault("edited_existing_tests", [])
             if path not in edited:
                 edited.append(path)
                 del edited[:-MAX_WRITTEN]
+
+    def _created_here(self, path: str) -> bool:
+        """Whether this run created `path`, under the name it was asked for or where it landed.
+
+        A file the sandbox diverted is recorded when it is created under the path that was asked for,
+        and a later edit may name where it landed; the two are one file.
+        """
+        keys = {_file_key(p) for p in self.data.get("created_files") or []}
+        if _file_key(path) in keys:
+            return True
+        for requested, landed in self.redirected_writes():
+            pair = {_file_key(requested), _file_key(landed)}
+            if _file_key(path) in pair and pair & keys:
+                return True
+        return False
 
     def edited_existing_tests(self) -> list[str]:
         return list(self.data.get("edited_existing_tests") or [])
@@ -423,6 +485,21 @@ class TrajectoryState:
     def written_paths(self) -> list[str]:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
+
+    def landed_paths(self) -> list[str]:
+        """The files this run wrote, each at the place it actually is.
+
+        A write the sandbox diverted is recorded under the path that was asked for, but the file
+        is where it landed. Checks that open the files (the smoke test, the credential scan) need
+        that place, or they find nothing there and silently skip the file.
+        """
+        moved = {_file_key(req): landed for req, landed in self.redirected_writes()}
+        paths: list[str] = []
+        for path in self.written_paths():
+            actual = moved.get(_file_key(path), path)
+            if actual not in paths:
+                paths.append(actual)
+        return paths
 
     def redirected_writes(self) -> list[tuple[str, str]]:
         """(requested, landed) pairs for writes the sandbox routed elsewhere."""
