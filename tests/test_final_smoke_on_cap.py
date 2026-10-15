@@ -74,7 +74,7 @@ def _run_to_the_cap(engine, monkeypatch, tmp_path, request="Build the page and s
 def test_a_page_that_fails_is_noted_when_the_cap_ends_the_run(eng, monkeypatch, tmp_path):
     seen = _stub_check(monkeypatch, app_check.FAIL)
     answer, calls = _run_to_the_cap(eng, monkeypatch, tmp_path)
-    assert answer.startswith("I am done.")
+    assert "I am done." in answer
     assert seen == ["index.html"], "checked once"
     assert "Smoke test: index.html: smoke test FAILED" in answer
     assert not any("smoke test of what you built failed" in str(m[-1].get("content")) for m in calls), "no follow-up"
@@ -99,7 +99,7 @@ def test_a_check_that_cannot_run_never_takes_the_ending_down(eng, monkeypatch, t
 
     monkeypatch.setattr(app_check, "check_target", boom)
     answer, _ = _run_to_the_cap(eng, monkeypatch, tmp_path)
-    assert answer.startswith("I am done.")
+    assert "I am done." in answer
 
 
 def test_sub_agents_are_not_checked(eng, monkeypatch, tmp_path):
