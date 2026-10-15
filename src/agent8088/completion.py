@@ -219,8 +219,153 @@ def _has_content(path: Path) -> bool:
         return False
 
 
+# --- files that were already there ----------------------------------------------------
+#
+# A request often names a file it supplies ("the format is in example.json"). The
+# word "export" or "save" earlier in the same sentence made such a file look like
+# something to produce. Two independent facts are needed before a named file is
+# treated as supplied: it was there when the request started and is unchanged and
+# unwritten now (measured), and every place the request mentions it reads like a
+# reference to existing material (worded). Either alone is not enough: a stale
+# file with an output's name is exactly what the missing-file check exists to catch.
+
+INVENTORY_LIMIT = 400        # files recorded at the start of a request
+INVENTORY_VISIT_LIMIT = 4000  # directory entries looked at, so a huge tree cannot stall the start
+INVENTORY_DEPTH = 3
+_INVENTORY_SKIP = frozenset({"node_modules", ".git", ".venv", "venv", "__pycache__", ".tox",
+                             ".mypy_cache", ".pytest_cache", "dist", "build"})
+
+
+def _file_id(path: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def inventory(roots: Iterable[Path]) -> dict[str, list[int]]:
+    """Size and modification time of the files under `roots`, bounded in count and depth."""
+    found: dict[str, list[int]] = {}
+    visited = 0
+    for root in roots:
+        stack = [(Path(root), 0)]
+        while stack and len(found) < INVENTORY_LIMIT and visited < INVENTORY_VISIT_LIMIT:
+            folder, depth = stack.pop()
+            try:
+                # Consume at most the remaining budget, rather than eagerly
+                # materialising every entry of a potentially enormous folder.
+                from itertools import islice
+                remaining = min(INVENTORY_LIMIT - len(found), INVENTORY_VISIT_LIMIT - visited)
+                with os.scandir(folder) as scan:
+                    entries = list(islice(scan, remaining))
+            except OSError:
+                continue
+            for entry in entries:
+                visited += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < INVENTORY_DEPTH and entry.name not in _INVENTORY_SKIP:
+                            stack.append((Path(entry.path), depth + 1))
+                    elif entry.is_file(follow_symlinks=False) and len(found) < INVENTORY_LIMIT:
+                        info = entry.stat()
+                        found.setdefault(_file_id(entry.path), [info.st_size, info.st_mtime_ns])
+                except OSError:
+                    continue
+    return found
+
+
+_INPUT_REFERENCE = re.compile(
+    r"\b(?:(?:is|are|was|were)\s+(?:already\s+)?(?:in|given\s+in|described\s+in|listed\s+in|shown\s+in|"
+    r"defined\s+in|documented\s+in|inside)|see|described\s+in|listed\s+in|shown\s+in|defined\s+in|"
+    r"documented\s+in|as\s+in|like\s+in|follows?|matches|matching)\b",
+    re.IGNORECASE)
+
+
+_CLAUSE_BREAK = re.compile(r"[,;()]|and|then|but", re.IGNORECASE)
+
+
+def is_input_reference(request: str, path: str) -> bool:
+    """Whether every mention of `path` in the request reads like a pointer to existing material.
+
+    "(the format is in spec.json)" and "see spec.json" do; "save it to spec.json" does not.
+    A path with no mention at all is not a reference.
+    """
+    mentions = 0
+    for sentence in _SENTENCE_SPLIT.split(_prose(request)):
+        start = sentence.find(path)
+        while start != -1:
+            mentions += 1
+            before = sentence[:start]
+            # Only the clause that holds the path counts: "(see notes.md) and write spec.json"
+            # points at notes.md, not at spec.json.
+            clause = _CLAUSE_BREAK.split(before)[-1]
+            if not _INPUT_REFERENCE.search(clause):
+                return False
+            start = sentence.find(path, start + len(path))
+    return mentions > 0
+
+
+def supplied_input(request: str, path: str, candidates: Iterable[Path],
+                   start_files: dict | None, written: Iterable[str],
+                   roots: Iterable[Path]) -> bool:
+    """A named file that was there at the start, is unchanged, was never written, and is only
+    mentioned as existing material."""
+    if not start_files or not is_input_reference(request, path):
+        return False
+    written_ids = set()
+    for item in written:
+        p = Path(os.path.expanduser(str(item)))
+        written_ids.add(_file_id(p))
+        if not p.is_absolute():
+            written_ids.update(_file_id(Path(root) / p) for root in roots)
+    for candidate in candidates:
+        before = start_files.get(_file_id(candidate))
+        if before is None or _file_id(candidate) in written_ids:
+            continue
+        try:
+            info = candidate.stat()
+        except OSError:
+            continue
+        if [info.st_size, info.st_mtime_ns] == list(before):
+            return True
+    return False
+
+
+def _ids_of(path: str, roots: Iterable[Path]) -> set:
+    return {_file_id(c) for c in _candidates(path, roots)} | {_file_id(path)}
+
+
+def _landed_copy(path: str, landed: Iterable, roots: Iterable[Path]) -> bool:
+    """Whether a write to `path` was diverted and the file now exists where it landed.
+
+    The write tool keeps files the sandbox cannot reach (anything outside the artifacts folder)
+    in the artifacts folder and reports both places. The file exists; the end of the run
+    puts a copy back at the path that was asked for.
+    """
+    wanted = _ids_of(path, roots)
+    for pair in landed:
+        try:
+            requested, got = pair[0], pair[1]
+        except (TypeError, IndexError):
+            continue
+        if wanted & _ids_of(str(requested), roots) and _nonempty_file(Path(str(got))):
+            return True
+    return False
+
+
+def _landed_under(folder: Path, landed: Iterable, roots: Iterable[Path]) -> bool:
+    """Whether a diverted write that was meant for a file inside `folder` now exists."""
+    prefix = _file_id(folder) + os.sep
+    for pair in landed:
+        try:
+            requested, got = str(pair[0]), Path(str(pair[1]))
+        except (TypeError, IndexError):
+            continue
+        if any(i.startswith(prefix) for i in _ids_of(requested, roots)) and _nonempty_file(got):
+            return True
+    return False
+
+
 def missing_outputs(request: str, reply: str, written: Iterable[str],
-                    roots: Iterable[Path], mirror_roots: Iterable[Path] = ()) -> list[str]:
+                    roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
+                    start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
     """Named or claimed deliverables that do not exist, are empty, or sit in the
     wrong place.
 
@@ -234,20 +379,27 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     roots = [Path(r) for r in roots]
     mirrors = [Path(r) for r in mirror_roots]
     written = list(written)
+    landed = list(landed)
     missing: list[str] = []
     for path in named_output_paths(request):
-        satisfied = any(_nonempty_file(c) for c in _candidates(path, roots))
+        satisfied = (any(_nonempty_file(c) for c in _candidates(path, roots))
+                     or _landed_copy(path, landed, roots + mirrors))
+        if not satisfied and supplied_input(request, path, _candidates(path, roots + mirrors),
+                                            start_files, written, roots + mirrors):
+            continue
         if not satisfied:
             elsewhere = any(_nonempty_file(c) for c in _candidates(path, mirrors))
             missing.append(f"{path} (found only in {mirrors[0]}; create it at the requested path)"
                            if elsewhere and mirrors else path)
     for path in named_output_dirs(request):
-        if not any(_has_content(c) for c in _candidates(path, roots)):
+        if not any(_has_content(c) or _landed_under(c, landed, roots + mirrors)
+                   for c in _candidates(path, roots)):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
     for path in written:
         name = PurePath(path).name
-        if name.lower() in lowered and not _exists_somewhere(path, roots + mirrors) and path not in missing:
+        if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
+                and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
@@ -543,6 +695,42 @@ def is_scratch(path: str, temp_dir: str = "", root: str = "") -> bool:
     if _LIBRARY_STEM.search(stem):
         return False   # fetch_utils.py is a library, not a throwaway fetch script
     return any(stem == w or stem.startswith(w + "_") or stem.endswith("_" + w) for w in _SCRIPT_WORDS)
+
+
+_HELPER_WORDS = frozenset({"probe", "diag", "diagnose", "diagnostic", "cdp", "e2e", "inspect", "debug",
+                           "tmp", "temp", "scratch", "smoke", "sandbox"})
+
+
+def is_throwaway_helper(path: str, request: str, written: Iterable[str],
+                        roots: Iterable[Path]) -> bool:
+    """A file the run made only to look at its own work: a helper-word name, not named in
+    the request, and not used by any other file the run wrote.
+
+    A file another written file refers to by name is part of the work, whatever it is called.
+    """
+    p = PurePath(path)
+    tokens = [t for t in re.split(r"[_\-.\s]+", p.stem.lower()) if t]
+    if not tokens or not (set(tokens) & _HELPER_WORDS or any(t.startswith("diag") for t in tokens)):
+        return False
+    if p.name.lower() in (request or "").lower():
+        return False
+    roots = [Path(r) for r in roots]
+    own = _file_id(path)
+    for other in written:
+        candidates = _candidates(str(other), roots)
+        for candidate in candidates:
+            if not candidate.is_file() or _file_id(candidate) == own:
+                continue
+            try:
+                if candidate.stat().st_size > 400_000:
+                    continue
+                text = candidate.read_text(encoding="utf-8", errors="ignore").lower()
+            except OSError:
+                continue
+            if p.name.lower() in text or p.stem.lower() in text:
+                return False
+            break
+    return True
 
 
 def is_library_code(path: str, temp_dir: str = "", root: str = "") -> bool:

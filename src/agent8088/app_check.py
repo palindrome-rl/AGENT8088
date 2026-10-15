@@ -66,6 +66,8 @@ class Report:
     warnings: list[str] = field(default_factory=list)
     console: list[str] = field(default_factory=list)
     note: str = ""
+    output: str = ""              # what a script printed when started (clipped); for diagnosis only
+    ask: bool = False             # not verified, and worth asking the model to run it itself
 
     @property
     def failed(self) -> bool:
@@ -227,13 +229,45 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
 
 # --- the page check ------------------------------------------------------------------------------
 
+# Whether a click on a control is expected to change the page. A filter, an undo, an export or an
+# "Add" button next to an empty field can all do nothing by design, so a click that changes nothing
+# says something about the page only when the control is one that must act.
+_COMMITTAL_JS = """
+  const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme)\\b/i;
+  const emptyField = x => {
+    const t = (x.getAttribute('type') || 'text').toLowerCase();
+    if (['button', 'submit', 'checkbox', 'radio', 'hidden', 'file', 'reset', 'image'].includes(t)) return false;
+    const r = x.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && !x.value;
+  };
+  const hasEmptyField = root => (root.matches && root.matches('input, textarea') && emptyField(root))
+    || [...(root.querySelectorAll ? root.querySelectorAll('input, textarea') : [])].some(emptyField);
+  const emptyFieldNear = el => {
+    let p = el.parentElement;
+    if (p === document.body) {   // a loose toolbar: only the neighbours count, not the whole page
+      const kids = [...p.children], at = kids.indexOf(el);
+      return kids.slice(Math.max(0, at - 3), at + 4).some(hasEmptyField);
+    }
+    for (let i = 0; i < 2 && p && p !== document.body; i++, p = p.parentElement) {
+      if (hasEmptyField(p)) return true;
+    }
+    return false;
+  };
+  const labelOf = el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+  const committal = el => el.tagName !== 'SELECT' && el.getAttribute('aria-disabled') !== 'true'
+    && !/disabled/i.test(typeof el.className === 'string' ? el.className : '')
+    && !NOOP_OK.test(labelOf(el)) && !emptyFieldNear(el);
+"""
+
 _FIRST_CONTROL_JS = """() => {
   const selector = 'button, input[type=button], input[type=submit], [role=button], [onclick], summary, select, a[href^="#"]';
   const visible = el => {
     const r = el.getBoundingClientRect(), s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && !el.disabled;
   };
-  const el = [...document.querySelectorAll(selector)].find(visible);
+  /*COMMITTAL*/
+  const found = [...document.querySelectorAll(selector)].filter(visible);
+  const el = found.find(committal) || found[0];
   if (!el) return null;
   el.scrollIntoView({block: 'center', inline: 'center'});
   const r = el.getBoundingClientRect();
@@ -242,8 +276,9 @@ _FIRST_CONTROL_JS = """() => {
   const name = n => n ? n.tagName.toLowerCase() + (n.id ? '#' + n.id : '')
                         + (typeof n.className === 'string' && n.className.trim() ? '.' + n.className.trim().split(/\\s+/)[0] : '') : 'nothing';
   return {x, y, label: name(el), text: (el.innerText || el.value || '').trim().slice(0, 40),
-          blocked: !(top && (top === el || el.contains(top))), blocker: name(top)};
-}"""
+          blocked: !(top && (top === el || el.contains(top))), blocker: name(top),
+          committal: committal(el)};
+}""".replace("/*COMMITTAL*/", _COMMITTAL_JS)
 
 # The next visible, unblocked control not clicked yet. Outermost elements only (a card and
 # every child that inherits its pointer cursor are one control), and controls that lead
@@ -255,6 +290,7 @@ _NEXT_CONTROL_JS = """(seen) => {
     const r = el.getBoundingClientRect(), s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && !el.disabled;
   };
+  /*COMMITTAL*/
   const candidates = [...document.querySelectorAll('body *')].slice(0, 3000)
     .filter(el => visible(el) && (el.matches(selector) || getComputedStyle(el).cursor === 'pointer'));
   const set = new Set(candidates);
@@ -268,14 +304,14 @@ _NEXT_CONTROL_JS = """(seen) => {
     const name = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')
       + (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/)[0] : '');
     return {x, y, text, label: name, sig: name + '|' + text + '|' + Math.round(x / 40) + ',' + Math.round(y / 40),
-            blocked: !(top && (top === el || el.contains(top)))};
+            blocked: !(top && (top === el || el.contains(top))), committal: committal(el)};
   };
   const fresh = outer.map(info).filter(i => !seen.includes(i.sig));
   const open = fresh.filter(i => !i.blocked);
   const first = open.find(i => !away.test(i.text)) || open[0];
   if (first) return first;
   return fresh.length ? {sig: fresh[0].sig, skipped: true} : null;
-}"""
+}""".replace("/*COMMITTAL*/", _COMMITTAL_JS)
 
 _STATE_JS = """() => {
   const h = s => { let a = 0; for (let i = 0; i < s.length; i++) a = (a * 31 + s.charCodeAt(i)) | 0; return a; };
@@ -290,17 +326,24 @@ _EXTERNAL_SYMPTOM = re.compile(
     r"Failed to load resource|\$ is not|jQuery", re.IGNORECASE)
 
 
-def _click_through(tab, steps: int, budget: float, failures: list, seen: list) -> int:
-    """Click up to ``steps`` further controls; returns how many were clicked.
+def _click_through(tab, steps: int, budget: float, failures: list, seen: list,
+                   effects: list | None = None) -> tuple[int, int, list[str]]:
+    """Click up to ``steps`` further controls; returns (clicked, changed, idle).
+
+    ``changed`` is how many clicks visibly did something (the page changed, or a dialog,
+    download, file chooser or new tab opened, which ``effects`` records). ``idle`` names
+    the controls that must act but did nothing, for the report to mention.
 
     Stops when the page leaves its own address, when no new control is visible, or when
     the time budget is spent. A page error raised by a click is annotated with the
     control that caused it. Whatever the clicks break is collected by the page's own
     error listeners, so this only drives the page.
     """
+    effects = effects if effects is not None else []
     deadline = time.monotonic() + budget
     start = tab.url.split("#")[0]
-    clicked = 0
+    clicked = changed = 0
+    idle: list[str] = []
     while clicked < steps and time.monotonic() < deadline:
         try:
             nxt = tab.evaluate(_NEXT_CONTROL_JS, seen)
@@ -311,7 +354,11 @@ def _click_through(tab, steps: int, budget: float, failures: list, seen: list) -
         seen.append(nxt["sig"])
         if nxt.get("skipped"):
             continue   # covered by something else; not a control to click
-        known = len(failures)
+        known, effects_before = len(failures), len(effects)
+        try:
+            before = tab.evaluate(_STATE_JS)
+        except Exception:  # noqa: BLE001
+            before = None
         try:
             tab.mouse.click(nxt["x"], nxt["y"])
             tab.wait_for_timeout(150)
@@ -322,9 +369,17 @@ def _click_through(tab, steps: int, budget: float, failures: list, seen: list) -
         for i in range(known, len(failures)):
             if failures[i].startswith(("page error", "console error")):
                 failures[i] += cause
+        try:
+            did_something = tab.evaluate(_STATE_JS) != before or len(effects) > effects_before
+        except Exception:  # noqa: BLE001 -- the click navigated away: that is a change
+            did_something = True
+        if did_something:
+            changed += 1
+        elif nxt.get("committal"):
+            idle.append(f"{nxt['label']}" + (f" \"{nxt['text']}\"" if nxt["text"] else ""))
         if tab.url.split("#")[0] != start:
             break
-    return clicked
+    return clicked, changed, idle
 
 
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
@@ -335,6 +390,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
     external: list[str] = []
     external_scripts: list[str] = []
     dialogs: list[str] = []
+    effects: list[str] = []   # visible effects that are not a change of the page: dialogs, downloads, new tabs
     cancelled = out.setdefault("cancelled", threading.Event())
     if cancelled.is_set():
         return
@@ -382,7 +438,11 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
             tab.set_default_timeout(timeout * 1000)
             # alert()/confirm() is a visible effect of a click; dismiss it so the
             # page does not hang waiting for an answer.
-            tab.on("dialog", lambda dialog: (dialogs.append(dialog.message[:80]), dialog.dismiss()))
+            tab.on("dialog", lambda dialog: (dialogs.append(dialog.message[:80]),
+                                             effects.append("dialog"), dialog.dismiss()))
+            tab.on("download", lambda download: effects.append("download"))
+            tab.on("filechooser", lambda chooser: effects.append("file chooser"))
+            tab.on("popup", lambda popup: effects.append("new tab"))
 
             def own(url: str) -> bool:
                 return not url or url.startswith((origin, "data:", "blob:", "about:"))
@@ -423,23 +483,41 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         + f") is covered by {control['blocker']}, so a click never reaches it")
                 else:
                     before = tab.evaluate(_STATE_JS)
+                    effects_before = len(effects)
                     tab.mouse.click(control["x"], control["y"])
                     tab.wait_for_timeout(400)
                     try:
                         after = tab.evaluate(_STATE_JS)
                     except Exception:  # noqa: BLE001 -- the click navigated away: that is a change
                         after = None
+                    described = (f"({control['label']}"
+                                 + (f" \"{control['text']}\"" if control['text'] else "") + ")")
+                    changed = 0 if after == before else 1
+                    undecided = False   # a control that may do nothing by design; judged after the click-through
                     if after == before and dialogs:
                         warnings.append(f"the first control opened a popup: \"{dialogs[0]}\"")
+                    elif after == before and len(effects) > effects_before:
+                        changed = 1     # a download, a file chooser or a new tab is something happening
+                    elif after == before and control.get("committal", True):
+                        # A button that must act, and nothing happened: the page is not working.
+                        failures.append(f"clicking the first control {described} changed nothing on the page")
                     elif after == before:
-                        failures.append(
-                            f"clicking the first control ({control['label']}"
-                            + (f" \"{control['text']}\"" if control['text'] else "")
-                            + ") changed nothing on the page")
+                        undecided = True
                     if after is not None and click_steps > 0:
-                        _click_through(tab, click_steps, min(timeout * 0.5, 12.0), failures,
-                                       [f"{control['label']}|{control['text']}|"
-                                        f"{round(control['x'] / 40)},{round(control['y'] / 40)}"])
+                        _, more, idle = _click_through(
+                            tab, click_steps, min(timeout * 0.5, 12.0), failures,
+                            [f"{control['label']}|{control['text']}|"
+                             f"{round(control['x'] / 40)},{round(control['y'] / 40)}"], effects)
+                        changed += more
+                        # Later controls can depend on what was clicked before, so they only warn.
+                        warnings.extend(f"clicking {item} changed nothing on the page" for item in idle[:3])
+                    if undecided:
+                        if changed == 0:
+                            failures.append(f"clicking the first control {described} changed nothing on the page,"
+                                            " and no other control that was tried changed it either")
+                        else:
+                            warnings.append(f"the first control {described} changed nothing "
+                                            f"({changed} other control{'s' if changed != 1 else ''} did)")
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -545,12 +623,53 @@ _BROWSER_GLOBAL = re.compile(
     r"customElements|screen|history) is not defined")
 
 
+OUTPUT_CLIP = 400   # characters kept from each end of a script's start-up output
+
+
+def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
+    """The first and last `limit` characters of an output, so a long one stays readable."""
+    text = (output or "").strip()
+    if len(text) <= 2 * limit:
+        return text
+    return text[:limit] + "\n[...]\n" + text[-limit:]
+
+
+# The last line of a traceback or error that is about the place the script was started in
+# (a read-only copy, an input or output path, a missing argument) and not about the script.
+_ENVIRONMENT_FINAL = re.compile(
+    r"^(?:PermissionError|FileNotFoundError|IsADirectoryError|NotADirectoryError|EOFError"
+    r"|OSError: \[(?:Errno (?:1|2|13|30)|WinError (?:2|3|5|19|32))\]|Error: (?:EROFS|EACCES|ENOENT|EPERM))"
+    r"|read-only file system|no such file or directory|permission denied|access is denied"
+    r"|\[winerror (?:2|3|5|19|32)\]",
+    re.IGNORECASE)
+# The note the sandbox appends when a command tried to write where it may not. It is about the
+# place the command ran in, never about the script, so it is not part of the error to judge.
+_SANDBOX_NOTE = re.compile(r"\n?\[sandbox\][\s\S]*$")
+
+
+def _final_line(output: str) -> str:
+    lines = [line.strip() for line in output.strip().splitlines()
+             if line.strip() and not line.strip().startswith("Command exited")]
+    return lines[-1] if lines else ""
+
+
 def _run_briefly(path: Path, run: Callable[[str, int], str],
-                 unavailable: list[str] | None = None) -> list[str]:
+                 unavailable: list[str] | None = None,
+                 captured: list[str] | None = None,
+                 soft: list[str] | None = None) -> list[str]:
     """Start the script with --help in the sandbox; return crash findings.
 
     Only a crash on startup counts. Printing usage, finishing, or still running
     when the short clock ends are all fine, and a missing sandbox is no finding.
+    `captured`, when given, receives the clipped output of a start that reported
+    a crash, so a failure can be diagnosed from what the script actually printed.
+
+    The start happens in a read-only copy with no arguments, so a script that does its
+    work when started (builds a file, reads an input) can fail there for reasons that say
+    nothing about it. With `soft` given, such a start (a bare non-zero exit with no
+    error text, or an error about a path, permission or read-only file system) is
+    reported there as "not verified" instead of as a crash. An error about the code itself
+    (a syntax, import, name or type error) is a crash either way.
     """
     program = "python" if path.suffix.lower() in PYTHON_SUFFIXES else "node"
     output = str(run(f"{program} {shlex.quote(path.name)} --help", 10) or "")
@@ -564,6 +683,14 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
     exited = _EXIT_NONZERO.search(output)
     if crashed or (exited and "usage" not in output.lower()):
         last = [line for line in output.strip().splitlines() if line.strip()]
+        if captured is not None:
+            captured.append(clip_output(output))
+        final = _final_line(_SANDBOX_NOTE.sub("", output))
+        if soft is not None and ((not crashed) or _ENVIRONMENT_FINAL.search(final)):
+            status = exited.group(1) if exited else "?"
+            soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
+                        + (f" ({final[:100]})" if crashed else "") + "; whether it works was not verified")
+            return []
         return [f"the script crashed when started: {last[-1][:160] if last else 'non-zero exit'}"]
     return []
 
@@ -779,9 +906,13 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
                 # A server is verified by booting it, not by asking it for
                 # --help: the boot probe answers the question --help never could.
                 return _boot_report(path, "python", port, run)
-            crash = _run_briefly(path, run)
+            captured: list[str] = []
+            soft: list[str] = []
+            crash = _run_briefly(path, run, captured=captured, soft=soft)
             if crash:
-                return Report("script", str(path), FAIL, crash)
+                return Report("script", str(path), FAIL, crash, output="".join(captured))
+            if soft:
+                return Report("script", str(path), UNAVAILABLE, note=soft[0], output="".join(captured), ask=True)
             if looks_like_server(source):
                 return Report("script", str(path), UNAVAILABLE,
                               note="looks like a server but the port it will listen on "
@@ -809,9 +940,13 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             if port is not None:
                 return _boot_report(path, "node", port, run)
             unavailable = []
-            crash = _run_briefly(path, run, unavailable)
+            captured: list[str] = []
+            soft: list[str] = []
+            crash = _run_briefly(path, run, unavailable, captured, soft)
             if crash:
-                return Report("script", str(path), FAIL, crash)
+                return Report("script", str(path), FAIL, crash, output="".join(captured))
+            if soft:
+                return Report("script", str(path), UNAVAILABLE, note=soft[0], output="".join(captured), ask=True)
             if unavailable:
                 return Report("script", str(path), UNAVAILABLE, note=unavailable[0])
             if looks_like_server(source):

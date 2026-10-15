@@ -200,17 +200,31 @@ A deterministic smoke test of something the agent built; no model call.
   SSRF rules and `browse_page` gating are not involved or loosened.
 - **Fails on:** an uncaught page error, a console error from the page's own code,
   an own file that is missing or fails to load, a first control that an overlay
-  covers, and a first control whose click changes nothing (HTML, address, title,
-  canvas pixels and form values are compared).
+  covers, and a click that changes nothing where something must happen (HTML,
+  address, title, canvas pixels and form values are compared; a dialog, download,
+  file chooser or new tab also counts as something happening). The first control
+  is chosen among the controls that must act, so a filter, an undo, an export or an
+  "add" button beside an empty field is not mistaken for the page. If the first
+  control is one of those and does nothing, the page fails only when no other
+  control that was tried changed it either.
 - **Only warns on:** blocked requests to external hosts (hotlinked fonts, images,
-  CDN scripts) and a page with no control to click.
+  CDN scripts), a page with no control to click, a first control that may do
+  nothing by design while others work, and later controls that must act but did
+  nothing (what they do can depend on what was clicked before).
 - A JavaScript dependency error alongside a blocked CDN script is inconclusive
   (`unavailable`), not a pass. Blocked fonts/images never excuse local script errors.
   Timed-out checks stop only their own marked browser process tree.
 - **Script** (`.py`, `.js`/`.mjs`/`.cjs`): syntax-checked (`compile`, `node
   --check`). Scripts inside the artifact workspace also get a brief `--help`
   startup check in a disposable read-only sandbox when available. Without that
-  sandbox the result explicitly says it was not executed.
+  sandbox the result explicitly says it was not executed. A start that exits
+  non-zero with no error text, or whose last error line is about a path,
+  permission or read-only file system (a script that builds a file or reads an
+  input when started), is reported as `unavailable` ("not verified"), not as a
+  crash; an error about the code itself (syntax, import, name, type, missing
+  module) is still a crash. A script that could not be verified is asked about
+  once: run it yourself and look at its output, or say that you did not. A later
+  successful command that runs it settles it.
 - Browser-only JavaScript that requires globals such as `window` cannot be
   startup-verified under Node. It reports `unavailable`, not a successful startup;
   check the containing HTML page to verify it in a browser context.
