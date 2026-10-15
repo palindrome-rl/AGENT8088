@@ -57,10 +57,11 @@ def test_only_the_first_change_in_a_session_is_backed_up(bk):
 
 
 def test_a_file_the_agent_created_is_backed_up_before_its_first_rewrite(bk):
+    # Valid Python: every .py write is syntax-checked, so prose would be rejected.
     target = bk.work / "made.py"
-    write(bk, target, "version one")
-    write(bk, target, "version two")
-    assert [p.read_text(encoding="utf-8") for p in backups(bk)] == ["version one"]
+    write(bk, target, "x = 1")
+    write(bk, target, "x = 2")
+    assert [p.read_text(encoding="utf-8") for p in backups(bk)] == ["x = 1"]
 
 
 def test_edit_file_backs_up_the_file(bk):
