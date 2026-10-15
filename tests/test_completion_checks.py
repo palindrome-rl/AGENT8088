@@ -501,3 +501,19 @@ def test_a_diverted_write_whose_copy_is_gone_or_empty_is_still_missing(tmp_path)
     reply = "I wrote outputs/watch.py as asked."
     assert c.missing_outputs("make it", reply, [str(requested)], [project], mirror_roots=[artifacts],
                              landed=pairs) == [str(requested)]
+
+
+@pytest.mark.parametrize("reply", [
+    "The cards carry a data-test-hook attribute and test-assertion helpers, and a test-hook.",
+    "It is test-driven, with a test-first approach.",
+])
+def test_hyphenated_words_about_tests_are_not_claimed_test_files(reply):
+    assert c._claimed_but_unwritten(reply.lower(), [], []) == []
+
+
+@pytest.mark.parametrize("reply, found", [
+    ("I added test_board.py and logic_test.js.", ["test_board.py", "logic_test.js"]),
+    ("Run tests/test-board.py or a.spec.ts.", ["test-board.py", "a.spec.ts"]),
+])
+def test_real_test_file_names_are_still_claims(reply, found):
+    assert c._claimed_but_unwritten(reply.lower(), [], []) == found

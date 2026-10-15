@@ -358,11 +358,26 @@ class TrajectoryState:
                 created.append(path)
                 del created[:-MAX_WRITTEN]
             return
-        if _is_test_path(path) and path not in created:
+        if _is_test_path(path) and not self._created_here(path):
             edited = self.data.setdefault("edited_existing_tests", [])
             if path not in edited:
                 edited.append(path)
                 del edited[:-MAX_WRITTEN]
+
+    def _created_here(self, path: str) -> bool:
+        """Whether this run created `path`, under the name it was asked for or where it landed.
+
+        A file the sandbox diverted is recorded when it is created under the path that was asked for,
+        and a later edit may name where it landed; the two are one file.
+        """
+        keys = {_file_key(p) for p in self.data.get("created_files") or []}
+        if _file_key(path) in keys:
+            return True
+        for requested, landed in self.redirected_writes():
+            pair = {_file_key(requested), _file_key(landed)}
+            if _file_key(path) in pair and pair & keys:
+                return True
+        return False
 
     def edited_existing_tests(self) -> list[str]:
         return list(self.data.get("edited_existing_tests") or [])
@@ -423,6 +438,21 @@ class TrajectoryState:
     def written_paths(self) -> list[str]:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
+
+    def landed_paths(self) -> list[str]:
+        """The files this run wrote, each at the place it actually is.
+
+        A write the sandbox diverted is recorded under the path that was asked for, but the file
+        is where it landed. Checks that open the files (the smoke test, the credential scan) need
+        that place, or they find nothing there and silently skip the file.
+        """
+        moved = {_file_key(req): landed for req, landed in self.redirected_writes()}
+        paths: list[str] = []
+        for path in self.written_paths():
+            actual = moved.get(_file_key(path), path)
+            if actual not in paths:
+                paths.append(actual)
+        return paths
 
     def redirected_writes(self) -> list[tuple[str, str]]:
         """(requested, landed) pairs for writes the sandbox routed elsewhere."""

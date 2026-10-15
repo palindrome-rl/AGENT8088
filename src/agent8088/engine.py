@@ -18545,7 +18545,7 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         return None
     mark = trajectory.progress_mark()
     budget.observe(mark)
-    written = trajectory.written_paths()
+    written = trajectory.landed_paths()
     nudge = None
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         nudge = completion_checks.Nudge(
