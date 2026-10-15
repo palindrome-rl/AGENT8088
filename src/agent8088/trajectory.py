@@ -154,6 +154,9 @@ class TrajectoryState:
                  workspace: str = ""):
         self.data = state if isinstance(state, dict) else {}
         self._normalise(goal, message_count, workspace)
+        # Files present when this request started (path -> size, mtime). Kept on the
+        # object, not in the saved state: it describes this call only.
+        self.start_files: dict | None = None
 
     def _normalise(self, goal: str, message_count: int, workspace: str) -> None:
         if not isinstance(self.data.get("operations"), list):

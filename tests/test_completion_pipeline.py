@@ -289,3 +289,30 @@ def test_replanning_is_separate_from_the_budget(eng, monkeypatch):
     ], tool=failing_then_ok(["Error: one", "Error: two"]))
     run(eng, "do it", script)
     assert script.nudges("two recent actions failed")
+
+
+def _supplied_example(tmp_path):
+    (tmp_path / "artifacts").mkdir(exist_ok=True)
+    (tmp_path / "artifacts" / "example.json").write_text("{}", encoding="utf-8")
+
+
+def test_a_supplied_file_the_request_points_to_is_not_demanded_as_output(eng, monkeypatch, tmp_path):
+    _supplied_example(tmp_path)
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename="index.html", content="<html></html>"),
+        "The page is written.",
+    ], tool=failing_then_ok([]))
+    answer = run(eng, "Build a page that can export its data to a JSON file (the format is in "
+                      "example.json). Put the page in index.html.", script)
+    assert not script.nudges("missing or empty")
+    assert "example.json" not in answer
+
+
+def test_a_file_the_request_asks_to_be_created_is_still_demanded(eng, monkeypatch, tmp_path):
+    _supplied_example(tmp_path)
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename="index.html", content="<html></html>"),
+        "The page is written.",
+    ], tool=failing_then_ok([]))
+    run(eng, "Build a page and save the data to example.json. Put the page in index.html.", script)
+    assert script.nudges("example.json")
