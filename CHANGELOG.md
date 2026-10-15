@@ -4,6 +4,51 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-15
+
+The public channel moves to the `AGENT8088-v1.3` branch. Installers,
+`agent8088 --update`, the Docker image and the wiki follow it. Existing
+configuration and memory are preserved.
+
+### Added
+
+- `copy_file` and `move_file` copy an existing local file byte-for-byte (PDFs,
+  images), for example to file an attachment into `Drive/Finance/`. A folder
+  destination keeps the file's name. A missing folder is created only when you
+  named it; otherwise the file stays in `artifacts/` and the reply says so.
+  `move_file` only moves files from inside the project.
+- Credential-shaped strings in pasted input and written files are detected, and
+  the web chat warns before sending one. Product and version tokens are no
+  longer reported as credentials.
+- The model is told when its time or rounds are running out.
+
+### Improved
+
+- Completion checks compare each part of a request with what the run delivered,
+  ask once for a lookup when a build needs facts the run never checked, and send
+  a reply back while the latest automated check is still failing. Only a command
+  that runs a check can mark a run as failing one.
+- Page smoke tests keep clicking after the first control and judge the page as a
+  whole. Script smoke tests tell "could not start here" from a crash, keep a
+  failed start's output, and recognise failures that have since been fixed.
+- A run that brings nothing new is asked to decide; a finished run is told to
+  finish. Empty replies and unknown-tool calls count toward the in-a-row limits.
+- Your rules are kept word for word through context compaction.
+- A write diverted to `artifacts/` is checked where it landed, and is copied to
+  the path you named. A supplied input file is no longer demanded as output.
+- Native Windows shell commands start in the workspace.
+- The plan file, web trace export, headless resume and sub-agent routing are
+  more reliable.
+
+### Security
+
+- `copy_file` and `move_file` refuse another session's web attachment, as
+  `read_text` already did.
+
+### Fixed
+
+- A plan file that cannot be written is logged instead of raising an error.
+
 ## v1.2 branch maintenance - 2026-10-14
 
 ### Improved
@@ -161,5 +206,6 @@ CI, support files and existing installation-recovery safeguards are preserved.
 - 12 provider profiles, custom OpenAI-compatible endpoints and local Ollama,
   with fallback chains on retryable failures.
 
+[1.3.0]: https://github.com/palindrome-rl/AGENT8088/releases/tag/v1.3.0
 [1.2.0]: https://github.com/palindrome-rl/AGENT8088/releases/tag/v1.2.0
 [1.0.0]: https://github.com/palindrome-rl/AGENT8088/releases/tag/v1.0.0

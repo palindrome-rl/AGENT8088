@@ -97,15 +97,27 @@ analysis, academic research and community pain-points.
 
 ---
 
-## Reliability updates on the v1.3 branch
+## What's new in v1.3
 
-This branch includes clearer CLI and Web UI health reporting, automatic search
-fallback notices, scanned-document OCR improvements, working-directory recovery,
-bounded verification loops, and better handling of model output limits.
-Run `agent8088 --doctor` (or `/doctor` inside the agent) for actionable setup
-diagnostics. The Web UI also shows which optional capabilities are limited.
-OpenCodeReview installation is pinned, reports download errors, and retries
-transient network failures. Existing configuration and memory are preserved.
+- **File copy and move.** New `copy_file` and `move_file` tools copy an existing
+  file byte-for-byte, so an attachment such as a PDF can be filed into a project
+  folder (for example `Drive/Finance/`). They use the same safety checks as
+  `write_file`, and they never create a folder you did not name.
+- **Checked completion.** Each part of a request is checked against what the run
+  actually delivered, and a run is not marked done while its latest check fails.
+  Smoke tests judge the whole page or script and can tell "could not start here"
+  from a real crash.
+- **Long-run guidance.** The model is told when its time or rounds are running
+  out, a run that stops making progress is asked to decide, and your rules are
+  kept word for word through context compaction.
+- **Credential safety.** Pasted text and written files are scanned for
+  credential-shaped strings, the web chat warns before sending one, and another
+  session's attachment cannot be read or copied.
+
+Earlier v1.2 reliability work (health reporting with `agent8088 --doctor`,
+search fallback notices, OCR, working-directory recovery and output-limit
+handling) is included. Existing configuration and memory are preserved. See the
+[CHANGELOG](CHANGELOG.md) for the full list.
 
 ## Quick start
 
