@@ -7695,7 +7695,7 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     try:
         plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
     except OSError as exc:
-        log.warning("could not write %s: %s", plan_path, exc)
+        _log.warning("could not write %s: %s", plan_path, exc)
         plan_path = None
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
