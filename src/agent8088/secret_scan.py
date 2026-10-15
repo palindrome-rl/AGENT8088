@@ -78,6 +78,10 @@ _DIGITS_ONLY_RE = re.compile(r"[0-9]+")
 # design and are public by nature.
 _URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 _PATHY_RE = re.compile(r"^(?:\.{0,2}/|~/)|[A-Za-z0-9_-]\.[a-z]{1,5}$")
+# A product and its version, the shape of every User-Agent part: HarborWatch/1.0, Chrome/118.0.0.0,
+# Python-urllib/3.11. The name is words, so a random-looking key with a trailing /5.0 does not match.
+_PRODUCT_VERSION_RE = re.compile(
+    r"[A-Za-z][A-Za-z_-]{2,}[0-9]{0,2}/v?[0-9]+(?:\.[0-9]+){0,3}(?:[-+][\w.]+)?")
 _HASHISH_WORDS = frozenset({
     "sha256", "sha-256", "sha1", "md5", "sha512", "checksum", "digest",
 })
@@ -137,6 +141,8 @@ def _is_noise(token: str) -> bool:
     if _URL_RE.search(token):
         return True
     if _PATHY_RE.search(token):
+        return True
+    if _PRODUCT_VERSION_RE.fullmatch(token):
         return True
     if token.lower() in _HASHISH_WORDS:
         return True

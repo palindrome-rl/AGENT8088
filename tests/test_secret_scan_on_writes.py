@@ -109,3 +109,24 @@ def test_unicode_secret_split_across_append_boundary(workspace, monkeypatch):
     path.write_text("x" * 100000 + secret[:-5], encoding="utf-8")
     assert "credential" in write(engine, path, secret[-5:], mode="append")
     assert not path.read_text(encoding="utf-8").endswith(secret)
+
+
+@pytest.mark.parametrize("line", [
+    'UA = "HarborWatch/1.0"',
+    'headers = {"User-Agent": "HarborPriceWatch/1.0 (competitor price check)"}',
+    'USER_AGENT = "Mozilla/5.0 AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36"',
+    'req.add_header("User-Agent", "Python-urllib/3.11")',
+])
+def test_a_product_and_version_is_not_a_credential(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line) == []
+
+
+@pytest.mark.parametrize("line", [
+    'key = "sk-live-AbCdEf0123456789xyz"',
+    'token = "Kx9fQ2mPz7Lr4Tw8YbN3/vH6"',
+    'blob = "aB3dE5gH7jK9mN1pQ3sT/5.0"',
+])
+def test_a_real_looking_key_is_still_reported(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line)
