@@ -438,3 +438,42 @@ def test_a_file_the_request_names_or_with_an_ordinary_name_is_not_a_helper(tmp_p
     plain.write_text("x = 1", encoding="utf-8")
     assert c.is_throwaway_helper(str(named), "write probe.py that checks ports", [str(named)], [tmp_path]) is False
     assert c.is_throwaway_helper(str(plain), "build it", [str(plain)], [tmp_path]) is False
+
+
+# --- a write the sandbox diverted is a file that exists -----------------------------------------------
+
+def _diverted(tmp_path):
+    """A file written for outputs/watch.py that the sandbox kept in the artifacts folder."""
+    project, artifacts = tmp_path / "project", tmp_path / "project" / "artifacts"
+    (artifacts / "outputs").mkdir(parents=True)
+    landed = artifacts / "outputs" / "watch.py"
+    landed.write_text("print('x')\n", encoding="utf-8")
+    requested = project / "outputs" / "watch.py"
+    return project, artifacts, requested, landed
+
+
+def test_a_file_the_sandbox_kept_in_the_artifacts_folder_is_not_reported_missing(tmp_path):
+    project, artifacts, requested, landed = _diverted(tmp_path)
+    pairs = [[str(requested), str(landed)]]
+    reply = "I wrote outputs/watch.py as asked."
+    request = f"Write the script to {requested}"
+    assert c.missing_outputs(request, reply, [str(requested)], [project], mirror_roots=[artifacts]) != []
+    assert c.missing_outputs(request, reply, [str(requested)], [project],
+                             mirror_roots=[artifacts], landed=pairs) == []
+
+
+def test_a_diverted_file_also_satisfies_a_folder_the_request_asked_to_fill(tmp_path):
+    project, artifacts, requested, landed = _diverted(tmp_path)
+    pairs = [["outputs/watch.py", str(landed)]]
+    request = "Put the scripts in a folder called outputs"
+    assert c.missing_outputs(request, "done", [], [project], mirror_roots=[artifacts]) == ["outputs/ (missing or empty)"]
+    assert c.missing_outputs(request, "done", [], [project], mirror_roots=[artifacts], landed=pairs) == []
+
+
+def test_a_diverted_write_whose_copy_is_gone_or_empty_is_still_missing(tmp_path):
+    project, artifacts, requested, landed = _diverted(tmp_path)
+    pairs = [[str(requested), str(landed)]]
+    landed.write_text("", encoding="utf-8")
+    reply = "I wrote outputs/watch.py as asked."
+    assert c.missing_outputs("make it", reply, [str(requested)], [project], mirror_roots=[artifacts],
+                             landed=pairs) == [str(requested)]

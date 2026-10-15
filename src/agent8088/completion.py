@@ -323,9 +323,44 @@ def supplied_input(request: str, path: str, candidates: Iterable[Path],
     return False
 
 
+def _ids_of(path: str, roots: Iterable[Path]) -> set:
+    return {_file_id(c) for c in _candidates(path, roots)} | {_file_id(path)}
+
+
+def _landed_copy(path: str, landed: Iterable, roots: Iterable[Path]) -> bool:
+    """Whether a write to `path` was diverted and the file now exists where it landed.
+
+    The write tool keeps files the sandbox cannot reach (anything outside the artifacts folder)
+    in the artifacts folder and reports both places. The file exists; the end of the run
+    puts a copy back at the path that was asked for.
+    """
+    wanted = _ids_of(path, roots)
+    for pair in landed:
+        try:
+            requested, got = pair[0], pair[1]
+        except (TypeError, IndexError):
+            continue
+        if wanted & _ids_of(str(requested), roots) and _nonempty_file(Path(str(got))):
+            return True
+    return False
+
+
+def _landed_under(folder: Path, landed: Iterable, roots: Iterable[Path]) -> bool:
+    """Whether a diverted write that was meant for a file inside `folder` now exists."""
+    prefix = _file_id(folder) + os.sep
+    for pair in landed:
+        try:
+            requested, got = str(pair[0]), Path(str(pair[1]))
+        except (TypeError, IndexError):
+            continue
+        if any(i.startswith(prefix) for i in _ids_of(requested, roots)) and _nonempty_file(got):
+            return True
+    return False
+
+
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
-                    start_files: dict | None = None) -> list[str]:
+                    start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
     """Named or claimed deliverables that do not exist, are empty, or sit in the
     wrong place.
 
@@ -339,9 +374,11 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     roots = [Path(r) for r in roots]
     mirrors = [Path(r) for r in mirror_roots]
     written = list(written)
+    landed = list(landed)
     missing: list[str] = []
     for path in named_output_paths(request):
-        satisfied = any(_nonempty_file(c) for c in _candidates(path, roots))
+        satisfied = (any(_nonempty_file(c) for c in _candidates(path, roots))
+                     or _landed_copy(path, landed, roots + mirrors))
         if not satisfied and supplied_input(request, path, _candidates(path, roots + mirrors),
                                             start_files, written, roots + mirrors):
             continue
@@ -350,12 +387,14 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
             missing.append(f"{path} (found only in {mirrors[0]}; create it at the requested path)"
                            if elsewhere and mirrors else path)
     for path in named_output_dirs(request):
-        if not any(_has_content(c) for c in _candidates(path, roots)):
+        if not any(_has_content(c) or _landed_under(c, landed, roots + mirrors)
+                   for c in _candidates(path, roots)):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
     for path in written:
         name = PurePath(path).name
-        if name.lower() in lowered and not _exists_somewhere(path, roots + mirrors) and path not in missing:
+        if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
+                and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
