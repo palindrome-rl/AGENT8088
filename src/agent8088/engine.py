@@ -7676,6 +7676,16 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
         return ("Plan not approved: this session has no way to ask the user "
                 "(non-interactive). Nothing was written or run. Report the plan "
                 "to the user as your answer instead.")
+    # The plan was chat text and nothing else: it existed only until the
+    # transcript scrolled away, so an approved plan had no file behind it and
+    # a teammate had nothing to read. Written before the approval prompt, so
+    # it is on disk whether the plan is approved, revised or rejected.
+    plan_path = PROJECT_ROOT / "PLAN.md"
+    try:
+        plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not write %s: %s", plan_path, exc)
+        plan_path = None
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
     if not chosen:
@@ -7692,7 +7702,60 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
         message += (" Every mutating step will be verified against the real environment "
                     "by a read-only auditor, and a step that fails verification is put "
                     "back — so make each one do exactly what the plan said.")
+    if plan_path is not None:
+        message += f" The plan is also saved at {plan_path}."
     return message
+
+
+def _plan_step_profile(tool_name: str, tool_args: dict) -> str:
+    """The sub-agent profile that runs this plan step, or "" to run it inline.
+
+    Why: plan steps always ran inline, so the explore and coder profiles in
+    agents/ were unreachable and only the auditor and test-writer ever ran as
+    sub-agents. The split uses _tool_call_mutates, the same question the audit
+    asks: a step that only reads goes to explore, one that changes state goes
+    to coder. A profile is chosen only when it actually holds the tool, so the
+    verifier and test-writer profiles are never reached from a plan step.
+    """
+    mutating = _tool_call_mutates(tool_name, tool_args)
+    # Only write_file goes to coder: it replaces the whole file, so the inline
+    # fallback after a half-finished sub-run is idempotent. A mutating shell
+    # command is not, and stays inline.
+    for profile, wants_mutation in (("explore", False), ("coder", True)):
+        spec = SUBAGENT_SPECS.get(profile)
+        if profile == "coder" and tool_name != "write_file":
+            continue
+        if spec and mutating == wants_mutation and tool_name in spec.get("tools", ()):
+            return profile
+    return ""
+
+
+def _run_plan_step(tool_name: str, tool_args: dict, step_text: str, depth: int) -> str:
+    """Run one plan step in its matching sub-agent, falling back to inline.
+
+    Why the fallback: a sub-agent that errors, times out or reports a failure
+    marker must not lose the step, so it then runs exactly as it always did.
+    Re-running a coder step inline is safe because write_file replaces the
+    whole file, so a half-finished sub-run is overwritten rather than doubled.
+    """
+    profile = _plan_step_profile(tool_name, tool_args)
+    if profile:
+        task = (f"{step_text}\n\nDo this with the {tool_name} tool, using exactly these "
+                f"arguments: {json.dumps(tool_args, default=str)}")
+        try:
+            answer = _exec_subagent({"agent_type": profile, "task": task}, depth=depth)
+        except Exception:
+            answer = ""
+        # A sub-run whose model could not be reached returns a friendly
+        # "I could not answer:" text rather than raising, so it is checked by
+        # its wording too; _plan_step_failed only knows the tool error forms.
+        failed = not answer or _plan_step_failed(answer) or "I could not answer:" in answer[:200]
+        if not failed:
+            return answer
+    try:
+        return run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
 def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> str:
@@ -7791,10 +7854,7 @@ def _exec_plan(args: dict, on_step=None, on_escalation=None, depth: int = 0) -> 
                                                               tool_args)
         if will_audit and PLAN_AUDIT_REVERT:
             snapshot = _capture_write_state(tool_name, tool_args)
-        try:
-            result = run_tool(tool_name, tool_args, allow_plan=False, depth=depth)
-        except Exception as exc:
-            result = f"Error: {exc}"
+        result = _run_plan_step(tool_name, tool_args, step_text, depth)
         if will_audit and _audit_is_redundant(tool_name, tool_args, result, acceptance):
             will_audit = False
         _remember_escalation(tool_name, tool_args, result)
