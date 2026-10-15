@@ -542,9 +542,13 @@ def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
 # (a read-only copy, an input or output path, a missing argument) and not about the script.
 _ENVIRONMENT_FINAL = re.compile(
     r"^(?:PermissionError|FileNotFoundError|IsADirectoryError|NotADirectoryError|EOFError"
-    r"|OSError: \[Errno (?:1|2|13|30)\]|Error: (?:EROFS|EACCES|ENOENT|EPERM))"
-    r"|read-only file system|no such file or directory|permission denied",
+    r"|OSError: \[(?:Errno (?:1|2|13|30)|WinError (?:2|3|5|19|32))\]|Error: (?:EROFS|EACCES|ENOENT|EPERM))"
+    r"|read-only file system|no such file or directory|permission denied|access is denied"
+    r"|\[winerror (?:2|3|5|19|32)\]",
     re.IGNORECASE)
+# The note the sandbox appends when a command tried to write where it may not. It is about the
+# place the command ran in, never about the script, so it is not part of the error to judge.
+_SANDBOX_NOTE = re.compile(r"\n?\[sandbox\][\s\S]*$")
 
 
 def _final_line(output: str) -> str:
@@ -585,7 +589,7 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
         last = [line for line in output.strip().splitlines() if line.strip()]
         if captured is not None:
             captured.append(clip_output(output))
-        final = _final_line(output)
+        final = _final_line(_SANDBOX_NOTE.sub("", output))
         if soft is not None and ((not crashed) or _ENVIRONMENT_FINAL.search(final)):
             status = exited.group(1) if exited else "?"
             soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
