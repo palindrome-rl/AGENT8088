@@ -176,3 +176,72 @@ def test_main_loop_requests_one_different_approach_after_repeated_failures(monke
     assert "correct paths next" in answer
     assert any("Do not repeat them" in str(message["content"]) for message in messages)
     assert "Unresolved tool work remains" in answer
+
+
+def _ran(state, command, verdict, status="done", tool="execute_shell"):
+    op = {"tool": tool, "status": "running"}
+    state.after_tool(op, "output", failed=status != "done", blocked=False, mutated=False,
+                     verdict=verdict, command=command)
+
+
+def test_a_command_that_only_looks_around_and_exits_non_zero_is_not_a_failed_check():
+    state = TrajectoryState({}, goal="g", message_count=1)
+    _ran(state, 'dir /B && for %F in (a.txt) do type %F', "failed")
+    _ran(state, 'copy a.txt outputs\\a.txt', "failed")
+    assert not state.check_failing()
+
+
+def test_a_command_that_runs_a_check_and_fails_is_a_failed_check():
+    for command in ("python test_board.py", "node logic_test.js", "pytest -q", "python -m py_compile app.py",
+                    "npm run build", "python verify_outputs.py", "cd /d C:\\w && python e2e_check.py"):
+        state = TrajectoryState({}, goal="g", message_count=1)
+        _ran(state, command, "failed")
+        assert state.check_failing(), command
+
+
+def test_a_failure_of_a_dedicated_check_tool_is_still_a_failed_check():
+    state = TrajectoryState({}, goal="g", message_count=1)
+    _ran(state, "", "failed", tool="check_app")
+    assert state.check_failing()
+
+
+def test_the_command_that_failed_running_cleanly_later_settles_it_and_another_command_does_not():
+    state = TrajectoryState({}, goal="g", message_count=1)
+    _ran(state, "python test_board.py", "failed")
+    _ran(state, "python other_script.py", "unknown")
+    assert state.check_failing(), "a different command says nothing about the failed one"
+    _ran(state, "python  test_board.py", "unknown")
+    assert not state.check_failing() and state.failing_check_detail() == ""
+
+
+def test_a_check_the_sandbox_stopped_did_not_fail_it_never_ran_to_a_result():
+    blocked = ("[WinError 5] Access is denied: '__pycache__'\nCommand exited with status 1.\n"
+               "[sandbox] Shell commands may write only to C:\\w\\artifacts and the sandbox temp folder; "
+               "everything else is read-only to them.")
+    state = TrajectoryState({}, goal="g", message_count=1)
+    op = {"tool": "execute_shell", "status": "running"}
+    state.after_tool(op, blocked, failed=False, blocked=False, mutated=False, verdict="failed",
+                     command="python -m py_compile app.py")
+    assert not state.check_failing()
+    op = {"tool": "execute_shell", "status": "running"}
+    state.after_tool(op, "Traceback ...\nAssertionError\nCommand exited with status 1.", failed=False, blocked=False,
+                     mutated=False, verdict="failed", command="python test_app.py")
+    assert state.check_failing(), "the same kind of command failing without the sandbox note is still a failed check"
+
+
+def test_running_a_program_the_run_wrote_and_failing_is_a_failed_check_whatever_the_command_is_called():
+    for command in ("python main.py", "cd /d C:\\w && node server.js --port 8080", "python3 -u src/main.py",
+                    'python "C:\\w\\artifacts\\main.py" input.csv'):
+        state = TrajectoryState({}, goal="g", message_count=1)
+        state.data["written_paths"] = ["C:\\w\\main.py", "C:\\w\\server.js"]
+        _ran(state, command, "failed")
+        assert state.check_failing(), command
+
+
+def test_a_command_that_only_names_a_written_file_or_runs_something_else_is_not_a_failed_check():
+    for command in ("type main.py", "copy main.py outputs\\main.py", "dir main.py", "python other.py", "python -c \"print(1)\"",
+                    "echo main.py"):
+        state = TrajectoryState({}, goal="g", message_count=1)
+        state.data["written_paths"] = ["C:\\w\\main.py"]
+        _ran(state, command, "failed")
+        assert not state.check_failing(), command
