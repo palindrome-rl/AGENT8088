@@ -56,6 +56,8 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
 | `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. LibreOffice is opt-in; when it is missing the tool says to run `agent8088 --libreoffice-setup`. |
+| `copy_file` | `write_text` | `source`, `destination` | prompt | Copy an existing local file byte-for-byte (PDFs, images); a folder destination keeps the file's name. Same write gate as `write_file`. |
+| `move_file` | `write_text` | `source`, `destination` | prompt | Copy, then remove the original; project files only. Same write gate as `write_file`. |
 | `run_sandboxed` | `docker` | `code` | prompt | Run a Python snippet with native OS isolation and no network, falling back to Docker. |
 | `schedule_task` | `cron` | `action`, `schedule`*, `task`* | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
