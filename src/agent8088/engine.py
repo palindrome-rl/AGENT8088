@@ -16633,6 +16633,11 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     run_trajectory = trajectory.TrajectoryState(
         trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
     )
+    if not kwargs.get("depth"):
+        try:
+            run_trajectory.start_files = completion_checks.inventory([PROJECT_ROOT, ARTIFACTS_ROOT])
+        except Exception as exc:  # noqa: BLE001 -- a missing inventory only turns the input rule off
+            _log.warning("could not list the files present at the start: %s", exc)
 
     # Choose a smaller native schema surface once for the human request, before
     # the model's first completion. Tool-result messages are deliberately not
@@ -18109,7 +18114,9 @@ def _delivered_evidence(written) -> str | None:
 def _missing_required_files(trajectory, reply: str, request: str) -> list:
     return completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
-        mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [])
+        mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [],
+        start_files=trajectory.start_files,
+        landed=trajectory.data.get("redirected_writes") or [])
 
 
 def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth: int) -> list:
@@ -18224,7 +18231,10 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
     if nudge is None and not DISPOSABLE_CONTAINER and not trajectory.smoke_failures():
         temp_dir, project = tempfile.gettempdir(), str(PROJECT_ROOT)
         # The system temp dir is scratch space, unless the project itself lives there.
-        relevant = lambda path: completion_checks.is_library_code(path, temp_dir, project)
+        written_now = trajectory.written_paths()
+        relevant = lambda path: (completion_checks.is_library_code(path, temp_dir, project)
+                                 and not completion_checks.is_throwaway_helper(
+                                     path, request, written_now, [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]))
         if (completion_checks.project_has_tests(PROJECT_ROOT)
                 and trajectory.request_tests(relevant)):
             nudge = completion_checks.tests_nudge(trajectory.relevant_untested(relevant))
