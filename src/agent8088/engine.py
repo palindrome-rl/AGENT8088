@@ -15839,12 +15839,15 @@ def _grown_search_allowance(allowance: int, cap: int, productive: list,
     searches cannot chain extensions on their own, growth also needs a search
     that found new pages since the last extension (`since`)."""
     try:
-        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 3))
+        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 6))
         extension = max(1, _config_int("web_search_extension", 3))
     except (TypeError, ValueError):
-        ceiling, extension = cap * 3, 3
-    recent = [p for p in productive if p is not None][-_SEARCH_PRODUCTIVE_WINDOW:]
-    if (allowance < ceiling and len(recent) == _SEARCH_PRODUCTIVE_WINDOW
+        ceiling, extension = cap * 6, 3
+    # Up to three times the starting cap two productive searches in a row earn more, as before. Past that,
+    # which only a long research request reaches, it takes three in a row.
+    window = _SEARCH_PRODUCTIVE_WINDOW + (1 if allowance >= cap * 3 else 0)
+    recent = [p for p in productive if p is not None][-window:]
+    if (allowance < ceiling and len(recent) == window
             and all(recent) and any(productive[since:])):
         return min(ceiling, allowance + extension)
     return allowance
@@ -18794,6 +18797,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     search_productive = []       # per search that ran: new pages? (None = no pages)
     search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
+    search_limit_told = False   # the model has been refused a search for this request
+    build_chance_used = False   # the one extra "start building" message has been spent
+    search_corrections = 0      # calls to the search tool corrected after its allowance was spent
     user_turns = _genuine_user_turns(messages)
     request_text = _message_text(user_turns[-1]) if user_turns else ""
     durable_browser_goal = next((_message_text(message)
@@ -18834,6 +18840,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             round_allowed_tools.discard("execute_shell")
         if not (_plan_approved or _browser_request_is_explicit(messages)):
             round_allowed_tools.discard("browse_page")
+        if search_limit_told:
+            # Refused once, so offering it again only invites more refused calls.
+            round_allowed_tools.discard("web_search")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
@@ -19360,8 +19369,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 continue
             unknown = [n for n in attempted
                        if _resolve_tool_name(n) not in round_allowed_tools]
-            if unknown and unknown_retries < 2 and not forcing:
-                unknown_retries += 1
+            # A call to the search tool after its allowance is spent is guidance, not a tool the model made up,
+            # so it is corrected a few more times than a real unknown tool before the reply is taken as final.
+            spent_search = (bool(unknown) and search_limit_told
+                            and all(_resolve_tool_name(n) == "web_search" for n in unknown))
+            if unknown and not forcing and (unknown_retries < 2 or (spent_search and search_corrections < 3)):
+                if spent_search:
+                    search_corrections += 1
+                else:
+                    unknown_retries += 1
                 available = ", ".join(sorted(round_allowed_tools)) or "(none)"
                 # A gated tool is not an unknown one. browse_page is withheld
                 # until the request actually asks for a browser, and telling
@@ -19369,6 +19385,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # describe_tool first -- three turns to be told a fourth time.
                 # Name the real reason so the next move is the right one.
                 name = unknown[0]
+                if spent_search:
+                    if (not build_chance_used and depth == 0 and trajectory is not None
+                            and not trajectory.mutation_count() and _CHANGE_REQUEST.search(request_text)
+                            and not completion_checks.is_advice_request(request_text)):
+                        # Nothing has been written for a request to build something: say so once, plainly.
+                        build_chance_used = True
+                        messages.append(_harness_turn(
+                            "You have enough research to start. Start writing the files now with what you have, "
+                            "and say plainly in your answer what is missing."))
+                        if trace is not None:
+                            trace.append({"turn": turn, "type": "build_chance"})
+                    else:
+                        messages.append(_harness_turn(
+                            "Error: web_search is not available any more for this request: its allowance is used up. "
+                            "Use what you have collected (fetch a specific page with the shell or a read tool if one "
+                            "detail is missing), go on to the work, and say plainly what the results did not confirm."))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
+                    continue
                 gated = _resolve_tool_name(name) in TOOL_SPECS
                 headline = (f"{name} is not available for this request."
                             if gated else f"Unknown tool '{name}' — not available.")
@@ -19611,8 +19646,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 if cap and searches_run >= search_allowance:
                     result = (f"Search limit reached: {searches_run} web searches "
                               "already ran for this request. Do not search again. "
-                              "Answer now from the results above, and say plainly "
-                              "what they did not confirm.")
+                              "Use the results above: if one specific page would settle a detail, fetch it with "
+                              "the shell or a read tool; otherwise go on to the work now, and say plainly "
+                              "what the results did not confirm.")
+                    if not search_limit_told:
+                        search_limit_told = True
+                        executed = True   # the first refusal is guidance, not a call repeated without progress
                     tool_outputs.append(result)
                     if on_result:
                         on_result(name, result)
@@ -20113,8 +20152,21 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # still hit the normal breaker once the cap is spent.
             policy.record_round(fresh=False, output=None)
         elif forcing:
-            forced_stop = True
-            break
+            if (not build_chance_used and depth == 0 and trajectory is not None
+                    and not trajectory.mutation_count() and _CHANGE_REQUEST.search(request_text)
+                    and not completion_checks.is_advice_request(request_text)):
+                # Nothing has been written and the request is to build something: ending now would leave the
+                # person with no files at all. Once per request, say what to do instead.
+                build_chance_used = True
+                forcing = False
+                messages.append(_harness_turn(
+                    "You have enough research to start. Start writing the files now with what you have, and say "
+                    "plainly in your answer what is missing."))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "build_chance"})
+            else:
+                forced_stop = True
+                break
         else:
             forcing = True
             messages.append(_harness_turn("You keep repeating tool calls without progress. Stop using tools and give your final answer now."))

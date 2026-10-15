@@ -80,8 +80,15 @@ def test_rephrasing_one_question_still_stops_at_the_cap(monkeypatch):
 
 
 def test_growth_stops_at_the_hard_ceiling(monkeypatch):
-    # Default ceiling: 3 x the starting cap.
-    dispatched, prompts = _run(monkeypatch, 25, _fresh)
+    # Default ceiling: 6 x the starting cap.
+    dispatched, prompts = _run(monkeypatch, 45, _fresh)
+
+    assert len(dispatched) == 36
+    assert any("Search limit reached: 36 web searches" in p for p in prompts)
+
+
+def test_a_fixed_ceiling_of_three_times_the_cap_is_still_available(monkeypatch):
+    dispatched, prompts = _run(monkeypatch, 25, _fresh, multiplier=3)
 
     assert len(dispatched) == 18
     assert any("Search limit reached: 18 web searches" in p for p in prompts)
