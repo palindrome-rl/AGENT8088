@@ -132,3 +132,43 @@ def test_cut_off_calls_in_a_row_still_end_in_a_forced_answer(eng, monkeypatch):
     eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=40,
                   tools_def=[], allowed_tools={"write_file", "execute_shell"})
     assert script.nudges("You keep repeating tool calls without progress")
+
+
+def test_empty_replies_spread_over_a_run_each_get_their_one_retry(eng, monkeypatch):
+    replies = []
+    for i in range(3):
+        replies += ["", _call("execute_shell", command=f"echo {i}")]
+    replies += ["All finished."]
+    script = Script(eng, monkeypatch, replies, tool=failing_then_ok(["ok"] * 3))
+    answer = eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=40,
+                           tools_def=[], allowed_tools={"execute_shell"})
+    assert len(script.nudges("You did not provide an answer")) == 3
+    assert answer.startswith("All finished.") and "wasn't able to produce" not in answer
+
+
+def test_unknown_tool_calls_spread_over_a_run_are_each_corrected(eng, monkeypatch):
+    replies = []
+    for i in range(3):
+        replies += [_call("no_such_tool", x=i), _call("execute_shell", command=f"echo {i}")]
+    replies += ["All finished."]
+    script = Script(eng, monkeypatch, replies, tool=failing_then_ok(["ok"] * 3))
+    eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=40,
+                  tools_def=[], allowed_tools={"execute_shell"})
+    assert len(script.nudges("does not exist")) == 3
+
+
+def test_a_long_run_with_trouble_spread_through_it_is_never_forced_to_stop(eng, monkeypatch):
+    """Sixty rounds with a cut-off call or an unknown tool every few rounds."""
+    replies = []
+    for i in range(60):
+        if i % 12 == 3:
+            replies.append(CUT)
+        elif i % 12 == 10:
+            replies.append(_call("no_such_tool", x=i))
+        replies.append(_call("execute_shell", command=f"echo {i}"))
+    replies.append("All finished.")
+    script = Script(eng, monkeypatch, replies, tool=_cut_off_aware_tool(eng))
+    answer = eng.run_agent([{"role": "user", "content": "do the work"}], max_turns=200,
+                           tools_def=[], allowed_tools={"execute_shell", "write_file"})
+    assert not script.nudges("You keep repeating tool calls without progress")
+    assert answer.startswith("All finished.")
