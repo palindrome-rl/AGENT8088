@@ -159,6 +159,31 @@ def test_key_shapes_are_still_reported(line):
     assert secret_scan.find_secrets(line)
 
 
+@pytest.mark.parametrize("line", [
+    "{ name: 'Flamethrower', effectChance:30, power: 90 }",
+    "{ sleepTarget:1, selfDrain:0.33, effectChance:.25 }",
+    "const o=document.createElement('option'); const d=document.getElementById('log');",
+    "l.scrollTop=l.scrollHeight; s.style.animationDuration=rand+'s';",
+    "const idxs=Engine.getActiveIdx(side); const myTeam=fighters.filter(f=>f.alive);",
+    "randF=0.85+Math.random()*0.15; f.el.offsetTop-6; targetSide:1-side",
+    "// MOVES/ABILITIES/ITEMS tables; a1=teamAlive(1)",
+])
+def test_source_code_is_not_reported_as_a_credential(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line) == []
+
+
+@pytest.mark.parametrize("line", [
+    "token=Kx9fQ2mPz7Lr4Tw8YbN3vH6",
+    "auth:aB3dE5gH7jK9mN1pQ3sT",
+    "secret=9f86d081884c7d659a2feaa0",
+    "x=Zq8Lr4Tw8YbN3vH6Kx9fQ2mPz7+Ab",
+])
+def test_a_key_after_a_name_and_separator_is_still_reported(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line)
+
+
 def test_only_an_opaque_string_with_no_digit_is_weak():
     from agent8088 import secret_scan
     weak = secret_scan.find_secrets('key = "aBcDeFgHiJ/kLmNoPqRsTu"')

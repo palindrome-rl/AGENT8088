@@ -155,10 +155,35 @@ def _wordlike(token: str) -> bool:
     return bool(parts) and all(p.isalpha() and sum(c.isupper() for c in p) <= 2 for p in parts)
 
 
+_CODE_SPLIT_RE = re.compile(r"[:=+/.$-]")
+_SHORT_NUMBER_RE = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,4})?")
+
+
+def _code_piece(piece: str) -> bool:
+    """One identifier-sized word: letters with at most two digits and four capitals (``effectChance``,
+    ``f2b``, ``createElement``), or ALL CAPS."""
+    if not piece or len(piece) > 24 or not re.fullmatch(r"[A-Za-z_]\w*", piece):
+        return False
+    if sum(c.isdigit() for c in piece) > 2:
+        return False
+    return piece.isupper() or sum(c.isupper() for c in piece) <= 4
+
+
+def _codelike(token: str) -> bool:
+    """Source code that happens to be one token: ``effectChance:30``, ``d=document.createElement``,
+    ``a.b.c``. Every part between the separators is a short identifier or a short number, so there is no
+    run long enough or random enough to be a key (a random 20 character part has far more than two digits
+    or four capitals)."""
+    if not _CODE_SPLIT_RE.search(token):
+        return False
+    pieces = [p for p in _CODE_SPLIT_RE.split(token) if p]
+    return bool(pieces) and all(_SHORT_NUMBER_RE.fullmatch(p) or _code_piece(p) for p in pieces)
+
+
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token):
         return True
-    if _wordlike(token):
+    if _wordlike(token) or _codelike(token):
         return True
     if _PATHY_RE.search(token):
         return True
