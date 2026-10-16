@@ -8,6 +8,9 @@ All notable changes to Agent8088 are recorded here. The format follows
 
 ### Improved
 
+- If context compaction receives an empty summary, it retries once with reduced
+  reasoning and a fenced transcript. An empty retry or a tool-call-shaped reply
+  leaves the original conversation intact.
 - When a run is stopped by its closing cap, the page or script is smoke-checked
   once, and the answer starts with a NOT VERIFIED line when the run saw a clear
   sign of trouble.

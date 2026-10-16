@@ -118,3 +118,40 @@ def test_rule_files_require_adoption_and_keep_their_full_identity(runtime, monke
         assert "Never submit before approval." in messages[0]["content"]
         assert str(path) in messages[0]["content"]
         messages.extend(filler())
+
+
+@pytest.mark.parametrize("first,second,expected", [
+    (None, "Recovered summary", "Recovered summary"),
+    ("First summary", None, "First summary"),
+    (None, None, None),
+    (None, "✿FUNCTION✿: execute_shell ✿ARGS✿: {}", None),
+])
+def test_empty_compaction_retry_is_bounded_and_never_uses_a_tool_call(
+        runtime, monkeypatch, first, second, expected):
+    sent, charged = [], []
+    replies = [first, second]
+
+    def summarize(*args, **kwargs):
+        sent.append((kwargs["thinking"], args[1][0]["content"]))
+        content = replies.pop(0)
+        return N(choices=[N(message=N(content=content, tool_calls=None), finish_reason="stop")])
+
+    monkeypatch.setattr(runtime, "create_completion", summarize)
+    monkeypatch.setattr(runtime, "_TURN_FILES_TOUCHED", [])
+    monkeypatch.setattr(runtime, "_VERDICT_LEDGER", {})
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+                for i in range(8)]
+    before = list(messages)
+    budget = N(add_usage=lambda response, **kwargs: charged.append(response))
+    success = runtime.compact_messages(messages, keep=3, completion_client=object(), budget=budget)
+    assert success == (expected is not None)
+    assert len(charged) == len(sent) == (1 if first else 2)
+    assert sent[0][0] is False
+    if not first:
+        assert sent[1][0] == "length_retry"
+        assert "<transcript>\n" in sent[1][1]
+        assert sent[1][1].rstrip().endswith("as plain text.")
+    if success:
+        assert expected in messages[0]["content"]
+    else:
+        assert messages == before
