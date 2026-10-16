@@ -4,6 +4,24 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-10-16
+
+### Improved
+
+- When a run is stopped by its closing cap, the page or script is smoke-checked
+  once, and the answer starts with a NOT VERIFIED line when the run saw a clear
+  sign of trouble.
+- A run that repeats itself is warned in steps before it is ended.
+- Productive research may run more searches; a refused search ends with guidance
+  and the files gathered so far.
+- A relative `artifacts/` path is kept as written after a command changes
+  directory.
+- Credential scanning no longer flags plain words, MIME type lists, encoded URLs
+  or source-code tokens.
+
+Public installation commands, update channel, version 1.3.0, MIT licensing and
+existing public-specific diagnostics and Web UI fixes remain preserved.
+
 ## [1.3.0] - 2026-10-15
 
 The public channel moves to the `AGENT8088-v1.3` branch. Installers,

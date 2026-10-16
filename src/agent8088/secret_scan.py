@@ -82,6 +82,13 @@ _PATHY_RE = re.compile(r"^(?:\.{0,2}/|~/)|[A-Za-z0-9_-]\.[a-z]{1,5}$")
 # Python-urllib/3.11. The name is words, so a random-looking key with a trailing /5.0 does not match.
 _PRODUCT_VERSION_RE = re.compile(
     r"[A-Za-z][A-Za-z_-]{2,}[0-9]{0,2}/v?[0-9]+(?:\.[0-9]+){0,3}(?:[-+][\w.]+)?")
+# Plain words joined by slashes, plus signs, dashes or dots: "moves/items/partners", "application/xhtml+xml",
+# "atkMult/defMult". No digit, and every part is letters with at most two capitals (a word, a Capitalised
+# word or lowerCamel). A random key has digits, or about half its letters in capitals.
+_JOINER_RE = re.compile(r"[/+_.\-]")
+# A URL up to the next space or closing quote or bracket; judged by the URL rules, not as a pile of tokens.
+_URL_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>)\]]+")
+OPAQUE_KIND = "Possible credential (opaque string)"
 _HASHISH_WORDS = frozenset({
     "sha256", "sha-256", "sha1", "md5", "sha512", "checksum", "digest",
 })
@@ -92,11 +99,14 @@ _EDGE_PUNCT = "\"'`()[]{}<>,;!?*"
 class Finding:
     """One credential-shaped string. ``masked`` is safe to show or log."""
 
-    __slots__ = ("kind", "masked")
+    __slots__ = ("kind", "masked", "weak")
 
-    def __init__(self, kind, masked):
+    def __init__(self, kind, masked, weak=False):
         self.kind = kind
         self.masked = masked
+        # Found only because of how the string looks and with no digit in it, so it can only have come through
+        # the slash / plus / equals route of the opaque rule: worth one question, not a standing demand.
+        self.weak = weak
 
     def __repr__(self):
         return "Finding(%r, %r)" % (self.kind, self.masked)
@@ -137,8 +147,43 @@ def looks_like_opaque_credential(value: str) -> bool:
     return all(re.search(p, value) for p in _MIXED)
 
 
+def _wordlike(token: str) -> bool:
+    """Words joined by separators, with no digit: text, not a key."""
+    if re.search(r"[0-9]", token):
+        return False
+    parts = [p for p in _JOINER_RE.split(token) if p]
+    return bool(parts) and all(p.isalpha() and sum(c.isupper() for c in p) <= 2 for p in parts)
+
+
+_CODE_SPLIT_RE = re.compile(r"[:=+/.$-]")
+_SHORT_NUMBER_RE = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,4})?")
+
+
+def _code_piece(piece: str) -> bool:
+    """One identifier-sized word: letters with at most two digits and four capitals (``effectChance``,
+    ``f2b``, ``createElement``), or ALL CAPS."""
+    if not piece or len(piece) > 24 or not re.fullmatch(r"[A-Za-z_]\w*", piece):
+        return False
+    if sum(c.isdigit() for c in piece) > 2:
+        return False
+    return piece.isupper() or sum(c.isupper() for c in piece) <= 4
+
+
+def _codelike(token: str) -> bool:
+    """Source code that happens to be one token: ``effectChance:30``, ``d=document.createElement``,
+    ``a.b.c``. Every part between the separators is a short identifier or a short number, so there is no
+    run long enough or random enough to be a key (a random 20 character part has far more than two digits
+    or four capitals)."""
+    if not _CODE_SPLIT_RE.search(token):
+        return False
+    pieces = [p for p in _CODE_SPLIT_RE.split(token) if p]
+    return bool(pieces) and all(_SHORT_NUMBER_RE.fullmatch(p) or _code_piece(p) for p in pieces)
+
+
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token):
+        return True
+    if _wordlike(token) or _codelike(token):
         return True
     if _PATHY_RE.search(token):
         return True
@@ -167,13 +212,15 @@ def find_secrets(text: str) -> list:
             seen.add(value)
             found.append(Finding(label, mask(value)))
 
-    for raw in _TOKEN_SPLIT_RE.split(text):
+    # The opaque-string pass judges what is left once URLs are taken out: a percent-encoded address would
+    # otherwise be cut at every "%" into pieces that no longer look like part of a URL.
+    for raw in _TOKEN_SPLIT_RE.split(_URL_TEXT_RE.sub(" ", text)):
         token = raw.strip(_EDGE_PUNCT)
         if len(token) < _MIN_MIXED or token in seen or _is_noise(token):
             continue
         if looks_like_opaque_credential(token):
             seen.add(token)
-            found.append(Finding("Possible credential (opaque string)", mask(token)))
+            found.append(Finding(OPAQUE_KIND, mask(token), weak=not re.search(r"[0-9]", token)))
     return found
 
 

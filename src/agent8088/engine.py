@@ -11101,8 +11101,48 @@ _ARTIFACTS_WORD_RE = re.compile(
 )
 
 
+# A command that changes directory. Everything after it runs somewhere else, so a relative path in it
+# means that place, not the artifacts workspace the command started in.
+_CWD_CHANGE_RE = re.compile(
+    r"(?i)(?<![\w./\\:~-])(?:cd|chdir|pushd|set-location)\s+(?:/d\s+)?"
+    r"(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<bare>[^\s\"'&|;]+))")
+
+
+def _first_directory_change(command: str):
+    """The end of the first `cd` to somewhere other than the artifacts workspace, or None.
+
+    `cd .`, `cd artifacts` and `cd artifacts\\sub` stay in the workspace the command already started in.
+    """
+    for match in _CWD_CHANGE_RE.finditer(command):
+        target = (match.group("dq") or match.group("sq") or match.group("bare") or "").strip()
+        probe = target.replace("\\", "/").lstrip("./").rstrip("/").lower()
+        if target in ("", ".", "./", ".\\") or probe == "artifacts" or probe.startswith("artifacts/") \
+                or target.replace("\\", "/").rstrip("/").lower().endswith("/artifacts"):
+            continue
+        return match.end()
+    return None
+
+
 def _artifact_workspace_command(command: str) -> str:
-    """Map project-relative artifact paths into the mounted artifact directory."""
+    """Map project-relative artifact paths into the mounted artifact directory.
+
+    Only the part of the command that runs in the workspace is mapped: once the command has changed
+    directory to somewhere else (`cd <project> && python artifacts\\x.py`), `artifacts\\x.py` means the
+    folder it says, and rewriting it to `./x.py` pointed at a file that does not exist.
+    """
+    # The container alias is an absolute path, so it maps wherever it appears.
+    command = _CONTAINER_ARTIFACTS_RE.sub(
+        lambda match: match.group("workspace")
+        + ("/" if match.group("tail") in ("/", "\\") else ""),
+        command,
+    )
+    cut = _first_directory_change(command)
+    if cut is not None:
+        return _map_artifact_paths(command[:cut]) + command[cut:]
+    return _map_artifact_paths(command)
+
+
+def _map_artifact_paths(command: str) -> str:
     command = _CONTAINER_ARTIFACTS_RE.sub(
         lambda match: match.group("workspace")
         + ("/" if match.group("tail") in ("/", "\\") else ""),
@@ -15857,12 +15897,15 @@ def _grown_search_allowance(allowance: int, cap: int, productive: list,
     searches cannot chain extensions on their own, growth also needs a search
     that found new pages since the last extension (`since`)."""
     try:
-        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 3))
+        ceiling = cap * max(1, _config_int("web_search_ceiling_multiplier", 6))
         extension = max(1, _config_int("web_search_extension", 3))
     except (TypeError, ValueError):
-        ceiling, extension = cap * 3, 3
-    recent = [p for p in productive if p is not None][-_SEARCH_PRODUCTIVE_WINDOW:]
-    if (allowance < ceiling and len(recent) == _SEARCH_PRODUCTIVE_WINDOW
+        ceiling, extension = cap * 6, 3
+    # Up to three times the starting cap two productive searches in a row earn more, as before. Past that,
+    # which only a long research request reaches, it takes three in a row.
+    window = _SEARCH_PRODUCTIVE_WINDOW + (1 if allowance >= cap * 3 else 0)
+    recent = [p for p in productive if p is not None][-window:]
+    if (allowance < ceiling and len(recent) == window
             and all(recent) and any(productive[since:])):
         return min(ceiling, allowance + extension)
     return allowance
@@ -18060,6 +18103,19 @@ SETTLED_MESSAGE = ("The requested files exist and the latest checks pass, and yo
                    "what you built, what you checked, and anything you could not verify.")
 
 
+# What a run is told when it keeps sending calls that already ran. Three steps for the main run, then it ends.
+REPEAT_STOP_NOW = "You keep repeating tool calls without progress. Stop using tools and give your final answer now."
+REPEAT_WARNINGS = (
+    "You keep repeating tool calls without progress. That call already ran with the same result: do not send it "
+    "again. Take the next step that is still missing, or give your final answer if the work is done.",
+    "You sent the same call again. Say in one line what is still missing, then make one call that does it, with "
+    "different arguments or a different tool. If you cannot make progress, give your final answer and say what "
+    "is missing.",
+    "Last warning: the next repeated call ends the run. Make a different call now, or give your final answer "
+    "with what is done and what is missing.",
+)
+
+
 class _TurnPolicy:
     """How many rounds this run starts with, and how many it may still earn.
 
@@ -18191,6 +18247,15 @@ CHECKS_FAILED_NOTE = ("Incomplete: the latest automated check failed and was not
 # A reply that ends the work while the latest automated check (tests, an audit) is still
 # failing used to get only a note at the end. With this on it gets up to two follow-ups
 # per request, each naming the failing command: fix it, or say plainly that it still fails.
+# A line at the very top of the answer when the run itself saw a clear sign that the work is not finished or
+# not working. The notes at the end say the same thing, but a reader who stops after the first lines of a
+# message that says "the task is complete" would never see them.
+NOT_VERIFIED_HEADLINE = str(APP_CONFIG.get("not_verified_headline", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+# What an unmet-check note must start with to count as a clear sign (the common "no fresh verification",
+# "no tests written" and "smoke test unavailable" notes are not: they appear on correct work too).
+_STRONG_UNMET = ("missing or empty", "a file was cut off", "the smoke test failed", "the latest check failed",
+                 "the reply says the work is unfinished", "a credential is written")
 FAILING_CHECK_FOLLOW_UP = str(APP_CONFIG.get("failing_check_follow_up", "1")).strip().lower() in (
     "1", "true", "yes", "on")
 
@@ -18368,11 +18433,12 @@ def _smoke_script_runner(target):
     return run
 
 
-def _smoke_test_step(trajectory, written: list):
+def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     """Smoke-test the pages and scripts this run wrote, once per state of the work.
 
     Every result goes in the answer's notes. Only in `enforce` mode does a failure
     become a follow-up, and then at most COMPLETION_SMOKE_MAX_FAILURES times.
+    `report_only` records the notes and never returns a follow-up (the run is ending).
     """
     roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
     targets = app_check.deliverable_targets(written, roots)
@@ -18393,6 +18459,8 @@ def _smoke_test_step(trajectory, written: list):
             failures.append(report)
         elif report.ask:
             unverified.append(report)
+    if report_only:
+        return None
     if (failures and COMPLETION_SMOKE_TEST == "enforce"
             and trajectory.smoke_failures() <= COMPLETION_SMOKE_MAX_FAILURES):
         detail = "\n".join(r.text(900) for r in failures)
@@ -18446,6 +18514,15 @@ def _secrets_step(trajectory, written: list):
             trajectory.record_secret_scan(path)
     if not hits:
         return None
+    weak_only = all(finding.weak for _p, _l, finding in hits)
+    if weak_only:
+        # Strings that only look like a key. Ask once; after that they are taken as the model's answer
+        # (it can say they are words or placeholders) and they never reach the "Not completed" note.
+        if trajectory.weak_secret_asked():
+            for path in pending:
+                trajectory.record_secret_scan(path)
+            return None
+        trajectory.mark_weak_secret_asked()
     detail = "\n".join(
         "%s:%s  %s  %s" % (Path(path).name, line, finding.kind, finding.masked)
         for path, line, finding in hits[:8])
@@ -18458,7 +18535,7 @@ def _secrets_step(trajectory, written: list):
             "If any is real, remove it from the file and read it from an environment "
             "variable or a .env file that is not committed instead.",
             "Continue: remove the credential, or state that it is a placeholder."),
-        unmet="a credential is written in clear text in: " + ", ".join(names[:6]))
+        unmet="" if weak_only else "a credential is written in clear text in: " + ", ".join(names[:6]))
 
 
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
@@ -18515,9 +18592,19 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     spends none of the continuation budget, arms no one-shot reminder, and does
     not run the browser smoke test. What it finds goes into the answer's
     "Not completed" note.
+
+    The page or script check is the exception: it runs once, report-only, for the
+    deliverables that changed since they were last checked. It costs a few seconds, adds
+    no round and no follow-up, and without it a run that ends here says nothing about a
+    page that does not load.
     """
     if trajectory is None or not budget.enabled:
         return []
+    if depth == 0 and COMPLETION_SMOKE_TEST != "off":
+        try:
+            _smoke_test_step(trajectory, trajectory.landed_paths(), report_only=True)
+        except Exception as exc:  # noqa: BLE001 -- a failed check must never take the ending down
+            _log.warning("end-of-run smoke test failed to run: %s", exc)
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
@@ -18651,6 +18738,28 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+def _not_verified_reasons(trajectory) -> list:
+    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones."""
+    if trajectory is None:
+        return []
+    reasons = []
+    failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
+    if failed:
+        reasons.append("the page/script check failed (" + ", ".join(failed[:3]) + ")")
+    if trajectory.check_failing():
+        reasons.append("the latest check failed")
+    if trajectory.open_subgoals():
+        reasons.append(f"{len(trajectory.open_subgoals())} part(s) of the request not addressed")
+    if trajectory.partial_files():
+        reasons.append("a file was cut off before it was finished")
+    for unmet in trajectory.data.get("unmet_checks") or []:
+        text = str(unmet)
+        if text.lower().startswith(_STRONG_UNMET) and not any(text.lower().startswith(w) for w in
+                                                              ("the smoke test failed", "the latest check failed")):
+            reasons.append(text[:120])
+    return list(dict.fromkeys(reasons))
+
+
 def _with_task_notes(answer: str, trajectory) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
@@ -18680,6 +18789,10 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
+    reasons = _not_verified_reasons(trajectory) if NOT_VERIFIED_HEADLINE else []
+    if reasons and not answer.startswith("NOT VERIFIED:"):
+        answer = ("NOT VERIFIED: " + "; ".join(reasons[:4])
+                  + ". Details are in the notes at the end.\n\n" + answer)
     return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
@@ -18766,6 +18879,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
+    repeat_strikes = 0   # rounds in a row that only repeated earlier calls; cleared by a round that ran a tool or a cut-off
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
@@ -18812,6 +18926,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     search_productive = []       # per search that ran: new pages? (None = no pages)
     search_grant_mark = 0        # len(search_productive) at the last extension
     forced_stop = False
+    search_limit_told = False   # the model has been refused a search for this request
+    build_chance_used = False   # the one extra "start building" message has been spent
+    search_corrections = 0      # calls to the search tool corrected after its allowance was spent
     user_turns = _genuine_user_turns(messages)
     request_text = _message_text(user_turns[-1]) if user_turns else ""
     durable_browser_goal = next((_message_text(message)
@@ -18852,6 +18969,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             round_allowed_tools.discard("execute_shell")
         if not (_plan_approved or _browser_request_is_explicit(messages)):
             round_allowed_tools.discard("browse_page")
+        if search_limit_told:
+            # Refused once, so offering it again only invites more refused calls.
+            round_allowed_tools.discard("web_search")
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
@@ -19317,6 +19437,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if salvage_note:
                 retry_instruction = f"{warning} {salvage_note}"
             messages.append(_harness_turn(retry_instruction))
+            # A cut-off reply is not a repeated call: what the model lost to it is not held against it.
+            forcing, repeat_strikes = False, 0
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
         messages.append({"role": "assistant", "content": content})
@@ -19378,8 +19500,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 continue
             unknown = [n for n in attempted
                        if _resolve_tool_name(n) not in round_allowed_tools]
-            if unknown and unknown_retries < 2 and not forcing:
-                unknown_retries += 1
+            # A call to the search tool after its allowance is spent is guidance, not a tool the model made up,
+            # so it is corrected a few more times than a real unknown tool before the reply is taken as final.
+            spent_search = (bool(unknown) and search_limit_told
+                            and all(_resolve_tool_name(n) == "web_search" for n in unknown))
+            if unknown and not forcing and (unknown_retries < 2 or (spent_search and search_corrections < 3)):
+                if spent_search:
+                    search_corrections += 1
+                else:
+                    unknown_retries += 1
                 available = ", ".join(sorted(round_allowed_tools)) or "(none)"
                 # A gated tool is not an unknown one. browse_page is withheld
                 # until the request actually asks for a browser, and telling
@@ -19387,6 +19516,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # describe_tool first -- three turns to be told a fourth time.
                 # Name the real reason so the next move is the right one.
                 name = unknown[0]
+                if spent_search:
+                    if (not build_chance_used and depth == 0 and trajectory is not None
+                            and not trajectory.mutation_count() and _CHANGE_REQUEST.search(request_text)
+                            and not completion_checks.is_advice_request(request_text)):
+                        # Nothing has been written for a request to build something: say so once, plainly.
+                        build_chance_used = True
+                        messages.append(_harness_turn(
+                            "You have enough research to start. Start writing the files now with what you have, "
+                            "and say plainly in your answer what is missing."))
+                        if trace is not None:
+                            trace.append({"turn": turn, "type": "build_chance"})
+                    else:
+                        messages.append(_harness_turn(
+                            "Error: web_search is not available any more for this request: its allowance is used up. "
+                            "Use what you have collected (fetch a specific page with the shell or a read tool if one "
+                            "detail is missing), go on to the work, and say plainly what the results did not confirm."))
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "unknown_tool", "names": unknown})
+                    continue
                 gated = _resolve_tool_name(name) in TOOL_SPECS
                 headline = (f"{name} is not available for this request."
                             if gated else f"Unknown tool '{name}' — not available.")
@@ -19536,6 +19684,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_repeated = False  # a call this round only repeated an earlier one (answered from the earlier result)
         round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
         for call in calls:
@@ -19629,8 +19778,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 if cap and searches_run >= search_allowance:
                     result = (f"Search limit reached: {searches_run} web searches "
                               "already ran for this request. Do not search again. "
-                              "Answer now from the results above, and say plainly "
-                              "what they did not confirm.")
+                              "Use the results above: if one specific page would settle a detail, fetch it with "
+                              "the shell or a read tool; otherwise go on to the work now, and say plainly "
+                              "what the results did not confirm.")
+                    if not search_limit_told:
+                        search_limit_told = True
+                        executed = True   # the first refusal is guidance, not a call repeated without progress
                     tool_outputs.append(result)
                     if on_result:
                         on_result(name, result)
@@ -19692,6 +19845,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 messages.append(_harness_turn(cached))
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
+                round_repeated = True
                 continue
 
             rewrite_note = ""
@@ -20085,7 +20239,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         trace.append({"turn": turn, "type": "post_check_cap",
                                       "rounds": post_check_rounds})
         if executed:
-            forcing = False
+            forcing, repeat_strikes = False, 0
             # A round that ran a tool is progress, so the allowance for malformed calls is for
             # failures in a row. Counted over the whole run it was used up after a few cut-off
             # writes spread over an hour, and the next one forced a final answer on work that was
@@ -20130,12 +20284,34 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # left and never wrote the file it needed. Endless malformed calls
             # still hit the normal breaker once the cap is spent.
             policy.record_round(fresh=False, output=None)
+        elif (forcing and depth == 0 and round_repeated and not malformed_round
+                and repeat_strikes < len(REPEAT_WARNINGS)):
+            # A run that sent the same call again is told, in steps, what to do instead of being ended at
+            # the second repeat: an hour of work was lost to two repeats with a cut-off between them.
+            messages.append(_harness_turn(REPEAT_WARNINGS[repeat_strikes]))
+            repeat_strikes += 1
+            if trace is not None:
+                trace.append({"turn": turn, "type": "repeat_warning", "strike": repeat_strikes})
         elif forcing:
-            forced_stop = True
-            break
+            if (not build_chance_used and depth == 0 and trajectory is not None
+                    and not trajectory.mutation_count() and _CHANGE_REQUEST.search(request_text)
+                    and not completion_checks.is_advice_request(request_text)):
+                # Nothing has been written and the request is to build something: ending now would leave the
+                # person with no files at all. Once per request, say what to do instead.
+                build_chance_used = True
+                forcing = False
+                messages.append(_harness_turn(
+                    "You have enough research to start. Start writing the files now with what you have, and say "
+                    "plainly in your answer what is missing."))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "build_chance"})
+            else:
+                forced_stop = True
+                break
         else:
             forcing = True
-            messages.append(_harness_turn("You keep repeating tool calls without progress. Stop using tools and give your final answer now."))
+            repeat_strikes = 1
+            messages.append(_harness_turn(REPEAT_WARNINGS[0] if depth == 0 else REPEAT_STOP_NOW))
 
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).

@@ -209,6 +209,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_failures": 0,
         "smoke_checked": {},
         "smoke_unverified": {},
+        "weak_secret_asked": False,
         "smoke_asked": [],
         "consecutive_setbacks": 0,
         "stalled": False,
@@ -274,6 +275,7 @@ class TrajectoryState:
             self.data["smoke_checked"] = {}
             self.data["smoke_output"] = {}
             self.data["smoke_unverified"] = {}
+            self.data["weak_secret_asked"] = False
             self.data["smoke_asked"] = []
             self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
@@ -674,6 +676,13 @@ class TrajectoryState:
         """Files not yet scanned for credentials at the current state of the work."""
         checked = self.data.setdefault("secrets_checked", {})
         return [p for p in paths if checked.get(p) != self.mutation_count()]
+
+    def weak_secret_asked(self) -> bool:
+        """Whether this request was already asked once about findings that only look like a key."""
+        return bool(self.data.get("weak_secret_asked"))
+
+    def mark_weak_secret_asked(self) -> None:
+        self.data["weak_secret_asked"] = True
 
     def record_secret_scan(self, path: str) -> None:
         self.data.setdefault("secrets_checked", {})[path] = self.mutation_count()
