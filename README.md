@@ -93,7 +93,7 @@ smaller models, limited context, and explicit operational boundaries.
 
 Agent8088 is developed around measured failure modes rather than idealized
 demos. Its reliability work is informed by regression testing, live workflow
-analysis, academic research and community pain-points. 💻🧠🤖
+analysis, academic research and community pain-points.
 
 ---
 
