@@ -12902,8 +12902,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 target_mode="edit",
                 paths=[f"web_search (DDGS): {query[:100]}"],
                 change_type="network_fallback",
-                reason=("Local SearXNG returned no results. Retry this exact query "
-                        "with public DuckDuckGo search?"),
+                reason=((f"{_searxng_fallback_cause(report)} Retry this exact query "
+                         "with public DuckDuckGo search? Choosing Session lets later searches "
+                         "do the same without asking.")),
             )
         return _frame_search_results(_with_search_note(report))
 
@@ -15998,6 +15999,19 @@ def _search_was_usable(result: str) -> bool:
     refused as "the search already answered this".
     """
     return "Search results (via " in (result or "")
+
+
+def _searxng_fallback_cause(report) -> str:
+    """What to tell the user about why the local SearXNG did not serve this search.
+
+    The same prompt covers a SearXNG that is not running and one that ran and found
+    nothing; saying "returned no results" for the first sent a user looking for a
+    query problem when the container had been removed.
+    """
+    detail = " ".join(str(f) for f in getattr(report, "failures", ()) if str(f).startswith("searxng"))
+    if re.search(r"could not reach|connection refused|timed out|not answering|unreachable", detail, re.I):
+        return "Local SearXNG is not answering."
+    return "Local SearXNG returned no results."
 
 
 def _frame_search_results(results: str, now=None) -> str:
