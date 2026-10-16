@@ -18173,6 +18173,15 @@ CHECKS_FAILED_NOTE = ("Incomplete: the latest automated check failed and was not
 # A reply that ends the work while the latest automated check (tests, an audit) is still
 # failing used to get only a note at the end. With this on it gets up to two follow-ups
 # per request, each naming the failing command: fix it, or say plainly that it still fails.
+# A line at the very top of the answer when the run itself saw a clear sign that the work is not finished or
+# not working. The notes at the end say the same thing, but a reader who stops after the first lines of a
+# message that says "the task is complete" would never see them.
+NOT_VERIFIED_HEADLINE = str(APP_CONFIG.get("not_verified_headline", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+# What an unmet-check note must start with to count as a clear sign (the common "no fresh verification",
+# "no tests written" and "smoke test unavailable" notes are not: they appear on correct work too).
+_STRONG_UNMET = ("missing or empty", "a file was cut off", "the smoke test failed", "the latest check failed",
+                 "the reply says the work is unfinished", "a credential is written")
 FAILING_CHECK_FOLLOW_UP = str(APP_CONFIG.get("failing_check_follow_up", "1")).strip().lower() in (
     "1", "true", "yes", "on")
 
@@ -18655,6 +18664,28 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+def _not_verified_reasons(trajectory) -> list:
+    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones."""
+    if trajectory is None:
+        return []
+    reasons = []
+    failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
+    if failed:
+        reasons.append("the page/script check failed (" + ", ".join(failed[:3]) + ")")
+    if trajectory.check_failing():
+        reasons.append("the latest check failed")
+    if trajectory.open_subgoals():
+        reasons.append(f"{len(trajectory.open_subgoals())} part(s) of the request not addressed")
+    if trajectory.partial_files():
+        reasons.append("a file was cut off before it was finished")
+    for unmet in trajectory.data.get("unmet_checks") or []:
+        text = str(unmet)
+        if text.lower().startswith(_STRONG_UNMET) and not any(text.lower().startswith(w) for w in
+                                                              ("the smoke test failed", "the latest check failed")):
+            reasons.append(text[:120])
+    return list(dict.fromkeys(reasons))
+
+
 def _with_task_notes(answer: str, trajectory) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
@@ -18684,6 +18715,10 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
+    reasons = _not_verified_reasons(trajectory) if NOT_VERIFIED_HEADLINE else []
+    if reasons and not answer.startswith("NOT VERIFIED:"):
+        answer = ("NOT VERIFIED: " + "; ".join(reasons[:4])
+                  + ". Details are in the notes at the end.\n\n" + answer)
     return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",

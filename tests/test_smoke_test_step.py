@@ -109,7 +109,8 @@ def test_enforce_mode_gives_up_after_two_failures_with_an_honest_note(eng, monke
         p.replies[n] = _write(p.page, n)
     answer = p.run()
     assert len(p.nudges()) == eng.COMPLETION_SMOKE_MAX_FAILURES == 2
-    assert "smoke test FAILED" in answer and answer.startswith("Really ready.")
+    assert "smoke test FAILED" in answer and answer.startswith("NOT VERIFIED: the page/script check failed (index.html)")
+    assert "Really ready." in answer.split("\n\n")[1]
 
 
 def test_off_skips_the_check(eng, monkeypatch, tmp_path):
