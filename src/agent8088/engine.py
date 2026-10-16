@@ -18085,6 +18085,19 @@ SETTLED_MESSAGE = ("The requested files exist and the latest checks pass, and yo
                    "what you built, what you checked, and anything you could not verify.")
 
 
+# What a run is told when it keeps sending calls that already ran. Three steps for the main run, then it ends.
+REPEAT_STOP_NOW = "You keep repeating tool calls without progress. Stop using tools and give your final answer now."
+REPEAT_WARNINGS = (
+    "You keep repeating tool calls without progress. That call already ran with the same result: do not send it "
+    "again. Take the next step that is still missing, or give your final answer if the work is done.",
+    "You sent the same call again. Say in one line what is still missing, then make one call that does it, with "
+    "different arguments or a different tool. If you cannot make progress, give your final answer and say what "
+    "is missing.",
+    "Last warning: the next repeated call ends the run. Make a different call now, or give your final answer "
+    "with what is done and what is missing.",
+)
+
+
 class _TurnPolicy:
     """How many rounds this run starts with, and how many it may still earn.
 
@@ -18848,6 +18861,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     read_results = {}  # bounded to this run; invalidated by non-read operations
     tool_outputs = [] # completed outputs, preserved if a loop forces fallback
     forcing = False   # True after we've told a looping model to stop and answer
+    repeat_strikes = 0   # rounds in a row that only repeated earlier calls; cleared by a round that ran a tool or a cut-off
     unknown_retries = 0  # times the model emitted a call to a non-existent tool
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
@@ -19405,6 +19419,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if salvage_note:
                 retry_instruction = f"{warning} {salvage_note}"
             messages.append(_harness_turn(retry_instruction))
+            # A cut-off reply is not a repeated call: what the model lost to it is not held against it.
+            forcing, repeat_strikes = False, 0
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
         messages.append({"role": "assistant", "content": content})
@@ -19650,6 +19666,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_repeated = False  # a call this round only repeated an earlier one (answered from the earlier result)
         round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
         for call in calls:
@@ -19810,6 +19827,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 messages.append(_harness_turn(cached))
                 if turn_tools is not None:
                     turn_tools.append({"name": name, "arguments": args, "result": "(cached/repeat)", "cached": True})
+                round_repeated = True
                 continue
 
             rewrite_note = ""
@@ -20203,7 +20221,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         trace.append({"turn": turn, "type": "post_check_cap",
                                       "rounds": post_check_rounds})
         if executed:
-            forcing = False
+            forcing, repeat_strikes = False, 0
             # A round that ran a tool is progress, so the allowance for malformed calls is for
             # failures in a row. Counted over the whole run it was used up after a few cut-off
             # writes spread over an hour, and the next one forced a final answer on work that was
@@ -20248,6 +20266,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # left and never wrote the file it needed. Endless malformed calls
             # still hit the normal breaker once the cap is spent.
             policy.record_round(fresh=False, output=None)
+        elif (forcing and depth == 0 and round_repeated and not malformed_round
+                and repeat_strikes < len(REPEAT_WARNINGS)):
+            # A run that sent the same call again is told, in steps, what to do instead of being ended at
+            # the second repeat: an hour of work was lost to two repeats with a cut-off between them.
+            messages.append(_harness_turn(REPEAT_WARNINGS[repeat_strikes]))
+            repeat_strikes += 1
+            if trace is not None:
+                trace.append({"turn": turn, "type": "repeat_warning", "strike": repeat_strikes})
         elif forcing:
             if (not build_chance_used and depth == 0 and trajectory is not None
                     and not trajectory.mutation_count() and _CHANGE_REQUEST.search(request_text)
@@ -20266,7 +20292,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 break
         else:
             forcing = True
-            messages.append(_harness_turn("You keep repeating tool calls without progress. Stop using tools and give your final answer now."))
+            repeat_strikes = 1
+            messages.append(_harness_turn(REPEAT_WARNINGS[0] if depth == 0 else REPEAT_STOP_NOW))
 
     # Max turns reached or forced stop: report the failure, not the beginning of
     # accumulated tool context (which is usually a skill document).
