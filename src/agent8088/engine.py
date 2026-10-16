@@ -18350,11 +18350,12 @@ def _smoke_script_runner(target):
     return run
 
 
-def _smoke_test_step(trajectory, written: list):
+def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     """Smoke-test the pages and scripts this run wrote, once per state of the work.
 
     Every result goes in the answer's notes. Only in `enforce` mode does a failure
     become a follow-up, and then at most COMPLETION_SMOKE_MAX_FAILURES times.
+    `report_only` records the notes and never returns a follow-up (the run is ending).
     """
     roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
     targets = app_check.deliverable_targets(written, roots)
@@ -18375,6 +18376,8 @@ def _smoke_test_step(trajectory, written: list):
             failures.append(report)
         elif report.ask:
             unverified.append(report)
+    if report_only:
+        return None
     if (failures and COMPLETION_SMOKE_TEST == "enforce"
             and trajectory.smoke_failures() <= COMPLETION_SMOKE_MAX_FAILURES):
         detail = "\n".join(r.text(900) for r in failures)
@@ -18506,9 +18509,19 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     spends none of the continuation budget, arms no one-shot reminder, and does
     not run the browser smoke test. What it finds goes into the answer's
     "Not completed" note.
+
+    The page or script check is the exception: it runs once, report-only, for the
+    deliverables that changed since they were last checked. It costs a few seconds, adds
+    no round and no follow-up, and without it a run that ends here says nothing about a
+    page that does not load.
     """
     if trajectory is None or not budget.enabled:
         return []
+    if depth == 0 and COMPLETION_SMOKE_TEST != "off":
+        try:
+            _smoke_test_step(trajectory, trajectory.landed_paths(), report_only=True)
+        except Exception as exc:  # noqa: BLE001 -- a failed check must never take the ending down
+            _log.warning("end-of-run smoke test failed to run: %s", exc)
     reasons = []
     if depth == 0 and _reply_admits_unfinished(trajectory, reply, request):
         reasons.append("the reply says the work is unfinished")
