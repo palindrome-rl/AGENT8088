@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/57%20built--in%20tools-execution%20grounded-10b981" alt="57 built-in tools">
+  <img src="https://img.shields.io/badge/59%20built--in%20tools-execution%20grounded-10b981" alt="59 built-in tools">
   <img src="https://img.shields.io/badge/verification--gated%20completion-recovery%20%2B%20reverts-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
   <img src="https://img.shields.io/badge/39%20skill%20packages-extensible-6366f1" alt="39 skill packages">
@@ -99,25 +99,12 @@ analysis, academic research and community pain-points.
 
 ## What's new in v1.3
 
-- **File copy and move.** New `copy_file` and `move_file` tools copy an existing
-  file byte-for-byte, so an attachment such as a PDF can be filed into a project
-  folder (for example `Drive/Finance/`). They use the same safety checks as
-  `write_file`, and they never create a folder you did not name.
-- **Checked completion.** Each part of a request is checked against what the run
-  actually delivered, and a run is not marked done while its latest check fails.
-  Smoke tests judge the whole page or script and can tell "could not start here"
-  from a real crash.
-- **Long-run guidance.** The model is told when its time or rounds are running
-  out, a run that stops making progress is asked to decide, and your rules are
-  kept word for word through context compaction.
-- **Credential safety.** Pasted text and written files are scanned for
-  credential-shaped strings, the web chat warns before sending one, and another
-  session's attachment cannot be read or copied.
+- **Task completion:** each part of a request is checked against delivered output; smoke tests separate "could not start here" from real crashes.
+- **Long-running tasks:** time and round budget warnings, stall decisions, and your rules kept word for word through compaction.
+- **Credential safety:** secret scanning on pasted text and written files; attachments isolated per session.
+- **File handling:** byte-exact `copy_file` and `move_file`.
 
-Earlier v1.2 reliability work (health reporting with `agent8088 --doctor`,
-search fallback notices, OCR, working-directory recovery and output-limit
-handling) is included. Existing configuration and memory are preserved. See the
-[CHANGELOG](CHANGELOG.md) for the full list.
+Includes the v1.2 reliability fixes; existing configuration and memory are preserved. See the [CHANGELOG](CHANGELOG.md).
 
 ## Quick start
 
