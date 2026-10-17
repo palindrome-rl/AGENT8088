@@ -353,7 +353,29 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
 # (created there by --setup) rather than silently falling back to the global
 # install's config just because nothing has been written to the project
 # directory yet.
-_in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+def _own_install_prefix(prefix: str | Path | None = None) -> bool:
+    """Whether this Python is Agent8088's own installed environment, not a project's.
+
+    The installer puts Agent8088 in a venv under its data folder, so `sys.prefix != sys.base_prefix`
+    is always true for the installed command. That is not "inside a project's venv", and treating it
+    so sent every launch to ./config.txt (usually absent) instead of the user's own config.
+    """
+    try:
+        here = Path(prefix or sys.prefix).resolve()
+        roots = [os.environ.get("AGENT8088_HOME"), str(Path.home() / ".agent8088"),
+                 str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088")]
+        return any(root and here.is_relative_to(Path(root).expanduser().resolve()) for root in roots)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _project_venv_active() -> bool:
+    """A venv other than Agent8088's own install is active or in use: its project owns config.txt."""
+    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    return in_venv and not _own_install_prefix()
+
+
+_in_venv = _project_venv_active()
 _cwd_config = Path.cwd() / "config.txt"
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
@@ -368,6 +390,15 @@ elif _win_config.exists():
 else:
     CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+if not CONFIG_PATH.exists() and not os.environ.get("AGENT8088_CONFIG"):
+    # A launch that finds no config of its own while the user has one elsewhere would otherwise run
+    # on the built-in defaults without a word.
+    for _other in (_user_config, _win_config):
+        if _other.exists() and _other != CONFIG_PATH:
+            _config_warn(f"No config.txt at {CONFIG_PATH}, so built-in defaults are in use; a config exists at "
+                         f"{_other}. Run from a folder without a venv, set AGENT8088_CONFIG, or run "
+                         "`agent8088 --setup` here.")
+            break
 try:
     from agent8088 import errors as _errors
     for _warning in _errors.unknown_config_keys(APP_CONFIG, source=CONFIG_PATH.name):

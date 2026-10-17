@@ -7607,7 +7607,7 @@ def _resolve_config_path():
     if os.environ.get("AGENT8088_CONFIG"):
         return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
     cwd_config = Path.cwd() / "config.txt"
-    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    in_venv = A._project_venv_active()
     if cwd_config.exists() or in_venv:
         return cwd_config
     return Path(_agent8088_home() / "config.txt")
