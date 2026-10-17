@@ -17371,10 +17371,14 @@ def _tool_result_for_model(name: str, result: str) -> str:
     hint = (f"read_content with ref={ref} and offset={limit} returns the rest"
             if mode in _HEAD_FIRST_MODES else
             f"read_content with ref={ref} and offset=N returns the middle")
+    # The banner is bounded (tool_output.Verdict.banner), but a limit of zero or less would make clamp return the
+    # whole text, so the output always keeps at least half of the budget.
+    room = max(limit // 2, limit - len(banner) - 1) if banner else limit
     shown = tool_output.clamp(
-        body, limit - len(banner) - 1 if banner else limit,
-        keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
-    return f"{banner}\n{shown}" if banner else shown
+        body, room, keep="head" if mode in _HEAD_FIRST_MODES else "tail", hint=hint)
+    out = f"{banner}\n{shown}" if banner else shown
+    # Whatever the pieces were, one tool result never goes past the budget by more than a banner's worth.
+    return tool_output.clamp(out, limit + 2 * tool_output.MAX_BANNER_DIAGNOSTICS, keep="head", hint=hint)
 
 
 def _genuine_user_turns(messages) -> list:
