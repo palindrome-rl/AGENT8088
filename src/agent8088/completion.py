@@ -831,12 +831,65 @@ VERIFY_ASK = ("Continue, and also run what you changed: inspect or test the chan
               "suitable command, fix anything that fails, then reply. If it cannot be run here, say so plainly.")
 
 
+def tests_near(changed: Iterable[str]) -> tuple | None:
+    """The nearest test suite above the changed files: (folder to run it from, command), or None.
+
+    The project root the harness was started in is not always where the work lives (a run's files are
+    written into its workspace), so the reminder looks upward from the files themselves. A suite beside a
+    package (`proj/tests` next to `proj/pkg`) is found from any file inside the package.
+    """
+    for path in changed:
+        try:
+            # A relative path means whatever folder the process happens to be in, which says nothing about the project.
+            if not Path(str(path)).is_absolute():
+                continue
+            folder = Path(str(path)).resolve().parent
+        except (OSError, ValueError):
+            continue
+        for _ in range(4):
+            # Never a drive root or a home folder: files lying about there belong to no project.
+            if folder.parent == folder or folder == Path.home():
+                break
+            try:
+                found = _suite_in(folder)
+            except OSError:
+                found = None
+            if found:
+                return folder, found
+            folder = folder.parent
+    return None
+
+
+def _suite_in(folder: Path) -> str | None:
+    """The command that runs the tests in this folder, or None if it holds no suite."""
+    tests = [d for d in ("tests", "test") if (folder / d).is_dir()]
+    files = []
+    for d in tests:
+        files += sorted((folder / d).glob("test*.py"))[:3]
+    files += sorted(folder.glob("test_*.py"))[:3]
+    if files:
+        text = ""
+        for file in files:
+            try:
+                text += file.read_text(encoding="utf-8", errors="ignore")[:4000]
+            except OSError:
+                continue
+        if re.search(r"\bimport pytest\b|\bfrom pytest\b", text) or (folder / "pytest.ini").exists():
+            return "python -m pytest -q"
+        return f"python -m unittest discover -s {tests[0] if tests else '.'}"
+    package = folder / "package.json"
+    if package.is_file() and '"test"' in package.read_text(encoding="utf-8", errors="ignore")[:4000]:
+        return "npm test"
+    return None
+
+
 def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
     """The verification reminder with the files and the exact command named.
 
     Small models do the check when told precisely what to run; a bare "inspect
     or test the result" is often skipped or answered with an unrelated command.
     """
+    changed = list(changed)
     names = []
     for path in changed:
         name = PurePath(str(path)).name
@@ -847,8 +900,16 @@ def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
     shown = ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
     first = names[0]
     suffix = PurePath(first).suffix.lower()
+    near = None if has_tests else tests_near(changed)
     if has_tests:
         command = "run_tests"
+    elif near:
+        # The project's own tests, run from the folder they belong to: running a package's module files one by
+        # one as scripts fails on their relative imports, which is a problem with the check, not with the code.
+        command = f"{near[1]}` from `{near[0]}"
+    elif suffix == ".py" and _package_of(changed[0]):
+        package, parent = _package_of(changed[0])
+        command = f"python -c \"import {package}.{PurePath(first).stem}\"` from `{parent}"
     elif suffix == ".py":
         command = f"python {first}"
     elif suffix in {".js", ".mjs", ".cjs"}:
@@ -861,6 +922,23 @@ def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
         command = f"read_text on {first}"
     return (f"Continue, and also run what you changed ({shown}) with `{command}` now, "
             "fix anything that fails, then reply. If it cannot be run here, say so plainly.")
+
+
+def _package_of(path: str) -> tuple | None:
+    """(dotted package name, folder that holds it) for a file inside a Python package, else None."""
+    try:
+        if not Path(str(path)).is_absolute():
+            return None
+        folder = Path(str(path)).resolve().parent
+    except (OSError, ValueError):
+        return None
+    if not (folder / "__init__.py").is_file():
+        return None
+    parts = [folder.name]
+    while (folder.parent / "__init__.py").is_file() and folder.parent != folder:
+        folder = folder.parent
+        parts.insert(0, folder.name)
+    return ".".join(parts), folder.parent
 
 
 def outputs_nudge(missing: list[str]) -> Nudge:
