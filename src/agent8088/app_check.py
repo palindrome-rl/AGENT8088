@@ -177,6 +177,8 @@ _BACKEND_FILES = frozenset({"server.js", "server.mjs", "server.cjs", "server.ts"
 _BACKEND_PACKAGES = re.compile(r'"(?:express|fastify|koa|hono|@hapi/hapi|next|nuxt|socket\.io)"')
 _BACKEND_REQUIREMENTS = re.compile(r"^\s*(?:flask|fastapi|django|aiohttp|starlette|tornado|bottle)\b", re.I | re.M)
 _BACKEND_STATUSES = (404, 405, 501)
+# What a page says when it parses an HTML error page as JSON.
+_HTML_AS_DATA = re.compile(r"unexpected token '?<|is not valid json|unexpected end of json input|<!doctype", re.I)
 
 
 def _is_route(path: str) -> bool:
@@ -413,6 +415,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
 
     failures, warnings, console = [], [], []
     backend_asked: list[str] = []       # same-origin fetch/XHR paths the static server could not answer
+    backend_texts: list[str] = []       # the status line text of those answers ("File not found")
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
     external_scripts: list[str] = []
@@ -495,6 +498,8 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         # The page asked its own server for data; this check serves files only, so the
                         # backend is not running and a 404 or 405 says nothing about the page.
                         backend_asked.append(path)
+                        if response.status_text:
+                            backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
                             f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
                             "serves static files only, so the backend was not running. Call the server after a "
@@ -563,6 +568,18 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 failures[:] = [item for i, item in enumerate(failures)
                                if not (i in console_where and console_where[i].split("?")[0] in asked
                                        and item.startswith("console error: Failed to load resource"))]
+                # A page that turns the answer into an error (`throw new Error(response.statusText)`, or parses the
+                # static server's error page as JSON) reports it as a page error of its own. That is the same
+                # missing backend, not a second fault.
+                kept = []
+                for item in failures:
+                    low = item.lower()
+                    if item.startswith("page error") and (
+                            any(text and text in low for text in backend_texts) or _HTML_AS_DATA.search(item)):
+                        warnings.append(f"{item} (the reply of a server this check could not run; not counted)")
+                    else:
+                        kept.append(item)
+                failures[:] = kept
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -678,6 +695,13 @@ def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
         return text
     return text[:limit] + "\n[...]\n" + text[-limit:]
 
+
+# What a server that cannot start in the probe's surroundings says: a database or log file it must create next to
+# itself in a read-only copy, or a port that is already taken.
+_START_ENVIRONMENT = re.compile(
+    r"unable to open database file|attempt to write a readonly database|readonly database|read-only file system"
+    r"|errno 30\b|\[errno 13\]|permission denied|eacces|erofs|address already in use|eaddrinuse"
+    r"|only one usage of each socket|errno 98\b|errno 10048|winerror 10048|winerror 10013", re.I)
 
 # The last line of a traceback or error that is about the place the script was started in
 # (a read-only copy, an input or output path, a missing argument) and not about the script.
@@ -922,6 +946,12 @@ def _boot_report(path: Path, program: str, port: int,
                        f"within {BOOT_WAIT:.0f}s"])
     if line.startswith("BOOT:DIED"):
         detail = line[len("BOOT:DIED"):].strip(" :")
+        if _START_ENVIRONMENT.search(detail):
+            # The probe starts it in a read-only copy, with its own port: a server that must create its database
+            # file, or finds its port taken, has run into the probe's surroundings and not into a defect.
+            return Report("script", str(path), UNAVAILABLE,
+                          note=f"the server stopped at start because of where the probe ran it ({detail[:100]}); "
+                               "serving was not verified")
         return Report("script", str(path), FAIL,
                       ["the server exited before accepting connections on port "
                        f"{port}" + (f": {detail}" if detail else "")])
