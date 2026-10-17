@@ -87,6 +87,11 @@ class Mem0MemoryStore:
         # nothing about why, and an unsupported-provider config looked identical
         # to mem0ai simply not being installed.
         self.last_error = ""
+        # True when mem0 is unavailable for an ordinary reason (the package is not
+        # installed, or this machine has no embedding service at all) rather than
+        # because something that should work broke. The memory module then falls
+        # back to the native store without announcing a fault.
+        self.quiet = False
 
     @_serialized
     def _init_memory(self):
@@ -99,6 +104,7 @@ class Mem0MemoryStore:
         if memory_cls is None:
             self.last_error = ("the mem0ai package is not installed "
                                "(install it with: agent8088 --memory-setup)")
+            self.quiet = True
             self._available = False
             return None
 
@@ -272,6 +278,7 @@ class Mem0MemoryStore:
                     self.last_error = (f"embedding service unavailable for "
                                        f"{embed_provider}/{model}"
                                        + (f": {detail}" if detail else ""))[:300]
+                    self.quiet = bool(getattr(probe, "absent", False))
                     self._memory = None
                     self._available = False
                     return None
