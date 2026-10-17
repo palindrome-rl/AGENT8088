@@ -516,10 +516,10 @@ READ_PAGE_LINES = _config_int("read_page_lines", 200)
 MAX_DOCUMENT_BYTES = _config_int("max_document_bytes", 25 * 1024 * 1024)
 MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
-MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 600))
+MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
 # Shared starting allowance for CLI, Web UI, gateways and direct engine calls.
-DEFAULT_MAX_TURNS = 50
+DEFAULT_MAX_TURNS = 150
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -641,7 +641,7 @@ COST_PER_1K_OUTPUT = _config_float("cost_per_1k_output", 0.0)
 # an error. Progress buys more rounds, up to max_turns * this multiplier.
 # 1 disables growth entirely and restores the old fixed limit.
 DYNAMIC_TURNS_CEILING_MULTIPLIER = max(
-    1, _config_int("dynamic_turns_ceiling_multiplier", 4))
+    1, _config_int("dynamic_turns_ceiling_multiplier", 3))
 # Rounds granted per extension. Small on purpose: a run that has stalled should
 # have to re-prove progress often rather than coast to the ceiling.
 DYNAMIC_TURNS_EXTENSION = max(1, _config_int("dynamic_turns_extension", 5))
@@ -9346,7 +9346,7 @@ def _browser_profile_kwargs(proxy_url: str) -> dict:
 
 _BROWSER_PROFILE_PREFIX = "agent8088-browser-profile-"
 # Well beyond any single browsing call: browser_task_timeout_seconds is itself
-# clamped to max_tool_timeout_seconds (600s by default), so an hour cannot
+# clamped to max_tool_timeout_seconds (1200s by default), so an hour cannot
 # overlap a session that is still legitimately running.
 _BROWSER_PROFILE_MAX_AGE_SECONDS = 3600
 

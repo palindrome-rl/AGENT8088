@@ -17,6 +17,7 @@ feature is reachable here:
 Run:  python agent8088_cli.py
 """
 import sys, os, re, json, shlex, time, threading, select, socket  # noqa: F401
+import itertools
 import subprocess
 import uuid
 import shutil
@@ -688,6 +689,7 @@ _SESSION_COMMANDS = (
     ("/memory", "Cross-session facts"),
     ("/compact", "Shrink the context"),
     ("/status", "Session and context"),
+    ("/limits", "Turn and tool limits"),
 )
 
 # Kept as the old name so callers and tests that ask for "the banner commands" still
@@ -718,7 +720,7 @@ def _essential_commands(available):
     Three tiers, and every command survives all of them:
 
       * wide   — the two groups side by side, split by a vertical rule
-      * medium — one aligned block of all twelve
+      * medium — one aligned block of every command
       * narrow — a run-on list, descriptions dropped
 
     A grid rather than hand-padded strings: rich measures the command columns, so the
@@ -750,9 +752,9 @@ def _essential_commands(available):
     grid.add_column(style="bold #00edff", no_wrap=True,
                     width=max(len(command) for command, _ in _SESSION_COMMANDS))
     grid.add_column(style="#237dd7", no_wrap=True)
-    # strict: an unequal pair would silently drop the tail of the longer group.
-    for (left, left_text), (right, right_text) in zip(_SETUP_COMMANDS, _SESSION_COMMANDS,
-                                                      strict=True):
+    # The groups may differ in length by a row or two; the shorter one is padded, so no command is dropped.
+    for (left, left_text), (right, right_text) in itertools.zip_longest(
+            _SETUP_COMMANDS, _SESSION_COMMANDS, fillvalue=("", "")):
         grid.add_row(left, left_text, _DIVIDER, right, right_text)
     return grid
 
