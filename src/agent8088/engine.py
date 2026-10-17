@@ -6813,16 +6813,96 @@ def _tool_call_changed_state(name: str, args: dict, mutated: bool) -> bool:
 
 
 _NON_RUNNER_SEGMENT = re.compile(r"^\s*(?:echo|printf|cat|type|print)\b", re.I)
+# A label such as `echo === engine tests ===` between two test runs prints no result. Text that talks about a
+# result (`echo "3 tests passed"`, `echo ok`) is what must not be taken for one.
+_RESULT_WORDS = re.compile(
+    r"\d+\s+(?:tests?\s+)?(?:passed|failed|passing|failing)|\bRan \d+|test result|\bFAILED\b|^\W*OK\W*$", re.I)
+
+
+def _prints_text_of_its_own(part: str) -> bool:
+    if not _NON_RUNNER_SEGMENT.match(part):
+        return False
+    if re.match(r"^\s*(?:echo|printf)\b", part, re.I):
+        text = re.sub(r"^\s*(?:echo|printf)\b", "", part, count=1, flags=re.I).strip("\"' ")
+        return bool(_RESULT_WORDS.search(text))
+    return True
+
+
+# What a model puts around a test command so it can read the result: `2>&1`, `> nul`, `| tail -20`. None of it
+# changes what ran, and a trailing pipe to a text filter only trims what is printed.
+_RUNNER_REDIRECTS = re.compile(r"\s*(?:\d?>&\d|[12&]?>>?\s*(?:/dev/null|nul)\b)", re.IGNORECASE)
+_RUNNER_FILTER = re.compile(
+    r"\s*\|\s*(?:tail|head|more|cat|grep|findstr|tee|select-object|out-host|out-string)\b[^|&;<>]*$", re.IGNORECASE)
+# A test script the run wrote itself, run through its interpreter: `node tests.js`, `python test_engine.py`.
+_TEST_SCRIPT = re.compile(
+    r"(?:^|[\\/_])(?:tests?|specs?|checks?|verify|validate|smoke)(?:[_.-][\w.-]*)?\.(?:py|js|mjs|cjs|ts)$"
+    r"|[_.-](?:tests?|specs?|checks?|smoke)\.(?:py|js|mjs|cjs|ts)$", re.IGNORECASE)
+_SCRIPT_INTERPRETER = frozenset({"python", "python3", "py", "node", "nodejs", "deno", "bun", "tsx", "ts-node"})
+
+
+_INTERPRETER_PATH = re.compile(
+    r'^(?:"[^"]*[\\/]|[^"\s]*[\\/])((?:python[\d.]*|py|node(?:js)?)(?:\.exe)?)"?(?=\s|$)', re.IGNORECASE)
+
+
+def _split_command(command: str) -> list:
+    """The pieces of a shell line between `&&`, `&`, `;` and line breaks, leaving separators inside quotes alone
+    (`python -c "a(); b()" && python -m unittest` is two commands, not three)."""
+    pieces, current, quote, i = [], [], "", 0
+    text = command or ""
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            current.append(ch)
+        elif ch in ";\n" or (ch == "&" and not (current and current[-1] in "<>|")
+                             and not (text[i + 1:i + 2].isdigit() and current and current[-1] == ">")):
+            pieces.append("".join(current))
+            current = []
+            if text[i:i + 2] == "&&":
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    pieces.append("".join(current))
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _runner_core(part: str) -> str:
+    """The command in one segment, without output redirects, a trailing text filter or the folder the
+    interpreter was started from (`"C:\\Python\\python.exe" -m unittest` is `python -m unittest`)."""
+    text = _RUNNER_FILTER.sub("", part.strip())
+    text = _RUNNER_REDIRECTS.sub("", text).strip()
+    return _INTERPRETER_PATH.sub(lambda m: re.sub(r"\.exe$", "", m.group(1), flags=re.I), text, count=1)
+
+
+def _runs_a_test_script(command: str) -> bool:
+    """`node tests.js` or `python test_engine.py`: an interpreter and one script named like a test."""
+    if re.search(r"[;&|\n><`]|\$\(", command):
+        return False
+    try:
+        words = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    if not words or Path(words[0].strip("\"'")).name.lower().removesuffix(".exe") not in _SCRIPT_INTERPRETER:
+        return False
+    scripts = [w.strip("\"'") for w in words[1:] if not w.startswith("-")]
+    return len(scripts) >= 1 and bool(_TEST_SCRIPT.search(scripts[0]))
 
 
 def _runs_a_test_runner(command: str) -> bool:
     """True when the command really invokes a test runner (possibly after a
-    `cd x &&`), and does not also print text of its own that could be mistaken
-    for a result. `echo "3 tests passed"` is not a test."""
-    segments = [part for part in re.split(r"&&|;|\n", command or "") if part.strip()]
-    if not segments or any(_NON_RUNNER_SEGMENT.match(part) for part in segments):
+    `cd x &&`, with its output redirected or tailed), and does not also print
+    text of its own that could be mistaken for a result. `echo "3 tests passed"`
+    is not a test."""
+    segments = _split_command(command)
+    if not segments or any(_prints_text_of_its_own(part) for part in segments):
         return False
-    return any(_standalone_test_command(part.strip()) for part in segments)
+    return any(_standalone_test_command(_runner_core(part)) or _runs_a_test_script(_runner_core(part))
+               for part in segments)
 
 
 def _evidence_status(name: str, args: dict, result: str, status: str, source: str) -> str:
@@ -18764,10 +18844,19 @@ def _not_verified_reasons(trajectory) -> list:
     return list(dict.fromkeys(reasons))
 
 
+_ASSURANCE_LINES = {
+    "tested": "Verification: tested. A test run passed after the last change.",
+    "exercised": ("Verification: exercised. The result was run or loaded without an error, but no test run "
+                  "passed, which is weaker than a passing test."),
+}
+
+
 def _with_task_notes(answer: str, trajectory) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
+    if trajectory is not None and (line := _ASSURANCE_LINES.get(trajectory.assurance())):
+        notes.append(line)
     if trajectory is not None and trajectory.needs_verification():
         notes.append("Verification note: changes were made, but no fresh automated "
                      "verification evidence was recorded.")
@@ -19931,6 +20020,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # checked. Only the verification bookkeeping treats it as
                     # a check; caches were already invalidated as for any run.
                     mutated = False
+                    trajectory.note_ran_ok()
                 trajectory.after_tool(
                     operation, result,
                     failed=_plan_step_failed(result) or audit_verdict == "failed",
