@@ -167,16 +167,21 @@ _IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in word
 def _identifier_like(token: str) -> bool:
     """A single identifier in camelCase or snake_case (``raiseSpA2Speed``, ``max_tokens_v2``).
 
-    Made of real words: most of its letters sit in words of three or more letters, and it carries at most two
-    digits. A random mixed-case key splits into one- and two-character pieces instead, so it does not pass."""
+    Most letters must sit in at least two lower/capitalised word-shaped pieces,
+    not an unbroken lowercase blob or an uppercase acronym. This is a shape
+    heuristic, not proof that the text is a real word or cannot be a secret."""
     if len(token) > 40 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
         return False
     if sum(c.isdigit() for c in token) > 2 or (len(token) >= _MIN_HEX and _HEX_RE.fullmatch(token)):
         return False
+    if "_" not in token and not re.search(r"[a-z][A-Z]", token):
+        return False
     words = _IDENTIFIER_WORD_RE.findall(token.replace("_", " "))
     letters = [w for w in words if w.isalpha()]
     total = sum(len(w) for w in letters)
-    return total > 0 and sum(len(w) for w in letters if len(w) >= 3) / total >= _IDENTIFIER_LETTERS
+    meaningful = [w for w in letters if len(w) >= 3 and not w.isupper()]
+    return (len(meaningful) >= 2 and total > 0
+            and sum(len(w) for w in meaningful) / total >= _IDENTIFIER_LETTERS)
 
 
 def _code_piece(piece: str) -> bool:

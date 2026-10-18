@@ -176,3 +176,12 @@ def test_code_identifiers_and_model_sizes_are_not_credentials(text):
 def test_random_looking_keys_are_still_found(value):
     found = secret_scan.find_secrets(f'token = "{value}"')
     assert found, value
+
+
+@pytest.mark.parametrize("value", [
+    "QJXNZKPVTRWH7LMBCDYFS",  # uppercase blob with one digit
+    "qjxnzkpvtrwh7lmbcdyfs",  # a lowercase blob is not camelCase
+    "QjxNZKPVTRWH7LmbCDYFS",  # large acronym chunks are not words
+])
+def test_identifier_exemption_does_not_hide_unstructured_blobs(value):
+    assert secret_scan.find_secrets(value)
