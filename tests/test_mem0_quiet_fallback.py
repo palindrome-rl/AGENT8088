@@ -43,6 +43,47 @@ def test_package_not_installed_falls_back_quietly(monkeypatch, tmp_path, caplog)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
+@pytest.mark.parametrize("failure", [
+    RuntimeError("installed mem0 package failed during import"),
+    ModuleNotFoundError("missing installed mem0 dependency", name="mem0_dependency"),
+])
+def test_broken_installed_package_is_not_reported_as_missing(monkeypatch, tmp_path, caplog, failure):
+    import builtins
+    from agent8088.memory.mem0_store import Mem0MemoryStore
+
+    original = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "mem0":
+            raise failure
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    store = Mem0MemoryStore(config={"path": str(tmp_path / "mem0")})
+    with caplog.at_level(logging.WARNING):
+        assert not store.available()
+    assert not store.quiet
+    assert "mem0 import failed" in store.last_error
+    assert caplog.records
+
+
+def test_genuinely_missing_mem0_is_quiet(monkeypatch, tmp_path):
+    import builtins
+    from agent8088.memory.mem0_store import Mem0MemoryStore
+
+    original = builtins.__import__
+
+    def missing_import(name, *args, **kwargs):
+        if name == "mem0":
+            raise ModuleNotFoundError("optional package absent", name="mem0")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_import)
+    store = Mem0MemoryStore(config={"path": str(tmp_path / "mem0")})
+    assert not store.available()
+    assert store.quiet
+
+
 def test_a_real_mem0_fault_is_still_announced(monkeypatch, tmp_path, caplog):
     class Broken(_Mem0Store):
         last_error = "Qdrant folder is locked by another process"

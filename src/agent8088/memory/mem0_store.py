@@ -56,10 +56,13 @@ def _import_mem0():
         except Exception:
             pass
         import mem0
-        return getattr(mem0, "Memory", None)
-    except Exception as exc:
-        log.debug("mem0 library import failed: %s", exc)
-        return None
+        return mem0.Memory
+    except ModuleNotFoundError as exc:
+        if exc.name == "mem0":
+            return None
+        # A missing dependency inside an installed package is a broken install,
+        # not the ordinary optional-package-absent case.
+        raise
 
 
 class Mem0MemoryStore:
@@ -100,7 +103,14 @@ class Mem0MemoryStore:
         if self._memory is not None:
             return self._memory
 
-        memory_cls = _import_mem0()
+        self.quiet = False
+        try:
+            memory_cls = _import_mem0()
+        except Exception as exc:
+            self.last_error = ("mem0 import failed: " + " ".join(str(exc).split()))[:300]
+            self._available = False
+            log.warning("failed to import mem0 memory engine: %s", self.last_error)
+            return None
         if memory_cls is None:
             self.last_error = ("the mem0ai package is not installed "
                                "(install it with: agent8088 --memory-setup)")
