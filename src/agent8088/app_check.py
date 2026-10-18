@@ -340,6 +340,18 @@ _NEXT_CONTROL_JS = """(seen) => {
   return fresh.length ? {sig: fresh[0].sig, skipped: true} : null;
 }""".replace("/*COMMITTAL*/", _COMMITTAL_JS)
 
+# A dropdown is used by choosing another entry, not by clicking it: a click only opens the list and changes nothing the
+# page can see. This picks the next entry of the select under the point and fires the events a person's choice would.
+_CHANGE_SELECT_JS = """([x, y]) => {
+  let el = document.elementFromPoint(x, y);
+  while (el && el.tagName !== 'SELECT') el = el.parentElement;
+  if (!el || el.options.length < 2) return false;
+  el.selectedIndex = (el.selectedIndex + 1) % el.options.length;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return true;
+}"""
+
 _STATE_JS = """() => {
   const h = s => { let a = 0; for (let i = 0; i < s.length; i++) a = (a * 31 + s.charCodeAt(i)) | 0; return a; };
   const canvases = [...document.querySelectorAll('canvas')].map(c => { try { return h(c.toDataURL()); } catch (e) { return 'x'; } });
@@ -407,6 +419,13 @@ def _click_through(tab, steps: int, budget: float, failures: list, seen: list,
         if tab.url.split("#")[0] != start:
             break
     return clicked, changed, idle
+
+
+# The same state without the values of form fields: choosing an entry of a dropdown changes its own value, which is not
+# the page responding, so the page is judged on everything else.
+_STATE_NO_VALUES_JS = _STATE_JS.replace(
+    "const values = [...document.querySelectorAll('input,textarea,select')].map(i => i.value + ':' + i.checked);",
+    "const values = [];")
 
 
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
@@ -498,6 +517,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         # The page asked its own server for data; this check serves files only, so the
                         # backend is not running and a 404 or 405 says nothing about the page.
                         backend_asked.append(path)
+                        effects.append("server request")
                         if response.status_text:
                             backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
@@ -526,12 +546,23 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         + (f" \"{control['text']}\"" if control['text'] else "")
                         + f") is covered by {control['blocker']}, so a click never reaches it")
                 else:
-                    before = tab.evaluate(_STATE_JS)
+                    is_select = str(control["label"]).startswith("select")
+                    state_js = _STATE_NO_VALUES_JS if is_select else _STATE_JS
+                    before = tab.evaluate(state_js)
                     effects_before = len(effects)
-                    tab.mouse.click(control["x"], control["y"])
+                    if is_select:
+                        # Choose another entry; if that is not possible, a click is all there is.
+                        try:
+                            picked = tab.evaluate(_CHANGE_SELECT_JS, [control["x"], control["y"]])
+                        except Exception:  # noqa: BLE001
+                            picked = False
+                        if not picked:
+                            tab.mouse.click(control["x"], control["y"])
+                    else:
+                        tab.mouse.click(control["x"], control["y"])
                     tab.wait_for_timeout(400)
                     try:
-                        after = tab.evaluate(_STATE_JS)
+                        after = tab.evaluate(state_js)
                     except Exception:  # noqa: BLE001 -- the click navigated away: that is a change
                         after = None
                     described = (f"({control['label']}"
@@ -716,6 +747,17 @@ _ENVIRONMENT_FINAL = re.compile(
 _SANDBOX_NOTE = re.compile(r"\n?\[sandbox\][\s\S]*$")
 
 
+_ERROR_LINE = re.compile(r"^\s*(?:Uncaught\s+)?(?:[\w.]*(?:Error|Exception)\b|panic:|Error:)", re.IGNORECASE)
+
+
+def _error_line(output: str) -> str:
+    """The line that names the error (`ReferenceError: x is not defined`) rather than a stack frame after it."""
+    for line in output.strip().splitlines():
+        if _ERROR_LINE.match(line) and not line.strip().startswith("Command exited"):
+            return line.strip()
+    return _final_line(output)
+
+
 def _final_line(output: str) -> str:
     lines = [line.strip() for line in output.strip().splitlines()
              if line.strip() and not line.strip().startswith("Command exited")]
@@ -760,7 +802,9 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
             soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
                         + (f" ({final[:100]})" if crashed else "") + "; whether it works was not verified")
             return []
-        return [f"the script crashed when started: {last[-1][:160] if last else 'non-zero exit'}"]
+        # The error itself, not the harness's own "Command exited" line that follows it.
+        named = _error_line(_SANDBOX_NOTE.sub("", output))
+        return [f"the script crashed when started: {named[:160] or (last[-1][:160] if last else 'non-zero exit')}"]
     return []
 
 
@@ -963,6 +1007,38 @@ def _boot_report(path: Path, program: str, port: int,
                   note="the boot probe produced no verdict; serving was not verified")
 
 
+_SCRIPT_TAG = re.compile(r"<script\b[^>]*\bsrc\s*=\s*[\"']?([^\"'\s>]+)", re.IGNORECASE)
+
+
+def loaded_by_page(path: Path) -> Path | None:
+    """The page that loads this script with a `<script src>`, if one sits in its folder or up to three folders above.
+
+    A script a page loads is written for the browser: it uses the globals its sibling scripts define and the page's own
+    elements, so starting it alone under Node fails for reasons that say nothing about it. The page check, which loads
+    the real thing, is the check for it."""
+    path = Path(path)
+    name = path.name
+    folder = path.parent
+    for _ in range(4):
+        try:
+            pages = [entry for entry in folder.iterdir()
+                     if entry.is_file() and entry.suffix.lower() in WEB_SUFFIXES][:40]
+        except OSError:
+            pages = []
+        for page in pages:
+            try:
+                text = page.read_text(encoding="utf-8", errors="ignore")[:400_000]
+            except OSError:
+                continue
+            for src in _SCRIPT_TAG.findall(text):
+                if re.split(r"[\\/]", src.split("?")[0].split("#")[0])[-1] == name:
+                    return page
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    return None
+
+
 def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
@@ -1014,6 +1090,11 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             port = server_port(source)
             if port is not None:
                 return _boot_report(path, "node", port, run)
+            page = loaded_by_page(path)
+            if page is not None and not looks_like_server(source):
+                return Report("script", str(path), UNAVAILABLE,
+                              note=f"parses; it is loaded by {page.name} in a browser, so that page is checked "
+                                   "instead of starting it alone")
             unavailable = []
             captured: list[str] = []
             soft: list[str] = []
