@@ -435,6 +435,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
     failures, warnings, console = [], [], []
     backend_asked: list[str] = []       # same-origin fetch/XHR paths the static server could not answer
     backend_texts: list[str] = []       # the status line text of those answers ("File not found")
+    backend_codes: list[int] = []       # and their status codes (404)
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
     external_scripts: list[str] = []
@@ -518,6 +519,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         # backend is not running and a 404 or 405 says nothing about the page.
                         backend_asked.append(path)
                         effects.append("server request")
+                        backend_codes.append(response.status)
                         if response.status_text:
                             backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
@@ -606,7 +608,8 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 for item in failures:
                     low = item.lower()
                     if item.startswith("page error") and (
-                            any(text and text in low for text in backend_texts) or _HTML_AS_DATA.search(item)):
+                            any(text and text in low for text in backend_texts) or _HTML_AS_DATA.search(item)
+                            or any(re.search(rf"(?<!\d){code}(?!\d)", item) for code in set(backend_codes))):
                         warnings.append(f"{item} (the reply of a server this check could not run; not counted)")
                     else:
                         kept.append(item)

@@ -88,3 +88,32 @@ def test_a_real_page_error_beside_a_missing_backend_still_fails(tmp_path):
 def test_without_a_backend_the_same_page_error_still_fails(tmp_path):
     report = app_check.check_web_page(_page(tmp_path, STATUS_TEXT_AS_ERROR))
     assert report.failed
+
+
+STATUS_CODE_AS_ERROR = """<!doctype html><html><body>
+<button id="go" onclick="document.getElementById('out').textContent='clicked'">Go</button><p id="out">waiting</p>
+<script>
+fetch('/api/items').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+</script></body></html>"""
+
+OTHER_CODE_AS_ERROR = """<!doctype html><html><body>
+<button id="go" onclick="document.getElementById('out').textContent='clicked'">Go</button><p id="out">waiting</p>
+<script>
+fetch('/api/items').catch(() => {});
+setTimeout(() => { throw new Error('HTTP 500 from the stats module'); }, 50);
+</script></body></html>"""
+
+
+@needs_chromium
+def test_an_error_carrying_the_status_code_of_the_missing_backend_is_not_a_second_fault(tmp_path):
+    _with_server(tmp_path)
+    report = app_check.check_web_page(_page(tmp_path, STATUS_CODE_AS_ERROR))
+    assert report.status == app_check.PASS, report.failures
+    assert any("not counted" in w for w in report.warnings)
+
+
+@needs_chromium
+def test_an_error_with_a_different_code_still_fails(tmp_path):
+    _with_server(tmp_path)
+    report = app_check.check_web_page(_page(tmp_path, OTHER_CODE_AS_ERROR))
+    assert report.failed and any("HTTP 500" in f for f in report.failures)
