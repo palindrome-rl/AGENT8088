@@ -204,3 +204,24 @@ def test_lockfile_integrity_hashes_are_not_credentials():
     text = ('"integrity": "sha512-9Z2kq3rB7xYw1N0pQmVtL5uJh8aE4sDfG6yCnO3iRb0cXeTzWvUj1HlKpA2dMgSq/f8ZyNaB5tQ7w==",\n'
             '"integrity": "sha256-abc123DEF456ghi789JKL012mno345PQR678stu90vw="')
     assert secret_scan.find_secrets(text) == []
+
+
+# ------------------------------------------------- snake_case test and variable names are code
+@pytest.mark.parametrize("text", [
+    "def test_delete_returns_404_for_missing_note(self):",
+    "def test_create_with_empty_title_returns_400(self):",
+    "def test_put_unknown_id_returns_404(self):",
+    "max_hp_stat_2 = 252",
+    "const get_active_idx_v2 = pick(team)",
+])
+def test_snake_case_names_with_numbers_are_not_credentials(text):
+    assert secret_scan.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("value", [
+    "a8f_3k2_9zq_1mx_7vb_4tr_2wc_5nd",     # random base36 pieces joined by underscores
+    "x9f2k_p4m7q_r1t8v_w3z6y_b5n0c",
+    "k3j_9d2_f8s_1m4_q7w_z0x_c6v_b5n",
+])
+def test_random_underscore_strings_are_still_found(value):
+    assert secret_scan.find_secrets(f'api_token = "{value}"'), value

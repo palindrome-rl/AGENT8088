@@ -178,12 +178,26 @@ def _strict_camel(token: str) -> bool:
     return len(words) >= 2 and sum(len(w) for w in words) / len(words) >= _CAMEL_MEAN_WORD
 
 
+# snake_case made of words and small numbers: test_delete_returns_404_for_missing_note, max_hp_stat_2, get_active_idx_v2.
+# At least two real words (letters, three or more), and every other piece a word or a number of up to four digits.
+_SNAKE_PIECE_RE = re.compile(r"[a-z]+|[0-9]{1,4}")
+
+
+def _snake_case(token: str) -> bool:
+    if len(token) > 80 or "_" not in token or not re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", token):
+        return False
+    pieces = token.split("_")
+    if not all(_SNAKE_PIECE_RE.fullmatch(piece) for piece in pieces):
+        return False
+    return sum(1 for piece in pieces if piece.isalpha() and len(piece) >= 3) >= 2
+
+
 def _identifier_like(token: str) -> bool:
     """A single identifier in camelCase or snake_case (``raiseSpA2Speed``, ``max_tokens_v2``).
 
     Made of real words: most of its letters sit in words of three or more letters, and it carries at most two
     digits. A random mixed-case key splits into one- and two-character pieces instead, so it does not pass."""
-    if _strict_camel(token):
+    if _strict_camel(token) or _snake_case(token):
         return True
     if len(token) > 40 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
         return False
