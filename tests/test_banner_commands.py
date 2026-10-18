@@ -9,9 +9,9 @@ from agent8088 import cli
 
 
 @pytest.fixture(autouse=True)
-def _offline_model_metadata(monkeypatch):
-    """Layout checks must not contact a developer's model endpoint."""
-    monkeypatch.setattr(cli.A, "_maybe_probe_context_window", lambda: None)
+def _isolated_sandbox_metadata(monkeypatch):
+    """Layout checks must not repeatedly launch the host's sandbox probe."""
+    monkeypatch.setattr(cli.A, "sandbox_status", lambda: {"resolved": "native", "network_enforced": True})
 
 
 def _render(width):
