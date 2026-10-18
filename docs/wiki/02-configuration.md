@@ -229,7 +229,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `reuse_known_verdicts` | `1` | Reuse a recorded check or test result while nothing has changed since it ran. `0` always reruns. |
 | `max_http_bytes` | `5 MB` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
-| `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
+| `max_tool_timeout_seconds` | `1200` | Hard ceiling for one tool call. |
 | `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
 | `compaction_cooldown_turns` | `6` | Turns to wait after a successful automatic compaction before looking again, unless the context is already above 90% of the window. `0` removes the wait. |
 | `compaction_summary_max_chars` | `16000` | Longest the carried-over conversation summary may grow. Compaction keeps an earlier summary exactly as written and summarizes only what came after it, so a long run's first facts are not blurred by repeated rewriting; past this size the oldest summary sections are dropped whole, never rephrased. Each summary ends with a short harness record the model does not write (files written this run, verified checks), rebuilt from live state at every compaction. |
@@ -256,13 +256,13 @@ never does — and a recalled memory can never authorise a tool call.
 ### Dynamic turn budget
 
 `max_turns` is the starting allowance, not a fixed hard cap. The default is
-**50 rounds**, shared by the CLI, Web UI and messaging gateways. Set
+**150 rounds**, shared by the CLI, Web UI and messaging gateways. Set
 `max_turns` in `config.txt` or use `/maxturns <int>` to override it.
 Older saved sessions without this setting retain the current value on resume.
 
 At a block boundary, growth requires more than half the block's rounds to
 produce fresh, successful work. Extensions add another block of rounds up to
-`max_turns x dynamic_turns_ceiling_multiplier` (200 at the defaults).
+`max_turns x dynamic_turns_ceiling_multiplier` (450 at the defaults).
 Repetition and failed calls do not earn extensions.
 
 The signals come from state the loop already tracks, so extension costs no
@@ -272,8 +272,8 @@ them and ends where it is.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_turns` | `50` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
-| `dynamic_turns_ceiling_multiplier` | `4` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
+| `max_turns` | `150` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
+| `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 | `stall_rounds` | `6` | Rounds in a row that bring nothing new (no new call that worked, no file changed, no check newly passing, no part finished) before the main agent is asked once to finish with what it has or change approach. A second stretch of the same length with nothing ends the run with the usual summary. Reading or fetching something new always counts as progress. `0` turns the watch off. |
 | `verification_loop_rounds` | `8` | Once the work is built, its checks pass and no part is open, this many rounds in a row that change no file are answered once with a message that finishing is the next step (at most twice per request). It never ends the run. `0` turns it off. |
