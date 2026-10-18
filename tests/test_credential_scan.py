@@ -178,6 +178,55 @@ def test_random_looking_keys_are_still_found(value):
     assert found, value
 
 
+# ------------------------------------------------- strict camelCase is code
+@pytest.mark.parametrize("text", [
+    "effects: ['selfSpAtkUp2', 'selfSpAtkUp1SpDefUp1']",
+    "const k = 'selfAtkUp1SpAtkUp1SpdUp1DefDown1SpDefDown1';",
+    "applyBurnDamageEndOfTurn(target, 2)",
+    "getActiveIdx = Engine.getActiveIdx",
+    "TeamBuilderRosterSlotPicker",
+    "pokemonHeldItemChoiceBand2",
+])
+def test_strict_camelcase_words_are_not_credentials(text):
+    assert secret_scan.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("value", [
+    "Bc1De2Fg3Hi4Jk5Lm6No7Pq8Rs9Tu",       # alternating upper/lower pairs with digits between them
+    "xK9mQ2vL8nR4tY7wZ3bC6dF1hJ5",         # base62 with digits through it
+    "aB3dE9gH2jK5mN8pQ1rS4tU7vW0",
+])
+def test_random_mixed_case_is_still_found_after_the_camelcase_rule(value):
+    assert secret_scan.find_secrets(f'api_token = "{value}"'), value
+
+
+def test_lockfile_integrity_hashes_are_not_credentials():
+    text = ('"integrity": "sha512-9Z2kq3rB7xYw1N0pQmVtL5uJh8aE4sDfG6yCnO3iRb0cXeTzWvUj1HlKpA2dMgSq/f8ZyNaB5tQ7w==",\n'
+            '"integrity": "sha256-abc123DEF456ghi789JKL012mno345PQR678stu90vw="')
+    assert secret_scan.find_secrets(text) == []
+
+
+# ------------------------------------------------- snake_case test and variable names are code
+@pytest.mark.parametrize("text", [
+    "def test_delete_returns_404_for_missing_note(self):",
+    "def test_create_with_empty_title_returns_400(self):",
+    "def test_put_unknown_id_returns_404(self):",
+    "max_hp_stat_2 = 252",
+    "const get_active_idx_v2 = pick(team)",
+])
+def test_snake_case_names_with_numbers_are_not_credentials(text):
+    assert secret_scan.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("value", [
+    "a8f_3k2_9zq_1mx_7vb_4tr_2wc_5nd",     # random base36 pieces joined by underscores
+    "x9f2k_p4m7q_r1t8v_w3z6y_b5n0c",
+    "k3j_9d2_f8s_1m4_q7w_z0x_c6v_b5n",
+])
+def test_random_underscore_strings_are_still_found(value):
+    assert secret_scan.find_secrets(f'api_token = "{value}"'), value
+
+
 @pytest.mark.parametrize("value", [
     "QJXNZKPVTRWH7LMBCDYFS",  # uppercase blob with one digit
     "qjxnzkpvtrwh7lmbcdyfs",  # a lowercase blob is not camelCase
