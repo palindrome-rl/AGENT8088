@@ -5730,6 +5730,20 @@ def _project_relative(p: Path) -> Path:
         return p
 
 
+def _stated_artifacts_folder(rel: Path) -> bool:
+    """Did the person's own message say to put this folder in artifacts/ (`artifacts/pokemon-doubles/`)?
+
+    The model then writes `pokemon-doubles/server.js` without the prefix; the person's instruction decides where
+    that folder lives, not which file happened to be written first."""
+    if rel.is_absolute() or len(rel.parts) < 2 or rel.parts[0] in ("", ".", ".."):
+        return False
+    pattern = re.compile(r"(?<![" + chr(92) + "w./-])artifacts/" + re.escape(rel.parts[0].lower()) + r"(?:/|(?![" + chr(92) + "w-]))")
+    for message in _authorising_turns(_CURRENT_RUN_MESSAGES or []):
+        if pattern.search(_message_text(message).replace(chr(92), "/").lower()):
+            return True
+    return False
+
+
 def _project_folder_root(p: Path):
     """The root already holding the first folder of this relative path, or None."""
     if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
@@ -5782,6 +5796,11 @@ def resolve_write_path(raw_path: str) -> Path:
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
     rel = _project_relative(p)
+    if _stated_artifacts_folder(rel):
+        stated = (ARTIFACTS_ROOT / rel).resolve()
+        if _path_is_allowed(stated):
+            _note_project_folder(rel, stated)
+            return stated
     held = _project_folder_root(rel)
     if held is not None:
         # This folder already has files from this run in one root: the rest of it goes there too.
