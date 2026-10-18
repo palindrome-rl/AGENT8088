@@ -107,7 +107,8 @@ def test_agent_loop_passes_actual_check_targets_to_the_tracker(engine, monkeypat
         return next(results)
     Script(engine, monkeypatch, [
         _call('check_app', path='site-a/index.html'),
-        _call('check_app', path=second), 'Finished the checks.',
+        # A distinct spelling also avoids the intentional identical-call cache.
+        _call('check_app', path=str(tmp_path / second)), 'Finished the checks.',
     ], tool=tool)
     engine.run_agent([{'role': 'user', 'content': 'Check the pages and report the results.'}],
                      max_turns=8, tools_def=[], allowed_tools={'check_app'},
