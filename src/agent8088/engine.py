@@ -10476,7 +10476,8 @@ def native_sandbox_verified() -> bool:
 _PIPED_SPAWN_BLOCKED = "agent8088-piped-spawn-blocked"
 _PIPED_SPAWN_SCRIPT = (
     "const r = require('child_process').spawnSync(process.execPath, ['-e', '0']);"
-    f"console.log(r.error && r.error.code === 'EPERM' ? '{_PIPED_SPAWN_BLOCKED}' : 'agent8088-piped-spawn-ok');")
+    f"if (r.error && r.error.code === 'EPERM') console.log('{_PIPED_SPAWN_BLOCKED}');"
+    "else if (!r.error && r.status === 0) console.log('agent8088-piped-spawn-ok');")
 
 
 def _probe_piped_child_spawn(cwd: Path) -> None:
@@ -10502,6 +10503,8 @@ def _probe_piped_child_spawn(cwd: Path) -> None:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
         return
     output = result.stdout or ""
     if _PIPED_SPAWN_BLOCKED in output:
@@ -11224,7 +11227,8 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
-    if sys.platform == "win32" and "spawn EPERM" in (result or ""):
+    if (sys.platform == "win32" and "spawn EPERM" in (result or "")
+            and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
         return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
                 "a child process with piped output (Node's default), so tools built on it fail: esbuild, Vite, "
                 "Vitest, tsx and npm install scripts. It is not the file-write limit, and running the same "
