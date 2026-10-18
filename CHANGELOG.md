@@ -4,6 +4,29 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-10-18
+
+### Fixed
+
+- Plan-mode web searches can request one-time or session approval without being
+  treated as attempts to modify files; approved searches remain read-only.
+- Required-output checks recognize files in the requested project folder without
+  accepting unrelated input directories or relocating explicit root-level outputs.
+- Static page checks distinguish unavailable backend routes from missing assets,
+  including files whose names begin with `api`.
+- Installed launchers find the appropriate user or project configuration, including
+  activated project environments; configuration reads and writes use the same precedence.
+- Missing local Ollama embeddings fall back quietly to keyword search. Remote,
+  custom and proxied embeddings retain their configured client transport.
+
+### Improved
+
+- Windows native sandbox checks report verified piped-child-process limitations
+  and offer Docker guidance without changing sandbox permissions or isolation.
+
+Public installation links, update channel, version, license and existing
+public-specific fixes are unchanged.
+
 ## v1.3 branch maintenance - 2026-10-16
 
 ### Improved

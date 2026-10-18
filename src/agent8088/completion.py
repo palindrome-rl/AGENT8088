@@ -363,6 +363,68 @@ def _landed_under(folder: Path, landed: Iterable, roots: Iterable[Path]) -> bool
     return False
 
 
+def _named_folders(request: str) -> set[str]:
+    """Full output-directory paths, not input directories or isolated path segments."""
+    names = set(named_output_dirs(request))
+    for path in named_output_paths(request):
+        parent = str(PurePath(path.replace("\\", "/")).parent)
+        if parent != ".":
+            names.add(parent)
+    return {name.replace("\\", "/").rstrip("/") for name in names
+            if not Path(name).is_absolute() and ".." not in PurePath(name.replace("\\", "/")).parts
+            and name not in (".", "", "~")}
+
+
+def _written_in_named_folder(path: str, request: str, candidates: Iterable[str],
+                             roots: Iterable[Path]) -> bool:
+    """The request names `path` (server.js) and, elsewhere, the project folder it belongs to
+    (pokemon-doubles/); the run wrote that file inside that folder.
+
+    A plan lists the files of a project folder by their short names, so a check that looks for
+    them at the top of the workspace calls them missing while they sit in the folder the plan
+    named. The folder must be one the request itself names: a file written under an unrelated
+    folder does not count.
+    """
+    # Explicit root/absolute paths are not shorthand for a project-relative output.
+    normal = path.replace("\\", "/")
+    if normal.startswith(("./", "../", "~/")) or Path(path).is_absolute():
+        return False
+    folders = _named_folders(request)
+    if not normal or not folders:
+        return False
+    expected = {_file_id(Path(root) / folder / normal) for root in roots for folder in folders}
+    for candidate in candidates:
+        if any(_file_id(c) in expected and _nonempty_file(c) for c in _candidates(str(candidate), roots)):
+            return True
+    return False
+
+
+def _written_under_named_dir(folder: str, request: str, candidates: Iterable[str],
+                             roots: Iterable[Path], mirrors: Iterable[Path]) -> bool:
+    """A folder the request names (proj/, public/) holds files the run wrote, one level inside the
+    artifacts folder or inside another folder the request names."""
+    normal = folder.replace("\\", "/")
+    if not normal or normal.startswith(("./", "../", "~/")) or Path(folder).is_absolute():
+        return False
+    # Anchor every match to an allowed workspace/mirror root; a directory with the
+    # same basename somewhere else is not evidence that this output exists.
+    roots = list(roots) + list(mirrors)
+    parents = _named_folders(request) | {""}
+    expected = {_file_id(Path(root) / parent / normal) + os.sep for root in roots for parent in parents}
+    for candidate in candidates:
+        for item in _candidates(str(candidate), roots):
+            if any(_file_id(item).startswith(prefix) for prefix in expected) and _nonempty_file(item):
+                return True
+    return False
+
+
+def _moved_copy(path: str, written: Iterable[str], roots: Iterable[Path]) -> bool:
+    """A file the run wrote at one path and then moved: the same name exists, non-empty, at another path it wrote."""
+    name = PurePath(str(path).replace("\\", "/")).name.lower()
+    return any(other != path and PurePath(str(other).replace("\\", "/")).name.lower() == name
+               and _exists_somewhere(str(other), roots) for other in written)
+
+
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
                     start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
@@ -381,9 +443,11 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     written = list(written)
     landed = list(landed)
     missing: list[str] = []
+    wrote_at = written + [str(pair[1]) for pair in landed if len(pair) > 1]
     for path in named_output_paths(request):
         satisfied = (any(_nonempty_file(c) for c in _candidates(path, roots))
-                     or _landed_copy(path, landed, roots + mirrors))
+                     or _landed_copy(path, landed, roots + mirrors)
+                     or _written_in_named_folder(path, request, wrote_at, roots + mirrors))
         if not satisfied and supplied_input(request, path, _candidates(path, roots + mirrors),
                                             start_files, written, roots + mirrors):
             continue
@@ -393,13 +457,19 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
                            if elsewhere and mirrors else path)
     for path in named_output_dirs(request):
         if not any(_has_content(c) or _landed_under(c, landed, roots + mirrors)
-                   for c in _candidates(path, roots)):
+                   for c in _candidates(path, roots)) \
+                and not _written_under_named_dir(path, request, wrote_at, roots + mirrors, mirrors):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
     for path in written:
         name = PurePath(path).name
         if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
                 and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
+            # A scratch file the run made and removed, or a file it moved to a better place, is not a
+            # deliverable that went missing.
+            if (name.startswith("_") or _moved_copy(path, written, roots + mirrors)
+                    or is_throwaway_helper(path, request, written, roots + mirrors)):
+                continue
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))

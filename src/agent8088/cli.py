@@ -2135,13 +2135,22 @@ def _permission_choice(question, options, typed_prompt, typed_map, default):
     return typed_map.get(response, default)
 
 
-def _handle_escalation(result_text, live=None, esc=None):
+# Plan mode refuses writes, so the requests that still reach the user there are
+# read-only network ones. Those may be allowed for the whole session, as in any
+# other mode: asking again for every search made a research task in plan mode
+# a loop of the same question.
+_PLAN_MODE_SESSION_CHANGE_TYPES = frozenset({"network_fallback", "network_request"})
+
+
+def _handle_escalation(result_text, live=None, esc=None, plan_step=False):
     """Check if a tool result is an escalation request. If so, prompt the user
     with once/session/deny options and call grant_escalation() if approved.
 
-    In plan mode, offers approve/deny instead of once/session/deny. Picking the
-    mode an approved *plan* runs in is a separate prompt — see
-    `_make_plan_approval`, which `present_plan` calls.
+    For a step of an executing plan (`plan_step`) in plan mode, offers
+    approve/deny instead: approving lets the plan's steps run. An ordinary tool
+    call blocked while planning (a web search, say) is not a plan, so it gets the
+    usual wording. Picking the mode an approved *plan* runs in is a separate
+    prompt — see `_make_plan_approval`, which `present_plan` calls.
 
     `esc` is the turn's EscListener, paused while the prompt is up so it stops
     swallowing the keystrokes meant for the picker. Absent for the direct
@@ -2168,7 +2177,9 @@ def _handle_escalation(result_text, live=None, esc=None):
         title="[bold yellow]Permission Escalation Request[/bold yellow]",
         box=box.ROUNDED, border_style="yellow",
     ))
-    plan_only = A.PERMISSION_MODE == "plan-only"
+    planning = A.PERMISSION_MODE == "plan-only"
+    plan_only = planning and plan_step
+    can_remember = not planning or change_type in _PLAN_MODE_SESSION_CHANGE_TYPES
     try:
         try:
             with (esc.paused() if esc is not None else nullcontext()):
@@ -2182,14 +2193,17 @@ def _handle_escalation(result_text, live=None, esc=None):
                         default="deny",
                     )
                 else:
+                    options = [("once", "Once — allow just this action")]
+                    if can_remember:
+                        options.append(("session", f"Session — stop asking about '{change_type}'"))
+                    options.append(("deny", "Deny — stay in plan-only mode" if planning
+                                    else "Deny — block this action"))
                     choice = _permission_choice(
-                        "Allow this action?",
-                        [("once", "Once — allow just this action"),
-                         ("session", f"Session — stop asking about '{change_type}'"),
-                         ("deny", "Deny — block this action")],
-                        "[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]",
+                        "Allow this action?", options,
+                        ("[bold yellow]Allow? (o=once / s=session / d=deny): [/bold yellow]" if can_remember
+                         else "[bold yellow]Allow? (o=once / d=deny): [/bold yellow]"),
                         {"o": "once", "once": "once", "y": "once", "yes": "once",
-                         "s": "session", "session": "session"},
+                         **({"s": "session", "session": "session"} if can_remember else {})},
                         default="deny",
                     )
         # EOF is not a decision. Fail closed, but don't take the process down
@@ -2222,7 +2236,8 @@ def _handle_escalation(result_text, live=None, esc=None):
             console.print(f"[green]Approved for this session. '{change_type}' won't ask again.[/green]")
             approved = True
         else:
-            console.print("[red]Permission denied — staying in readonly mode.[/red]")
+            console.print("[red]Permission denied — staying in "
+                          f"{'plan-only' if planning else 'readonly'} mode.[/red]")
             approved = False
     finally:
         if live is not None:
@@ -2583,7 +2598,7 @@ def do_chat(query):
             live.update(Group(*rows) if rows else Text("planning..."))
 
         def _plan_on_escalation(escalation_text):
-            return _handle_escalation(escalation_text, live, esc)
+            return _handle_escalation(escalation_text, live, esc, plan_step=True)
 
         A._plan_on_step = _plan_on_step
         A._plan_on_escalation = _plan_on_escalation
@@ -7664,13 +7679,7 @@ def _resolve_config_path():
     project's venv should own its own config.txt rather than falling back
     to the global install.
     """
-    if os.environ.get("AGENT8088_CONFIG"):
-        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-    cwd_config = Path.cwd() / "config.txt"
-    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    if cwd_config.exists() or in_venv:
-        return cwd_config
-    return Path(_agent8088_home() / "config.txt")
+    return A._preferred_config_path() or Path(_agent8088_home() / "config.txt")
 
 
 def _agent8088_link_dir():

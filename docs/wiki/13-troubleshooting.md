@@ -430,6 +430,17 @@ sandbox_allowed_domains=pypi.org,api.example.com
 
 Note this is separate from `ssrf_allow_hosts`, which governs the HTTP *tools*.
 
+### `spawn EPERM` from Vite, esbuild, Vitest, tsx or `npm install` on Windows
+
+The native Windows sandbox does not let a program start a child process with
+piped output, which these Node tools do. It is not the file-write limit, and
+retrying does not help. Processes also end when their command ends, so a dev
+server cannot stay up for a later command. Plain HTML/CSS/JavaScript, Python and
+`node file.js` work. `/doctor` shows "sandbox child processes: limited". To use
+these tools, switch to the Docker backend with an image that has Python and Node
+and an allowlist for the package registry; see
+[Sandboxing](06-sandboxing.md).
+
 ## Development
 
 ### A test passes alone but fails in the suite (or vice versa)

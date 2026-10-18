@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import re
 import shlex
 import time
@@ -170,6 +171,61 @@ def serve_root(page: Path) -> Path:
             break
         root = root.parent
     return root
+
+
+_BACKEND_FILES = frozenset({"server.js", "server.mjs", "server.cjs", "server.ts", "server.py", "app.py", "main.py",
+                            "api.py", "manage.py", "server.rb", "server.go", "server.php"})
+_BACKEND_PACKAGES = re.compile(r'"(?:express|fastify|koa|hono|@hapi/hapi|next|nuxt|socket\.io)"')
+_BACKEND_REQUIREMENTS = re.compile(r"^\s*(?:flask|fastapi|django|aiohttp|starlette|tornado|bottle)\b", re.I | re.M)
+_BACKEND_STATUSES = (404, 405, 501)
+
+
+def _is_route(path: str) -> bool:
+    """An address that is a route of a server (/api/status, /ai-move), not a file (/data.json)."""
+    clean = path.split("?")[0].split("#")[0]
+    return clean == "/api" or clean.startswith("/api/") or "." not in clean.rsplit("/", 1)[-1]
+
+
+def has_backend(root: Path, page: Path | None = None) -> bool:
+    """Whether the project around this page has a server of its own.
+
+    Looked for in the folder served and up to three folders above it (the page may sit in `public/`):
+    a conventional server file, a package.json that starts one or depends on a server framework, or
+    Python requirements that name a web framework. Only used to tell a request the static check could
+    not answer from a file that is genuinely missing, so a wrong "yes" costs a warning, not a verdict.
+    """
+    folder = Path(root)
+    for _ in range(4):
+        try:
+            names = {entry.name for entry in folder.iterdir() if entry.is_file()}
+        except OSError:
+            names = set()
+        if names & _BACKEND_FILES:
+            return True
+        try:
+            if "package.json" in names:
+                try:
+                    package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    package = {}
+                if isinstance(package, dict):
+                    scripts = package.get("scripts", {})
+                    if isinstance(scripts, dict) and isinstance(scripts.get("start"), str) and scripts["start"].strip():
+                        return True
+                    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                        dependencies = package.get(section, {})
+                        if isinstance(dependencies, dict) and any(
+                                _BACKEND_PACKAGES.fullmatch(json.dumps(name)) for name in dependencies):
+                            return True
+            if "requirements.txt" in names and _BACKEND_REQUIREMENTS.search(
+                    (folder / "requirements.txt").read_text(encoding="utf-8", errors="ignore")):
+                return True
+        except OSError:
+            pass
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    return False
 
 
 # --- the static server -------------------------------------------------------------------------
@@ -383,10 +439,12 @@ def _click_through(tab, steps: int, budget: float, failures: list, seen: list,
 
 
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
-                click_steps: int = CLICK_THROUGH_STEPS) -> None:
+                click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
+    backend_asked: list[str] = []       # same-origin fetch/XHR paths the static server could not answer
+    console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
     external_scripts: list[str] = []
     dialogs: list[str] = []
@@ -456,12 +514,24 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 text = message.text[:200]
                 console.append(f"error: {text}" + (f" ({where.replace(origin, '')})" if where and own(where) else ""))
                 if own(where):
+                    console_where[len(failures)] = where.replace(origin, "")
                     failures.append(f"console error: {text}")
 
             def on_response(response):
                 if response.url.startswith(origin) and response.status >= 400:
-                    failures.append(f"missing or failing file: {response.url.replace(origin, '')} "
-                                    f"returned {response.status}")
+                    path = response.url.replace(origin, "")
+                    if (backend and response.status in _BACKEND_STATUSES
+                            and response.request.resource_type in ("fetch", "xhr")
+                            and _is_route(path)):
+                        # The page asked its own server for data; this check serves files only, so the
+                        # backend is not running and a 404 or 405 says nothing about the page.
+                        backend_asked.append(path)
+                        warnings.append(
+                            f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
+                            "serves static files only, so the backend was not running. Call the server after a "
+                            "click and handle a failure quietly, and the page will load cleanly without it")
+                        return
+                    failures.append(f"missing or failing file: {path} returned {response.status}")
 
             tab.on("console", on_console)
             tab.on("response", on_response)
@@ -518,6 +588,12 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         else:
                             warnings.append(f"the first control {described} changed nothing "
                                             f"({changed} other control{'s' if changed != 1 else ''} did)")
+            if backend_asked:
+                # The browser also logs "Failed to load resource" for each of those requests.
+                asked = {a.split("?")[0] for a in backend_asked}
+                failures[:] = [item for i, item in enumerate(failures)
+                               if not (i in console_where and console_where[i].split("?")[0] in asked
+                                       and item.startswith("console error: Failed to load resource"))]
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -595,7 +671,7 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
     started = time.time()
     steps = CLICK_THROUGH_STEPS if click_steps is None else max(0, click_steps)
-    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps),
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps, has_backend(root, path)),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)

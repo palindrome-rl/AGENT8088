@@ -213,6 +213,20 @@ recall runs on keyword search alone and the turn proceeds normally. `/memory`
 names the host that was asked and the error it gave, because "pull the model"
 cannot help a host that never received the request.
 
+How a missing embedder is handled, so a machine without Ollama is not nagged:
+
+- Before the first embedding request to built-in local Ollama, Agent8088 makes a short connection probe.
+  If nothing is listening, no embeddings request is sent. Remote, custom and proxied providers use their
+  configured client transport instead: a failed direct connection would not prove that a proxy cannot reach them.
+- **Ollama is not installed on this machine** (the default `ollama` provider, no `ollama` command, no Ollama
+  folder): keyword search is simply the mode. Nothing is announced during the session; `/capabilities` and
+  `/memory` show "keyword-only (BM25)", and recall and tool selection both use keywords.
+- **Ollama is installed but not running, or another provider you chose does not answer:** announced once, with the
+  fix, then left alone.
+- A service that keeps failing is asked again after 5 minutes, then 30 minutes, then every 2 hours (a machine with
+  no Ollama waits the longest window). One success starts the schedule over.
+- To skip embeddings entirely, set `memory=0` and `tool_selection=full`.
+
 ## Where it lives
 
 One file: `~/.agent8088/memory.db`, mode `0600`.
