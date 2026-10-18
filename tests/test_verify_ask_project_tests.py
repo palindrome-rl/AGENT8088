@@ -70,3 +70,32 @@ def test_a_relative_path_says_nothing_about_the_project(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert completion.tests_near(["app.py"]) is None
     assert "`python app.py`" in completion.verify_ask(["app.py"], False)
+
+
+def test_plain_pytest_functions_do_not_need_a_pytest_import(tmp_path):
+    root = _project(tmp_path)
+    (root / "tests" / "test_rooms.py").write_text("def test_room():\n    assert False\n")
+    assert completion.tests_near([str(root / "booking" / "rooms.py")])[1] == "python -m pytest -q"
+
+
+def test_an_npm_metadata_value_is_not_a_test_script(tmp_path):
+    (tmp_path / "package.json").write_text('{"name":"test","scripts":{"build":"node build.js"}}')
+    assert completion.tests_near([str(tmp_path / "app.js")]) is None
+
+
+def test_a_malformed_package_file_is_not_a_test_script(tmp_path):
+    (tmp_path / "package.json").write_text('{"scripts":{"test":')
+    assert completion.tests_near([str(tmp_path / "app.js")]) is None
+
+
+def test_an_empty_tests_directory_does_not_hide_a_unittest_suite_in_test(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "test").mkdir()
+    (tmp_path / "test" / "test_rooms.py").write_text("import unittest\n")
+    assert completion.tests_near([str(tmp_path / "app.py")])[1] == "python -m unittest discover -s test"
+
+
+def test_pytest_configuration_overrides_unittest_imports(tmp_path):
+    root = _project(tmp_path)
+    (root / "pyproject.toml").write_text('[tool.pytest.ini_options]\ntestpaths=["tests"]\n')
+    assert completion.tests_near([str(root / "booking" / "rooms.py")])[1] == "python -m pytest -q"

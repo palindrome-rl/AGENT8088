@@ -13,8 +13,10 @@ continuation budget so a task that cannot be finished still ends.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from itertools import islice
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -934,21 +936,50 @@ def _suite_in(folder: Path) -> str | None:
     """The command that runs the tests in this folder, or None if it holds no suite."""
     tests = [d for d in ("tests", "test") if (folder / d).is_dir()]
     files = []
-    for d in tests:
-        files += sorted((folder / d).glob("test*.py"))[:3]
-    files += sorted(folder.glob("test_*.py"))[:3]
+    suite_dir = "."
+    for d in [*tests, "."]:
+        # Bound both the directory walk and the number of file samples. Do not
+        # read a whole generated file merely to slice its first 4,000 characters.
+        candidates = sorted(islice((folder / d).glob("test*.py" if d != "." else "test_*.py"), 128))
+        if candidates and not files:
+            suite_dir = d
+        files.extend(p for p in candidates if p.is_file())
+        files = files[:3]
+        if len(files) == 3:
+            break
     if files:
         text = ""
         for file in files:
             try:
-                text += file.read_text(encoding="utf-8", errors="ignore")[:4000]
+                with file.open(encoding="utf-8", errors="ignore") as stream:
+                    text += "\n" + stream.read(4000)
             except OSError:
                 continue
-        if re.search(r"\bimport pytest\b|\bfrom pytest\b", text) or (folder / "pytest.ini").exists():
+        configured_pytest = (folder / "pytest.ini").is_file()
+        for name, marker in (("pyproject.toml", "[tool.pytest.ini_options]"),
+                             ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+            try:
+                with (folder / name).open(encoding="utf-8", errors="ignore") as stream:
+                    configured_pytest |= marker in stream.read(4000)
+            except OSError:
+                pass
+        # Plain test functions need pytest even when they use no pytest imports.
+        # Choose unittest only with affirmative evidence of unittest-style tests.
+        if (configured_pytest or re.search(r"\bimport pytest\b|\bfrom pytest\b|^(?:async\s+)?def\s+test_", text, re.M)
+                or not re.search(r"\bimport unittest\b|\bfrom unittest\b", text)):
             return "python -m pytest -q"
-        return f"python -m unittest discover -s {tests[0] if tests else '.'}"
+        return f"python -m unittest discover -s {suite_dir}"
     package = folder / "package.json"
-    if package.is_file() and '"test"' in package.read_text(encoding="utf-8", errors="ignore")[:4000]:
+    try:
+        with package.open(encoding="utf-8") as stream:
+            # Do not accept truncated or oversized metadata as valid JSON.
+            raw = stream.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else None
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        script = scripts.get("test") if isinstance(scripts, dict) else None
+    except (OSError, ValueError):
+        script = None
+    if isinstance(script, str) and script.strip():
         return "npm test"
     return None
 
