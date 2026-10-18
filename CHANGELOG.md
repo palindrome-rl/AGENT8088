@@ -8,6 +8,18 @@ All notable changes to Agent8088 are recorded here. The format follows
 
 ### Fixed
 
+- A failed script check settles after a clean retry without mistaking a plain
+  script startup for a passing test suite or accepting a printed traceback.
+- End-of-run verification notes survive output cut-offs and repeated-call stops.
+  Closing caps preserve fresh test evidence without hiding missing deliverables.
+- Page checks exercise dropdown choices, identify page-loaded scripts by their
+  actual local paths, and distinguish missing-backend limitations from code faults.
+- A model-invoked page-check failure remains visible until that same target
+  passes; another page with the same filename cannot clear it.
+- Required-output detection splits at whole-word conjunctions, and generated
+  project folders stay together across writes, including after folder deletion.
+- Strict camelCase, snake_case and lockfile integrity values avoid unnecessary
+  credential warnings while credential-prefix checks remain enforced.
 - Optional mem0 absence falls back quietly, while broken installed packages and
   unexpected initialization failures remain visible.
 - Verification recognizes redirected and chained test commands, reports its

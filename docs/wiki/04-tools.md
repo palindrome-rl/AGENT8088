@@ -173,6 +173,20 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `calc`, `eval`, `math` | `calculate` |
 | `last`, `prev_output` | `last_output` |
 
+## Keeping a generated project together
+
+For relative paths with a project folder, the first file placed in that folder
+chooses its location: the project root for a user-named file, or `artifacts/`
+for an invented file. Later files in the same folder follow that location,
+including files the user named, so an application's page, styles and server
+are not split across two roots. Another project folder is decided separately.
+Deleting the chosen folder releases the decision for subsequent writes.
+
+Bare filenames retain their existing placement rules. Absolute paths outside
+the project are not redirected by this rule, and allowed-path, sensitive-file
+and permission checks still apply. Disposable task containers retain their
+explicit-path behavior.
+
 ## Backups of overwritten files
 
 Before the first change to a file that already exists (`write_file`, `edit_file`,
@@ -232,6 +246,22 @@ A deterministic smoke test of something the agent built; no model call.
   check the containing HTML page to verify it in a browser context.
 - Without Chromium (`playwright install chromium`) it reports "unavailable"
   instead of failing the task.
+
+A dropdown is exercised by selecting another option and dispatching its change
+events. Changing only the dropdown's own value is not enough to pass: the page
+must respond. A request to a project's missing backend can count as a control's
+effect, with a warning; this does not verify that the backend works. An ambiguous
+page error matching a missing backend's status remains `unavailable`, not a pass.
+
+A script is treated as page-loaded only when its resolved local path matches a
+page's script reference, not merely its filename or a similarly named CDN asset.
+That script, and a Python package member requiring relative imports, are not
+started as standalone programs. Their startup is reported as unverified until
+checked in the appropriate page or package context.
+
+A failed `check_app` invoked by the model is recorded as a failing check. A later
+pass for the same actual target settles it; another page with the same filename
+does not. Passing this smoke test is not equivalent to passing a test suite.
 
 It also runs automatically on the pages and scripts a run wrote, just before the
 reply is accepted (see [completion checks](11-architecture.md#completion-checks)),

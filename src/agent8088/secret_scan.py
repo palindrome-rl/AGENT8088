@@ -164,12 +164,44 @@ _IDENTIFIER_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 _IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in words of three or more
 
 
+# camelCase / PascalCase made of capitalised words, each optionally followed by a small number: selfSpAtkUp2,
+# selfAtkUp1SpAtkUp1SpdUp1DefDown1SpDefDown1, getActiveIdx. Every capital starts a word of at least one lowercase letter.
+_STRICT_CAMEL_RE = re.compile(r"[A-Za-z]?[a-z]+(?:[A-Z][a-z]+[0-9]{0,2})+")
+_CAMEL_WORD_RE = re.compile(r"[A-Z]?[a-z]+")
+_CAMEL_MEAN_WORD = 2.5      # a random run of upper/lower pairs averages two letters a word
+
+
+def _strict_camel(token: str) -> bool:
+    if len(token) > 64 or not _STRICT_CAMEL_RE.fullmatch(token):
+        return False
+    words = _CAMEL_WORD_RE.findall(token)
+    return len(words) >= 2 and sum(len(w) for w in words) / len(words) >= _CAMEL_MEAN_WORD
+
+
+# snake_case made of words and small numbers: test_delete_returns_404_for_missing_note, max_hp_stat_2, get_active_idx_v2.
+# At least two real words (letters, three or more), and every other piece a word or a number of up to four digits.
+_SNAKE_PIECE_RE = re.compile(r"[a-z]+|[0-9]{1,4}")
+
+
+def _snake_case(token: str) -> bool:
+    if len(token) > 80 or "_" not in token or not re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+", token):
+        return False
+    pieces = token.split("_")
+    if not all(_SNAKE_PIECE_RE.fullmatch(piece) for piece in pieces):
+        return False
+    return sum(1 for piece in pieces if piece.isalpha() and len(piece) >= 3) >= 2
+
+
 def _identifier_like(token: str) -> bool:
     """A single identifier in camelCase or snake_case (``raiseSpA2Speed``, ``max_tokens_v2``).
 
     Most letters must sit in at least two lower/capitalised word-shaped pieces,
     not an unbroken lowercase blob or an uppercase acronym. This is a shape
-    heuristic, not proof that the text is a real word or cannot be a secret."""
+    heuristic, not proof that the text is a real word or cannot be a secret.
+
+    Strict camelCase made of capitalised words and snake_case made of words and small numbers are code outright."""
+    if _strict_camel(token) or _snake_case(token):
+        return True
     if len(token) > 40 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
         return False
     if sum(c.isdigit() for c in token) > 2 or (len(token) >= _MIN_HEX and _HEX_RE.fullmatch(token)):
@@ -207,8 +239,12 @@ def _codelike(token: str) -> bool:
     return bool(pieces) and all(_SHORT_NUMBER_RE.fullmatch(p) or _code_piece(p) for p in pieces)
 
 
+# Subresource / lockfile integrity values (`sha512-<base64>==`): public checksums of a download, not secrets.
+_INTEGRITY_RE = re.compile(r"sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}")
+
+
 def _is_noise(token: str) -> bool:
-    if _URL_RE.search(token):
+    if _URL_RE.search(token) or _INTEGRITY_RE.fullmatch(token):
         return True
     if _wordlike(token) or _codelike(token) or _identifier_like(token):
         return True

@@ -13,6 +13,27 @@ Three layers, all runnable offline with no model backend.
 `--prompt-file` runs one unattended, full-auto turn. Use it only in a trusted,
 isolated environment.
 
+## Runtime completion evidence
+
+These runtime checks ship with AGENT8088-v1.3 and do not require a root
+`tests/` directory. End-of-run notes distinguish a passing test run (`tested`)
+from running or loading the result without an error (`exercised`), inspecting
+files, and making changes without fresh verification. `Tested` means the run's
+own tests passed after the last change; it does not prove the result satisfies
+everything the user requested. Later edits invalidate earlier positive evidence.
+
+The notes also appear when output cut-offs, repeated calls or the turn limit
+stop a run. A post-check cap alone does not mark freshly tested or exercised
+work incomplete, but an unresolved failing check or an explicitly missing
+deliverable still does.
+
+A failed run of a written script can settle when that script later runs cleanly
+under a different command line. A failed test suite still needs appropriate
+passing check evidence: merely starting a file mentioned by that suite is not a
+suite pass, and output containing a traceback does not establish a clean retry.
+A browser script started in the wrong runtime is not proof that the page fails;
+verify it in its intended browser context instead.
+
 ## Prerequisites
 
 Install the sandbox runtime before running anything here:
