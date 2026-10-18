@@ -84,6 +84,19 @@ def test_a_script_a_page_loads_is_found(tmp_path):
     assert app_check.loaded_by_page(root / "js" / "other.js") is None
 
 
+@pytest.mark.parametrize("src", ["client/main.js", "https://example.com/main.js", "//example.com/main.js"])
+def test_a_page_does_not_load_a_different_script_with_the_same_basename(tmp_path, src):
+    (tmp_path / "index.html").write_text(f'<script src="{src}"></script>', encoding="utf-8")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    script = tools / "main.js"
+    script.write_text('throw new Error("broken CLI");', encoding="utf-8")
+    assert app_check.loaded_by_page(script) is None
+    report = app_check.check_script(script, run=lambda command, timeout:
+                                    "Error: broken CLI\nCommand exited with status 1.")
+    assert report.failed
+
+
 def test_a_page_script_is_not_started_alone(tmp_path):
     root = _site(tmp_path)
     ran = []

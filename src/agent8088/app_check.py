@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import threading
 import uuid
+from urllib.parse import unquote, urlsplit
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1065,22 +1066,35 @@ def loaded_by_page(path: Path) -> Path | None:
     elements, so starting it alone under Node fails for reasons that say nothing about it. The page check, which loads
     the real thing, is the check for it."""
     path = Path(path)
-    name = path.name
     folder = path.parent
     for _ in range(4):
         try:
-            pages = [entry for entry in folder.iterdir()
-                     if entry.is_file() and entry.suffix.lower() in WEB_SUFFIXES][:40]
+            pages = []
+            for index, entry in enumerate(folder.iterdir()):
+                if index >= 256 or len(pages) >= 40:
+                    break
+                if entry.is_file() and entry.suffix.lower() in WEB_SUFFIXES:
+                    pages.append(entry)
         except OSError:
             pages = []
         for page in pages:
             try:
-                text = page.read_text(encoding="utf-8", errors="ignore")[:400_000]
+                with page.open(encoding="utf-8", errors="ignore") as stream:
+                    text = stream.read(400_000)
             except OSError:
                 continue
             for src in _SCRIPT_TAG.findall(text):
-                if re.split(r"[\\/]", src.split("?")[0].split("#")[0])[-1] == name:
-                    return page
+                try:
+                    url = urlsplit(src)
+                    # A CDN script or a different local folder with the same
+                    # basename is not evidence that THIS script runs in a page.
+                    if url.scheme or url.netloc:
+                        continue
+                    target = page.parent / unquote(url.path).replace("\\", "/").lstrip("/")
+                    if target.resolve() == path.resolve():
+                        return page
+                except (OSError, ValueError):
+                    continue
         if folder.parent == folder:
             break
         folder = folder.parent
