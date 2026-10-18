@@ -196,6 +196,7 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             _RUNTIME.pop("last_error", None)
             _RUNTIME.pop("last_error_op", None)
             _RUNTIME.pop("mem0_error", None)
+            _RUNTIME.pop("mem0_quiet", None)
             existing = _RUNTIME.pop("store", None)
             if existing is not None:
                 try:
@@ -255,9 +256,15 @@ def store():
                 # of why mem0 could not start -- which is how an unsupported LLM
                 # provider went on looking exactly like "mem0ai isn't installed".
                 _RUNTIME["mem0_error"] = getattr(mem0_store, "last_error", "") or "unavailable"
-                log.warning("mem0 memory engine requested but unavailable (%s); "
-                            "falling back to native store", _RUNTIME["mem0_error"])
+                # Not installed, or no embedding service on this machine: the
+                # shipped default asks for mem0 everywhere, so this is the normal
+                # state of a plain install and not a fault to announce.
+                _RUNTIME["mem0_quiet"] = bool(getattr(mem0_store, "quiet", False))
+                (log.info if _RUNTIME["mem0_quiet"] else log.warning)(
+                    "mem0 memory engine requested but unavailable (%s); "
+                    "falling back to native store", _RUNTIME["mem0_error"])
             except Exception as exc:
+                _RUNTIME["mem0_quiet"] = False
                 _RUNTIME["mem0_error"] = " ".join(str(exc).split())[:300]
                 log.warning("mem0 store instantiation failed: %s; falling back to native", exc)
 
@@ -288,6 +295,13 @@ def _report_memory(active):
         elif active == configured:
             capabilities.report(capabilities.MEMORY, active=active, preferred=configured,
                                 state=capabilities.OK)
+        elif _RUNTIME.get("mem0_quiet"):
+            capabilities.report(
+                capabilities.MEMORY, active=active, preferred=configured,
+                state=capabilities.OK,
+                reason=f"mem0 not in use: {(_RUNTIME.get('mem0_error') or 'unavailable')[:120]}",
+                impact="memories use the native store",
+                fix="agent8088 --memory-setup to use mem0, or set memory_engine=native to stop looking for it")
         else:
             saved = _RUNTIME.get("native_writes_while_mem0_down", 0)
             split = (f"; {saved} memories saved to the native store while mem0 was down "

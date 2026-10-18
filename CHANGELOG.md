@@ -8,6 +8,18 @@ All notable changes to Agent8088 are recorded here. The format follows
 
 ### Fixed
 
+- Optional mem0 absence falls back quietly, while broken installed packages and
+  unexpected initialization failures remain visible.
+- Verification recognizes redirected and chained test commands, reports its
+  assurance level, and does not reuse a smoke-test pass after a later edit.
+- Project test discovery chooses an appropriate Python or npm runner instead of
+  running package modules as standalone scripts or inventing an npm test script.
+- Large diagnostic banners are bounded so a single tool result cannot exhaust
+  the model context; full output remains available through content handles.
+- Credential-shaped blobs remain flagged while code identifiers and model sizes
+  avoid unnecessary warnings.
+- Page checks distinguish missing-backend response decoding from unrelated
+  JavaScript failures. Ambiguous status-text errors remain unverified.
 - Plan-mode web searches can request one-time or session approval without being
   treated as attempts to modify files; approved searches remain read-only.
 - Required-output checks recognize files in the requested project folder without
@@ -21,6 +33,9 @@ All notable changes to Agent8088 are recorded here. The format follows
 
 ### Improved
 
+- New default allowances are 150 starting rounds, a progress-based ceiling of
+  450, and a 1200-second tool-timeout ceiling. Existing configured values and
+  time/token/cost budgets are preserved. `/limits` is listed at startup.
 - Windows native sandbox checks report verified piped-child-process limitations
   and offer Docker guidance without changing sandbox permissions or isolation.
 

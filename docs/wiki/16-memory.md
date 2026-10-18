@@ -226,6 +226,7 @@ How a missing embedder is handled, so a machine without Ollama is not nagged:
 - A service that keeps failing is asked again after 5 minutes, then 30 minutes, then every 2 hours (a machine with
   no Ollama waits the longest window). One success starts the schedule over.
 - To skip embeddings entirely, set `memory=0` and `tool_selection=full`.
+- The v1.3 release defaults to `memory_engine=native`. If you opt into `memory_engine=mem0` but the `mem0ai` package or embedding service is absent, memory uses the native store quietly: `/memory` and `/capabilities` show "mem0 not in use" with the reason and `agent8088 --memory-setup`. A broken installed package, locked folder, bad setting, or installed-but-stopped Ollama is still announced.
 
 ## Where it lives
 

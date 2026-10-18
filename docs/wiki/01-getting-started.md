@@ -197,7 +197,7 @@ rather than prompted for. See [Sandboxing](06-sandboxing.md).
 
 ## Turn limits and generated output
 
-Requests start with 50 rounds by default; `/maxturns <int>` changes the starting
+Requests start with 150 rounds by default; `/maxturns <int>` changes the starting
 allowance. Productive runs can earn more rounds within a hard ceiling. Time,
 token and cost limits are separate, so raising the turn allowance does not
 override those limits. See [Configuration](02-configuration.md#dynamic-turn-budget).

@@ -178,6 +178,28 @@ _BACKEND_FILES = frozenset({"server.js", "server.mjs", "server.cjs", "server.ts"
 _BACKEND_PACKAGES = re.compile(r'"(?:express|fastify|koa|hono|@hapi/hapi|next|nuxt|socket\.io)"')
 _BACKEND_REQUIREMENTS = re.compile(r"^\s*(?:flask|fastapi|django|aiohttp|starlette|tornado|bottle)\b", re.I | re.M)
 _BACKEND_STATUSES = (404, 405, 501)
+# Tag only errors produced by decoding an actual missing-backend response.
+# Tag the rejected native decoder error with a per-check nonce; unrelated
+# JSON.parse failures receive no tag. The observer strips it from diagnostics.
+# Promise rejection and the SyntaxError type are preserved.
+_BACKEND_JSON_ERRORS_JS = r"""marker => {
+    const original = Response.prototype.json;
+    Response.prototype.json = function (...args) {
+        const parsed = original.apply(this, args);
+        let unavailable = false;
+        try {
+            const url = new URL(this.url);
+            const path = url.pathname;
+            const route = path === '/api' || path.startsWith('/api/') || !path.split('/').pop().includes('.');
+            unavailable = url.origin === location.origin && [404, 405, 501].includes(this.status) && route;
+        } catch (_) {}
+        if (!unavailable) return parsed;
+        return parsed.catch(error => {
+            if (error instanceof SyntaxError) error.message += ' [' + marker + ']';
+            throw error;
+        });
+    };
+}"""
 
 
 def _is_route(path: str) -> bool:
@@ -444,6 +466,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
 
     failures, warnings, console = [], [], []
     backend_asked: list[str] = []       # same-origin fetch/XHR paths the static server could not answer
+    backend_texts: list[str] = []       # the status line text of those answers ("File not found")
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
     external_scripts: list[str] = []
@@ -492,6 +515,9 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                     request_route.abort()
 
             context.route("**/*", route)
+            backend_marker = f"agent8088-backend-json-{uuid.uuid4().hex}"
+            if backend:
+                context.add_init_script("(" + _BACKEND_JSON_ERRORS_JS + ")(" + json.dumps(backend_marker) + ")")
             tab = context.new_page()
             tab.set_default_timeout(timeout * 1000)
             # alert()/confirm() is a visible effect of a click; dismiss it so the
@@ -505,7 +531,21 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
             def own(url: str) -> bool:
                 return not url or url.startswith((origin, "data:", "blob:", "about:"))
 
-            tab.on("pageerror", lambda error: failures.append(f"page error: {str(error)[:200]}"))
+            def on_page_error(error):
+                message = str(error).strip()
+                tag = f" [{backend_marker}]"
+                if backend and message.endswith(tag):
+                    detail = message[:-len(tag)][:200]
+                    warnings.append(f"page error: {detail} (the reply of a server this check could not run; not counted)")
+                elif backend and message.lower() in backend_texts:
+                    # Matching words alone cannot prove causality: an app can
+                    # throw the same text independently. Never call that a pass.
+                    warnings.append(f"page error: {message[:200]} (possibly a missing backend reply; not verified)")
+                    out["unavailable"] = "a page error matched a missing backend reply; its cause was not verified"
+                else:
+                    failures.append(f"page error: {message[:200]}")
+
+            tab.on("pageerror", on_page_error)
 
             def on_console(message):
                 if message.type != "error":
@@ -526,6 +566,8 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         # The page asked its own server for data; this check serves files only, so the
                         # backend is not running and a 404 or 405 says nothing about the page.
                         backend_asked.append(path)
+                        if response.status_text:
+                            backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
                             f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
                             "serves static files only, so the backend was not running. Call the server after a "
@@ -709,6 +751,13 @@ def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
         return text
     return text[:limit] + "\n[...]\n" + text[-limit:]
 
+
+# What a server that cannot start in the probe's surroundings says: a database or log file it must create next to
+# itself in a read-only copy, or a port that is already taken.
+_START_ENVIRONMENT = re.compile(
+    r"unable to open database file|attempt to write a readonly database|readonly database|read-only file system"
+    r"|errno 30\b|\[errno 13\]|permission denied|eacces|erofs|address already in use|eaddrinuse"
+    r"|only one usage of each socket|errno 98\b|errno 10048|winerror 10048|winerror 10013", re.I)
 
 # The last line of a traceback or error that is about the place the script was started in
 # (a read-only copy, an input or output path, a missing argument) and not about the script.
@@ -953,6 +1002,12 @@ def _boot_report(path: Path, program: str, port: int,
                        f"within {BOOT_WAIT:.0f}s"])
     if line.startswith("BOOT:DIED"):
         detail = line[len("BOOT:DIED"):].strip(" :")
+        if _START_ENVIRONMENT.search(detail):
+            # The probe starts it in a read-only copy, with its own port: a server that must create its database
+            # file, or finds its port taken, has run into the probe's surroundings and not into a defect.
+            return Report("script", str(path), UNAVAILABLE,
+                          note=f"the server stopped at start because of where the probe ran it ({detail[:100]}); "
+                               "serving was not verified")
         return Report("script", str(path), FAIL,
                       ["the server exited before accepting connections on port "
                        f"{port}" + (f": {detail}" if detail else "")])

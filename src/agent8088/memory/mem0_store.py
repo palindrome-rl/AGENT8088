@@ -56,10 +56,13 @@ def _import_mem0():
         except Exception:
             pass
         import mem0
-        return getattr(mem0, "Memory", None)
-    except Exception as exc:
-        log.debug("mem0 library import failed: %s", exc)
-        return None
+        return mem0.Memory
+    except ModuleNotFoundError as exc:
+        if exc.name == "mem0":
+            return None
+        # A missing dependency inside an installed package is a broken install,
+        # not the ordinary optional-package-absent case.
+        raise
 
 
 class Mem0MemoryStore:
@@ -87,6 +90,11 @@ class Mem0MemoryStore:
         # nothing about why, and an unsupported-provider config looked identical
         # to mem0ai simply not being installed.
         self.last_error = ""
+        # True when mem0 is unavailable for an ordinary reason (the package is not
+        # installed, or this machine has no embedding service at all) rather than
+        # because something that should work broke. The memory module then falls
+        # back to the native store without announcing a fault.
+        self.quiet = False
 
     @_serialized
     def _init_memory(self):
@@ -95,10 +103,18 @@ class Mem0MemoryStore:
         if self._memory is not None:
             return self._memory
 
-        memory_cls = _import_mem0()
+        self.quiet = False
+        try:
+            memory_cls = _import_mem0()
+        except Exception as exc:
+            self.last_error = ("mem0 import failed: " + " ".join(str(exc).split()))[:300]
+            self._available = False
+            log.warning("failed to import mem0 memory engine: %s", self.last_error)
+            return None
         if memory_cls is None:
             self.last_error = ("the mem0ai package is not installed "
                                "(install it with: agent8088 --memory-setup)")
+            self.quiet = True
             self._available = False
             return None
 
@@ -272,6 +288,7 @@ class Mem0MemoryStore:
                     self.last_error = (f"embedding service unavailable for "
                                        f"{embed_provider}/{model}"
                                        + (f": {detail}" if detail else ""))[:300]
+                    self.quiet = bool(getattr(probe, "absent", False))
                     self._memory = None
                     self._available = False
                     return None

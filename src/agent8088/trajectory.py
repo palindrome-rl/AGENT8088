@@ -146,9 +146,57 @@ _CHECK_COMMAND = re.compile(
 _SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
 
 
+# Commands that move, list or remove files. A folder called `tests\` in their arguments does not make them a
+# check (`xcopy proj\tests dest` failing is a copy failing), so a segment that starts with one is not read for
+# check words. Every other command keeps the plain word match, so an unfamiliar check is still a check.
+_FILE_COMMANDS = frozenset({
+    "xcopy", "copy", "robocopy", "move", "del", "erase", "rmdir", "rd", "mkdir", "md", "ren", "rename", "dir",
+    "type", "attrib", "tree", "cd", "chdir", "pushd", "popd", "echo", "cls", "set", "ls", "cp", "mv", "rm",
+    "cat", "touch", "pwd", "mkdir", "chmod", "ln", "find", "stat", "where", "which",
+    "copy-item", "move-item", "remove-item", "get-childitem", "new-item", "set-location", "get-content"})
+def command_segments(command: str, *, split_or: bool = False) -> list[str]:
+    """Split shell sequencing outside quotes, without splitting `2>&1`.
+
+    Shared by runner evidence and failed-check bookkeeping so Windows `&`
+    sequences and quoted labels are classified consistently.
+    """
+    pieces, current, quote, i = [], [], "", 0
+    text = command or ""
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            current.append(ch)
+        elif (ch in ";\n" or (ch == "&" and not (current and current[-1] in "<>|"))
+              or (split_or and text[i:i + 2] == "||")):
+            pieces.append("".join(current))
+            current = []
+            if text[i:i + 2] in ("&&", "||"):
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    pieces.append("".join(current))
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _segment_program(segment: str) -> str:
+    words = segment.strip().split()
+    while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
+        words = words[1:]
+    return PurePath(words[0].strip("\"'")).name.lower().removesuffix(".exe") if words else ""
+
+
 def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
-    return not (command or "").strip() or bool(_CHECK_COMMAND.search(command))
+    if not (command or "").strip():
+        return True
+    return any(_CHECK_COMMAND.search(segment) for segment in command_segments(command, split_or=True)
+               if segment.strip() and _segment_program(segment) not in _FILE_COMMANDS)
 
 
 # Running the program the run itself wrote is the plainest way to see whether it works, whatever the
@@ -208,6 +256,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
+        "smoke_passed_at": {},
         "smoke_unverified": {},
         "weak_secret_asked": False,
         "smoke_asked": [],
@@ -273,6 +322,7 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["smoke_passed_at"] = {}
             self.data["smoke_output"] = {}
             self.data["smoke_unverified"] = {}
             self.data["weak_secret_asked"] = False
@@ -608,6 +658,11 @@ class TrajectoryState:
     def record_smoke(self, path: str, summary: str, failed: bool, output: str = "",
                      passed: bool = False, unverified: bool = False) -> None:
         self.data.setdefault("smoke_checked", {})[path] = self.mutation_count()
+        passed_at = self.data.setdefault("smoke_passed_at", {})
+        if passed and not failed and not unverified:
+            passed_at[path] = self.mutation_count()
+        else:
+            passed_at.pop(path, None)
         if output:
             # Raw start-up output of a failed script check, for diagnosis. Kept out of
             # the notes the model and the person read; bounded to the last few files.
@@ -708,6 +763,38 @@ class TrajectoryState:
 
     def needs_verification(self) -> bool:
         return self.data.get("verification") == "pending"
+
+    def note_ran_ok(self) -> None:
+        """A program this run wrote was run and finished without an error, at the current state of the work."""
+        self.data["ran_ok_at"] = self.mutation_count()
+
+    def assurance(self) -> str:
+        """How much the run's own evidence supports calling the changed work done, strongest first:
+
+        tested     a test run (or a check the harness trusts) passed after the last change
+        exercised  the result was loaded or run without an error, but no test run passed
+        inspected  the changed files were read back; nothing was run
+        unchecked  the work changed and nothing was run, read back or tested
+        failed     a check failed and has not passed since
+        ""         nothing was changed, so there is nothing to verify
+
+        It only summarises what the other checks recorded; it never decides that work is wrong."""
+        data = self.data
+        if not int(data.get("mutation_count") or 0):
+            level = ""
+        elif self.check_failing() or any("smoke test FAILED" in str(n) for n in data.get("smoke_notes") or []):
+            level = "failed"
+        elif data.get("verification") == "verified":
+            level = "tested"
+        elif (any(at == self.mutation_count() for at in (data.get("smoke_passed_at") or {}).values())
+              or data.get("ran_ok_at") == self.mutation_count()):
+            level = "exercised"
+        elif data.get("verification") == "inspected":
+            level = "inspected"
+        else:
+            level = "unchecked"
+        data["assurance"] = level
+        return level
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""

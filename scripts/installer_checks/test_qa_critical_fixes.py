@@ -12,10 +12,10 @@ from agent8088 import engine
 # A fresh install started every run at 10 rounds, which is below what a
 # multi-step task needs before the dynamic ceiling has any progress to grow on.
 
-def test_default_max_turns_is_fifty(monkeypatch):
+def test_default_max_turns_uses_the_shared_allowance(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {}, raising=False)
-    assert cli.Session().max_turns == 50
+    assert cli.Session().max_turns == engine.DEFAULT_MAX_TURNS == 150
 
 
 def test_configured_max_turns_still_wins(monkeypatch):
@@ -27,8 +27,8 @@ def test_configured_max_turns_still_wins(monkeypatch):
 def test_gateway_uses_the_shared_starting_allowance(monkeypatch):
     from agent8088.gateway import agent_bridge
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {})
-    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 50
-    assert agent_bridge._turn_max_turns("plan-only") == 50
+    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 150
+    assert agent_bridge._turn_max_turns("plan-only") == max(engine.DEFAULT_MAX_TURNS, agent_bridge.PLAN_MODE_MIN_TURNS)
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {"max_turns": "7"})
     assert agent_bridge._turn_max_turns("full-auto") == 7
 
@@ -41,7 +41,7 @@ def test_direct_engine_and_cli_defaults_agree():
 
 def test_capability_report_uses_the_shared_default(monkeypatch):
     monkeypatch.setattr(engine, "APP_CONFIG", {})
-    assert "Max turns per request: 50" in engine.describe_capabilities()
+    assert f"Max turns per request: {engine.DEFAULT_MAX_TURNS}" in engine.describe_capabilities()
     monkeypatch.setattr(engine, "APP_CONFIG", {"max_turns": "120"})
     assert "Max turns per request: 120" in engine.describe_capabilities()
 
@@ -49,7 +49,7 @@ def test_capability_report_uses_the_shared_default(monkeypatch):
 def test_unparseable_max_turns_falls_back_to_the_default(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {"max_turns": "not-a-number"}, raising=False)
-    assert cli.Session().max_turns == 50
+    assert cli.Session().max_turns == engine.DEFAULT_MAX_TURNS
 
 
 def test_max_turns_is_documented_in_the_shipped_config():
@@ -169,7 +169,7 @@ def test_growth_stops_at_the_ceiling():
         # Prove progress for every round of the block about to be judged.
         for _ in range(policy.limit):
             policy.record_round(fresh=True, output="ok")
-    assert policy.limit == policy.ceiling == 200
+    assert policy.limit == policy.ceiling == 50 * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
     for _ in range(policy.limit):
         policy.record_round(fresh=True, output="ok")
     assert policy.extend(policy.limit - 1) is None, "grew past the ceiling"

@@ -157,11 +157,38 @@ def _wordlike(token: str) -> bool:
 
 _CODE_SPLIT_RE = re.compile(r"[:=+/.$-]")
 _SHORT_NUMBER_RE = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,4})?")
+# A size or count with its unit, as model names carry them (0.8b, 70b, 4k, 2x).
+_QUANTITY_RE = re.compile(r"[0-9]{1,4}[A-Za-z]{1,3}")
+# The words inside an identifier: lower, Capitalised, ACRONYM (before a capital+lower), digits.
+_IDENTIFIER_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
+_IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in words of three or more
+
+
+def _identifier_like(token: str) -> bool:
+    """A single identifier in camelCase or snake_case (``raiseSpA2Speed``, ``max_tokens_v2``).
+
+    Most letters must sit in at least two lower/capitalised word-shaped pieces,
+    not an unbroken lowercase blob or an uppercase acronym. This is a shape
+    heuristic, not proof that the text is a real word or cannot be a secret."""
+    if len(token) > 40 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
+        return False
+    if sum(c.isdigit() for c in token) > 2 or (len(token) >= _MIN_HEX and _HEX_RE.fullmatch(token)):
+        return False
+    if "_" not in token and not re.search(r"[a-z][A-Z]", token):
+        return False
+    words = _IDENTIFIER_WORD_RE.findall(token.replace("_", " "))
+    letters = [w for w in words if w.isalpha()]
+    total = sum(len(w) for w in letters)
+    meaningful = [w for w in letters if len(w) >= 3 and not w.isupper()]
+    return (len(meaningful) >= 2 and total > 0
+            and sum(len(w) for w in meaningful) / total >= _IDENTIFIER_LETTERS)
 
 
 def _code_piece(piece: str) -> bool:
     """One identifier-sized word: letters with at most two digits and four capitals (``effectChance``,
-    ``f2b``, ``createElement``), or ALL CAPS."""
+    ``f2b``, ``createElement``), or ALL CAPS, or a size with its unit (``8b``)."""
+    if _QUANTITY_RE.fullmatch(piece or ""):
+        return True
     if not piece or len(piece) > 24 or not re.fullmatch(r"[A-Za-z_]\w*", piece):
         return False
     if sum(c.isdigit() for c in piece) > 2:
@@ -183,7 +210,7 @@ def _codelike(token: str) -> bool:
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token):
         return True
-    if _wordlike(token) or _codelike(token):
+    if _wordlike(token) or _codelike(token) or _identifier_like(token):
         return True
     if _PATHY_RE.search(token):
         return True

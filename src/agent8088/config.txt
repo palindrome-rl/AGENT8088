@@ -55,10 +55,10 @@ prompt_paths=~
 # earns more rounds, up to max_turns * dynamic_turns_ceiling_multiplier. Change
 # it here, or at any time with `/maxturns <n>` in the REPL, which writes it back
 # to this file.
-max_turns=50
+max_turns=150
 # How far progress may grow max_turns. 1 disables growth and restores a hard
 # fixed limit of exactly max_turns rounds.
-# dynamic_turns_ceiling_multiplier=4
+# dynamic_turns_ceiling_multiplier=3
 # Rounds granted per extension once progress is shown.
 # dynamic_turns_extension=5
 #
@@ -125,7 +125,7 @@ tool_selection=hybrid
 # Seconds without a chunk after streaming begins before recovery; 0 disables.
 # stream_idle_seconds=120
 # tool_selection_models=custom:your-model-name
-# max_tool_timeout_seconds=600
+# max_tool_timeout_seconds=1200
 # browser_max_steps=25
 # browser_task_timeout_seconds=600
 # Optional JSON forwarded only to browser-use model calls, for example:

@@ -121,6 +121,11 @@ class Embedder:
     def last_error(self) -> str:
         return self._last_error
 
+    @property
+    def absent(self) -> bool:
+        """True when the last attempt found no embedding service and none is expected on this machine."""
+        return self._absent
+
     def _window(self) -> float:
         steps = len(_BACKOFF)
         multiplier = _BACKOFF[-1] if self._absent else _BACKOFF[min(max(self._failures, 1), steps) - 1]
