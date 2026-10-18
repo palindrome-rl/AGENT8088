@@ -20164,7 +20164,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
-                    path=str(args.get("filename") or args.get("destination") or ""),
+                    path=(str(resolve_user_path(str(args["path"])))
+                          if name == "check_app" and args.get("path") else
+                          str(args.get("filename") or args.get("destination") or "")),
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
@@ -20172,7 +20174,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     written_to=_write_landing(name, args),
                 )
                 if name == "check_app":
-                    trajectory.settle_check_app(result)
+                    trajectory.settle_check_app(
+                        result, path=str(resolve_user_path(str(args["path"]))) if args.get("path") else "")
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):

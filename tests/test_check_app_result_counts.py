@@ -17,11 +17,11 @@ def state():
     return state
 
 
-def _check_app(engine, state, result, status=None):
+def _check_app(engine, state, result, status=None, path=""):
     operation = state.before_tool("check_app")
     status = engine._check_app_status("check_app", result, "unknown") if status is None else status
-    state.after_tool(operation, result, failed=False, blocked=False, mutated=False, verdict=status, command="")
-    state.settle_check_app(result)
+    state.after_tool(operation, result, failed=False, blocked=False, mutated=False, verdict=status, command="", path=path)
+    state.settle_check_app(result, path=path)
 
 
 def test_the_status_of_a_failed_check_app_is_failed(engine):
@@ -79,4 +79,14 @@ def test_a_long_target_can_settle_its_own_failure(engine, state, automatic):
         state.record_smoke(path, path + ': smoke test passed', False, passed=True)
     else:
         _check_app(engine, state, path + ': smoke test passed')
+    assert not state.check_failing()
+
+
+def test_two_pages_with_the_same_basename_are_not_the_same_check(engine, state):
+    # Real Report.summary() only displays the basename. Identity must come
+    # from the tool's actual path argument, not from those display words.
+    _check_app(engine, state, FAILED, path='site-a/index.html')
+    _check_app(engine, state, PASSED, path='site-b/index.html')
+    assert state.check_failing()
+    _check_app(engine, state, PASSED, path='site-a/index.html')
     assert not state.check_failing()

@@ -400,7 +400,7 @@ class TrajectoryState:
             # from settling the failure.
             target = (re.match(r"^(.+?): smoke test FAILED\b", str(result or ""))
                       if operation["tool"] == "check_app" else None)
-            self.data["failing_check_app_path"] = target.group(1) if target else ""
+            self.data["failing_check_app_path"] = (path or target.group(1)) if target else ""
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
@@ -810,7 +810,7 @@ class TrajectoryState:
         """The command (or tool) of the latest failing check and how it failed, shortened."""
         return str(self.data.get("failing_check") or "")
 
-    def settle_check_app(self, result: str) -> None:
+    def settle_check_app(self, result: str, path: str = "") -> None:
         """A check_app run that passed settles the earlier failure of that same page or script.
 
         The failure is recorded as "check_app -> <path>: smoke test FAILED ..."; only a later pass for that path clears
@@ -821,7 +821,7 @@ class TrajectoryState:
         text = str(result or "")
         passed = re.match(r"^\s*(.+?): smoke test passed\b", text)
         if (self.data.get("check_failing") and failed_path and "smoke test FAILED" not in text
-                and passed and _file_key(passed.group(1)) == _file_key(failed_path)):
+                and passed and _file_key(path or passed.group(1)) == _file_key(failed_path)):
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
             self.data["failing_check_app_path"] = ""
