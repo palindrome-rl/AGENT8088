@@ -364,31 +364,46 @@ def _own_install_prefix(prefix: str | Path | None = None) -> bool:
         here = Path(prefix or sys.prefix).resolve()
         roots = [os.environ.get("AGENT8088_HOME"), str(Path.home() / ".agent8088"),
                  str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088")]
-        return any(root and here.is_relative_to(Path(root).expanduser().resolve()) for root in roots)
+        return any(root and here in {
+            Path(root).expanduser().resolve() / name
+            for name in ("venv", ".venv", "agent8088/venv", "agent8088/.venv")
+        } for root in roots)
     except (OSError, ValueError, RuntimeError):
         return False
 
 
 def _project_venv_active() -> bool:
     """A venv other than Agent8088's own install is active or in use: its project owns config.txt."""
-    in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    return in_venv and not _own_install_prefix()
+    # An installed launcher still runs its own Python when invoked from an activated
+    # project environment. Check the activation separately from the interpreter.
+    active = os.environ.get("VIRTUAL_ENV")
+    if active and not _own_install_prefix(active):
+        return True
+    return ((bool(active) or sys.prefix != getattr(sys, "base_prefix", sys.prefix))
+            and not _own_install_prefix())
 
 
-_in_venv = _project_venv_active()
-_cwd_config = Path.cwd() / "config.txt"
+def _preferred_config_path() -> Path | None:
+    """Shared read/write precedence; None means no user/project config was selected.
+
+    Startup can then read packaged defaults, while setup creates a user config.
+    An existing user config must be the same for CLI writes and engine reads.
+    """
+    if os.environ.get("AGENT8088_CONFIG"):
+        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+    cwd = Path.cwd() / "config.txt"
+    if cwd.exists() or _project_venv_active():
+        return cwd
+    for candidate in (Path.home() / ".agent8088" / "config.txt",
+                      Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
-if os.environ.get("AGENT8088_CONFIG"):
-    CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-elif _cwd_config.exists() or _in_venv:
-    CONFIG_PATH = _cwd_config
-elif _user_config.exists():
-    CONFIG_PATH = _user_config
-elif _win_config.exists():
-    CONFIG_PATH = _win_config
-else:
-    CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
+CONFIG_PATH = _preferred_config_path() or Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
 if not CONFIG_PATH.exists() and not os.environ.get("AGENT8088_CONFIG"):
     # A launch that finds no config of its own while the user has one elsewhere would otherwise run

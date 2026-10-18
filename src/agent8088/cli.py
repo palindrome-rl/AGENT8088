@@ -7604,13 +7604,7 @@ def _resolve_config_path():
     project's venv should own its own config.txt rather than falling back
     to the global install.
     """
-    if os.environ.get("AGENT8088_CONFIG"):
-        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-    cwd_config = Path.cwd() / "config.txt"
-    in_venv = A._project_venv_active()
-    if cwd_config.exists() or in_venv:
-        return cwd_config
-    return Path(_agent8088_home() / "config.txt")
+    return A._preferred_config_path() or Path(_agent8088_home() / "config.txt")
 
 
 def _agent8088_link_dir():

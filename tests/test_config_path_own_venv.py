@@ -85,3 +85,30 @@ def test_the_cli_still_uses_the_project_config_in_a_project_venv(homes, tmp_path
 def test_an_explicit_config_variable_still_wins(homes, tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT8088_CONFIG", str(tmp_path / "mine.txt"))
     assert cli._resolve_config_path() == tmp_path / "mine.txt"
+
+
+def test_a_project_activation_is_honoured_even_when_the_launcher_uses_its_own_python(homes, tmp_path, monkeypatch):
+    data_dir, _ = homes
+    monkeypatch.setattr(engine.sys, "prefix", str(data_dir / "agent8088" / "venv"))
+    monkeypatch.setattr(engine.sys, "base_prefix", str(data_dir / "python"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "project" / ".venv"))
+    monkeypatch.chdir(tmp_path)
+    assert engine._project_venv_active() is True
+    assert cli._resolve_config_path() == tmp_path / "config.txt"
+
+
+def test_a_project_stored_under_the_data_directory_is_not_the_install(homes):
+    data_dir, _ = homes
+    assert not engine._own_install_prefix(data_dir / "projects" / "example" / ".venv")
+
+
+def test_cli_writes_follow_the_same_existing_global_config_as_the_engine(homes, tmp_path, monkeypatch):
+    data_dir, dot_dir = homes
+    dot_dir.mkdir()
+    (dot_dir / "config.txt").write_text("memory=0\n", encoding="utf-8")
+    (data_dir / "config.txt").write_text("memory=1\n", encoding="utf-8")
+    monkeypatch.setattr(engine.sys, "prefix", str(data_dir / "agent8088" / "venv"))
+    monkeypatch.setattr(engine.sys, "base_prefix", str(data_dir / "python"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert cli._resolve_config_path() == dot_dir / "config.txt"
