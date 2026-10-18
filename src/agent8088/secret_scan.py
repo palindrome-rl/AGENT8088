@@ -218,8 +218,12 @@ def _codelike(token: str) -> bool:
     return bool(pieces) and all(_SHORT_NUMBER_RE.fullmatch(p) or _code_piece(p) for p in pieces)
 
 
+# Subresource / lockfile integrity values (`sha512-<base64>==`): public checksums of a download, not secrets.
+_INTEGRITY_RE = re.compile(r"sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}")
+
+
 def _is_noise(token: str) -> bool:
-    if _URL_RE.search(token):
+    if _URL_RE.search(token) or _INTEGRITY_RE.fullmatch(token):
         return True
     if _wordlike(token) or _codelike(token) or _identifier_like(token):
         return True

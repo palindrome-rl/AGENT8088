@@ -198,3 +198,9 @@ def test_strict_camelcase_words_are_not_credentials(text):
 ])
 def test_random_mixed_case_is_still_found_after_the_camelcase_rule(value):
     assert secret_scan.find_secrets(f'api_token = "{value}"'), value
+
+
+def test_lockfile_integrity_hashes_are_not_credentials():
+    text = ('"integrity": "sha512-9Z2kq3rB7xYw1N0pQmVtL5uJh8aE4sDfG6yCnO3iRb0cXeTzWvUj1HlKpA2dMgSq/f8ZyNaB5tQ7w==",\n'
+            '"integrity": "sha256-abc123DEF456ghi789JKL012mno345PQR678stu90vw="')
+    assert secret_scan.find_secrets(text) == []
