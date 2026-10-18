@@ -9934,6 +9934,9 @@ _native_sandbox_broken = False
 _native_sandbox_verified = None
 _native_sandbox_failure = ""
 _NATIVE_SANDBOX_PROBE_TIMEOUT = 10
+# Whether the native Windows sandbox refuses a program that starts a child process with piped output (what
+# Node does by default): True, False, or None when not tested. The startup check passes either way.
+_native_piped_spawn_blocked = None
 # Docker gets the same two stages, for the same reason. `docker info` succeeding
 # does not mean the daemon can bind-mount our workspace: when Agent8088 itself
 # runs in a container the daemon resolves that path against the *host*, so the
@@ -10470,6 +10473,54 @@ def native_sandbox_verified() -> bool:
     return _native_sandbox_verified is True
 
 
+_PIPED_SPAWN_BLOCKED = "agent8088-piped-spawn-blocked"
+_PIPED_SPAWN_SCRIPT = (
+    "const r = require('child_process').spawnSync(process.execPath, ['-e', '0']);"
+    f"if (r.error && r.error.code === 'EPERM') console.log('{_PIPED_SPAWN_BLOCKED}');"
+    "else if (!r.error && r.status === 0) console.log('agent8088-piped-spawn-ok');")
+
+
+def _probe_piped_child_spawn(cwd: Path) -> None:
+    """Record whether the native Windows sandbox lets Node start a child with piped output.
+
+    The startup check only runs `python -c pass`, which passes whether or not this works, while
+    esbuild, Vite, Vitest, tsx and npm install scripts all start children this way. Windows only,
+    once; a probe that cannot run leaves the answer unknown rather than claiming a limit.
+    """
+    global _native_piped_spawn_blocked
+    _native_piped_spawn_blocked = None
+    if sys.platform != "win32" or _native_sandbox_broken:
+        return
+    try:
+        runtime = _native_sandbox_argv()
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
+        if not runtime or not node:
+            return
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+        result = subprocess.run(
+            runtime + ["--workspace", str(Path(cwd).resolve()), "--temp", str(sandbox_tmp),
+                       "--mode", "workspace-write", "--", node, "-e", _PIPED_SPAWN_SCRIPT],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        return
+    output = result.stdout or ""
+    if _PIPED_SPAWN_BLOCKED in output:
+        _native_piped_spawn_blocked = True
+    elif "agent8088-piped-spawn-ok" in output:
+        _native_piped_spawn_blocked = False
+
+
+SANDBOX_CHILDREN_IMPACT = (
+    "tools that start a child process with piped output fail with `spawn EPERM`: esbuild, Vite, Vitest, "
+    "tsx and npm install scripts; processes also end when the command that started them ends")
+SANDBOX_CHILDREN_FIX = (
+    "sandbox_backend=docker with docker_image (Python and Node) and docker_network=allowlist "
+    "(sandbox_allowed_domains=registry.npmjs.org)")
+
+
 # Signatures of the daemon refusing BEFORE the container ran, so the command did
 # not execute and retrying elsewhere repeats nothing. The mount entries are the
 # in-container case: the daemon resolves a bind source against the host, so a
@@ -10613,6 +10664,7 @@ def verify_sandbox_backend() -> dict:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
+            _probe_piped_child_spawn(ARTIFACTS_ROOT)
             status = sandbox_status()
             _report_sandbox(status)
             return status
@@ -10692,6 +10744,14 @@ def _report_sandbox(status: dict | None = None) -> None:
         else:
             # Docker has no network at all, which its own notice already says.
             capabilities.clear(capabilities.SANDBOX_NETWORK)
+        if resolved == "native" and _native_piped_spawn_blocked:
+            capabilities.report(
+                capabilities.SANDBOX_CHILDREN, active="no piped child processes", preferred="allowed",
+                state=capabilities.DEGRADED,
+                reason="the native Windows sandbox blocks a child process with piped output",
+                impact=SANDBOX_CHILDREN_IMPACT, fix=SANDBOX_CHILDREN_FIX)
+        else:
+            capabilities.clear(capabilities.SANDBOX_CHILDREN)
         if resolved == "native":
             capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
                                 state=capabilities.OK)
@@ -11167,6 +11227,16 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    if (sys.platform == "win32" and "spawn EPERM" in (result or "")
+            and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
+        return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
+                "a child process with piped output (Node's default), so tools built on it fail: esbuild, Vite, "
+                "Vitest, tsx and npm install scripts. It is not the file-write limit, and running the same "
+                "command again will not help. Processes also end when the command that started them ends, so "
+                "a dev server cannot be left running for a later command. Instead write plain HTML, CSS and "
+                "JavaScript that needs no build step, run scripts directly with `node file.js`, and check a "
+                "page with check_app. If the task needs a bundler or a test runner, say so in your answer: "
+                "the user can switch to the Docker backend (sandbox_backend=docker).")
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
