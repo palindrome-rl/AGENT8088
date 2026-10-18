@@ -8,6 +8,12 @@ from rich.console import Console
 from agent8088 import cli
 
 
+@pytest.fixture(autouse=True)
+def _offline_model_metadata(monkeypatch):
+    """Layout checks must not contact a developer's model endpoint."""
+    monkeypatch.setattr(cli.A, "_maybe_probe_context_window", lambda: None)
+
+
 def _render(width):
     console = Console(file=io.StringIO(), width=width, force_terminal=False, legacy_windows=False)
     original = cli.console
