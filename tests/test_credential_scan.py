@@ -176,3 +176,25 @@ def test_code_identifiers_and_model_sizes_are_not_credentials(text):
 def test_random_looking_keys_are_still_found(value):
     found = secret_scan.find_secrets(f'token = "{value}"')
     assert found, value
+
+
+# ------------------------------------------------- strict camelCase is code
+@pytest.mark.parametrize("text", [
+    "effects: ['selfSpAtkUp2', 'selfSpAtkUp1SpDefUp1']",
+    "const k = 'selfAtkUp1SpAtkUp1SpdUp1DefDown1SpDefDown1';",
+    "applyBurnDamageEndOfTurn(target, 2)",
+    "getActiveIdx = Engine.getActiveIdx",
+    "TeamBuilderRosterSlotPicker",
+    "pokemonHeldItemChoiceBand2",
+])
+def test_strict_camelcase_words_are_not_credentials(text):
+    assert secret_scan.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("value", [
+    "Bc1De2Fg3Hi4Jk5Lm6No7Pq8Rs9Tu",       # alternating upper/lower pairs with digits between them
+    "xK9mQ2vL8nR4tY7wZ3bC6dF1hJ5",         # base62 with digits through it
+    "aB3dE9gH2jK5mN8pQ1rS4tU7vW0",
+])
+def test_random_mixed_case_is_still_found_after_the_camelcase_rule(value):
+    assert secret_scan.find_secrets(f'api_token = "{value}"'), value

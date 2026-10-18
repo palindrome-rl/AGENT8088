@@ -164,11 +164,27 @@ _IDENTIFIER_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 _IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in words of three or more
 
 
+# camelCase / PascalCase made of capitalised words, each optionally followed by a small number: selfSpAtkUp2,
+# selfAtkUp1SpAtkUp1SpdUp1DefDown1SpDefDown1, getActiveIdx. Every capital starts a word of at least one lowercase letter.
+_STRICT_CAMEL_RE = re.compile(r"[A-Za-z]?[a-z]+(?:[A-Z][a-z]+[0-9]{0,2})+")
+_CAMEL_WORD_RE = re.compile(r"[A-Z]?[a-z]+")
+_CAMEL_MEAN_WORD = 2.5      # a random run of upper/lower pairs averages two letters a word
+
+
+def _strict_camel(token: str) -> bool:
+    if len(token) > 64 or not _STRICT_CAMEL_RE.fullmatch(token):
+        return False
+    words = _CAMEL_WORD_RE.findall(token)
+    return len(words) >= 2 and sum(len(w) for w in words) / len(words) >= _CAMEL_MEAN_WORD
+
+
 def _identifier_like(token: str) -> bool:
     """A single identifier in camelCase or snake_case (``raiseSpA2Speed``, ``max_tokens_v2``).
 
     Made of real words: most of its letters sit in words of three or more letters, and it carries at most two
     digits. A random mixed-case key splits into one- and two-character pieces instead, so it does not pass."""
+    if _strict_camel(token):
+        return True
     if len(token) > 40 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token):
         return False
     if sum(c.isdigit() for c in token) > 2 or (len(token) >= _MIN_HEX and _HEX_RE.fullmatch(token)):
