@@ -709,6 +709,14 @@ class TrajectoryState:
     def needs_verification(self) -> bool:
         return self.data.get("verification") == "pending"
 
+    def check_failing(self) -> bool:
+        """True until a subsequent passing check resolves the latest failure."""
+        return bool(self.data.get("check_failing"))
+
+    def failing_check_detail(self) -> str:
+        """The command (or tool) of the latest failing check and how it failed, shortened."""
+        return str(self.data.get("failing_check") or "")
+
     def settle_check_app(self, result: str) -> None:
         """A check_app run that passed settles the earlier failure of that same page or script.
 
@@ -721,14 +729,6 @@ class TrajectoryState:
                 and re.match(rf"^\s*{re.escape(match.group(1))}: smoke test passed", text)):
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
-
-    def check_failing(self) -> bool:
-        """True until a subsequent passing check resolves the latest failure."""
-        return bool(self.data.get("check_failing"))
-
-    def failing_check_detail(self) -> str:
-        """The command (or tool) of the latest failing check and how it failed, shortened."""
-        return str(self.data.get("failing_check") or "")
 
     def request_failing_follow_up(self) -> bool:
         """Ask once per failure (at most MAX_FAILING_NUDGES a request) to fix or disclose it."""
