@@ -353,21 +353,67 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
 # (created there by --setup) rather than silently falling back to the global
 # install's config just because nothing has been written to the project
 # directory yet.
-_in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-_cwd_config = Path.cwd() / "config.txt"
+def _own_install_prefix(prefix: str | Path | None = None) -> bool:
+    """Whether this Python is Agent8088's own installed environment, not a project's.
+
+    The installer puts Agent8088 in a venv under its data folder, so `sys.prefix != sys.base_prefix`
+    is always true for the installed command. That is not "inside a project's venv", and treating it
+    so sent every launch to ./config.txt (usually absent) instead of the user's own config.
+    """
+    try:
+        here = Path(prefix or sys.prefix).resolve()
+        roots = [os.environ.get("AGENT8088_HOME"), str(Path.home() / ".agent8088"),
+                 str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088")]
+        return any(root and here in {
+            Path(root).expanduser().resolve() / name
+            for name in ("venv", ".venv", "agent8088/venv", "agent8088/.venv")
+        } for root in roots)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _project_venv_active() -> bool:
+    """A venv other than Agent8088's own install is active or in use: its project owns config.txt."""
+    # An installed launcher still runs its own Python when invoked from an activated
+    # project environment. Check the activation separately from the interpreter.
+    active = os.environ.get("VIRTUAL_ENV")
+    if active and not _own_install_prefix(active):
+        return True
+    return ((bool(active) or sys.prefix != getattr(sys, "base_prefix", sys.prefix))
+            and not _own_install_prefix())
+
+
+def _preferred_config_path() -> Path | None:
+    """Shared read/write precedence; None means no user/project config was selected.
+
+    Startup can then read packaged defaults, while setup creates a user config.
+    An existing user config must be the same for CLI writes and engine reads.
+    """
+    if os.environ.get("AGENT8088_CONFIG"):
+        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+    cwd = Path.cwd() / "config.txt"
+    if cwd.exists() or _project_venv_active():
+        return cwd
+    for candidate in (Path.home() / ".agent8088" / "config.txt",
+                      Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
-if os.environ.get("AGENT8088_CONFIG"):
-    CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-elif _cwd_config.exists() or _in_venv:
-    CONFIG_PATH = _cwd_config
-elif _user_config.exists():
-    CONFIG_PATH = _user_config
-elif _win_config.exists():
-    CONFIG_PATH = _win_config
-else:
-    CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
+CONFIG_PATH = _preferred_config_path() or Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+if not CONFIG_PATH.exists() and not os.environ.get("AGENT8088_CONFIG"):
+    # A launch that finds no config of its own while the user has one elsewhere would otherwise run
+    # on the built-in defaults without a word.
+    for _other in (_user_config, _win_config):
+        if _other.exists() and _other != CONFIG_PATH:
+            _config_warn(f"No config.txt at {CONFIG_PATH}, so built-in defaults are in use; a config exists at "
+                         f"{_other}. Run from a folder without a venv, set AGENT8088_CONFIG, or run "
+                         "`agent8088 --setup` here.")
+            break
 try:
     from agent8088 import errors as _errors
     for _warning in _errors.unknown_config_keys(APP_CONFIG, source=CONFIG_PATH.name):
