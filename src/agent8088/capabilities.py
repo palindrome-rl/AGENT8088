@@ -36,6 +36,7 @@ MEMORY = "memory"
 MEMORY_EMBED = "memory_embed"
 SANDBOX = "sandbox"
 SANDBOX_NETWORK = "sandbox_network"
+SANDBOX_CHILDREN = "sandbox_children"
 BROWSER = "browser"
 MODEL = "model"
 CONTEXT = "context"
@@ -45,13 +46,14 @@ DOCUMENTS = "documents"
 GATEWAY = "gateway"
 INSTALL = "install"
 
-NAMES = (SEARCH, MEMORY, MEMORY_EMBED, SANDBOX, SANDBOX_NETWORK, BROWSER, MODEL, CONTEXT, MCP,
+NAMES = (SEARCH, MEMORY, MEMORY_EMBED, SANDBOX, SANDBOX_NETWORK, SANDBOX_CHILDREN, BROWSER, MODEL, CONTEXT, MCP,
          OCR, DOCUMENTS, GATEWAY, INSTALL)
 
 # Human labels for tables and notices. Unknown names fall back to the name.
 LABELS = {
     SEARCH: "search", MEMORY: "memory", MEMORY_EMBED: "semantic recall",
-    SANDBOX: "sandbox", SANDBOX_NETWORK: "sandbox network", BROWSER: "browser", MODEL: "model", CONTEXT: "context",
+    SANDBOX: "sandbox", SANDBOX_NETWORK: "sandbox network",
+    SANDBOX_CHILDREN: "sandbox child processes", BROWSER: "browser", MODEL: "model", CONTEXT: "context",
     MCP: "MCP", OCR: "OCR", DOCUMENTS: "documents", GATEWAY: "gateway",
     INSTALL: "install",
 }
