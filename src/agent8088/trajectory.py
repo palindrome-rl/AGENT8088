@@ -154,7 +154,34 @@ _FILE_COMMANDS = frozenset({
     "type", "attrib", "tree", "cd", "chdir", "pushd", "popd", "echo", "cls", "set", "ls", "cp", "mv", "rm",
     "cat", "touch", "pwd", "mkdir", "chmod", "ln", "find", "stat", "where", "which",
     "copy-item", "move-item", "remove-item", "get-childitem", "new-item", "set-location", "get-content"})
-_SEGMENT_SPLIT = re.compile(r"\s*(?:&&|\|\||;|\n)\s*")
+def command_segments(command: str, *, split_or: bool = False) -> list[str]:
+    """Split shell sequencing outside quotes, without splitting `2>&1`.
+
+    Shared by runner evidence and failed-check bookkeeping so Windows `&`
+    sequences and quoted labels are classified consistently.
+    """
+    pieces, current, quote, i = [], [], "", 0
+    text = command or ""
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            current.append(ch)
+        elif ch in "\"'":
+            quote = ch
+            current.append(ch)
+        elif (ch in ";\n" or (ch == "&" and not (current and current[-1] in "<>|"))
+              or (split_or and text[i:i + 2] == "||")):
+            pieces.append("".join(current))
+            current = []
+            if text[i:i + 2] in ("&&", "||"):
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    pieces.append("".join(current))
+    return [piece for piece in pieces if piece.strip()]
 
 
 def _segment_program(segment: str) -> str:
@@ -168,7 +195,7 @@ def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
     if not (command or "").strip():
         return True
-    return any(_CHECK_COMMAND.search(segment) for segment in _SEGMENT_SPLIT.split(command)
+    return any(_CHECK_COMMAND.search(segment) for segment in command_segments(command, split_or=True)
                if segment.strip() and _segment_program(segment) not in _FILE_COMMANDS)
 
 

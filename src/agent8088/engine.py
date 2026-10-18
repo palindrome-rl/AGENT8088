@@ -6902,28 +6902,7 @@ _INTERPRETER_PATH = re.compile(
 def _split_command(command: str) -> list:
     """The pieces of a shell line between `&&`, `&`, `;` and line breaks, leaving separators inside quotes alone
     (`python -c "a(); b()" && python -m unittest` is two commands, not three)."""
-    pieces, current, quote, i = [], [], "", 0
-    text = command or ""
-    while i < len(text):
-        ch = text[i]
-        if quote:
-            if ch == quote:
-                quote = ""
-            current.append(ch)
-        elif ch in "\"'":
-            quote = ch
-            current.append(ch)
-        elif ch in ";\n" or (ch == "&" and not (current and current[-1] in "<>|")
-                             and not (text[i + 1:i + 2].isdigit() and current and current[-1] == ">")):
-            pieces.append("".join(current))
-            current = []
-            if text[i:i + 2] == "&&":
-                i += 1
-        else:
-            current.append(ch)
-        i += 1
-    pieces.append("".join(current))
-    return [piece for piece in pieces if piece.strip()]
+    return trajectory.command_segments(command)
 
 
 def _runner_core(part: str) -> str:

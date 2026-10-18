@@ -79,6 +79,7 @@ def test_only_a_real_runner_verdict_counts_so_a_printed_pass_does_not(engine):
     "cd tests && dir",
     "rm -rf build/ && ls tests",
     "move build old_build",
+    'echo "label; tests"',
 ])
 def test_moving_or_listing_files_is_not_a_check_even_when_a_folder_is_called_tests(command):
     assert not _is_check_run(command)
@@ -91,6 +92,8 @@ def test_moving_or_listing_files_is_not_a_check_even_when_a_folder_is_called_tes
     "npm run build",
     "cd x && xcopy a b && pytest",
     "somefancytool tests",
+    "copy a b & python -m unittest",
+    "copy a b || pytest",
     "",
 ])
 def test_everything_else_keeps_the_plain_word_match(command):
