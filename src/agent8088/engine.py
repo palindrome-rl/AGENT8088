@@ -5709,6 +5709,55 @@ def _user_named_path(raw_path: str, parsed: Path) -> bool:
     return False
 
 
+# Which root holds a project folder the run has started writing: (project root, top-level folder) -> that root. A file
+# the person typed in their message stays at the project root while a file the agent invents goes to artifacts/, so one
+# folder (`pokemon-doubles/package.json` named, `pokemon-doubles/server.js` not) used to be split across both and could
+# not run. The first write into a folder decides, and the rest of the folder follows it.
+_PROJECT_FOLDER_ROOT: dict = {}
+
+
+def _project_relative(p: Path) -> Path:
+    """The path relative to the project root: as given when it is relative, or cut at the root when it is an absolute
+    path inside it (and not inside artifacts/). Anything else comes back unchanged and absolute."""
+    if not p.is_absolute():
+        return p
+    try:
+        resolved = p.resolve()
+        if ARTIFACTS_ROOT in resolved.parents or resolved == ARTIFACTS_ROOT:
+            return p
+        return resolved.relative_to(PROJECT_ROOT)
+    except (ValueError, OSError):
+        return p
+
+
+def _project_folder_root(p: Path):
+    """The root already holding the first folder of this relative path, or None."""
+    if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
+        return None
+    root = _PROJECT_FOLDER_ROOT.get((str(PROJECT_ROOT), p.parts[0].lower()))
+    if root is not None:
+        if (Path(root) / p.parts[0]).is_dir():
+            return Path(root)
+        # A removed folder must release its decision, not merely hide it:
+        # setdefault below otherwise keeps reviving the deleted root.
+        _PROJECT_FOLDER_ROOT.pop((str(PROJECT_ROOT), p.parts[0].lower()), None)
+    return None
+
+
+def _note_project_folder(p: Path, resolved: Path) -> None:
+    """Record where the first folder of this relative path was written."""
+    if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
+        return
+    for root in (ARTIFACTS_ROOT, PROJECT_ROOT):
+        try:
+            top = resolved.relative_to(root).parts
+        except ValueError:
+            continue
+        if top and top[0].lower() == p.parts[0].lower() and len(top) >= 2:
+            _PROJECT_FOLDER_ROOT.setdefault((str(PROJECT_ROOT), p.parts[0].lower()), root)
+            return
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -5732,12 +5781,20 @@ def resolve_write_path(raw_path: str) -> Path:
         if not _path_is_allowed(resolved):
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
+    rel = _project_relative(p)
+    held = _project_folder_root(rel)
+    if held is not None:
+        # This folder already has files from this run in one root: the rest of it goes there too.
+        together = (held / rel).resolve()
+        if _path_is_allowed(together):
+            return together
     if _user_named_path(raw_path, p):
         # The user typed this exact path: it is the deliverable, not a file the
         # agent invented, so it stays where they said (inside the permitted
         # workspace -- the checks below still refuse anything else).
         named = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
         if (named == PROJECT_ROOT or PROJECT_ROOT in named.parents) and _path_is_allowed(named):
+            _note_project_folder(rel, named)
             return named
     if p.is_absolute():
         resolved = p.resolve()
@@ -5757,6 +5814,7 @@ def resolve_write_path(raw_path: str) -> Path:
             resolved = (ARTIFACTS_ROOT / p).resolve()
     if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
+    _note_project_folder(rel, resolved)
     return resolved
 
 
