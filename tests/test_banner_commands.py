@@ -8,6 +8,12 @@ from rich.console import Console
 from agent8088 import cli
 
 
+@pytest.fixture(autouse=True)
+def _isolated_sandbox_metadata(monkeypatch):
+    """Layout checks must not repeatedly launch the host's sandbox probe."""
+    monkeypatch.setattr(cli.A, "sandbox_status", lambda: {"resolved": "native", "network_enforced": True})
+
+
 def _render(width):
     console = Console(file=io.StringIO(), width=width, force_terminal=False, legacy_windows=False)
     original = cli.console
@@ -24,9 +30,9 @@ def test_setup_commands_are_the_ones_a_new_user_needs():
     assert listed[:4] == ["/model setup", "/mode", "/search", "/doctor"]
 
 
-def test_the_two_groups_pair_up_row_for_row():
-    # The wide layout zips them; unequal groups would drop the tail of the longer one.
-    assert len(cli._SETUP_COMMANDS) == len(cli._SESSION_COMMANDS)
+def test_the_two_groups_stay_close_in_length_and_lose_no_command():
+    # The wide layout pads the shorter group; a group much longer would leave a gap in the other column.
+    assert abs(len(cli._SETUP_COMMANDS) - len(cli._SESSION_COMMANDS)) <= 1
     assert cli._ESSENTIAL_COMMANDS == cli._SETUP_COMMANDS + cli._SESSION_COMMANDS
 
 
@@ -96,3 +102,9 @@ def test_layout_tier_is_chosen_by_available_width():
     assert not isinstance(one_block, cli.Text)
     assert len(one_block.columns) == 2
     assert len(cli._essential_commands(cli._COMMANDS_TWO_BLOCK_WIDTH).columns) == 5
+
+
+def test_limits_is_listed_with_the_other_shortcuts():
+    assert "/limits" in [command for command, _ in cli._ESSENTIAL_COMMANDS]
+    for width in (140, 100, 60):
+        assert "/limits" in _render(width)
