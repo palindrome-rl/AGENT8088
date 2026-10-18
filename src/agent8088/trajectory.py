@@ -229,6 +229,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_notes": [],
         "smoke_failures": 0,
         "smoke_checked": {},
+        "smoke_passed_at": {},
         "smoke_unverified": {},
         "weak_secret_asked": False,
         "smoke_asked": [],
@@ -294,6 +295,7 @@ class TrajectoryState:
                                       if not str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
             self.data["smoke_notes"] = []
             self.data["smoke_checked"] = {}
+            self.data["smoke_passed_at"] = {}
             self.data["smoke_output"] = {}
             self.data["smoke_unverified"] = {}
             self.data["weak_secret_asked"] = False
@@ -629,6 +631,11 @@ class TrajectoryState:
     def record_smoke(self, path: str, summary: str, failed: bool, output: str = "",
                      passed: bool = False, unverified: bool = False) -> None:
         self.data.setdefault("smoke_checked", {})[path] = self.mutation_count()
+        passed_at = self.data.setdefault("smoke_passed_at", {})
+        if passed and not failed and not unverified:
+            passed_at[path] = self.mutation_count()
+        else:
+            passed_at.pop(path, None)
         if output:
             # Raw start-up output of a failed script check, for diagnosis. Kept out of
             # the notes the model and the person read; bounded to the last few files.
@@ -752,7 +759,7 @@ class TrajectoryState:
             level = "failed"
         elif data.get("verification") == "verified":
             level = "tested"
-        elif (any("smoke test passed" in str(n) for n in data.get("smoke_notes") or [])
+        elif (any(at == self.mutation_count() for at in (data.get("smoke_passed_at") or {}).values())
               or data.get("ran_ok_at") == self.mutation_count()):
             level = "exercised"
         elif data.get("verification") == "inspected":

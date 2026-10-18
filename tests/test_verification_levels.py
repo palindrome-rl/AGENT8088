@@ -145,8 +145,27 @@ def test_a_change_after_the_clean_run_drops_back():
 
 
 def test_a_page_that_loaded_cleanly_is_exercised():
-    state = _state(mutation_count=1, smoke_notes=["index.html: smoke test passed"])
+    state = _state(mutation_count=1)
+    state.record_smoke("index.html", "index.html: smoke test passed", failed=False, passed=True)
     assert state.assurance() == "exercised"
+
+
+def test_a_smoke_pass_before_a_later_edit_is_not_fresh_evidence():
+    state = _state(mutation_count=1, verification="pending")
+    state.record_smoke("index.html", "index.html: smoke test passed", failed=False, passed=True)
+    _run(state, "", "wrote file", mutated=True)
+    assert state.assurance() == "unchecked"
+
+
+def test_a_new_smoke_result_supersedes_the_previous_pass():
+    state = _state(mutation_count=1, verification="pending")
+    state.record_smoke("index.html", "index.html: smoke test passed", failed=False, passed=True)
+    state.record_smoke("index.html", "index.html: could not verify", failed=False, unverified=True)
+    assert state.assurance() == "unchecked"
+
+
+def test_legacy_smoke_text_without_a_revision_is_not_fresh_evidence():
+    assert _state(mutation_count=2, smoke_notes=["index.html: smoke test passed"]).assurance() == "unchecked"
 
 
 def test_reading_the_files_back_is_inspected():
@@ -162,7 +181,8 @@ def test_a_failing_check_or_page_is_failed_whatever_else_passed():
 def test_the_answer_says_which_level_it_reached(engine):
     tested = _state(mutation_count=1, verification="verified")
     assert "Verification: tested." in engine._with_task_notes("Done.", tested)
-    exercised = _state(mutation_count=1, smoke_notes=["index.html: smoke test passed"])
+    exercised = _state(mutation_count=1)
+    exercised.record_smoke("index.html", "index.html: smoke test passed", failed=False, passed=True)
     answer = engine._with_task_notes("Done.", exercised)
     assert "Verification: exercised." in answer and "weaker than a passing test" in answer
     assert not answer.startswith("NOT VERIFIED")
