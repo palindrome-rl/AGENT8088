@@ -5720,6 +5720,55 @@ def _user_named_path(raw_path: str, parsed: Path) -> bool:
     return False
 
 
+# Which root holds a project folder the run has started writing: (project root, top-level folder) -> that root. A file
+# the person typed in their message stays at the project root while a file the agent invents goes to artifacts/, so one
+# folder (`pokemon-doubles/package.json` named, `pokemon-doubles/server.js` not) used to be split across both and could
+# not run. The first write into a folder decides, and the rest of the folder follows it.
+_PROJECT_FOLDER_ROOT: dict = {}
+
+
+def _project_relative(p: Path) -> Path:
+    """The path relative to the project root: as given when it is relative, or cut at the root when it is an absolute
+    path inside it (and not inside artifacts/). Anything else comes back unchanged and absolute."""
+    if not p.is_absolute():
+        return p
+    try:
+        resolved = p.resolve()
+        if ARTIFACTS_ROOT in resolved.parents or resolved == ARTIFACTS_ROOT:
+            return p
+        return resolved.relative_to(PROJECT_ROOT)
+    except (ValueError, OSError):
+        return p
+
+
+def _project_folder_root(p: Path):
+    """The root already holding the first folder of this relative path, or None."""
+    if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
+        return None
+    root = _PROJECT_FOLDER_ROOT.get((str(PROJECT_ROOT), p.parts[0].lower()))
+    if root is not None:
+        if (Path(root) / p.parts[0]).is_dir():
+            return Path(root)
+        # A removed folder must release its decision, not merely hide it:
+        # setdefault below otherwise keeps reviving the deleted root.
+        _PROJECT_FOLDER_ROOT.pop((str(PROJECT_ROOT), p.parts[0].lower()), None)
+    return None
+
+
+def _note_project_folder(p: Path, resolved: Path) -> None:
+    """Record where the first folder of this relative path was written."""
+    if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
+        return
+    for root in (ARTIFACTS_ROOT, PROJECT_ROOT):
+        try:
+            top = resolved.relative_to(root).parts
+        except ValueError:
+            continue
+        if top and top[0].lower() == p.parts[0].lower() and len(top) >= 2:
+            _PROJECT_FOLDER_ROOT.setdefault((str(PROJECT_ROOT), p.parts[0].lower()), root)
+            return
+
+
 def resolve_write_path(raw_path: str) -> Path:
     """Store what the agent creates in artifacts/; honour a stated location.
 
@@ -5743,12 +5792,20 @@ def resolve_write_path(raw_path: str) -> Path:
         if not _path_is_allowed(resolved):
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
+    rel = _project_relative(p)
+    held = _project_folder_root(rel)
+    if held is not None:
+        # This folder already has files from this run in one root: the rest of it goes there too.
+        together = (held / rel).resolve()
+        if _path_is_allowed(together):
+            return together
     if _user_named_path(raw_path, p):
         # The user typed this exact path: it is the deliverable, not a file the
         # agent invented, so it stays where they said (inside the permitted
         # workspace -- the checks below still refuse anything else).
         named = (p if p.is_absolute() else PROJECT_ROOT / p).resolve()
         if (named == PROJECT_ROOT or PROJECT_ROOT in named.parents) and _path_is_allowed(named):
+            _note_project_folder(rel, named)
             return named
     if p.is_absolute():
         resolved = p.resolve()
@@ -5768,6 +5825,7 @@ def resolve_write_path(raw_path: str) -> Path:
             resolved = (ARTIFACTS_ROOT / p).resolve()
     if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
+    _note_project_folder(rel, resolved)
     return resolved
 
 
@@ -6967,6 +7025,17 @@ def _evidence_status(name: str, args: dict, result: str, status: str, source: st
     if status == "failed" and name == "execute_shell" and "exit status" in source:
         return status
     return "unknown"
+
+
+def _check_app_status(name: str, result: str, status: str) -> str:
+    """The page or script check the model ran itself reports its own verdict: "<path>: smoke test FAILED - ...".
+
+    No test runner printed it, so detect_verdict cannot read it and it stayed "unknown": a run whose own check_app showed
+    a broken page ended with no failing check and no headline. Only the failure is taken from the text; a pass is not
+    a test run and is handled by the tracker, which settles the earlier failure of the same page."""
+    if name == "check_app" and status not in ("passed", "failed") and "smoke test FAILED" in str(result or ""):
+        return "failed"
+    return status
 
 
 def _standalone_test_command(command: str) -> bool:
@@ -18986,7 +19055,8 @@ def _not_verified_reasons(trajectory) -> list:
 
 
 _ASSURANCE_LINES = {
-    "tested": "Verification: tested. A test run passed after the last change.",
+    "tested": ("Verification: tested. A test run passed after the last change (the run's own tests; this does not "
+               "check the result against what was asked)."),
     "exercised": ("Verification: exercised. The result was run or loaded without an error, but no test run "
                   "passed, which is weaker than a passing test."),
 }
@@ -19627,11 +19697,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                          "is done and what is still missing."))
                 answer = (answer or str(_last_tool_output or "")
                           or "No answer was produced before the output limit.")
-                answer = _guard_answer(
+                answer = _with_task_notes(_guard_answer(
                     f"{answer}\n\n[Stopped after {length_retries} output-limit "
                     "cut-offs. Raise main_llm_min_tokens or length_retry_max_tokens "
                     "(or the provider's max_completion_tokens) if replies are "
-                    "legitimately this long.]")
+                    "legitimately this long.]"), trajectory)
                 if on_answer:
                     on_answer(answer)
                 return answer
@@ -19906,9 +19976,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                      # A run the post-check cap stopped was never watched
                                                      # pass, so it is not a clean success even with no failing
                                                      # verdict recorded. Calling it one let a broken run exit 0.
-                                                     post_check_told
+                                                     # One whose work was tested, or run and loaded cleanly,
+                                                     # was watched pass.
+                                                     (post_check_told
+                                                      and (trajectory is None
+                                                           or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
             return answer
 
         if on_calls:
@@ -20150,6 +20225,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # waiting for, so say so rather than letting the summary fall
                 # through to "no automated verification passed".
                 status = _evidence_status(name, args, result, verdict.status, verdict.source)
+                status = _check_app_status(name, result, status)
                 audit_verdict = _take_audit_verdict()
                 if audit_verdict == "passed":
                     status = "passed"
@@ -20162,6 +20238,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                     trajectory.note_ran_ok()
+                check_app_path = ""
+                if name == "check_app" and args.get("path"):
+                    try:
+                        check_app_path = str(resolve_user_path(str(args["path"])))
+                    except (OSError, ValueError, RuntimeError):
+                        # The tool already reports invalid/disallowed paths.
+                        # Bookkeeping must not turn that refusal into a crash.
+                        pass
                 trajectory.after_tool(
                     operation, result,
                     failed=_plan_step_failed(result) or audit_verdict == "failed",
@@ -20170,13 +20254,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
-                    path=str(args.get("filename") or args.get("destination") or ""),
+                    path=(check_app_path if name == "check_app" else
+                          str(args.get("filename") or args.get("destination") or "")),
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                     written_to=_write_landing(name, args),
                 )
+                if name == "check_app":
+                    trajectory.settle_check_app(result, path=check_app_path)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):
@@ -20460,9 +20547,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                      # A run the post-check cap stopped was never watched
                                                      # pass, so it is not a clean success even with no failing
                                                      # verdict recorded. Calling it one let a broken run exit 0.
-                                                     post_check_told
+                                                     (post_check_told
+                                                      and (trajectory is None
+                                                           or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
@@ -20559,7 +20649,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         interrupt_check=interrupt_check, trace=trace, turn=policy.limit,
         client=client, provider_name=provider_name, model_name=model_name)
     if wrapped:
-        answer = _guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_")
+        answer = _with_task_notes(_guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_"), trajectory)
         if on_answer:
             on_answer(answer)
         if trace is not None:
@@ -20569,7 +20659,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     fallback = f"Error: Agent {reason}."
     if latest:
         fallback += f"\n\nLatest tool result:\n{latest[:2500]}"
-    fallback = _guard_answer(fallback)
+    fallback = _with_task_notes(_guard_answer(fallback), trajectory)
     if on_answer:
         on_answer(fallback)
     if trace is not None:

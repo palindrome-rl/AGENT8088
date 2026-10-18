@@ -214,6 +214,40 @@ def _runs_a_written_file(command: str, written) -> bool:
     return False
 
 
+# What a script says when it was run in the wrong place: a browser file started under Node or Python (no `document`, no
+# `window`), or an ES module started as a plain script. The file may be fine where it belongs, so that run says
+# nothing about it. Only a run of a file the run wrote, with no check word in the command, is read this way: a
+# failing test or check script is still a failure.
+_WRONG_PLACE = re.compile(
+    r"\b(?:document|window|navigator|localStorage|sessionStorage|alert|confirm|Image|Audio|HTMLElement|"
+    r"requestAnimationFrame|XMLHttpRequest|customElements|MutationObserver|ResizeObserver|IntersectionObserver|"
+    r"AudioContext|CanvasRenderingContext2D)\s+is not defined"
+    r"|Cannot use import statement outside a module|Unexpected token 'export'"
+    r"|require is not defined in ES module scope|ERR_REQUIRE_ESM|ERR_UNKNOWN_FILE_EXTENSION"
+    r"|name '(?:document|window|navigator)' is not defined", re.IGNORECASE)
+_TRACEBACK = re.compile(r"Traceback \(most recent call last\)|^\s*(?:\w+\.)*\w*(?:Error|Exception)\b", re.MULTILINE)
+# `cd "C:\long\path" &&` in front of the command says where, not what.
+_CD_PREFIX = re.compile(r"""^\s*(?:cd|chdir|pushd)\s+(?:/d\s+)?(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;|&)\s*""", re.IGNORECASE)
+
+
+def _command_core(command: str) -> str:
+    """The command without the `cd <folder> &&` in front of it (up to two of them)."""
+    text = (command or "").strip()
+    for _ in range(2):
+        stripped = _CD_PREFIX.sub("", text, count=1)
+        if stripped == text or not stripped.strip():
+            break
+        text = stripped
+    return text
+
+
+def _wrong_place_failure(command: str, result: str, written) -> bool:
+    """A run of a written file that failed only because it was started where it does not belong."""
+    return (bool(_WRONG_PLACE.search(str(result)))
+            and _runs_a_written_file(command, written)
+            and not _is_check_run(command))
+
+
 def _same_command(a: str, b: str) -> bool:
     return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
 
@@ -388,22 +422,44 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
+        written_now = self.data.get("written_paths")
         if (operation["verdict"] == "failed"
-                and (_is_check_run(command) or _runs_a_written_file(command, self.data.get("written_paths")))
-                and not _SANDBOX_BLOCKED.search(str(result))):
+                and (_is_check_run(command) or _runs_a_written_file(command, written_now))
+                and not _SANDBOX_BLOCKED.search(str(result))
+                and not _wrong_place_failure(command, result, written_now)):
             self.data["check_failing"] = True
-            what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
+            what = (_command_core(command) or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
             self.data["failing_command"] = " ".join(command.split())
+            # The written files this run started: a clean run of any of them later settles the failure.
+            self.data["failing_files"] = ([] if _is_check_run(command) else
+                                         [PurePath(str(f)).name for f in written_now or []
+                                          if _runs_a_written_file(command, [f])][:6])
+            # Display notes are deliberately shortened. Keep the check target
+            # separately so a long path cannot prevent its successful retry
+            # from settling the failure.
+            target = (re.match(r"^(.+?): smoke test FAILED\b", str(result or ""))
+                      if operation["tool"] == "check_app" else None)
+            self.data["failing_check_app_path"] = (path or target.group(1)) if target else ""
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
                 and self.data.get("check_failing")
+                and not _TRACEBACK.search(str(result))
                 and _same_command(self.data.get("failing_command"), command)):
             # The very command that failed has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
+        elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
+                and self.data.get("check_failing") and self.data.get("failing_files")
+                and not _TRACEBACK.search(str(result))
+                and any(_runs_a_written_file(command, [name]) for name in self.data["failing_files"])):
+            # The failure was a run of a file the run wrote; that file has now run again, exited cleanly and
+            # printed no error, whatever else the command line said.
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+            self.data["failing_files"] = []
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self._set_step("Complete the requested work", "done")
@@ -688,10 +744,10 @@ class TrajectoryState:
             # check of that same file (its name is in the failure) no longer stands.
             failure = str(self.data.get("failing_check") or "")
             match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failure)
-            failed_path = match.group(1) if match else ""
+            failed_path = self.data.get("failing_check_app_path") or (match.group(1) if match else "")
             same = (_file_key(failed_path) == _file_key(path)
                     or (failed_path == PurePath(path).name))
-            if self.data.get("check_failing") and match and same:
+            if self.data.get("check_failing") and failed_path and same:
                 self.data["check_failing"] = False
                 self.data["failing_check"] = ""
 
@@ -803,6 +859,22 @@ class TrajectoryState:
     def failing_check_detail(self) -> str:
         """The command (or tool) of the latest failing check and how it failed, shortened."""
         return str(self.data.get("failing_check") or "")
+
+    def settle_check_app(self, result: str, path: str = "") -> None:
+        """A check_app run that passed settles the earlier failure of that same page or script.
+
+        The failure is recorded as "check_app -> <path>: smoke test FAILED ..."; only a later pass for that path clears
+        it, and a pass for another file does not. A pass here is not a test run: it never makes the work "verified"."""
+        failing = str(self.data.get("failing_check") or "")
+        match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failing)
+        failed_path = self.data.get("failing_check_app_path") or (match.group(1) if match else "")
+        text = str(result or "")
+        passed = re.match(r"^\s*(.+?): smoke test passed\b", text)
+        if (self.data.get("check_failing") and failed_path and "smoke test FAILED" not in text
+                and passed and _file_key(path or passed.group(1)) == _file_key(failed_path)):
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+            self.data["failing_check_app_path"] = ""
 
     def request_failing_follow_up(self) -> bool:
         """Ask once per failure (at most MAX_FAILING_NUDGES a request) to fix or disclose it."""
