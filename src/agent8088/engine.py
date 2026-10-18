@@ -2019,6 +2019,15 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
             return True
         if mode == "cron" and command == "list":
             return True
+        if mode == "search":
+            # A search the user has just approved is read-only, so the grant counts here as it does in
+            # the other modes. Without this the approval was ignored and the same search asked again.
+            if _ANY_GRANT_KEY in _one_shot_grants:
+                _one_shot_grants.discard(_ANY_GRANT_KEY)
+                return True
+            if approval_key and approval_key in _one_shot_grants:
+                _one_shot_grants.discard(approval_key)
+                return True
         return False
     if mode == "write_text" and path_zone == "no_prompt":
         return True
@@ -12720,9 +12729,10 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     # instead of telling the model how plan mode works — the model never learns why.
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
+    # A search is not one of them: it only reads, so planning needs it. One that has to ask first reaches
+    # the permission gate below and asks the user. Blocking it here told the model to "keep reading" and
+    # then refused to let it, and two refused searches ended the whole plan session.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
-    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled()
-                          and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
@@ -12972,8 +12982,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 target_mode="edit",
                 paths=[f"web_search (DDGS): {query[:100]}"],
                 change_type="network_fallback",
-                reason=("Local SearXNG returned no results. Retry this exact query "
-                        "with public DuckDuckGo search?"),
+                reason=((f"{_searxng_fallback_cause(report)} Retry this exact query "
+                         "with public DuckDuckGo search? Choosing Session lets later searches "
+                         "do the same without asking.")),
             )
         return _frame_search_results(_with_search_note(report))
 
@@ -16068,6 +16079,19 @@ def _search_was_usable(result: str) -> bool:
     refused as "the search already answered this".
     """
     return "Search results (via " in (result or "")
+
+
+def _searxng_fallback_cause(report) -> str:
+    """What to tell the user about why the local SearXNG did not serve this search.
+
+    The same prompt covers a SearXNG that is not running and one that ran and found
+    nothing; saying "returned no results" for the first sent a user looking for a
+    query problem when the container had been removed.
+    """
+    detail = " ".join(str(f) for f in getattr(report, "failures", ()) if str(f).startswith("searxng"))
+    if re.search(r"could not reach|connection refused|timed out|not answering|unreachable", detail, re.I):
+        return "Local SearXNG is not answering."
+    return "Local SearXNG returned no results."
 
 
 def _frame_search_results(results: str, now=None) -> str:
