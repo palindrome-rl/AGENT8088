@@ -395,6 +395,12 @@ class TrajectoryState:
             what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
             self.data["failing_command"] = " ".join(command.split())
+            # Display notes are deliberately shortened. Keep the check target
+            # separately so a long path cannot prevent its successful retry
+            # from settling the failure.
+            target = (re.match(r"^(.+?): smoke test FAILED\b", str(result or ""))
+                      if operation["tool"] == "check_app" else None)
+            self.data["failing_check_app_path"] = target.group(1) if target else ""
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
@@ -688,10 +694,10 @@ class TrajectoryState:
             # check of that same file (its name is in the failure) no longer stands.
             failure = str(self.data.get("failing_check") or "")
             match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failure)
-            failed_path = match.group(1) if match else ""
+            failed_path = self.data.get("failing_check_app_path") or (match.group(1) if match else "")
             same = (_file_key(failed_path) == _file_key(path)
                     or (failed_path == PurePath(path).name))
-            if self.data.get("check_failing") and match and same:
+            if self.data.get("check_failing") and failed_path and same:
                 self.data["check_failing"] = False
                 self.data["failing_check"] = ""
 
@@ -811,11 +817,14 @@ class TrajectoryState:
         it, and a pass for another file does not. A pass here is not a test run: it never makes the work "verified"."""
         failing = str(self.data.get("failing_check") or "")
         match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failing)
+        failed_path = self.data.get("failing_check_app_path") or (match.group(1) if match else "")
         text = str(result or "")
-        if (self.data.get("check_failing") and match and "smoke test FAILED" not in text
-                and re.match(rf"^\s*{re.escape(match.group(1))}: smoke test passed", text)):
+        passed = re.match(r"^\s*(.+?): smoke test passed\b", text)
+        if (self.data.get("check_failing") and failed_path and "smoke test FAILED" not in text
+                and passed and _file_key(passed.group(1)) == _file_key(failed_path)):
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
+            self.data["failing_check_app_path"] = ""
 
     def request_failing_follow_up(self) -> bool:
         """Ask once per failure (at most MAX_FAILING_NUDGES a request) to fix or disclose it."""

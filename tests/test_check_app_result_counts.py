@@ -66,3 +66,17 @@ def test_a_pass_with_warnings_only_does_not_set_anything(engine, state):
 def test_an_unavailable_check_sets_nothing(engine, state):
     _check_app(engine, state, "index.html: smoke test unavailable (no browser)")
     assert not state.check_failing()
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_a_long_target_can_settle_its_own_failure(engine, state, automatic):
+    path = 'site/' + 'nested/' * 28 + 'index.html'
+    _check_app(engine, state, path + ': smoke test FAILED - broken')
+    assert state.check_failing()
+    _check_app(engine, state, 'other/index.html: smoke test passed')
+    assert state.check_failing()
+    if automatic:
+        state.record_smoke(path, path + ': smoke test passed', False, passed=True)
+    else:
+        _check_app(engine, state, path + ': smoke test passed')
+    assert not state.check_failing()
