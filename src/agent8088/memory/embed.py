@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import getproxies, proxy_bypass
 
 from agent8088 import capabilities
 
@@ -76,13 +77,21 @@ def endpoint_state(base_url, provider=""):
 
     "up": a connection opens. "absent": nothing answers and, for the built-in local ollama provider, Ollama is
     not installed here at all, so no message could tell the user to do something that helps. "down": nothing
-    answers but the service is expected (Ollama installed but not running, a remote or custom provider).
-    "unknown": the address could not be read, so ask the service and let it answer.
+    answers but local Ollama is installed and expected.
+    "unknown": a direct probe is not applicable, so use the configured client's transport.
     """
     endpoint = _endpoint(base_url)
     if endpoint is None:
         return "unknown"
     host, port = endpoint
+    # A direct TCP probe cannot judge a remote/proxied/custom client. Corporate
+    # proxies and custom HTTP transports may work even when direct access does not.
+    if str(provider or "").lower() != "ollama" or host.lower() not in _LOOPBACK:
+        return "unknown"
+    scheme = urlparse(str(base_url)).scheme
+    proxies = getproxies()
+    if (proxies.get(scheme) or proxies.get("all")) and not proxy_bypass(host):
+        return "unknown"
     if _reachable(host, port):
         return "up"
     if str(provider or "").lower() == "ollama" and host.lower() in _LOOPBACK and not _ollama_installed():
@@ -225,9 +234,8 @@ class Embedder:
                     "active provider exposes no /embeddings endpoint; "
                     "set memory_embed_provider to one that does"))
                 return []
-            # Until it has answered once, check that something is listening before sending a request: a refused
-            # connection is instant and a silent host costs under a second, where the request itself waits its
-            # full timeout. Nothing listening is then not a failure to announce on a machine with no Ollama.
+            # Probe only the built-in local Ollama path before its first success.
+            # Remote/custom/proxied services must be judged by their configured transport.
             if self._probed is not True:
                 address = getattr(client, "base_url", None)
                 state = endpoint_state(address, self.provider)
