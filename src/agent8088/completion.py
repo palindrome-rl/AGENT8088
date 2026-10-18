@@ -363,15 +363,16 @@ def _landed_under(folder: Path, landed: Iterable, roots: Iterable[Path]) -> bool
     return False
 
 
-_FOLDER_PREFIX = re.compile(r"(?<![\w/\\.:@-])((?:[\w.-]+[\\/])+)")
-
-
 def _named_folders(request: str) -> set[str]:
-    """Folder names the request writes as a path prefix: "pokemon-doubles/", "public/data/"."""
-    names: set[str] = set()
-    for match in _FOLDER_PREFIX.finditer(_prose(request)):
-        names.update(seg.lower() for seg in re.split(r"[\\/]", match.group(1)) if seg and seg not in (".", ".."))
-    return names
+    """Full output-directory paths, not input directories or isolated path segments."""
+    names = set(named_output_dirs(request))
+    for path in named_output_paths(request):
+        parent = str(PurePath(path.replace("\\", "/")).parent)
+        if parent != ".":
+            names.add(parent)
+    return {name.replace("\\", "/").rstrip("/") for name in names
+            if not Path(name).is_absolute() and ".." not in PurePath(name.replace("\\", "/")).parts
+            and name not in (".", "", "~")}
 
 
 def _written_in_named_folder(path: str, request: str, candidates: Iterable[str],
@@ -384,15 +385,16 @@ def _written_in_named_folder(path: str, request: str, candidates: Iterable[str],
     named. The folder must be one the request itself names: a file written under an unrelated
     folder does not count.
     """
-    tail = [p.lower() for p in PurePath(path.replace("\\", "/")).parts if p not in ("/", "\\")]
-    folders = _named_folders(request)
-    if not tail or not folders:
+    # Explicit root/absolute paths are not shorthand for a project-relative output.
+    normal = path.replace("\\", "/")
+    if normal.startswith(("./", "../", "~/")) or Path(path).is_absolute():
         return False
-    n = len(tail)
+    folders = _named_folders(request)
+    if not normal or not folders:
+        return False
+    expected = {_file_id(Path(root) / folder / normal) for root in roots for folder in folders}
     for candidate in candidates:
-        low = [p.lower() for p in PurePath(str(candidate).replace("\\", "/")).parts]
-        if len(low) > n and low[-n:] == tail and low[-n - 1] in folders \
-                and _exists_somewhere(str(candidate), roots):
+        if any(_file_id(c) in expected and _nonempty_file(c) for c in _candidates(str(candidate), roots)):
             return True
     return False
 
@@ -401,15 +403,17 @@ def _written_under_named_dir(folder: str, request: str, candidates: Iterable[str
                              roots: Iterable[Path], mirrors: Iterable[Path]) -> bool:
     """A folder the request names (proj/, public/) holds files the run wrote, one level inside the
     artifacts folder or inside another folder the request names."""
-    tail = [p.lower() for p in PurePath(folder.replace("\\", "/")).parts if p not in ("/", "\\")]
-    if not tail:
+    normal = folder.replace("\\", "/")
+    if not normal or normal.startswith(("./", "../", "~/")) or Path(folder).is_absolute():
         return False
-    parents = _named_folders(request) | {PurePath(str(m)).name.lower() for m in mirrors}
-    n = len(tail)
+    # Anchor every match to an allowed workspace/mirror root; a directory with the
+    # same basename somewhere else is not evidence that this output exists.
+    roots = list(roots) + list(mirrors)
+    parents = _named_folders(request) | {""}
+    expected = {_file_id(Path(root) / parent / normal) + os.sep for root in roots for parent in parents}
     for candidate in candidates:
-        low = [p.lower() for p in PurePath(str(candidate).replace("\\", "/")).parts[:-1]]
-        for i in range(1, len(low) - n + 1):
-            if low[i:i + n] == tail and low[i - 1] in parents and _exists_somewhere(str(candidate), roots):
+        for item in _candidates(str(candidate), roots):
+            if any(_file_id(item).startswith(prefix) for prefix in expected) and _nonempty_file(item):
                 return True
     return False
 

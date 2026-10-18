@@ -79,3 +79,16 @@ def test_a_folder_of_that_name_somewhere_unrelated_does_not_count(tmp_path):
     written = [_write(tmp_path / "elsewhere" / "deep" / "proj" / "server.js")]
     missing = _missing(tmp_path, "Put the results in the proj/ folder.", "done", written)
     assert "proj/ (missing or empty)" in missing
+
+
+def test_an_explicit_root_output_cannot_be_satisfied_by_another_named_folder(tmp_path):
+    written = [_write(tmp_path / "artifacts" / "logs" / "server.js"),
+               _write(tmp_path / "logs" / "debug.txt")]
+    missing = _missing(tmp_path, "Create ./server.js at the workspace root. Write logs/debug.txt.", "done", written)
+    assert any("server.js" in item for item in missing)
+
+
+def test_an_input_directory_does_not_relocate_the_requested_output(tmp_path):
+    written = [_write(tmp_path / "artifacts" / "inputs" / "report.csv")]
+    missing = _missing(tmp_path, "Read inputs/data.csv and write report.csv.", "done", written)
+    assert any(item.startswith("report.csv") for item in missing)
