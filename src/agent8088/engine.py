@@ -20447,7 +20447,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                      # A run the post-check cap stopped was never watched
                                                      # pass, so it is not a clean success even with no failing
                                                      # verdict recorded. Calling it one let a broken run exit 0.
-                                                     post_check_told
+                                                     (post_check_told
+                                                      and (trajectory is None
+                                                           or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
                                                          and trajectory.check_failing()))})
                     return answer

@@ -3,6 +3,7 @@
 Seen in real runs: a run ended by repeated output cut-offs, or by the repeated-call breaker, gave an honest model reply but
 no verification level and no "NOT VERIFIED" headline, because only the ordinary finish path added the end-of-run notes."""
 from types import SimpleNamespace as N
+import pytest
 
 from tests.test_completion_pipeline import _call, eng, failing_then_ok  # noqa: F401
 from tests.test_length_retry import _PARTIAL_CALL, _length_response, _stop_response
@@ -65,3 +66,26 @@ def test_tested_says_what_it_covers(engine):
     state.data.update(TESTED)
     note = engine._with_task_notes("Done.", state)
     assert "the run's own tests" in note and "does not check the result against what was asked" in note
+
+
+@pytest.mark.parametrize('level,failing,incomplete', [
+    ('tested', False, False), ('exercised', False, False),
+    ('unchecked', False, True), ('failed', True, True), ('tested', True, True),
+])
+def test_the_hard_backstop_uses_the_same_completion_policy(engine, monkeypatch, level, failing, incomplete):
+    from agent8088.trajectory import TrajectoryState
+    from tests.test_unmet_after_cap import _run, _calc
+    monkeypatch.setattr(engine, 'DISPOSABLE_CONTAINER', True)
+    monkeypatch.setattr(engine, 'MAX_POST_CHECK_ROUNDS', 2)
+    monkeypatch.setattr(TrajectoryState, 'assurance', lambda self: level)
+    monkeypatch.setattr(TrajectoryState, 'check_failing', lambda self: failing)
+
+    def script(i, messages):
+        if 'no more tools will run' in str(messages[-1].get('content')):
+            return 'Fresh summary.'
+        return 'All done.' if i == 1 else _calc(i)
+
+    _, _, trace = _run(engine, monkeypatch, 'compute', script)
+    assert any(event['type'] == 'post_check_backstop' for event in trace)
+    final = [event for event in trace if event['type'] == 'final_answer'][-1]
+    assert final['incomplete'] is incomplete
