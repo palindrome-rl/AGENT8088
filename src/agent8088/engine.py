@@ -18968,7 +18968,8 @@ def _not_verified_reasons(trajectory) -> list:
 
 
 _ASSURANCE_LINES = {
-    "tested": "Verification: tested. A test run passed after the last change.",
+    "tested": ("Verification: tested. A test run passed after the last change (the run's own tests; this does not "
+               "check the result against what was asked)."),
     "exercised": ("Verification: exercised. The result was run or loaded without an error, but no test run "
                   "passed, which is weaker than a passing test."),
 }
@@ -19609,11 +19610,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                          "is done and what is still missing."))
                 answer = (answer or str(_last_tool_output or "")
                           or "No answer was produced before the output limit.")
-                answer = _guard_answer(
+                answer = _with_task_notes(_guard_answer(
                     f"{answer}\n\n[Stopped after {length_retries} output-limit "
                     "cut-offs. Raise main_llm_min_tokens or length_retry_max_tokens "
                     "(or the provider's max_completion_tokens) if replies are "
-                    "legitimately this long.]")
+                    "legitimately this long.]"), trajectory)
                 if on_answer:
                     on_answer(answer)
                 return answer
@@ -19888,9 +19889,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                      # A run the post-check cap stopped was never watched
                                                      # pass, so it is not a clean success even with no failing
                                                      # verdict recorded. Calling it one let a broken run exit 0.
-                                                     post_check_told
+                                                     # One whose work was tested, or run and loaded cleanly,
+                                                     # was watched pass.
+                                                     (post_check_told
+                                                      and (trajectory is None
+                                                           or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
             return answer
 
         if on_calls:
@@ -20442,9 +20448,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                      # A run the post-check cap stopped was never watched
                                                      # pass, so it is not a clean success even with no failing
                                                      # verdict recorded. Calling it one let a broken run exit 0.
-                                                     post_check_told
+                                                     (post_check_told
+                                                      and (trajectory is None
+                                                           or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
@@ -20541,7 +20550,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         interrupt_check=interrupt_check, trace=trace, turn=policy.limit,
         client=client, provider_name=provider_name, model_name=model_name)
     if wrapped:
-        answer = _guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_")
+        answer = _with_task_notes(_guard_answer(f"{wrapped}\n\n_(The agent {reason}.)_"), trajectory)
         if on_answer:
             on_answer(answer)
         if trace is not None:
@@ -20551,7 +20560,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     fallback = f"Error: Agent {reason}."
     if latest:
         fallback += f"\n\nLatest tool result:\n{latest[:2500]}"
-    fallback = _guard_answer(fallback)
+    fallback = _with_task_notes(_guard_answer(fallback), trajectory)
     if on_answer:
         on_answer(fallback)
     if trace is not None:
