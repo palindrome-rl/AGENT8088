@@ -62,6 +62,8 @@ def test_a_folder_the_person_deleted_is_decided_again(engine, roots):
     shutil.rmtree(project / "pokemon-doubles")
     again = _write(engine, "pokemon-doubles/server.js")
     assert again == artifacts / "pokemon-doubles" / "server.js"
+    # The replacement decision must also hold for the NEXT named file.
+    assert _write(engine, "pokemon-doubles/package.json").parent == artifacts / "pokemon-doubles"
 
 
 def test_a_bare_file_and_an_absolute_path_are_not_affected(engine, roots):

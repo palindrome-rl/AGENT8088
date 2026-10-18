@@ -5735,8 +5735,12 @@ def _project_folder_root(p: Path):
     if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
         return None
     root = _PROJECT_FOLDER_ROOT.get((str(PROJECT_ROOT), p.parts[0].lower()))
-    if root is not None and (Path(root) / p.parts[0]).is_dir():
-        return Path(root)
+    if root is not None:
+        if (Path(root) / p.parts[0]).is_dir():
+            return Path(root)
+        # A removed folder must release its decision, not merely hide it:
+        # setdefault below otherwise keeps reviving the deleted root.
+        _PROJECT_FOLDER_ROOT.pop((str(PROJECT_ROOT), p.parts[0].lower()), None)
     return None
 
 
