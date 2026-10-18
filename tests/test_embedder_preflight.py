@@ -90,17 +90,19 @@ def test_ollama_installed_but_not_running_is_announced_once(machine, caplog):
 
 def test_a_remote_ollama_that_does_not_answer_is_not_called_absent(machine):
     machine["installed"] = False
-    client = Client(base_url="http://gpu-box.lan:11434/v1/")
+    client = Client(base_url="http://embeddings.example.invalid:11434/v1/", fail=True)
     embedder = _embedder(client)
     embedder.embed(["a"])
     assert capabilities.get(capabilities.MEMORY_EMBED).state == capabilities.DEGRADED
+    assert client.requests == 1 and machine["probes"] == 0
 
 
 def test_another_provider_that_does_not_answer_is_announced(machine):
-    client = Client(base_url="http://127.0.0.1:8000/v1/")
+    client = Client(base_url="http://127.0.0.1:8000/v1/", fail=True)
     embedder = _embedder(client, provider="custom")
     embedder.embed(["a"])
     assert capabilities.get(capabilities.MEMORY_EMBED).state == capabilities.DEGRADED
+    assert client.requests == 1 and machine["probes"] == 0
 
 
 def test_a_listening_service_is_used_and_not_probed_again(machine):
@@ -173,3 +175,30 @@ def test_endpoint_state_reads_the_address(machine):
     assert embed.endpoint_state("http://127.0.0.1:11434/v1/", "ollama") == "down"
     machine["listening"] = True
     assert embed.endpoint_state("http://127.0.0.1:11434/v1/", "ollama") == "up"
+
+
+def test_a_working_configured_transport_is_not_vetoed_by_a_direct_tcp_probe(machine):
+    import httpx
+    from openai import OpenAI
+    calls = []
+
+    def respond(request):
+        calls.append(request.url)
+        return httpx.Response(200, json={"data": [{"embedding": [1.0, 0.0], "index": 0}],
+                                         "model": "test-model", "object": "list"})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        client = OpenAI(api_key="synthetic-review-token", base_url="https://embeddings.example.invalid/v1",
+                        http_client=transport)
+        result = Embedder(lambda: client, "test-model", provider="custom").embed(["hello"])
+    assert result == [[1.0, 0.0]]
+    assert len(calls) == 1
+    assert machine["probes"] == 0
+
+
+def test_local_ollama_routed_through_a_proxy_uses_the_configured_client(machine, monkeypatch):
+    monkeypatch.setattr(embed, "getproxies", lambda: {"http": "http://proxy.example.invalid:8080"})
+    monkeypatch.setattr(embed, "proxy_bypass", lambda host: False)
+    client = Client()
+    assert _embedder(client).embed(["hello"]) == [[1.0, 0.0]]
+    assert client.requests == 1 and machine["probes"] == 0

@@ -215,8 +215,9 @@ cannot help a host that never received the request.
 
 How a missing embedder is handled, so a machine without Ollama is not nagged:
 
-- Before the first embedding request, Agent8088 checks that something is listening at the embeddings address
-  (under a second). Nothing is sent to an address nobody answers, so there is no multi-second timeout per attempt.
+- Before the first embedding request to built-in local Ollama, Agent8088 makes a short connection probe.
+  If nothing is listening, no embeddings request is sent. Remote, custom and proxied providers use their
+  configured client transport instead: a failed direct connection would not prove that a proxy cannot reach them.
 - **Ollama is not installed on this machine** (the default `ollama` provider, no `ollama` command, no Ollama
   folder): keyword search is simply the mode. Nothing is announced during the session; `/capabilities` and
   `/memory` show "keyword-only (BM25)", and recall and tool selection both use keywords.
