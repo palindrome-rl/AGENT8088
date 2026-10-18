@@ -6844,6 +6844,17 @@ def _evidence_status(name: str, args: dict, result: str, status: str, source: st
     return "unknown"
 
 
+def _check_app_status(name: str, result: str, status: str) -> str:
+    """The page or script check the model ran itself reports its own verdict: "<path>: smoke test FAILED - ...".
+
+    No test runner printed it, so detect_verdict cannot read it and it stayed "unknown": a run whose own check_app showed
+    a broken page ended with no failing check and no headline. Only the failure is taken from the text; a pass is not
+    a test run and is handled by the tracker, which settles the earlier failure of the same page."""
+    if name == "check_app" and status not in ("passed", "failed") and "smoke test FAILED" in str(result or ""):
+        return "failed"
+    return status
+
+
 def _standalone_test_command(command: str) -> bool:
     """Recognise explicit test runners, without assuming scripts are tests."""
     if not isinstance(command, str):
@@ -19920,6 +19931,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # waiting for, so say so rather than letting the summary fall
                 # through to "no automated verification passed".
                 status = _evidence_status(name, args, result, verdict.status, verdict.source)
+                status = _check_app_status(name, result, status)
                 audit_verdict = _take_audit_verdict()
                 if audit_verdict == "passed":
                     status = "passed"
@@ -19946,6 +19958,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     existed=existed_before,
                     written_to=_write_landing(name, args),
                 )
+                if name == "check_app":
+                    trajectory.settle_check_app(result)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):

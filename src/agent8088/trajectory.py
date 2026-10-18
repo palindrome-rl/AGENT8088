@@ -709,6 +709,19 @@ class TrajectoryState:
     def needs_verification(self) -> bool:
         return self.data.get("verification") == "pending"
 
+    def settle_check_app(self, result: str) -> None:
+        """A check_app run that passed settles the earlier failure of that same page or script.
+
+        The failure is recorded as "check_app -> <path>: smoke test FAILED ..."; only a later pass for that path clears
+        it, and a pass for another file does not. A pass here is not a test run: it never makes the work "verified"."""
+        failing = str(self.data.get("failing_check") or "")
+        match = re.match(r"^check_app -> (.+?): smoke test FAILED\b", failing)
+        text = str(result or "")
+        if (self.data.get("check_failing") and match and "smoke test FAILED" not in text
+                and re.match(rf"^\s*{re.escape(match.group(1))}: smoke test passed", text)):
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
         return bool(self.data.get("check_failing"))
