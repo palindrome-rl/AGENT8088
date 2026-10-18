@@ -280,7 +280,7 @@ _INPUT_REFERENCE = re.compile(
     re.IGNORECASE)
 
 
-_CLAUSE_BREAK = re.compile(r"[,;()]|and|then|but", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(r"[,;()]|\band\b|\bthen\b|\bbut\b", re.IGNORECASE)
 
 
 def is_input_reference(request: str, path: str) -> bool:
