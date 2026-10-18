@@ -308,7 +308,8 @@ def embedder():
     with _LOCK:
         existing = _RUNTIME.get("embedder")
         if existing is None:
-            existing = Embedder(_RUNTIME["client_factory"], _RUNTIME["embed_model"])
+            existing = Embedder(_RUNTIME["client_factory"], _RUNTIME["embed_model"],
+                                provider=_RUNTIME.get("embed_provider", ""))
             _RUNTIME["embedder"] = existing
         return existing
 
