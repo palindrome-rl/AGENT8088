@@ -89,3 +89,25 @@ def test_the_hard_backstop_uses_the_same_completion_policy(engine, monkeypatch, 
     assert any(event['type'] == 'post_check_backstop' for event in trace)
     final = [event for event in trace if event['type'] == 'final_answer'][-1]
     assert final['incomplete'] is incomplete
+
+
+@pytest.mark.parametrize('hard_backstop', [False, True])
+@pytest.mark.parametrize('level', ['tested', 'exercised'])
+def test_fresh_tests_do_not_excuse_an_explicitly_missing_deliverable(engine, monkeypatch, tmp_path, level, hard_backstop):
+    from agent8088.trajectory import TrajectoryState
+    from tests.test_unmet_after_cap import _run, _calc
+    monkeypatch.setattr(engine, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(engine, 'ARTIFACTS_ROOT', tmp_path / 'artifacts')
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [tmp_path])
+    monkeypatch.setattr(engine, 'DISPOSABLE_CONTAINER', True)
+    monkeypatch.setattr(engine, 'MAX_POST_CHECK_ROUNDS', 2)
+    monkeypatch.setattr(TrajectoryState, 'assurance', lambda self: level)
+    def script(i, messages):
+        marker = 'no more tools will run' if hard_backstop else 'Checks are complete'
+        if marker in str(messages[-1].get('content')):
+            return 'Finished.'
+        return 'All done.' if i == 1 else _calc(i)
+    answer, _, trace = _run(engine, monkeypatch, 'Compute and save the result to out.txt', script)
+    assert 'out.txt' in answer and answer.startswith('NOT VERIFIED:')
+    final = [event for event in trace if event['type'] == 'final_answer'][-1]
+    assert final['incomplete'] is True

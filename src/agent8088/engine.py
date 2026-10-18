@@ -19895,7 +19895,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                       and (trajectory is None
                                                            or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
             return answer
 
         if on_calls:
@@ -20451,7 +20452,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                                       and (trajectory is None
                                                            or trajectory.assurance() not in ("tested", "exercised")))
                                                      or (trajectory is not None
-                                                         and trajectory.check_failing()))})
+                                                         and (trajectory.check_failing()
+                                                              or bool(trajectory.unmet_review()))))})
                     return answer
                 if post_check_rounds == MAX_POST_CHECK_ROUNDS and not post_check_told:
                     post_check_told = True
