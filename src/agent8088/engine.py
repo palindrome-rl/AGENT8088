@@ -353,21 +353,67 @@ def _migrate_keys_to_env(config_path: Path, env_path: Path) -> int:
 # (created there by --setup) rather than silently falling back to the global
 # install's config just because nothing has been written to the project
 # directory yet.
-_in_venv = bool(os.environ.get("VIRTUAL_ENV")) or sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-_cwd_config = Path.cwd() / "config.txt"
+def _own_install_prefix(prefix: str | Path | None = None) -> bool:
+    """Whether this Python is Agent8088's own installed environment, not a project's.
+
+    The installer puts Agent8088 in a venv under its data folder, so `sys.prefix != sys.base_prefix`
+    is always true for the installed command. That is not "inside a project's venv", and treating it
+    so sent every launch to ./config.txt (usually absent) instead of the user's own config.
+    """
+    try:
+        here = Path(prefix or sys.prefix).resolve()
+        roots = [os.environ.get("AGENT8088_HOME"), str(Path.home() / ".agent8088"),
+                 str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088")]
+        return any(root and here in {
+            Path(root).expanduser().resolve() / name
+            for name in ("venv", ".venv", "agent8088/venv", "agent8088/.venv")
+        } for root in roots)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _project_venv_active() -> bool:
+    """A venv other than Agent8088's own install is active or in use: its project owns config.txt."""
+    # An installed launcher still runs its own Python when invoked from an activated
+    # project environment. Check the activation separately from the interpreter.
+    active = os.environ.get("VIRTUAL_ENV")
+    if active and not _own_install_prefix(active):
+        return True
+    return ((bool(active) or sys.prefix != getattr(sys, "base_prefix", sys.prefix))
+            and not _own_install_prefix())
+
+
+def _preferred_config_path() -> Path | None:
+    """Shared read/write precedence; None means no user/project config was selected.
+
+    Startup can then read packaged defaults, while setup creates a user config.
+    An existing user config must be the same for CLI writes and engine reads.
+    """
+    if os.environ.get("AGENT8088_CONFIG"):
+        return Path(os.environ["AGENT8088_CONFIG"]).expanduser()
+    cwd = Path.cwd() / "config.txt"
+    if cwd.exists() or _project_venv_active():
+        return cwd
+    for candidate in (Path.home() / ".agent8088" / "config.txt",
+                      Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 _user_config = Path.home() / ".agent8088" / "config.txt"
 _win_config = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "agent8088" / "config.txt"
-if os.environ.get("AGENT8088_CONFIG"):
-    CONFIG_PATH = Path(os.environ["AGENT8088_CONFIG"]).expanduser()
-elif _cwd_config.exists() or _in_venv:
-    CONFIG_PATH = _cwd_config
-elif _user_config.exists():
-    CONFIG_PATH = _user_config
-elif _win_config.exists():
-    CONFIG_PATH = _win_config
-else:
-    CONFIG_PATH = Path(str(APP_DIR / "config.txt")).expanduser()
+CONFIG_PATH = _preferred_config_path() or Path(str(APP_DIR / "config.txt")).expanduser()
 APP_CONFIG = load_simple_config(CONFIG_PATH)
+if not CONFIG_PATH.exists() and not os.environ.get("AGENT8088_CONFIG"):
+    # A launch that finds no config of its own while the user has one elsewhere would otherwise run
+    # on the built-in defaults without a word.
+    for _other in (_user_config, _win_config):
+        if _other.exists() and _other != CONFIG_PATH:
+            _config_warn(f"No config.txt at {CONFIG_PATH}, so built-in defaults are in use; a config exists at "
+                         f"{_other}. Run from a folder without a venv, set AGENT8088_CONFIG, or run "
+                         "`agent8088 --setup` here.")
+            break
 try:
     from agent8088 import errors as _errors
     for _warning in _errors.unknown_config_keys(APP_CONFIG, source=CONFIG_PATH.name):
@@ -2030,6 +2076,15 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
             return True
         if mode == "cron" and command == "list":
             return True
+        if mode == "search":
+            # A search the user has just approved is read-only, so the grant counts here as it does in
+            # the other modes. Without this the approval was ignored and the same search asked again.
+            if _ANY_GRANT_KEY in _one_shot_grants:
+                _one_shot_grants.discard(_ANY_GRANT_KEY)
+                return True
+            if approval_key and approval_key in _one_shot_grants:
+                _one_shot_grants.discard(approval_key)
+                return True
         return False
     if mode == "write_text" and path_zone == "no_prompt":
         return True
@@ -9945,6 +10000,9 @@ _native_sandbox_broken = False
 _native_sandbox_verified = None
 _native_sandbox_failure = ""
 _NATIVE_SANDBOX_PROBE_TIMEOUT = 10
+# Whether the native Windows sandbox refuses a program that starts a child process with piped output (what
+# Node does by default): True, False, or None when not tested. The startup check passes either way.
+_native_piped_spawn_blocked = None
 # Docker gets the same two stages, for the same reason. `docker info` succeeding
 # does not mean the daemon can bind-mount our workspace: when Agent8088 itself
 # runs in a container the daemon resolves that path against the *host*, so the
@@ -10481,6 +10539,54 @@ def native_sandbox_verified() -> bool:
     return _native_sandbox_verified is True
 
 
+_PIPED_SPAWN_BLOCKED = "agent8088-piped-spawn-blocked"
+_PIPED_SPAWN_SCRIPT = (
+    "const r = require('child_process').spawnSync(process.execPath, ['-e', '0']);"
+    f"if (r.error && r.error.code === 'EPERM') console.log('{_PIPED_SPAWN_BLOCKED}');"
+    "else if (!r.error && r.status === 0) console.log('agent8088-piped-spawn-ok');")
+
+
+def _probe_piped_child_spawn(cwd: Path) -> None:
+    """Record whether the native Windows sandbox lets Node start a child with piped output.
+
+    The startup check only runs `python -c pass`, which passes whether or not this works, while
+    esbuild, Vite, Vitest, tsx and npm install scripts all start children this way. Windows only,
+    once; a probe that cannot run leaves the answer unknown rather than claiming a limit.
+    """
+    global _native_piped_spawn_blocked
+    _native_piped_spawn_blocked = None
+    if sys.platform != "win32" or _native_sandbox_broken:
+        return
+    try:
+        runtime = _native_sandbox_argv()
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
+        if not runtime or not node:
+            return
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+        result = subprocess.run(
+            runtime + ["--workspace", str(Path(cwd).resolve()), "--temp", str(sandbox_tmp),
+                       "--mode", "workspace-write", "--", node, "-e", _PIPED_SPAWN_SCRIPT],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=_NATIVE_SANDBOX_PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        return
+    output = result.stdout or ""
+    if _PIPED_SPAWN_BLOCKED in output:
+        _native_piped_spawn_blocked = True
+    elif "agent8088-piped-spawn-ok" in output:
+        _native_piped_spawn_blocked = False
+
+
+SANDBOX_CHILDREN_IMPACT = (
+    "tools that start a child process with piped output fail with `spawn EPERM`: esbuild, Vite, Vitest, "
+    "tsx and npm install scripts; processes also end when the command that started them ends")
+SANDBOX_CHILDREN_FIX = (
+    "sandbox_backend=docker with docker_image (Python and Node) and docker_network=allowlist "
+    "(sandbox_allowed_domains=registry.npmjs.org)")
+
+
 # Signatures of the daemon refusing BEFORE the container ran, so the command did
 # not execute and retrying elsewhere repeats nothing. The mount entries are the
 # in-container case: the daemon resolves a bind source against the host, so a
@@ -10624,6 +10730,7 @@ def verify_sandbox_backend() -> dict:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
+            _probe_piped_child_spawn(ARTIFACTS_ROOT)
             status = sandbox_status()
             _report_sandbox(status)
             return status
@@ -10703,6 +10810,14 @@ def _report_sandbox(status: dict | None = None) -> None:
         else:
             # Docker has no network at all, which its own notice already says.
             capabilities.clear(capabilities.SANDBOX_NETWORK)
+        if resolved == "native" and _native_piped_spawn_blocked:
+            capabilities.report(
+                capabilities.SANDBOX_CHILDREN, active="no piped child processes", preferred="allowed",
+                state=capabilities.DEGRADED,
+                reason="the native Windows sandbox blocks a child process with piped output",
+                impact=SANDBOX_CHILDREN_IMPACT, fix=SANDBOX_CHILDREN_FIX)
+        else:
+            capabilities.clear(capabilities.SANDBOX_CHILDREN)
         if resolved == "native":
             capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
                                 state=capabilities.OK)
@@ -11178,6 +11293,16 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    if (sys.platform == "win32" and "spawn EPERM" in (result or "")
+            and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
+        return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
+                "a child process with piped output (Node's default), so tools built on it fail: esbuild, Vite, "
+                "Vitest, tsx and npm install scripts. It is not the file-write limit, and running the same "
+                "command again will not help. Processes also end when the command that started them ends, so "
+                "a dev server cannot be left running for a later command. Instead write plain HTML, CSS and "
+                "JavaScript that needs no build step, run scripts directly with `node file.js`, and check a "
+                "page with check_app. If the task needs a bundler or a test runner, say so in your answer: "
+                "the user can switch to the Docker backend (sandbox_backend=docker).")
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
@@ -12661,9 +12786,10 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     # instead of telling the model how plan mode works — the model never learns why.
     # allow_plan=False means we're INSIDE _exec_plan (a plan step) — let it through
     # to the normal check_permission gate so it escalates properly.
+    # A search is not one of them: it only reads, so planning needs it. One that has to ask first reaches
+    # the permission gate below and asks the user. Blocking it here told the model to "keep reading" and
+    # then refused to let it, and two refused searches ended the whole plan session.
     plan_only_blocked = mode in ("write_text", "shell", "docker", "cron", "browser")
-    plan_only_blocked |= (mode == "search" and not _local_searxng_no_prompt_enabled()
-                          and not _ddgs_only_chain())
     if PERMISSION_MODE == "plan-only" and allow_plan and plan_only_blocked:
         return _plan_mode_block_message()
 
@@ -12913,8 +13039,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 target_mode="edit",
                 paths=[f"web_search (DDGS): {query[:100]}"],
                 change_type="network_fallback",
-                reason=("Local SearXNG returned no results. Retry this exact query "
-                        "with public DuckDuckGo search?"),
+                reason=((f"{_searxng_fallback_cause(report)} Retry this exact query "
+                         "with public DuckDuckGo search? Choosing Session lets later searches "
+                         "do the same without asking.")),
             )
         return _frame_search_results(_with_search_note(report))
 
@@ -16016,6 +16143,19 @@ def _search_was_usable(result: str) -> bool:
     refused as "the search already answered this".
     """
     return "Search results (via " in (result or "")
+
+
+def _searxng_fallback_cause(report) -> str:
+    """What to tell the user about why the local SearXNG did not serve this search.
+
+    The same prompt covers a SearXNG that is not running and one that ran and found
+    nothing; saying "returned no results" for the first sent a user looking for a
+    query problem when the container had been removed.
+    """
+    detail = " ".join(str(f) for f in getattr(report, "failures", ()) if str(f).startswith("searxng"))
+    if re.search(r"could not reach|connection refused|timed out|not answering|unreachable", detail, re.I):
+        return "Local SearXNG is not answering."
+    return "Local SearXNG returned no results."
 
 
 def _frame_search_results(results: str, now=None) -> str:

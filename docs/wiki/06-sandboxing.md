@@ -62,6 +62,33 @@ enforced on this backend (write restriction only)"), and `/doctor` warns when
 `sandbox_backend=docker`. Stopping processes by name is refused in every mode
 for the same reason (see [permissions](03-permissions-and-security.md)).
 
+**The Windows native backend also blocks child processes with piped output.**
+A program that starts another program and captures its output (Node's default)
+fails with `spawn EPERM` inside it. That stops esbuild and the tools built on it
+(Vite, Vitest, tsx), `npm install` scripts for packages such as esbuild, and
+other Node build tooling. Python's `subprocess`, `node file.js` and programs
+whose children write straight to the console still work. Every process also
+ends when the command that started it ends, so a dev server cannot be left
+running for a later command. Plain HTML, CSS and JavaScript apps, Python
+scripts and `check_app` are not affected. The startup check passes either way;
+Agent8088 runs a second probe on Windows and, when it fails, `/doctor` and the
+start-up notice show "sandbox child processes: limited", and a `spawn EPERM`
+result tells the model the real cause. macOS and Linux use different
+sandboxes and are not affected.
+
+To build projects that need these tools on Windows, run commands in Docker
+(needs Docker Desktop and an image that has both Python and Node):
+
+```ini
+sandbox_backend=docker
+docker_image=<an image with Python and Node>
+docker_network=allowlist
+sandbox_allowed_domains=registry.npmjs.org
+```
+
+Packages installed in the container are Linux builds in your project folder, so
+run `npm install` again on Windows before you run the project yourself.
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run:
