@@ -13,8 +13,10 @@ continuation budget so a task that cannot be finished still ends.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from itertools import islice
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -363,6 +365,68 @@ def _landed_under(folder: Path, landed: Iterable, roots: Iterable[Path]) -> bool
     return False
 
 
+def _named_folders(request: str) -> set[str]:
+    """Full output-directory paths, not input directories or isolated path segments."""
+    names = set(named_output_dirs(request))
+    for path in named_output_paths(request):
+        parent = str(PurePath(path.replace("\\", "/")).parent)
+        if parent != ".":
+            names.add(parent)
+    return {name.replace("\\", "/").rstrip("/") for name in names
+            if not Path(name).is_absolute() and ".." not in PurePath(name.replace("\\", "/")).parts
+            and name not in (".", "", "~")}
+
+
+def _written_in_named_folder(path: str, request: str, candidates: Iterable[str],
+                             roots: Iterable[Path]) -> bool:
+    """The request names `path` (server.js) and, elsewhere, the project folder it belongs to
+    (pokemon-doubles/); the run wrote that file inside that folder.
+
+    A plan lists the files of a project folder by their short names, so a check that looks for
+    them at the top of the workspace calls them missing while they sit in the folder the plan
+    named. The folder must be one the request itself names: a file written under an unrelated
+    folder does not count.
+    """
+    # Explicit root/absolute paths are not shorthand for a project-relative output.
+    normal = path.replace("\\", "/")
+    if normal.startswith(("./", "../", "~/")) or Path(path).is_absolute():
+        return False
+    folders = _named_folders(request)
+    if not normal or not folders:
+        return False
+    expected = {_file_id(Path(root) / folder / normal) for root in roots for folder in folders}
+    for candidate in candidates:
+        if any(_file_id(c) in expected and _nonempty_file(c) for c in _candidates(str(candidate), roots)):
+            return True
+    return False
+
+
+def _written_under_named_dir(folder: str, request: str, candidates: Iterable[str],
+                             roots: Iterable[Path], mirrors: Iterable[Path]) -> bool:
+    """A folder the request names (proj/, public/) holds files the run wrote, one level inside the
+    artifacts folder or inside another folder the request names."""
+    normal = folder.replace("\\", "/")
+    if not normal or normal.startswith(("./", "../", "~/")) or Path(folder).is_absolute():
+        return False
+    # Anchor every match to an allowed workspace/mirror root; a directory with the
+    # same basename somewhere else is not evidence that this output exists.
+    roots = list(roots) + list(mirrors)
+    parents = _named_folders(request) | {""}
+    expected = {_file_id(Path(root) / parent / normal) + os.sep for root in roots for parent in parents}
+    for candidate in candidates:
+        for item in _candidates(str(candidate), roots):
+            if any(_file_id(item).startswith(prefix) for prefix in expected) and _nonempty_file(item):
+                return True
+    return False
+
+
+def _moved_copy(path: str, written: Iterable[str], roots: Iterable[Path]) -> bool:
+    """A file the run wrote at one path and then moved: the same name exists, non-empty, at another path it wrote."""
+    name = PurePath(str(path).replace("\\", "/")).name.lower()
+    return any(other != path and PurePath(str(other).replace("\\", "/")).name.lower() == name
+               and _exists_somewhere(str(other), roots) for other in written)
+
+
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
                     start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
@@ -381,9 +445,11 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     written = list(written)
     landed = list(landed)
     missing: list[str] = []
+    wrote_at = written + [str(pair[1]) for pair in landed if len(pair) > 1]
     for path in named_output_paths(request):
         satisfied = (any(_nonempty_file(c) for c in _candidates(path, roots))
-                     or _landed_copy(path, landed, roots + mirrors))
+                     or _landed_copy(path, landed, roots + mirrors)
+                     or _written_in_named_folder(path, request, wrote_at, roots + mirrors))
         if not satisfied and supplied_input(request, path, _candidates(path, roots + mirrors),
                                             start_files, written, roots + mirrors):
             continue
@@ -393,13 +459,19 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
                            if elsewhere and mirrors else path)
     for path in named_output_dirs(request):
         if not any(_has_content(c) or _landed_under(c, landed, roots + mirrors)
-                   for c in _candidates(path, roots)):
+                   for c in _candidates(path, roots)) \
+                and not _written_under_named_dir(path, request, wrote_at, roots + mirrors, mirrors):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
     for path in written:
         name = PurePath(path).name
         if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
                 and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
+            # A scratch file the run made and removed, or a file it moved to a better place, is not a
+            # deliverable that went missing.
+            if (name.startswith("_") or _moved_copy(path, written, roots + mirrors)
+                    or is_throwaway_helper(path, request, written, roots + mirrors)):
+                continue
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
@@ -831,12 +903,94 @@ VERIFY_ASK = ("Continue, and also run what you changed: inspect or test the chan
               "suitable command, fix anything that fails, then reply. If it cannot be run here, say so plainly.")
 
 
+def tests_near(changed: Iterable[str]) -> tuple | None:
+    """The nearest test suite above the changed files: (folder to run it from, command), or None.
+
+    The project root the harness was started in is not always where the work lives (a run's files are
+    written into its workspace), so the reminder looks upward from the files themselves. A suite beside a
+    package (`proj/tests` next to `proj/pkg`) is found from any file inside the package.
+    """
+    for path in changed:
+        try:
+            # A relative path means whatever folder the process happens to be in, which says nothing about the project.
+            if not Path(str(path)).is_absolute():
+                continue
+            folder = Path(str(path)).resolve().parent
+        except (OSError, ValueError):
+            continue
+        for _ in range(4):
+            # Never a drive root or a home folder: files lying about there belong to no project.
+            if folder.parent == folder or folder == Path.home():
+                break
+            try:
+                found = _suite_in(folder)
+            except OSError:
+                found = None
+            if found:
+                return folder, found
+            folder = folder.parent
+    return None
+
+
+def _suite_in(folder: Path) -> str | None:
+    """The command that runs the tests in this folder, or None if it holds no suite."""
+    tests = [d for d in ("tests", "test") if (folder / d).is_dir()]
+    files = []
+    suite_dir = "."
+    for d in [*tests, "."]:
+        # Bound both the directory walk and the number of file samples. Do not
+        # read a whole generated file merely to slice its first 4,000 characters.
+        candidates = sorted(islice((folder / d).glob("test*.py" if d != "." else "test_*.py"), 128))
+        if candidates and not files:
+            suite_dir = d
+        files.extend(p for p in candidates if p.is_file())
+        files = files[:3]
+        if len(files) == 3:
+            break
+    if files:
+        text = ""
+        for file in files:
+            try:
+                with file.open(encoding="utf-8", errors="ignore") as stream:
+                    text += "\n" + stream.read(4000)
+            except OSError:
+                continue
+        configured_pytest = (folder / "pytest.ini").is_file()
+        for name, marker in (("pyproject.toml", "[tool.pytest.ini_options]"),
+                             ("setup.cfg", "[tool:pytest]"), ("tox.ini", "[pytest]")):
+            try:
+                with (folder / name).open(encoding="utf-8", errors="ignore") as stream:
+                    configured_pytest |= marker in stream.read(4000)
+            except OSError:
+                pass
+        # Plain test functions need pytest even when they use no pytest imports.
+        # Choose unittest only with affirmative evidence of unittest-style tests.
+        if (configured_pytest or re.search(r"\bimport pytest\b|\bfrom pytest\b|^(?:async\s+)?def\s+test_", text, re.M)
+                or not re.search(r"\bimport unittest\b|\bfrom unittest\b", text)):
+            return "python -m pytest -q"
+        return f"python -m unittest discover -s {suite_dir}"
+    package = folder / "package.json"
+    try:
+        with package.open(encoding="utf-8") as stream:
+            # Do not accept truncated or oversized metadata as valid JSON.
+            raw = stream.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else None
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        script = scripts.get("test") if isinstance(scripts, dict) else None
+    except (OSError, ValueError):
+        script = None
+    if isinstance(script, str) and script.strip():
+        return "npm test"
+    return None
+
+
 def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
     """The verification reminder with the files and the exact command named.
 
     Small models do the check when told precisely what to run; a bare "inspect
     or test the result" is often skipped or answered with an unrelated command.
     """
+    changed = list(changed)
     names = []
     for path in changed:
         name = PurePath(str(path)).name
@@ -847,8 +1001,16 @@ def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
     shown = ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
     first = names[0]
     suffix = PurePath(first).suffix.lower()
+    near = None if has_tests else tests_near(changed)
     if has_tests:
         command = "run_tests"
+    elif near:
+        # The project's own tests, run from the folder they belong to: running a package's module files one by
+        # one as scripts fails on their relative imports, which is a problem with the check, not with the code.
+        command = f"{near[1]}` from `{near[0]}"
+    elif suffix == ".py" and _package_of(changed[0]):
+        package, parent = _package_of(changed[0])
+        command = f"python -c \"import {package}.{PurePath(first).stem}\"` from `{parent}"
     elif suffix == ".py":
         command = f"python {first}"
     elif suffix in {".js", ".mjs", ".cjs"}:
@@ -861,6 +1023,23 @@ def verify_ask(changed: Iterable[str], has_tests: bool) -> str:
         command = f"read_text on {first}"
     return (f"Continue, and also run what you changed ({shown}) with `{command}` now, "
             "fix anything that fails, then reply. If it cannot be run here, say so plainly.")
+
+
+def _package_of(path: str) -> tuple | None:
+    """(dotted package name, folder that holds it) for a file inside a Python package, else None."""
+    try:
+        if not Path(str(path)).is_absolute():
+            return None
+        folder = Path(str(path)).resolve().parent
+    except (OSError, ValueError):
+        return None
+    if not (folder / "__init__.py").is_file():
+        return None
+    parts = [folder.name]
+    while (folder.parent / "__init__.py").is_file() and folder.parent != folder:
+        folder = folder.parent
+        parts.insert(0, folder.name)
+    return ".".join(parts), folder.parent
 
 
 def outputs_nudge(missing: list[str]) -> Nudge:

@@ -42,6 +42,24 @@ def _fresh_capability_registry():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_searxng_container(monkeypatch):
+    """Keep tests away from the developer's real `agent8088-searxng` container.
+
+    The uninstall tests run `_run_windows_uninstall` and `_run_posix_uninstall`, which end in
+    `searxng_provision.stop()`: a real `docker rm -f agent8088-searxng`. On a machine where
+    `/search setup` had started that container, a full test run removed it, and the next real
+    search found its local SearXNG gone. Every docker call the provisioner makes now answers
+    "no such container" unless the test installs its own fake `_run`, as the provisioning tests do."""
+    from types import SimpleNamespace
+
+    from agent8088 import searxng_provision
+    monkeypatch.setattr(
+        searxng_provision, "_run",
+        lambda argv, timeout=90: SimpleNamespace(
+            returncode=1, stdout="", stderr="Error: No such object (blocked by tests/conftest.py)"))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_install_state(monkeypatch):
     """The startup banner and /doctor read $AGENT8088_HOME/install-state.json.
     Point that at a file that never exists, so a real install's skipped stages
