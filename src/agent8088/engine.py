@@ -6958,6 +6958,17 @@ def _evidence_status(name: str, args: dict, result: str, status: str, source: st
     return "unknown"
 
 
+def _check_app_status(name: str, result: str, status: str) -> str:
+    """The page or script check the model ran itself reports its own verdict: "<path>: smoke test FAILED - ...".
+
+    No test runner printed it, so detect_verdict cannot read it and it stayed "unknown": a run whose own check_app showed
+    a broken page ended with no failing check and no headline. Only the failure is taken from the text; a pass is not
+    a test run and is handled by the tracker, which settles the earlier failure of the same page."""
+    if name == "check_app" and status not in ("passed", "failed") and "smoke test FAILED" in str(result or ""):
+        return "failed"
+    return status
+
+
 def _standalone_test_command(command: str) -> bool:
     """Recognise explicit test runners, without assuming scripts are tests."""
     if not isinstance(command, str):
@@ -20138,6 +20149,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # waiting for, so say so rather than letting the summary fall
                 # through to "no automated verification passed".
                 status = _evidence_status(name, args, result, verdict.status, verdict.source)
+                status = _check_app_status(name, result, status)
                 audit_verdict = _take_audit_verdict()
                 if audit_verdict == "passed":
                     status = "passed"
@@ -20150,6 +20162,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                     trajectory.note_ran_ok()
+                check_app_path = ""
+                if name == "check_app" and args.get("path"):
+                    try:
+                        check_app_path = str(resolve_user_path(str(args["path"])))
+                    except (OSError, ValueError, RuntimeError):
+                        # The tool already reports invalid/disallowed paths.
+                        # Bookkeeping must not turn that refusal into a crash.
+                        pass
                 trajectory.after_tool(
                     operation, result,
                     failed=_plan_step_failed(result) or audit_verdict == "failed",
@@ -20158,13 +20178,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
-                    path=str(args.get("filename") or args.get("destination") or ""),
+                    path=(check_app_path if name == "check_app" else
+                          str(args.get("filename") or args.get("destination") or "")),
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                     written_to=_write_landing(name, args),
                 )
+                if name == "check_app":
+                    trajectory.settle_check_app(result, path=check_app_path)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):
