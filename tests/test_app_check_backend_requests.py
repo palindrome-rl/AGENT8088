@@ -96,3 +96,21 @@ def test_what_counts_as_a_route():
     assert app_check._is_route("/api/status") and app_check._is_route("/ai-move?x=1")
     assert app_check._is_route("/api/data.json")
     assert not app_check._is_route("/data.json") and not app_check._is_route("/css/site.css?v=2")
+
+
+@pytest.mark.parametrize("path", ["/api-client.json", "/apiary/data.json", "/apiculture.js"])
+def test_api_prefix_is_a_path_segment_not_a_filename_prefix(path):
+    assert not app_check._is_route(path)
+
+
+@needs_chromium
+def test_a_missing_api_prefixed_asset_still_fails_with_a_backend(tmp_path):
+    _with_server(tmp_path)
+    report = app_check.check_web_page(_page(tmp_path, MISSING_DATA_FILE.replace("data.json", "api-client.json")))
+    assert report.status == app_check.FAIL, report.text()
+    assert any("api-client.json returned 404" in failure for failure in report.failures)
+
+
+def test_a_package_description_is_not_a_start_script(tmp_path):
+    (tmp_path / "package.json").write_text('{"description": "start"}', encoding="utf-8")
+    assert not app_check.has_backend(tmp_path)

@@ -66,8 +66,8 @@ def _with_server(tmp_path):
 def test_the_static_servers_error_text_thrown_by_the_page_is_not_a_second_fault(tmp_path):
     _with_server(tmp_path)
     report = app_check.check_web_page(_page(tmp_path, STATUS_TEXT_AS_ERROR))
-    assert report.status == app_check.PASS, report.failures
-    assert any("not counted" in w for w in report.warnings)
+    assert report.status == app_check.UNAVAILABLE, report.text()
+    assert any("not verified" in w for w in report.warnings)
 
 
 @needs_chromium
@@ -108,8 +108,9 @@ setTimeout(() => { throw new Error('HTTP 500 from the stats module'); }, 50);
 def test_an_error_carrying_the_status_code_of_the_missing_backend_is_not_a_second_fault(tmp_path):
     _with_server(tmp_path)
     report = app_check.check_web_page(_page(tmp_path, STATUS_CODE_AS_ERROR))
-    assert report.status == app_check.PASS, report.failures
-    assert any("not counted" in w for w in report.warnings)
+    assert not report.failed, report.failures
+    assert report.status != app_check.PASS, "matching a code cannot prove causality: not verified, never a pass"
+    assert any("possibly a missing backend reply" in w for w in report.warnings)
 
 
 @needs_chromium
@@ -117,3 +118,36 @@ def test_an_error_with_a_different_code_still_fails(tmp_path):
     _with_server(tmp_path)
     report = app_check.check_web_page(_page(tmp_path, OTHER_CODE_AS_ERROR))
     assert report.failed and any("HTTP 500" in f for f in report.failures)
+
+
+@needs_chromium
+def test_an_unrelated_json_parse_error_beside_a_missing_backend_still_fails(tmp_path):
+    _with_server(tmp_path)
+    html = REAL_ERROR_BESIDE_IT.replace("undefinedFunction();", "JSON.parse('');")
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.failed, report.text()
+    assert any("JSON" in f for f in report.failures)
+
+
+@needs_chromium
+def test_a_status_text_substring_does_not_excuse_an_unrelated_error(tmp_path):
+    _with_server(tmp_path)
+    html = REAL_ERROR_BESIDE_IT.replace("undefinedFunction();", "throw new Error('template File not found: broken widget');")
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.failed, report.text()
+
+
+@needs_chromium
+def test_an_ambiguous_status_text_does_not_become_a_pass(tmp_path):
+    _with_server(tmp_path)
+    html = REAL_ERROR_BESIDE_IT.replace("undefinedFunction();", "throw new Error('File not found');")
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.status != app_check.PASS, report.text()
+
+
+@needs_chromium
+def test_a_missing_data_file_json_parse_is_still_a_failure(tmp_path):
+    _with_server(tmp_path)
+    html = HTML_PARSED_AS_JSON.replace("'/api/items'", "'/missing.json'")
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.failed, report.text()

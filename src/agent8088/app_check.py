@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import re
 import shlex
 import time
@@ -177,14 +178,44 @@ _BACKEND_FILES = frozenset({"server.js", "server.mjs", "server.cjs", "server.ts"
 _BACKEND_PACKAGES = re.compile(r'"(?:express|fastify|koa|hono|@hapi/hapi|next|nuxt|socket\.io)"')
 _BACKEND_REQUIREMENTS = re.compile(r"^\s*(?:flask|fastapi|django|aiohttp|starlette|tornado|bottle)\b", re.I | re.M)
 _BACKEND_STATUSES = (404, 405, 501)
-# What a page says when it parses an HTML error page as JSON.
-_HTML_AS_DATA = re.compile(r"unexpected token '?<|is not valid json|unexpected end of json input|<!doctype", re.I)
+# Tag only errors produced by decoding an actual missing-backend response.
+# Tag the rejected native decoder error with a per-check nonce; unrelated
+# JSON.parse failures receive no tag. The observer strips it from diagnostics.
+# Promise rejection and the SyntaxError type are preserved.
+_BACKEND_JSON_ERRORS_JS = r"""marker => {
+    const original = Response.prototype.json;
+    Response.prototype.json = function (...args) {
+        const parsed = original.apply(this, args);
+        let unavailable = false;
+        try {
+            const url = new URL(this.url);
+            const path = url.pathname;
+            const route = path === '/api' || path.startsWith('/api/') || !path.split('/').pop().includes('.');
+            unavailable = url.origin === location.origin && [404, 405, 501].includes(this.status) && route;
+        } catch (_) {}
+        if (!unavailable) return parsed;
+        return parsed.catch(error => {
+            if (error instanceof SyntaxError) error.message += ' [' + marker + ']';
+            throw error;
+        });
+    };
+}"""
+
+
+_STATUS_CODE_MESSAGE = re.compile(
+    r"^(?:error:\s*)?(?:http|status|request failed with status(?: code)?)\s*:?\s*(\d{3})\b[^\n]{0,20}$", re.IGNORECASE)
+
+
+def _is_status_code_error(message: str, codes) -> bool:
+    """A page error that is only the status code of a backend reply the check set aside (`HTTP 404`)."""
+    found = _STATUS_CODE_MESSAGE.match(message.strip())
+    return bool(found) and int(found.group(1)) in set(codes)
 
 
 def _is_route(path: str) -> bool:
     """An address that is a route of a server (/api/status, /ai-move), not a file (/data.json)."""
     clean = path.split("?")[0].split("#")[0]
-    return clean.startswith("/api") or "." not in clean.rsplit("/", 1)[-1]
+    return clean == "/api" or clean.startswith("/api/") or "." not in clean.rsplit("/", 1)[-1]
 
 
 def has_backend(root: Path, page: Path | None = None) -> bool:
@@ -205,9 +236,19 @@ def has_backend(root: Path, page: Path | None = None) -> bool:
             return True
         try:
             if "package.json" in names:
-                text = (folder / "package.json").read_text(encoding="utf-8", errors="ignore")
-                if '"start"' in text or _BACKEND_PACKAGES.search(text):
-                    return True
+                try:
+                    package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    package = {}
+                if isinstance(package, dict):
+                    scripts = package.get("scripts", {})
+                    if isinstance(scripts, dict) and isinstance(scripts.get("start"), str) and scripts["start"].strip():
+                        return True
+                    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                        dependencies = package.get(section, {})
+                        if isinstance(dependencies, dict) and any(
+                                _BACKEND_PACKAGES.fullmatch(json.dumps(name)) for name in dependencies):
+                            return True
             if "requirements.txt" in names and _BACKEND_REQUIREMENTS.search(
                     (folder / "requirements.txt").read_text(encoding="utf-8", errors="ignore")):
                 return True
@@ -484,6 +525,9 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                     request_route.abort()
 
             context.route("**/*", route)
+            backend_marker = f"agent8088-backend-json-{uuid.uuid4().hex}"
+            if backend:
+                context.add_init_script("(" + _BACKEND_JSON_ERRORS_JS + ")(" + json.dumps(backend_marker) + ")")
             tab = context.new_page()
             tab.set_default_timeout(timeout * 1000)
             # alert()/confirm() is a visible effect of a click; dismiss it so the
@@ -497,7 +541,21 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
             def own(url: str) -> bool:
                 return not url or url.startswith((origin, "data:", "blob:", "about:"))
 
-            tab.on("pageerror", lambda error: failures.append(f"page error: {str(error)[:200]}"))
+            def on_page_error(error):
+                message = str(error).strip()
+                tag = f" [{backend_marker}]"
+                if backend and message.endswith(tag):
+                    detail = message[:-len(tag)][:200]
+                    warnings.append(f"page error: {detail} (the reply of a server this check could not run; not counted)")
+                elif backend and (message.lower() in backend_texts or _is_status_code_error(message, backend_codes)):
+                    # Matching words alone cannot prove causality: an app can
+                    # throw the same text independently. Never call that a pass.
+                    warnings.append(f"page error: {message[:200]} (possibly a missing backend reply; not verified)")
+                    out["unavailable"] = "a page error matched a missing backend reply; its cause was not verified"
+                else:
+                    failures.append(f"page error: {message[:200]}")
+
+            tab.on("pageerror", on_page_error)
 
             def on_console(message):
                 if message.type != "error":
@@ -601,19 +659,6 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 failures[:] = [item for i, item in enumerate(failures)
                                if not (i in console_where and console_where[i].split("?")[0] in asked
                                        and item.startswith("console error: Failed to load resource"))]
-                # A page that turns the answer into an error (`throw new Error(response.statusText)`, or parses the
-                # static server's error page as JSON) reports it as a page error of its own. That is the same
-                # missing backend, not a second fault.
-                kept = []
-                for item in failures:
-                    low = item.lower()
-                    if item.startswith("page error") and (
-                            any(text and text in low for text in backend_texts) or _HTML_AS_DATA.search(item)
-                            or any(re.search(rf"(?<!\d){code}(?!\d)", item) for code in set(backend_codes))):
-                        warnings.append(f"{item} (the reply of a server this check could not run; not counted)")
-                    else:
-                        kept.append(item)
-                failures[:] = kept
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone

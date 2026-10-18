@@ -164,12 +164,17 @@ class Verdict:
     def banner(self) -> str:
         if not self.known:
             return ""
-        banner = f"[verdict: {self.status.upper()}] {self.summary}".rstrip()
-        if self.diagnostics:
-            banner += "\n" + json.dumps(
-                {"diagnostics": [item.as_dict() for item in self.diagnostics]},
-                ensure_ascii=False, separators=(",", ":"),
-            )
+        banner = f"[verdict: {self.status.upper()}] {self.summary}"[:MAX_BANNER_SUMMARY].rstrip()
+        # The banner sits in front of the clamped output, so it must stay small whatever the output looked like:
+        # one 2 MB line that happened to look like "file:12: message" used to make it larger than the whole
+        # budget, and the output was then passed on uncut.
+        kept = list(self.diagnostics)
+        while kept:
+            text = json.dumps({"diagnostics": [item.as_dict() for item in kept]},
+                              ensure_ascii=False, separators=(",", ":"))
+            if len(text) <= MAX_BANNER_DIAGNOSTICS:
+                return banner + "\n" + text
+            kept.pop()
         return banner
 
 
@@ -185,6 +190,10 @@ _DIAGNOSTIC = re.compile(
 _TRACEBACK_FRAME = re.compile(r'^\s*File "(?P<path>.+)", line (?P<line>\d+)')
 _EXCEPTION = re.compile(r"^(?P<name>[A-Za-z_][\w.]*(?:Error|Exception|Failure))(?::\s*(?P<message>.*))?$")
 _MAX_DIAGNOSTICS = 20
+MAX_BANNER_SUMMARY = 300           # characters of a runner's summary line kept in the banner
+MAX_BANNER_DIAGNOSTICS = 2_000     # characters of diagnostics kept in the banner
+_MAX_DIAGNOSTIC_PATH = 260
+_MAX_DIAGNOSTIC_MESSAGE = 300
 
 
 def parse_diagnostics(text: str) -> tuple[Diagnostic, ...]:
@@ -194,7 +203,8 @@ def parse_diagnostics(text: str) -> tuple[Diagnostic, ...]:
 
     def add(path: str, line: int, message: str, column: int | None = None,
             severity: str = "error") -> None:
-        item = Diagnostic(path.strip(), line, message.strip(), column, severity.lower())
+        item = Diagnostic(path.strip()[:_MAX_DIAGNOSTIC_PATH], line, message.strip()[:_MAX_DIAGNOSTIC_MESSAGE],
+                          column, severity.lower())
         if item.path and item.message and item not in found and len(found) < _MAX_DIAGNOSTICS:
             found.append(item)
 
