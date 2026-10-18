@@ -150,3 +150,38 @@ def test_fixed_file_stops_being_reported(tmp_path):
     target.write_text('API_KEY = os.getenv("API_KEY")\n', encoding="utf-8")
     state.data["mutation_count"] = 1  # a rewrite rescan
     assert engine._secrets_step(state, [str(target)]) is None
+
+# ------------------------------------------------- identifiers and sizes are not keys
+@pytest.mark.parametrize("text", [
+    "raiseSpA2Speed(target, 1)",
+    "const raiseSpA2Speed = (m) => m.spa * 2;",
+    "max_tokens_v2 = 4096",
+    "applyStatusEffectLevel2()",
+    "OLLAMA_MODEL=tev1:0.8b",
+    "model = qwen3:0.6b",
+    "MODEL_NAME=llama3.2:70b",
+    "teamBuilderRosterSlot3Picker",
+])
+def test_code_identifiers_and_model_sizes_are_not_credentials(text):
+    assert secret_scan.find_secrets(text) == []
+
+
+@pytest.mark.parametrize("value", [
+    "aB3dE9gH2jK5mN8pQ1rS4tU7vW0xYz",     # random mixed-case with digits
+    "q8Zr1Lw0Tx7Vb3Nc5Mk2Hd9Jf4Gs6Ya",
+    "AbCdEfGhIjKlMnOpQrStUvWx12",
+    "9f8e7d6c5b4a39281706f5e4d3c2b1a0",   # hex, few letters
+    "badc0ffeeface12facade00dead",        # hex that spells words and has only two digits
+])
+def test_random_looking_keys_are_still_found(value):
+    found = secret_scan.find_secrets(f'token = "{value}"')
+    assert found, value
+
+
+@pytest.mark.parametrize("value", [
+    "QJXNZKPVTRWH7LMBCDYFS",  # uppercase blob with one digit
+    "qjxnzkpvtrwh7lmbcdyfs",  # a lowercase blob is not camelCase
+    "QjxNZKPVTRWH7LmbCDYFS",  # large acronym chunks are not words
+])
+def test_identifier_exemption_does_not_hide_unstructured_blobs(value):
+    assert secret_scan.find_secrets(value)
