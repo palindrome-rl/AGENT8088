@@ -90,10 +90,10 @@ def test_a_page_does_not_load_a_different_script_with_the_same_basename(tmp_path
     tools = tmp_path / "tools"
     tools.mkdir()
     script = tools / "main.js"
-    script.write_text('throw new Error("broken CLI");', encoding="utf-8")
+    script.write_text('missingFunction();', encoding="utf-8")
     assert app_check.loaded_by_page(script) is None
     report = app_check.check_script(script, run=lambda command, timeout:
-                                    "Error: broken CLI\nCommand exited with status 1.")
+                                    "ReferenceError: missingFunction is not defined\nCommand exited with status 1.")
     assert report.failed
 
 
