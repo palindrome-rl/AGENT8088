@@ -432,13 +432,15 @@ class TrajectoryState:
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
             self.data["failing_command"] = " ".join(command.split())
             # The written files this run started: a clean run of any of them later settles the failure.
-            self.data["failing_files"] = [PurePath(str(f)).name for f in written_now or []
-                                          if _runs_a_written_file(command, [f])][:6]
+            self.data["failing_files"] = ([] if _is_check_run(command) else
+                                         [PurePath(str(f)).name for f in written_now or []
+                                          if _runs_a_written_file(command, [f])][:6])
         elif operation["verdict"] == "passed":
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
                 and self.data.get("check_failing")
+                and not _TRACEBACK.search(str(result))
                 and _same_command(self.data.get("failing_command"), command)):
             # The very command that failed has now run without failing.
             self.data["check_failing"] = False

@@ -57,6 +57,20 @@ def test_a_test_runner_failure_is_not_settled_by_running_a_script():
     assert not state.check_failing()
 
 
+def test_a_failed_suite_that_names_a_written_file_needs_a_suite_pass():
+    state = _state(written=("watch.py",))
+    _run(state, "python -m pytest watch.py", "FAILED (failures=1)", verdict="failed")
+    _run(state, "python watch.py", "started fine")
+    assert state.check_failing()
+
+
+def test_identical_command_with_an_error_in_its_output_does_not_settle():
+    state = _state()
+    _run(state, "python watch.py", TRACE, verdict="failed")
+    _run(state, "python watch.py", TRACE)
+    assert state.check_failing()
+
+
 @pytest.mark.parametrize("result", [
     "ReferenceError: document is not defined\n    at main.js:3:1\nCommand exited with status 1.",
     "ReferenceError: window is not defined\nCommand exited with status 1.",
