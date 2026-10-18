@@ -99,3 +99,37 @@ def test_a_script_no_page_loads_is_still_started_and_names_its_error(tmp_path):
     assert report.failed
     assert "ReferenceError: POKEMON is not defined" in report.failures[0]
     assert "Command exited" not in report.failures[0]
+
+
+# -- package modules -----------------------------------------------------------------------------------
+
+def _package(tmp_path):
+    pkg = tmp_path / "booking"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .rooms import Room\n", encoding="utf-8")
+    (pkg / "rooms.py").write_text("from .intervals import overlaps\nclass Room: pass\n", encoding="utf-8")
+    (pkg / "intervals.py").write_text("def overlaps(a, b):\n    return a[0] < b[1]\n", encoding="utf-8")
+    return pkg
+
+
+def test_a_package_module_with_relative_imports_is_not_started_alone(tmp_path):
+    pkg = _package(tmp_path)
+    ran = []
+    for name in ("rooms.py", "__init__.py"):
+        report = app_check.check_script(pkg / name, run=lambda command, timeout: ran.append(command) or "")
+        assert report.status == app_check.UNAVAILABLE and not report.failed and "booking" in report.note
+    assert not ran
+
+
+def test_a_package_module_without_relative_imports_is_still_started(tmp_path):
+    pkg = _package(tmp_path)
+    ran = []
+    app_check.check_script(pkg / "intervals.py", run=lambda command, timeout: ran.append(command) or "")
+    assert ran
+
+
+def test_a_plain_script_outside_a_package_is_still_started(tmp_path):
+    (tmp_path / "tool.py").write_text("from . import x\n", encoding="utf-8")   # no package folder: syntax-wise fine
+    ran = []
+    app_check.check_script(tmp_path / "tool.py", run=lambda command, timeout: ran.append(command) or "")
+    assert ran

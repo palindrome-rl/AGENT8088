@@ -1039,6 +1039,21 @@ def loaded_by_page(path: Path) -> Path | None:
     return None
 
 
+_RELATIVE_IMPORT = re.compile(r"^\s*from\s+\.+[\w.]*\s+import", re.MULTILINE)
+
+
+def package_member(path: Path, source: str) -> str:
+    """The package name when this Python file sits in a package (a folder with `__init__.py`) and imports its siblings
+    with relative imports: started alone it fails with "attempted relative import with no known parent package", which
+    says nothing about it. Empty when it is not such a file."""
+    path = Path(path)
+    if path.name != "__init__.py" and not (path.parent / "__init__.py").is_file():
+        return ""
+    if path.name == "__init__.py" or _RELATIVE_IMPORT.search(source):
+        return path.parent.name
+    return ""
+
+
 def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Report:
     path = Path(path)
     if not path.is_file():
@@ -1052,6 +1067,11 @@ def check_script(path: Path, run: Callable[[str, int], str] | None = None) -> Re
             return Report("script", str(path), FAIL,
                           [f"syntax error on line {error.lineno}: {error.msg}"])
         if run is not None:
+            member = package_member(path, source)
+            if member:
+                return Report("script", str(path), UNAVAILABLE,
+                              note=f"compiles; it is part of the package {member} and uses relative imports, so it is "
+                                   "imported through its package and not started alone")
             port = server_port(source)
             if port is not None:
                 # A server is verified by booting it, not by asking it for
