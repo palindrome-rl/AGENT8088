@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import re
 import shlex
 import time
@@ -170,6 +171,83 @@ def serve_root(page: Path) -> Path:
             break
         root = root.parent
     return root
+
+
+_BACKEND_FILES = frozenset({"server.js", "server.mjs", "server.cjs", "server.ts", "server.py", "app.py", "main.py",
+                            "api.py", "manage.py", "server.rb", "server.go", "server.php"})
+_BACKEND_PACKAGES = re.compile(r'"(?:express|fastify|koa|hono|@hapi/hapi|next|nuxt|socket\.io)"')
+_BACKEND_REQUIREMENTS = re.compile(r"^\s*(?:flask|fastapi|django|aiohttp|starlette|tornado|bottle)\b", re.I | re.M)
+_BACKEND_STATUSES = (404, 405, 501)
+# Tag only errors produced by decoding an actual missing-backend response.
+# Tag the rejected native decoder error with a per-check nonce; unrelated
+# JSON.parse failures receive no tag. The observer strips it from diagnostics.
+# Promise rejection and the SyntaxError type are preserved.
+_BACKEND_JSON_ERRORS_JS = r"""marker => {
+    const original = Response.prototype.json;
+    Response.prototype.json = function (...args) {
+        const parsed = original.apply(this, args);
+        let unavailable = false;
+        try {
+            const url = new URL(this.url);
+            const path = url.pathname;
+            const route = path === '/api' || path.startsWith('/api/') || !path.split('/').pop().includes('.');
+            unavailable = url.origin === location.origin && [404, 405, 501].includes(this.status) && route;
+        } catch (_) {}
+        if (!unavailable) return parsed;
+        return parsed.catch(error => {
+            if (error instanceof SyntaxError) error.message += ' [' + marker + ']';
+            throw error;
+        });
+    };
+}"""
+
+
+def _is_route(path: str) -> bool:
+    """An address that is a route of a server (/api/status, /ai-move), not a file (/data.json)."""
+    clean = path.split("?")[0].split("#")[0]
+    return clean == "/api" or clean.startswith("/api/") or "." not in clean.rsplit("/", 1)[-1]
+
+
+def has_backend(root: Path, page: Path | None = None) -> bool:
+    """Whether the project around this page has a server of its own.
+
+    Looked for in the folder served and up to three folders above it (the page may sit in `public/`):
+    a conventional server file, a package.json that starts one or depends on a server framework, or
+    Python requirements that name a web framework. Only used to tell a request the static check could
+    not answer from a file that is genuinely missing, so a wrong "yes" costs a warning, not a verdict.
+    """
+    folder = Path(root)
+    for _ in range(4):
+        try:
+            names = {entry.name for entry in folder.iterdir() if entry.is_file()}
+        except OSError:
+            names = set()
+        if names & _BACKEND_FILES:
+            return True
+        try:
+            if "package.json" in names:
+                try:
+                    package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    package = {}
+                if isinstance(package, dict):
+                    scripts = package.get("scripts", {})
+                    if isinstance(scripts, dict) and isinstance(scripts.get("start"), str) and scripts["start"].strip():
+                        return True
+                    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                        dependencies = package.get(section, {})
+                        if isinstance(dependencies, dict) and any(
+                                _BACKEND_PACKAGES.fullmatch(json.dumps(name)) for name in dependencies):
+                            return True
+            if "requirements.txt" in names and _BACKEND_REQUIREMENTS.search(
+                    (folder / "requirements.txt").read_text(encoding="utf-8", errors="ignore")):
+                return True
+        except OSError:
+            pass
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    return False
 
 
 # --- the static server -------------------------------------------------------------------------
@@ -363,10 +441,13 @@ def _click_through(tab, steps: int, budget: float, failures: list, seen: list,
 
 
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
-                click_steps: int = CLICK_THROUGH_STEPS) -> None:
+                click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
+    backend_asked: list[str] = []       # same-origin fetch/XHR paths the static server could not answer
+    backend_texts: list[str] = []       # the status line text of those answers ("File not found")
+    console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
     external_scripts: list[str] = []
     dialogs: list[str] = []
@@ -414,6 +495,9 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                     request_route.abort()
 
             context.route("**/*", route)
+            backend_marker = f"agent8088-backend-json-{uuid.uuid4().hex}"
+            if backend:
+                context.add_init_script("(" + _BACKEND_JSON_ERRORS_JS + ")(" + json.dumps(backend_marker) + ")")
             tab = context.new_page()
             tab.set_default_timeout(timeout * 1000)
             # alert()/confirm() is a visible effect of a click; dismiss it so the
@@ -427,7 +511,21 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
             def own(url: str) -> bool:
                 return not url or url.startswith((origin, "data:", "blob:", "about:"))
 
-            tab.on("pageerror", lambda error: failures.append(f"page error: {str(error)[:200]}"))
+            def on_page_error(error):
+                message = str(error).strip()
+                tag = f" [{backend_marker}]"
+                if backend and message.endswith(tag):
+                    detail = message[:-len(tag)][:200]
+                    warnings.append(f"page error: {detail} (the reply of a server this check could not run; not counted)")
+                elif backend and message.lower() in backend_texts:
+                    # Matching words alone cannot prove causality: an app can
+                    # throw the same text independently. Never call that a pass.
+                    warnings.append(f"page error: {message[:200]} (possibly a missing backend reply; not verified)")
+                    out["unavailable"] = "a page error matched a missing backend reply; its cause was not verified"
+                else:
+                    failures.append(f"page error: {message[:200]}")
+
+            tab.on("pageerror", on_page_error)
 
             def on_console(message):
                 if message.type != "error":
@@ -436,12 +534,26 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 text = message.text[:200]
                 console.append(f"error: {text}" + (f" ({where.replace(origin, '')})" if where and own(where) else ""))
                 if own(where):
+                    console_where[len(failures)] = where.replace(origin, "")
                     failures.append(f"console error: {text}")
 
             def on_response(response):
                 if response.url.startswith(origin) and response.status >= 400:
-                    failures.append(f"missing or failing file: {response.url.replace(origin, '')} "
-                                    f"returned {response.status}")
+                    path = response.url.replace(origin, "")
+                    if (backend and response.status in _BACKEND_STATUSES
+                            and response.request.resource_type in ("fetch", "xhr")
+                            and _is_route(path)):
+                        # The page asked its own server for data; this check serves files only, so the
+                        # backend is not running and a 404 or 405 says nothing about the page.
+                        backend_asked.append(path)
+                        if response.status_text:
+                            backend_texts.append(response.status_text.strip().lower())
+                        warnings.append(
+                            f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
+                            "serves static files only, so the backend was not running. Call the server after a "
+                            "click and handle a failure quietly, and the page will load cleanly without it")
+                        return
+                    failures.append(f"missing or failing file: {path} returned {response.status}")
 
             tab.on("console", on_console)
             tab.on("response", on_response)
@@ -498,6 +610,12 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         else:
                             warnings.append(f"the first control {described} changed nothing "
                                             f"({changed} other control{'s' if changed != 1 else ''} did)")
+            if backend_asked:
+                # The browser also logs "Failed to load resource" for each of those requests.
+                asked = {a.split("?")[0] for a in backend_asked}
+                failures[:] = [item for i, item in enumerate(failures)
+                               if not (i in console_where and console_where[i].split("?")[0] in asked
+                                       and item.startswith("console error: Failed to load resource"))]
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
@@ -575,7 +693,7 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
     started = time.time()
     steps = CLICK_THROUGH_STEPS if click_steps is None else max(0, click_steps)
-    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps),
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps, has_backend(root, path)),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)
@@ -613,6 +731,13 @@ def clip_output(output: str, limit: int = OUTPUT_CLIP) -> str:
         return text
     return text[:limit] + "\n[...]\n" + text[-limit:]
 
+
+# What a server that cannot start in the probe's surroundings says: a database or log file it must create next to
+# itself in a read-only copy, or a port that is already taken.
+_START_ENVIRONMENT = re.compile(
+    r"unable to open database file|attempt to write a readonly database|readonly database|read-only file system"
+    r"|errno 30\b|\[errno 13\]|permission denied|eacces|erofs|address already in use|eaddrinuse"
+    r"|only one usage of each socket|errno 98\b|errno 10048|winerror 10048|winerror 10013", re.I)
 
 # The last line of a traceback or error that is about the place the script was started in
 # (a read-only copy, an input or output path, a missing argument) and not about the script.
@@ -857,6 +982,12 @@ def _boot_report(path: Path, program: str, port: int,
                        f"within {BOOT_WAIT:.0f}s"])
     if line.startswith("BOOT:DIED"):
         detail = line[len("BOOT:DIED"):].strip(" :")
+        if _START_ENVIRONMENT.search(detail):
+            # The probe starts it in a read-only copy, with its own port: a server that must create its database
+            # file, or finds its port taken, has run into the probe's surroundings and not into a defect.
+            return Report("script", str(path), UNAVAILABLE,
+                          note=f"the server stopped at start because of where the probe ran it ({detail[:100]}); "
+                               "serving was not verified")
         return Report("script", str(path), FAIL,
                       ["the server exited before accepting connections on port "
                        f"{port}" + (f": {detail}" if detail else "")])

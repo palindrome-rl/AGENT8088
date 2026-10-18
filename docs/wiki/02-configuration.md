@@ -217,7 +217,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_read_bytes` | `2 MB` | Cap on a single file read. |
 | `max_http_bytes` | `5 MB` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
-| `max_tool_timeout_seconds` | `600` | Hard ceiling for one tool call. |
+| `max_tool_timeout_seconds` | `1200` | Hard ceiling for one tool call. |
 | `compaction_threshold_pct` | `75` | Automatically summarize older messages at this estimated context usage (`0` disables). |
 | `compaction_cooldown_turns` | `6` | Turns to wait after a successful automatic compaction before looking again, unless the context is already above 90% of the window. `0` removes the wait. |
 | `compaction_summary_max_chars` | `16000` | Longest the carried-over conversation summary may grow. Compaction keeps an earlier summary exactly as written and summarizes only what came after it, so a long run's first facts are not blurred by repeated rewriting; past this size the oldest summary sections are dropped whole, never rephrased. Each summary ends with a short harness record the model does not write (files written this run, verified checks), rebuilt from live state at every compaction. |
@@ -255,7 +255,7 @@ them and ends where it is.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `dynamic_turns_ceiling_multiplier` | `4` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
+| `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns`. `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 | `stall_rounds` | `6` | Rounds in a row that bring nothing new (no new call that worked, no file changed, no check newly passing, no part finished) before the main agent is asked once to finish with what it has or change approach. A second stretch of the same length with nothing ends the run with the usual summary. Reading or fetching something new always counts as progress. `0` turns the watch off. |
 | `verification_loop_rounds` | `8` | Once the work is built, its checks pass and no part is open, this many rounds in a row that change no file are answered once with a message that finishing is the next step (at most twice per request). It never ends the run. `0` turns it off. |

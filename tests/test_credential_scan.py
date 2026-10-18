@@ -225,3 +225,12 @@ def test_snake_case_names_with_numbers_are_not_credentials(text):
 ])
 def test_random_underscore_strings_are_still_found(value):
     assert secret_scan.find_secrets(f'api_token = "{value}"'), value
+
+
+@pytest.mark.parametrize("value", [
+    "QJXNZKPVTRWH7LMBCDYFS",  # uppercase blob with one digit
+    "qjxnzkpvtrwh7lmbcdyfs",  # a lowercase blob is not camelCase
+    "QjxNZKPVTRWH7LmbCDYFS",  # large acronym chunks are not words
+])
+def test_identifier_exemption_does_not_hide_unstructured_blobs(value):
+    assert secret_scan.find_secrets(value)
