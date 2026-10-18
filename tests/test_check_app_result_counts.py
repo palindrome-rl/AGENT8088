@@ -90,3 +90,26 @@ def test_two_pages_with_the_same_basename_are_not_the_same_check(engine, state):
     assert state.check_failing()
     _check_app(engine, state, PASSED, path='site-a/index.html')
     assert not state.check_failing()
+
+
+@pytest.mark.parametrize('second,same', [('site-b/index.html', False), ('site-a/index.html', True)])
+def test_agent_loop_passes_actual_check_targets_to_the_tracker(engine, monkeypatch, tmp_path, second, same):
+    import json
+    from tests.test_completion_pipeline import Script, _call
+    monkeypatch.setattr(engine, 'PROJECT_ROOT', tmp_path)
+    monkeypatch.setattr(engine, 'ARTIFACTS_ROOT', tmp_path / 'artifacts')
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [tmp_path])
+    monkeypatch.setattr(engine, 'PERMISSION_MODE', 'full-auto')
+    results = iter([FAILED, PASSED])
+    seen = []
+    def tool(name, arguments, depth=0):
+        assert name == 'check_app' and json.loads(arguments)['path']
+        return next(results)
+    Script(engine, monkeypatch, [
+        _call('check_app', path='site-a/index.html'),
+        _call('check_app', path=second), 'Finished the checks.',
+    ], tool=tool)
+    engine.run_agent([{'role': 'user', 'content': 'Check the pages and report the results.'}],
+                     max_turns=8, tools_def=[], allowed_tools={'check_app'},
+                     memory_capture=False, on_trajectory_state=seen.append)
+    assert seen[-1]['check_failing'] is not same
