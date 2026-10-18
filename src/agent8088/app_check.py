@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import functools
+import json
 import re
 import shlex
 import time
@@ -182,7 +183,7 @@ _BACKEND_STATUSES = (404, 405, 501)
 def _is_route(path: str) -> bool:
     """An address that is a route of a server (/api/status, /ai-move), not a file (/data.json)."""
     clean = path.split("?")[0].split("#")[0]
-    return clean.startswith("/api") or "." not in clean.rsplit("/", 1)[-1]
+    return clean == "/api" or clean.startswith("/api/") or "." not in clean.rsplit("/", 1)[-1]
 
 
 def has_backend(root: Path, page: Path | None = None) -> bool:
@@ -203,9 +204,19 @@ def has_backend(root: Path, page: Path | None = None) -> bool:
             return True
         try:
             if "package.json" in names:
-                text = (folder / "package.json").read_text(encoding="utf-8", errors="ignore")
-                if '"start"' in text or _BACKEND_PACKAGES.search(text):
-                    return True
+                try:
+                    package = json.loads((folder / "package.json").read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    package = {}
+                if isinstance(package, dict):
+                    scripts = package.get("scripts", {})
+                    if isinstance(scripts, dict) and isinstance(scripts.get("start"), str) and scripts["start"].strip():
+                        return True
+                    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+                        dependencies = package.get(section, {})
+                        if isinstance(dependencies, dict) and any(
+                                _BACKEND_PACKAGES.fullmatch(json.dumps(name)) for name in dependencies):
+                            return True
             if "requirements.txt" in names and _BACKEND_REQUIREMENTS.search(
                     (folder / "requirements.txt").read_text(encoding="utf-8", errors="ignore")):
                 return True
