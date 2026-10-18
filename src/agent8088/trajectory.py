@@ -214,6 +214,40 @@ def _runs_a_written_file(command: str, written) -> bool:
     return False
 
 
+# What a script says when it was run in the wrong place: a browser file started under Node or Python (no `document`, no
+# `window`), or an ES module started as a plain script. The file may be fine where it belongs, so that run says
+# nothing about it. Only a run of a file the run wrote, with no check word in the command, is read this way: a
+# failing test or check script is still a failure.
+_WRONG_PLACE = re.compile(
+    r"\b(?:document|window|navigator|localStorage|sessionStorage|alert|confirm|Image|Audio|HTMLElement|"
+    r"requestAnimationFrame|XMLHttpRequest|customElements|MutationObserver|ResizeObserver|IntersectionObserver|"
+    r"AudioContext|CanvasRenderingContext2D)\s+is not defined"
+    r"|Cannot use import statement outside a module|Unexpected token 'export'"
+    r"|require is not defined in ES module scope|ERR_REQUIRE_ESM|ERR_UNKNOWN_FILE_EXTENSION"
+    r"|name '(?:document|window|navigator)' is not defined", re.IGNORECASE)
+_TRACEBACK = re.compile(r"Traceback \(most recent call last\)|^\s*(?:\w+\.)*\w*(?:Error|Exception)\b", re.MULTILINE)
+# `cd "C:\long\path" &&` in front of the command says where, not what.
+_CD_PREFIX = re.compile(r"""^\s*(?:cd|chdir|pushd)\s+(?:/d\s+)?(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;|&)\s*""", re.IGNORECASE)
+
+
+def _command_core(command: str) -> str:
+    """The command without the `cd <folder> &&` in front of it (up to two of them)."""
+    text = (command or "").strip()
+    for _ in range(2):
+        stripped = _CD_PREFIX.sub("", text, count=1)
+        if stripped == text or not stripped.strip():
+            break
+        text = stripped
+    return text
+
+
+def _wrong_place_failure(command: str, result: str, written) -> bool:
+    """A run of a written file that failed only because it was started where it does not belong."""
+    return (bool(_WRONG_PLACE.search(str(result)))
+            and _runs_a_written_file(command, written)
+            and not _is_check_run(command))
+
+
 def _same_command(a: str, b: str) -> bool:
     return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
 
@@ -388,13 +422,19 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
+        written_now = self.data.get("written_paths")
         if (operation["verdict"] == "failed"
-                and (_is_check_run(command) or _runs_a_written_file(command, self.data.get("written_paths")))
-                and not _SANDBOX_BLOCKED.search(str(result))):
+                and (_is_check_run(command) or _runs_a_written_file(command, written_now))
+                and not _SANDBOX_BLOCKED.search(str(result))
+                and not _wrong_place_failure(command, result, written_now)):
             self.data["check_failing"] = True
-            what = (command or operation["tool"]).strip().replace("\n", " ")[:100]
+            what = (_command_core(command) or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
             self.data["failing_command"] = " ".join(command.split())
+            # The written files this run started: a clean run of any of them later settles the failure.
+            self.data["failing_files"] = ([] if _is_check_run(command) else
+                                         [PurePath(str(f)).name for f in written_now or []
+                                          if _runs_a_written_file(command, [f])][:6])
             # Display notes are deliberately shortened. Keep the check target
             # separately so a long path cannot prevent its successful retry
             # from settling the failure.
@@ -406,10 +446,20 @@ class TrajectoryState:
             self.data["failing_check"] = ""
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
                 and self.data.get("check_failing")
+                and not _TRACEBACK.search(str(result))
                 and _same_command(self.data.get("failing_command"), command)):
             # The very command that failed has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
+        elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
+                and self.data.get("check_failing") and self.data.get("failing_files")
+                and not _TRACEBACK.search(str(result))
+                and any(_runs_a_written_file(command, [name]) for name in self.data["failing_files"])):
+            # The failure was a run of a file the run wrote; that file has now run again, exited cleanly and
+            # printed no error, whatever else the command line said.
+            self.data["check_failing"] = False
+            self.data["failing_check"] = ""
+            self.data["failing_files"] = []
         if mutated:
             self.data["mutation_count"] = int(self.data.get("mutation_count") or 0) + 1
             self._set_step("Complete the requested work", "done")
