@@ -20156,6 +20156,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                     trajectory.note_ran_ok()
+                check_app_path = ""
+                if name == "check_app" and args.get("path"):
+                    try:
+                        check_app_path = str(resolve_user_path(str(args["path"])))
+                    except (OSError, ValueError, RuntimeError):
+                        # The tool already reports invalid/disallowed paths.
+                        # Bookkeeping must not turn that refusal into a crash.
+                        pass
                 trajectory.after_tool(
                     operation, result,
                     failed=_plan_step_failed(result) or audit_verdict == "failed",
@@ -20164,8 +20172,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     # Every write tool in tools.txt uses 'filename' as its
                     # path_arg; a tool that declares none yields "", which the
                     # tracker ignores.
-                    path=(str(resolve_user_path(str(args["path"])))
-                          if name == "check_app" and args.get("path") else
+                    path=(check_app_path if name == "check_app" else
                           str(args.get("filename") or args.get("destination") or "")),
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
@@ -20174,8 +20181,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     written_to=_write_landing(name, args),
                 )
                 if name == "check_app":
-                    trajectory.settle_check_app(
-                        result, path=str(resolve_user_path(str(args["path"]))) if args.get("path") else "")
+                    trajectory.settle_check_app(result, path=check_app_path)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):
