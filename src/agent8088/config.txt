@@ -366,6 +366,9 @@ memory_mem0_dir=~/.agent8088/mem0
 # Changing the embedder changes vector dimensions, and mem0 has no migration:
 # clear the memory_mem0_dir when switching.
 memory_embed_provider=ollama
+# Seconds one embeddings request may take (default 30). A CPU-only machine needs
+# ~20 s to embed the tool list; too short a limit leaves tool choice keyword-only.
+# memory_embed_timeout_seconds=30
 #
 # Model for the fact-extraction call (default: your chat model). Point this at
 # something small if one extra call per turn on your main model is too slow.
