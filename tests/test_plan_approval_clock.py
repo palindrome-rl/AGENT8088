@@ -54,6 +54,7 @@ def test_no_active_budget_is_fine(engine, monkeypatch):
 
 def test_present_plan_approval_lifts_the_clock(engine, monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)        # present_plan saves PLAN.md
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])     # ...only inside allowed paths
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
     engine.enter_plan_mode()
     budget = _budget(engine, monkeypatch, 300)
