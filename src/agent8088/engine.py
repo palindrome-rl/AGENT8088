@@ -7969,6 +7969,23 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     return "\n".join(parts)
 
 
+def _lift_plan_clock() -> None:
+    """Planning has a wall-clock ceiling; the work an approval starts does not inherit it.
+
+    A request that starts in plan mode gets plan_mode_timeout_seconds (300s) because
+    max_turn_seconds is off by default. The budget is built once, when the request
+    starts, and the approved plan then runs inside that same request, so the build
+    died at 300s in total ("Time budget exceeded") however long the user's own
+    limits allowed. An approval ends the planning phase: hand the request back to
+    max_turn_seconds, which is 0 (off) unless the user set it. A user-set
+    max_turn_seconds was already the budget, so it is left alone.
+    """
+    budget = _active_budget
+    if (budget is not None and not MAX_TURN_SECONDS
+            and budget.max_seconds == PLAN_MODE_TIMEOUT_SECONDS):
+        budget.max_seconds = 0
+
+
 def _exec_present_plan(args: dict, depth: int = 0) -> str:
     """Show a finished plan and ask the user to approve it.
 
@@ -8017,6 +8034,7 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
                 "present_plan again, or answer the user's questions about it. "
                 "Nothing has been written or run.")
     set_permission_mode(chosen)
+    _lift_plan_clock()
     _plan_approved = True
     _plan_approved_text = plan_text
     message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
