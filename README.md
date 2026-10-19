@@ -227,6 +227,7 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 | `agent8088 --mcp-serve` | Expose Agent8088's safe tools over MCP stdio. |
 | `/plan <task>` | Research, propose a plan, and wait for your approval before mutations. |
 | `/capabilities` | Show the live tool, MCP, sandbox, skill, sub-agent, and guardrail configuration. |
+| `/limits [key value]` | Show every turn, budget, sub-agent, and tool limit, or change one (for example the starting rounds or the tool-timeout ceiling); changes are saved to your config. |
 | `/cli-anything <task>` | Find, install, run, build, refine, test, or validate an application CLI through the experimental CLI-Anything integration. |
 | `/doctor [--fix]` | Check local setup and report likely problems; `--fix` repairs a broken web-search install. |
 | `/dump` | Write a redacted diagnostic bundle (`dump-<date>-<time>.txt` in the data folder) for sharing in a bug report. |
