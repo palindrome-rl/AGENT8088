@@ -82,3 +82,30 @@ def test_the_decision_is_kept_per_project_root(engine, roots, tmp_path, monkeypa
     monkeypatch.setattr(engine, "ARTIFACTS_ROOT", other / "artifacts")
     monkeypatch.setattr(engine, "ALLOWED_PATHS", [other])
     assert engine.resolve_write_path("pokemon-doubles/server.js") == other / "artifacts" / "pokemon-doubles" / "server.js"
+
+
+def _said(monkeypatch, engine, text):
+    monkeypatch.setattr(engine, "_CURRENT_RUN_MESSAGES", [{"role": "user", "content": text}])
+
+
+def test_a_folder_the_person_put_in_artifacts_goes_there_whatever_is_written_first(engine, roots, monkeypatch):
+    project, artifacts = roots
+    _said(monkeypatch, engine, "Create the project in `artifacts/pokemon-doubles/`. Files: pokemon-doubles/package.json")
+    first = _write(engine, "pokemon-doubles/package.json")        # also typed by the person, which used to pin it to the root
+    second = _write(engine, "pokemon-doubles/server.js")
+    assert first == artifacts / "pokemon-doubles" / "package.json"
+    assert second == artifacts / "pokemon-doubles" / "server.js"
+    assert not (project / "pokemon-doubles").exists()
+
+
+def test_the_artifacts_instruction_beats_an_earlier_root_decision(engine, roots, monkeypatch):
+    project, artifacts = roots
+    _write(engine, "pokemon-doubles/package.json")                 # decided at the root before the person's words apply
+    _said(monkeypatch, engine, "Put the whole app in artifacts/pokemon-doubles/.")
+    assert engine.resolve_write_path("pokemon-doubles/server.js") == artifacts / "pokemon-doubles" / "server.js"
+
+
+def test_a_different_folder_name_in_the_instruction_changes_nothing(engine, roots, monkeypatch):
+    project, artifacts = roots
+    _said(monkeypatch, engine, "Put the notes in artifacts/notes-tool/. Also write pokemon-doubles/package.json.")
+    assert _write(engine, "pokemon-doubles/package.json") == project / "pokemon-doubles" / "package.json"
