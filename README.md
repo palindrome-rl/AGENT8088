@@ -100,9 +100,10 @@ analysis, academic research and community pain-points.
 ## What's new in v1.3
 
 - **Task completion:** each part of a request is checked against delivered output; smoke tests separate "could not start here" from real crashes.
+- **Verification you can read:** each answer says how well its changes were checked (tested, only run, or failed), and a failing check shows as NOT VERIFIED at the top.
 - **Long-running tasks:** time and round budget warnings, stall decisions, and your rules kept word for word through compaction.
 - **Credential safety:** secret scanning on pasted text and written files; attachments isolated per session.
-- **File handling:** byte-exact `copy_file` and `move_file`.
+- **File handling:** byte-exact `copy_file` and `move_file`; a generated project stays in one folder, and a folder you ask to put in `artifacts/` goes there.
 
 Includes the v1.2 reliability fixes; existing configuration and memory are preserved. See the [CHANGELOG](CHANGELOG.md).
 
