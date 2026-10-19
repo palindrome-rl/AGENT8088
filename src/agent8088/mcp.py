@@ -526,6 +526,10 @@ class MCPRuntime:
             os.chmod(temporary, 0o600)
         os.replace(temporary, path)
 
+    def server_config(self, name):
+        """The configured entry for `name` (project file wins), or None."""
+        return self._load_config().get(name)
+
     def set_server(self, name, config, project=False):
         self._validate(name, config)
         path = self.config_paths[1 if project else 0]
