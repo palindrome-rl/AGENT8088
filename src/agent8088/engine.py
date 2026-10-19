@@ -673,7 +673,7 @@ PROSE_CUTOFF_MAX = 2
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
 LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
-PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
+PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 4))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
 MAX_TURN_COST_USD = _config_float("max_turn_cost_usd", 0.0)
@@ -7969,6 +7969,34 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     return "\n".join(parts)
 
 
+def _lift_plan_clock() -> None:
+    """Planning has a wall-clock ceiling; the work an approval starts does not inherit it.
+
+    A request that starts in plan mode gets plan_mode_timeout_seconds (300s) because
+    max_turn_seconds is off by default. The budget is built once, when the request
+    starts, and the approved plan then runs inside that same request, so the build
+    died at 300s in total ("Time budget exceeded") however long the user's own
+    limits allowed. An approval ends the planning phase: hand the request back to
+    max_turn_seconds, which is 0 (off) unless the user set it. A user-set
+    max_turn_seconds was already the budget, so it is left alone.
+    """
+    budget = _active_budget
+    if (budget is not None and not MAX_TURN_SECONDS
+            and budget.max_seconds == PLAN_MODE_TIMEOUT_SECONDS):
+        budget.max_seconds = 0
+
+
+def _plan_retry_limit_message(attempts: int) -> str:
+    """What the user is told when plan mode gives up on a model that keeps trying to write.
+
+    The session is left in plan mode with no plan, so the message says what to type
+    next instead of only what went wrong."""
+    return (f"Plan mode stopped after {attempts} invalid mutation attempts. "
+            "Nothing was written or run. Reply with a short message such as "
+            "\"present the plan now\" to ask the model to present its plan with "
+            "present_plan, or leave plan mode (/mode full-auto) before retrying.")
+
+
 def _exec_present_plan(args: dict, depth: int = 0) -> str:
     """Show a finished plan and ask the user to approve it.
 
@@ -8017,6 +8045,7 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
                 "present_plan again, or answer the user's questions about it. "
                 "Nothing has been written or run.")
     set_permission_mode(chosen)
+    _lift_plan_clock()
     _plan_approved = True
     _plan_approved_text = plan_text
     message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
@@ -19781,11 +19810,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if invalid_plan:
                 plan_mutation_retries += 1
                 if plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT:
-                    answer = _guard_answer(
-                        f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                        "attempts. Nothing was written or run. Present the plan with "
-                        "present_plan, or leave plan mode before retrying."
-                    )
+                    answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
                     if on_answer:
                         on_answer(answer)
                     return answer
@@ -20486,11 +20511,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
-            answer = _guard_answer(
-                f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                "attempts. Nothing was written or run. Present the plan with "
-                "present_plan, or leave plan mode before retrying."
-            )
+            answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
             if on_answer:
                 on_answer(answer)
             if trace is not None:
