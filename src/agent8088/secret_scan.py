@@ -297,8 +297,12 @@ _SKIP_SUFFIXES = frozenset({
 })
 
 
-def scan_files(paths) -> list:
-    """Findings in files a run wrote, as ``(path, line_number, Finding)``."""
+def scan_files(paths, *, scanned: set[str] | None = None) -> list:
+    """Findings in written files; optionally report paths actually read.
+
+    A skipped or unreadable file is not evidence that its contents are clean.
+    Callers can use ``scanned`` to retire only successfully inspected files.
+    """
     hits = []
     for path in paths:
         try:
@@ -312,6 +316,8 @@ def scan_files(paths) -> list:
             # Unreadable, binary, or a dangling path. A scan that raises
             # would take the run down over a file it cannot open.
             continue
+        if scanned is not None:
+            scanned.add(str(p))
         for number, line in enumerate(content.splitlines(), 1):
             for finding in find_secrets(line):
                 hits.append((str(p), number, finding))

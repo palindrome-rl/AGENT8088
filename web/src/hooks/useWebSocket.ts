@@ -153,7 +153,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'notice':
         // Advisory (e.g. a pasted credential): a system line in the chat it came from.
-        if (visible) addMessage({ role: 'system', content: scrubMarkup(data.text) })
+        if (visible) addMessage({ role: 'system', notice: 'warning', content: scrubMarkup(data.text) })
         break
       case 'error':
         console.error('Agent error:', data.message)

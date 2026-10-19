@@ -24,6 +24,7 @@ def _roots(tmp_path):
 def test_a_plan_is_written_to_disk(tmp_path, monkeypatch):
     from agent8088 import engine
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
     monkeypatch.setattr(engine, "_plan_on_approval", lambda text: "full-auto")
     monkeypatch.setattr(engine, "_human_wait", lambda: _null_ctx())
@@ -40,6 +41,7 @@ def test_a_plan_is_written_to_disk(tmp_path, monkeypatch):
 def test_a_rejected_plan_is_still_on_disk(tmp_path, monkeypatch):
     from agent8088 import engine
     monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     monkeypatch.setattr(engine, "PERMISSION_MODE", "plan-only")
     monkeypatch.setattr(engine, "_plan_on_approval", lambda text: None)
     monkeypatch.setattr(engine, "_human_wait", lambda: _null_ctx())

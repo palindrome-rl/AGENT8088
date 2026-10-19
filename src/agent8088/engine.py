@@ -8015,18 +8015,35 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     # transcript scrolled away, so an approved plan had no file behind it and
     # a teammate had nothing to read. Written before the approval prompt, so
     # it is on disk whether the plan is approved, revised or rejected.
-    plan_path = PROJECT_ROOT / "PLAN.md"
-    try:
-        plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
-    except OSError as exc:
-        _log.warning("could not write %s: %s", plan_path, exc)
-        plan_path = None
+    # Save a proposal without ever replacing a user's plan (including links).
+    # Exclusive creation also closes the exists/write race. The plan-only tool
+    # may create this draft, but must obey the workspace's path protections.
+    for attempt in range(4):
+        plan_path = PROJECT_ROOT / ("PLAN.md" if attempt == 0 else
+                                    f"PLAN.proposal-{uuid.uuid4().hex[:12]}.md")
+        if os.path.lexists(plan_path):
+            continue
+        try:
+            target = plan_path.resolve()
+            if (not _path_is_allowed(target) or _is_sensitive_path(str(target))
+                    or _is_shell_startup_file(str(target))
+                    or _check_path_zone(target) == "blocked"):
+                return f"Error: cannot save a plan proposal at the protected path {plan_path}. Nothing was approved or run."
+            with plan_path.open("x", encoding="utf-8") as draft:
+                draft.write(plan_text.rstrip() + "\n")
+            break
+        except FileExistsError:
+            continue
+        except (OSError, ValueError) as exc:
+            return f"Error: could not save the plan proposal at {plan_path}: {exc}. Nothing was approved or run."
+    else:
+        return "Error: could not create a new plan proposal. Nothing was approved or run."
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
     if not chosen:
         return ("Plan not approved — still in plan mode. Revise the plan and call "
                 "present_plan again, or answer the user's questions about it. "
-                "Nothing has been written or run.")
+                f"Proposal saved at {plan_path}. No plan steps were run.")
     set_permission_mode(chosen)
     _plan_approved = True
     _plan_approved_text = plan_text
@@ -18821,6 +18838,27 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     return None
 
 
+def _secret_scan_paths(trajectory, written: list) -> list[str]:
+    """Resolve trajectory names to the files the write tool actually produced.
+
+    Recorded sandbox landings take precedence over namesakes in the project or
+    launch directory. Older trajectories without landings use the write resolver.
+    """
+    landings = dict(trajectory.redirected_writes())
+    paths = []
+    for raw in written:
+        name = str(raw)
+        try:
+            stored = Path(_from_container_path(name)).expanduser()
+            path = landings.get(name) or str(
+                stored if stored.is_absolute() else resolve_write_path(name))
+        except (OSError, ValueError):
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def _secrets_step(trajectory, written: list):
     """Scan the files this run wrote for credentials before calling the work done.
 
@@ -18835,8 +18873,9 @@ def _secrets_step(trajectory, written: list):
     Each file is scanned once per state of the work, so a rewrite is rescanned
     but an unchanged file is not re-reported every round.
     """
-    pending = trajectory.secrets_unchecked([str(p) for p in written])
-    hits = secret_scan.scan_files(pending)
+    pending = trajectory.secrets_unchecked(_secret_scan_paths(trajectory, written))
+    scanned = set()
+    hits = secret_scan.scan_files(pending, scanned=scanned)
     dirty = {path for path, _line, _finding in hits}
     # Only a file that came back clean is retired. Retiring one that still
     # holds a credential is what let a real leak disappear: the first pass
@@ -18844,7 +18883,7 @@ def _secrets_step(trajectory, written: list):
     # pending list with the file already ticked off, so nothing was reported
     # and the run ended as a plain success.
     for path in pending:
-        if path not in dirty:
+        if path in scanned and path not in dirty:
             trajectory.record_secret_scan(path)
     if not hits:
         return None
@@ -18952,7 +18991,7 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         if missing:
             reasons.append("missing or empty files: " + ", ".join(missing[:6]))
         leaked = secret_scan.scan_files(trajectory.secrets_unchecked(
-            [str(p) for p in trajectory.written_paths()]))
+            _secret_scan_paths(trajectory, trajectory.written_paths())))
         if leaked:
             names = sorted({Path(path).name for path, _l, _f in leaked})
             reasons.append("a credential is written in clear text in: "
@@ -20431,7 +20470,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         "This session cannot request approval, so nothing was run.")
                 else:
                     answer = _guard_answer(
-                        "Plan not approved. Nothing was written or run. "
+                        result + " " +
                         "I will wait for your changes or approval before proceeding.")
                 if on_answer:
                     on_answer(answer)

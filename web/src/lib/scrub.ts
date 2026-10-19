@@ -76,6 +76,9 @@ export function parseEscalation(text: string): { changeType: string; paths: stri
 // restoring history, while retaining real user messages (including errors).
 export function displayMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.filter((message, index) => {
+    if (message.role === 'system') {
+      return message.notice === 'warning' && Boolean(scrubMarkup(message.content).trim())
+    }
     if (message.role === 'assistant') {
       return Boolean(scrubMarkup(message.content).trim() || message.tools?.length || message.reasoning?.length)
     }
