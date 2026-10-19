@@ -55,7 +55,7 @@ prompt_paths=~
 # earns more rounds, up to max_turns * dynamic_turns_ceiling_multiplier. Change
 # it here, or at any time with `/maxturns <n>` in the REPL, which writes it back
 # to this file.
-max_turns=150
+max_turns=300
 # How far progress may grow max_turns. 1 disables growth and restores a hard
 # fixed limit of exactly max_turns rounds.
 # dynamic_turns_ceiling_multiplier=3
