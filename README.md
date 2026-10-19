@@ -72,7 +72,7 @@ smaller models, limited context, and explicit operational boundaries.
     </td>
     <td width="33%" valign="top">
       <strong>Robust context management</strong><br>
-      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
+      <sub>Pre-call token budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters within the window.</sub>
     </td>
   </tr>
   <tr>
@@ -82,21 +82,21 @@ smaller models, limited context, and explicit operational boundaries.
     </td>
     <td width="33%" valign="top">
       <strong>Grounded execution</strong><br>
-      <sub>A persistent control loop plans, acts through structured tools, observes the result, and recovers when execution fails.</sub>
+      <sub>Work proceeds through structured tools and observable results, so each step is checked against real files, test output, and system state rather than the model's own claims.</sub>
     </td>
     <td width="33%" valign="top">
-      <strong>Reliable by design</strong><br>
-      <sub>Rollback of failed changes, resumable tasks, loop and stall detection, and forced replanning keep long runs recoverable.</sub>
+      <strong>Reliable control loop</strong><br>
+      <sub>A persistent loop plans, acts, and observes, detects repeats and stalls, replans after failures, and enforces time and round limits to keep runs moving.</sub>
     </td>
   </tr>
   <tr>
     <td width="33%" valign="top">
-      <strong>Transparent, safe and controlled</strong><br>
-      <sub>Permission modes, usage visibility, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
+      <strong>Failure recovery</strong><br>
+      <sub>Rollback of failed changes, resumable tasks, overflow and cut-off retries, and halting at the first failed step keep long runs recoverable.</sub>
     </td>
     <td width="33%" valign="top">
-      <strong>Efficiency and cost</strong><br>
-      <sub>Token budgeting, lean prompts, selective verification, and per-role usage reporting keep reliability affordable on small models.</sub>
+      <strong>Transparent, safe and controlled</strong><br>
+      <sub>Permission modes, usage and cost monitoring, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Low-friction and extensible</strong><br>
