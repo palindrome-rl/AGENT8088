@@ -2,10 +2,10 @@
 from agent8088 import engine
 
 
-def test_a_request_starts_at_150_rounds_and_can_grow_to_450():
-    assert engine.DEFAULT_MAX_TURNS == 150
+def test_a_request_starts_at_300_rounds_and_can_grow_to_900():
+    assert engine.DEFAULT_MAX_TURNS == 300
     assert engine.DYNAMIC_TURNS_CEILING_MULTIPLIER == 3
-    assert engine.DEFAULT_MAX_TURNS * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER == 450
+    assert engine.DEFAULT_MAX_TURNS * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER == 900
 
 
 def test_one_tool_call_may_run_for_twenty_minutes(tmp_path):
@@ -30,6 +30,6 @@ def test_the_web_ui_accepts_the_grown_budget():
 def test_the_config_template_shows_the_same_defaults():
     from pathlib import Path
     text = (Path(engine.__file__).parent / "config.txt").read_text(encoding="utf-8")
-    assert "\nmax_turns=150\n" in text
+    assert "\nmax_turns=300\n" in text
     assert "# dynamic_turns_ceiling_multiplier=3" in text
     assert "# max_tool_timeout_seconds=1200" in text
