@@ -12634,6 +12634,19 @@ def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
     if bearer_env:
         config["bearer_token_env"] = bearer_env
 
+    # A model that cannot see a server's tools tends to "add" it again under the
+    # same name, and the write below replaced the working entry: one run lost
+    # every mail tool to a package that did not exist (issue sheet row 48).
+    previous = MCP_RUNTIME.server_config(server_name)
+    replace = str(args.get("replace") or "").strip().lower() in ("1", "true", "yes")
+    if previous is not None and not replace:
+        status = MCP_RUNTIME.statuses.get(server_name, {})
+        tools = ", ".join(status.get("tools", [])) or "none reported"
+        return (f"Error: an MCP server named '{server_name}' is already configured "
+                f"(state: {status.get('state', 'unknown')}; tools: {tools}). Nothing was "
+                "changed. Use its tools directly (describe_tool explains one), choose "
+                "another name for a second server, or pass replace=true to swap it out.")
+
     display = f"add_mcp_server: {server_name} ({transport}) -> {display_cmd}"
     if not check_permission("shell", display, host=True, approval_key=approval_key):
         _audit("escalation_requested", tool=name, mode="shell",
@@ -12652,6 +12665,15 @@ def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
     status = MCP_RUNTIME.statuses.get(server_name, {})
     state = status.get("state", "unknown")
     tools = ", ".join(status.get("tools", [])) or status.get("error", "")
+    if previous is not None and state != "connected":
+        # The replacement did not come up: put the working server back.
+        try:
+            MCP_RUNTIME.set_server(server_name, previous, project=bool(args.get("project")))
+            reload_mcp_tools()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error: the replacement failed ({tools}) and restoring '{server_name}' failed: {exc}"
+        return (f"Error: the replacement for '{server_name}' did not connect ({state}: {tools}). "
+                "The previous configuration was restored.")
     return (f"Added '{server_name}' ({transport}). Connection state: {state}"
             + (f" -- {tools}" if tools else ""))
 
