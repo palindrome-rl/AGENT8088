@@ -673,7 +673,7 @@ PROSE_CUTOFF_MAX = 2
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
 LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
-PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
+PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 4))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
 MAX_TURN_COST_USD = _config_float("max_turn_cost_usd", 0.0)
@@ -7984,6 +7984,17 @@ def _lift_plan_clock() -> None:
     if (budget is not None and not MAX_TURN_SECONDS
             and budget.max_seconds == PLAN_MODE_TIMEOUT_SECONDS):
         budget.max_seconds = 0
+
+
+def _plan_retry_limit_message(attempts: int) -> str:
+    """What the user is told when plan mode gives up on a model that keeps trying to write.
+
+    The session is left in plan mode with no plan, so the message says what to type
+    next instead of only what went wrong."""
+    return (f"Plan mode stopped after {attempts} invalid mutation attempts. "
+            "Nothing was written or run. Reply with a short message such as "
+            "\"present the plan now\" to ask the model to present its plan with "
+            "present_plan, or leave plan mode (/mode full-auto) before retrying.")
 
 
 def _exec_present_plan(args: dict, depth: int = 0) -> str:
@@ -19799,11 +19810,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if invalid_plan:
                 plan_mutation_retries += 1
                 if plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT:
-                    answer = _guard_answer(
-                        f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                        "attempts. Nothing was written or run. Present the plan with "
-                        "present_plan, or leave plan mode before retrying."
-                    )
+                    answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
                     if on_answer:
                         on_answer(answer)
                     return answer
@@ -20504,11 +20511,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
-            answer = _guard_answer(
-                f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                "attempts. Nothing was written or run. Present the plan with "
-                "present_plan, or leave plan mode before retrying."
-            )
+            answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
             if on_answer:
                 on_answer(answer)
             if trace is not None:
