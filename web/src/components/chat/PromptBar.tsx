@@ -6,6 +6,7 @@ import { useWebSocket, drainPromptQueue, planTaskOf } from '@/hooks/useWebSocket
 import { useCommandCatalog } from '@/lib/commands'
 import { useUIStore } from '@/stores/ui'
 import { cn } from '@/lib/utils'
+import { askNotifyPermission } from '@/lib/notify'
 import { Otto } from './Otto'
 
 /* ─────────────────────────────────────────────────────────
@@ -316,6 +317,7 @@ export function PromptBar() {
       wsSend({ type: 'command', command: cmd, args: rest.join(' '),
         session_id: useSessionStore.getState().sessionId || undefined })
     } else {
+      askNotifyPermission()
       const message = trimmed || `Please review ${readyAttachments.map((attachment) => attachment.file.name).join(', ')}.`
       try {
         await ensureSession(message)

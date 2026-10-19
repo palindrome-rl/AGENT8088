@@ -218,6 +218,17 @@ browser_headless=1
 sandbox_backend=auto
 sandbox_runtime_version=0.0.73
 # sandbox_allowed_domains=api.example.com
+# `open` lets sandboxed commands reach anything this computer can: the internet,
+# its own services (mail, databases, dev servers on localhost) and the local
+# network. File-write limits still apply. In auto mode, Linux/macOS commands
+# prefer Docker because the native sandbox cannot open its network. Linux uses
+# host networking; macOS uses bridge networking (localhost stays in the container).
+# Off by default: a command steered by a malicious page or email could send
+# project files anywhere.
+# sandbox_network=open
+# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running,
+# for the sandbox fallback or the managed SearXNG. 0 turns this off.
+# docker_autostart=1
 # Seconds allowed for pulling a missing container image. This is deliberately
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.
@@ -226,7 +237,7 @@ sandbox_runtime_version=0.0.73
 # Plan mode gets a wall-clock ceiling even when max_turn_seconds is unset, and
 # stops after repeated mutation attempts instead of looping until max_turns.
 # plan_mode_timeout_seconds=300
-# plan_mode_retry_limit=2
+# plan_mode_retry_limit=4
 
 # --- plan step auditing ---
 # With plan_audit=1, every mutating execute_plan step is verified against the
@@ -352,6 +363,9 @@ memory_mem0_dir=~/.agent8088/mem0
 # Changing the embedder changes vector dimensions, and mem0 has no migration:
 # clear the memory_mem0_dir when switching.
 memory_embed_provider=ollama
+# Seconds one embeddings request may take (default 30). A CPU-only machine needs
+# ~20 s to embed the tool list; too short a limit leaves tool choice keyword-only.
+# memory_embed_timeout_seconds=30
 #
 # Model for the fact-extraction call (default: your chat model). Point this at
 # something small if one extra call per turn on your main model is too slow.

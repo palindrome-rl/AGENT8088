@@ -3,6 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useSessionStore } from '@/stores/session'
 import { useUIStore } from '@/stores/ui'
 import { scrubMarkup } from '@/lib/scrub'
+import { notifyTaskDone } from '@/lib/notify'
 import type { ChatMessage, PendingApprovalFrame, StatusInfo, WSClientMessage, WSEvent } from '@/types/api'
 
 /* ─────────────────────────────────────────────────────────
@@ -153,7 +154,7 @@ function wireSocket(ws: WebSocket) {
         break
       case 'notice':
         // Advisory (e.g. a pasted credential): a system line in the chat it came from.
-        if (visible) addMessage({ role: 'system', content: scrubMarkup(data.text) })
+        if (visible) addMessage({ role: 'system', notice: 'warning', content: scrubMarkup(data.text) })
         break
       case 'error':
         console.error('Agent error:', data.message)
@@ -181,6 +182,7 @@ function wireSocket(ws: WebSocket) {
           const wasInterrupted = interruptRequested
           interruptRequested = false
           if (wasInterrupted) pauseQueueIfPending()
+          else notifyTaskDone(visible ? useSessionStore.getState().sessionName : '')
         }
         // There is one running turn across chats. A background completion must
         // also clear any working state left by a history refresh of this view.

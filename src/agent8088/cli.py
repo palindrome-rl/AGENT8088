@@ -2281,7 +2281,7 @@ def _make_plan_approval(live=None, esc=None):
         if answer in ("e", "edit", "edits", "r", "readonly"):
             console.print("[green]Plan approved — each write will ask first.[/green]")
             return "readonly"
-        console.print("[yellow]Still in plan mode. Nothing was written or run — "
+        console.print("[yellow]Still in plan mode. No plan steps were run — "
                       "say what to change and Agent8088 will revise the plan.[/yellow]")
         return ""
     return approve
@@ -3617,8 +3617,8 @@ def cmd_plan(rest):
     approved (see A.finish_plan_session) or the user changes it by hand."""
     A.enter_plan_mode()
     console.print("[bold #00edff]plan mode[/bold #00edff] — reads only. Agent8088 will "
-                  "research, propose a plan, and wait for your approval before "
-                  "anything is written or run.")
+                  "research, save a plan proposal, and wait for your approval "
+                  "before carrying out the plan.")
     task = rest.strip()
     if task:
         do_chat(task)

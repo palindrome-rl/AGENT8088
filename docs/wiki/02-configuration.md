@@ -156,6 +156,8 @@ not per call.
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
+| `sandbox_network` | (empty) | Explicitly setting `open` removes network filtering for Docker commands. In `auto` mode this prefers Docker on Linux/macOS; an explicit `native` backend remains native. Linux uses host networking; macOS uses bridge networking, where host services need `host.docker.internal`, not `localhost`. This can expose reachable services and allow project data to leave the sandbox; enable only for trusted work. Filesystem protections still apply. |
+| `docker_autostart` | `1` | Start an already-installed Docker Desktop on Windows/macOS when needed for sandbox fallback or managed SearXNG recovery. Set `0` to disable; `AGENT8088_DOCKER_AUTOSTART=0` also disables it. Does not install Docker or start a Linux system daemon. |
 | `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |
 | `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
@@ -197,6 +199,7 @@ On by default. Full explanation in [Memory](16-memory.md).
 | `memory_scope_by_identity` | `0` | `1` gives each gateway identity its own namespace. Needed only if a `*_allowed_users` line holds more than one person. |
 | `memory_embed_model` | `nomic-embed-text` | Embedding model for semantic recall (274 MB; the installers pull it). Missing or unreachable degrades recall to keyword-only rather than failing. |
 | `memory_embed_provider` | `ollama` | Provider asked for embeddings. Deliberately **not** your chat provider — chat and embeddings are separate services, and the default embed model is an Ollama model. Whatever serves chat is irrelevant here. |
+| `memory_embed_timeout_seconds` | `30` | Timeout for an embedding request, in seconds (minimum `1`). Increase for a slow local embedding service; unavailable embeddings still degrade to keyword-only selection. |
 | `memory_extract_model` | *(chat model)* | Model for the fact-extraction call. Point at something small to spend less. |
 | `memory_extract_max_tokens` | `4000` | Output budget for the fact-extraction call (minimum `256`). Reasoning models need room to think before they answer. |
 | `memory_capture` | `1` | `0` keeps recall and stops learning new facts. |
@@ -319,8 +322,8 @@ number of rounds. All default to `0`, meaning disabled.
 | `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
 | `thinking_off_sticky_calls` | `3` | After a cut-off whose whole budget went to reasoning (no answer, no tool call), this many following ordinary calls also run with thinking off, at the normal cap, so a file the model drafted in its thinking is written straight into the tool call. Thinking returns to normal afterwards. `0` keeps only the one retry. |
 | `reasoning_budget_tokens` | `0` | Tokens a model may spend thinking on an ordinary turn, where the provider can be told (see `provider.<name>.reasoning_budget_extra_body`). `0` leaves the provider's default. Prefer this to raising the output cap: a larger cap makes every runaway call proportionally longer without making an answer more likely. |
-| `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling used in plan mode when `max_turn_seconds` is unset. |
-| `plan_mode_retry_limit` | `2` | Invalid mutation attempts allowed before plan mode stops safely. |
+| `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling for the planning phase when `max_turn_seconds` is unset. It ends when the plan is approved; the work that follows is limited only by `max_turn_seconds` (off by default). |
+| `plan_mode_retry_limit` | `4` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
 | `max_turn_cost_usd` | `0` | USD ceiling. Needs the two price keys below. |
 | `cost_per_1k_input` | `0` | Input token price, for the cost ceiling. |

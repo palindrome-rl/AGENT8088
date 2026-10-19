@@ -1857,7 +1857,7 @@ async def get_history():
         return [entry["frame"] for entry in list(store.values())
                 if entry.get("session_id") == sid and "frame" in entry]
 
-    return {"messages": [_history_message(message) for message in S.messages],
+    return {"messages": _with_command_log(sid, [_history_message(message) for message in S.messages]),
             "conversation_trace": S.conversation_trace,
             "session_id": sid,
             "name": S.name or "",
@@ -1893,6 +1893,39 @@ def _read_attachments(A, C, S=None) -> dict:
         return loaded if isinstance(loaded, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+# Slash commands and their output, per chat, for display only: they are not
+# conversation the model should read, so they never enter S.messages. Without
+# this a reload or chat switch rebuilt the chat from S.messages and every typed
+# /command vanished (issue sheet row 23).
+# Display-only command history is in memory and is forgotten on server restart.
+_COMMAND_LOG: dict[str, list] = {}
+_COMMAND_LOG_SKIP = {"new", "resume", "reset", "compact", "raw"}
+
+
+def _log_command(msg: dict, event: dict) -> None:
+    command = str(event.get("command") or "").strip().lstrip("/")
+    result = str(event.get("result") or "")
+    if event.get("type") != "command_result" or command.lower() in _COMMAND_LOG_SKIP:
+        return
+    S = _cl().S
+    sid = msg.get("_session_id") or _sid(S)
+    typed = f"/{command} {msg.get('args') or ''}".strip()
+    _COMMAND_LOG.setdefault(sid, []).append((len(S.messages), typed, result))
+
+
+def _with_command_log(sid: str, messages: list) -> list:
+    """Interleave logged commands at the point in the chat where they ran."""
+    out = list(messages)
+    for position, typed, result in reversed(_COMMAND_LOG.get(sid, [])):
+        if position > len(out):
+            continue  # the conversation was reset after it ran
+        shown = [{"role": "user", "content": typed}]
+        if result.strip():
+            shown.append({"role": "assistant", "content": result, "format": "terminal"})
+        out[position:position] = shown
+    return out
 
 
 def _history_message(message: dict) -> dict:
@@ -3005,6 +3038,7 @@ async def _handle_command(ws: WebSocket, msg: dict, A, C):
 async def _send_command_event(ws, msg, event):
     if msg.get("_session_id"):
         event.setdefault("session_id", msg["_session_id"])
+    _log_command(msg, event)
     await ws.send_json(event)
 
 

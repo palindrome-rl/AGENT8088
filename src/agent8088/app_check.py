@@ -953,6 +953,15 @@ def server_port(source: str) -> int | None:
 # the snippet must therefore contain no other % character.
 _BOOT_SNIPPET = """import os, signal, socket, subprocess, sys, threading, time
 program, script, port, wait = %r, %r, %d, %r
+# This check must run inside the sandbox, where the app's port will live.
+# A pre-existing service says nothing about whether our child can bind it.
+try:
+    socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+except OSError:
+    pass
+else:
+    print("BOOT:OCCUPIED")
+    raise SystemExit(0)
 try:
     proc = subprocess.Popen([program, script], stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -1053,6 +1062,10 @@ def _boot_report(path: Path, program: str, port: int,
     if line.startswith("BOOT:SERVING"):
         return Report("script", str(path), PASS,
                       note=f"starts and accepts connections on 127.0.0.1:{port}")
+    if line.startswith("BOOT:OCCUPIED"):
+        return Report("script", str(path), UNAVAILABLE,
+                      note=f"port {port} was already in use before launch; "
+                           "the generated server's startup was not verified")
     if line.startswith("BOOT:REFUSED"):
         return Report("script", str(path), FAIL,
                       [f"started but port {port} never accepted a connection "

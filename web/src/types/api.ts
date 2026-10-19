@@ -105,6 +105,8 @@ export interface SessionData {
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
+  /** A live advisory frame, distinct from private system instructions in history. */
+  notice?: 'warning'
   /** CLI/Rich output is terminal text, not Markdown. */
   format?: 'markdown' | 'terminal'
   attachments?: ChatAttachment[]

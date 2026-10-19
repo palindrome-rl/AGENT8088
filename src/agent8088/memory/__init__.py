@@ -147,7 +147,9 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
         resolved_path = db_path or os.path.expanduser("~/.agent8088/memory.db")
         client_settings = {key: value for key, value in config.items()
                            if key.startswith("provider.") or key == "default_provider"}
-        embed_inputs = (embed_model, str(embed_provider or ""), client_factory, client_settings)
+        embed_timeout = max(1, _number("memory_embed_timeout_seconds", 30))
+        embed_inputs = (embed_model, str(embed_provider or ""), client_factory, client_settings,
+                        embed_timeout)
         store_inputs = (resolved_path, engine_name,
                         dict(mem0_cfg) if engine_name == "mem0" else None,
                         embed_inputs if engine_name == "mem0" else None)
@@ -172,6 +174,7 @@ def configure(*, config=None, client_factory=None, completion=None, redact=None,
             user_id=user_id or str(config.get("memory_user_id") or "owner").strip(),
             scope_by_identity=_flag("memory_scope_by_identity"),
             embed_model=embed_model,
+            embed_timeout=embed_timeout,
             # Recorded for reporting only. The caller has already resolved which
             # endpoint client_factory reaches; naming it is what lets /memory say
             # *where* an embeddings request went, instead of advising a fix for a
@@ -323,7 +326,8 @@ def embedder():
         existing = _RUNTIME.get("embedder")
         if existing is None:
             existing = Embedder(_RUNTIME["client_factory"], _RUNTIME["embed_model"],
-                                provider=_RUNTIME.get("embed_provider", ""))
+                                provider=_RUNTIME.get("embed_provider", ""),
+                                timeout=_RUNTIME.get("embed_timeout"))
             _RUNTIME["embedder"] = existing
         return existing
 

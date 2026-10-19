@@ -673,7 +673,7 @@ PROSE_CUTOFF_MAX = 2
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
 LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
 PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
-PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 2))
+PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 4))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
 MAX_TURN_COST_USD = _config_float("max_turn_cost_usd", 0.0)
@@ -4438,6 +4438,15 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+def _mcp_tool_names(allowed) -> set[str]:
+    """Every connected MCP tool the run may use. Ranked one by one, a server
+    showed only its best-scoring tool: a mail server offered forward_email
+    without list or read, so the model judged the server useless and replaced
+    it with add_mcp_server. A server is offered whole or not at all."""
+    # Offer all permitted MCP schemas; large servers can increase prompt size.
+    return {name for name in allowed if TOOL_SPECS.get(name, {}).get("mode") == "mcp"}
+
+
 _TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
 
 
@@ -4463,7 +4472,8 @@ def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
     if semantic:
         ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
     picked = {names[index] for index in ranked}
-    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED
+                | _mcp_tool_names(allowed)) & set(allowed)
     return _apply_tool_intent_guards(query, selected, set(allowed))
 
 
@@ -4512,7 +4522,8 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         for position, index in enumerate(ranking, 1):
             scores[index] += 1 / (60 + position)
     picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
-    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED
+                | _mcp_tool_names(allowed)) & set(allowed)
     return _apply_tool_intent_guards(query, selected, set(allowed))
 
 
@@ -5741,6 +5752,20 @@ def _project_relative(p: Path) -> Path:
         return p
 
 
+def _stated_artifacts_folder(rel: Path) -> bool:
+    """Did the person's own message say to put this folder in artifacts/ (`artifacts/pokemon-doubles/`)?
+
+    The model then writes `pokemon-doubles/server.js` without the prefix; the person's instruction decides where
+    that folder lives, not which file happened to be written first."""
+    if rel.is_absolute() or len(rel.parts) < 2 or rel.parts[0] in ("", ".", ".."):
+        return False
+    pattern = re.compile(r"(?<![" + chr(92) + "w./-])artifacts/" + re.escape(rel.parts[0].lower()) + r"(?:/|(?![" + chr(92) + "w-]))")
+    for message in _authorising_turns(_CURRENT_RUN_MESSAGES or []):
+        if pattern.search(_message_text(message).replace(chr(92), "/").lower()):
+            return True
+    return False
+
+
 def _project_folder_root(p: Path):
     """The root already holding the first folder of this relative path, or None."""
     if p.is_absolute() or len(p.parts) < 2 or p.parts[0] in ("", ".", ".."):
@@ -5793,6 +5818,11 @@ def resolve_write_path(raw_path: str) -> Path:
             raise ValueError(f"Path not allowed: {resolved}")
         return resolved
     rel = _project_relative(p)
+    if _stated_artifacts_folder(rel):
+        stated = (ARTIFACTS_ROOT / rel).resolve()
+        if _path_is_allowed(stated):
+            _note_project_folder(rel, stated)
+            return stated
     held = _project_folder_root(rel)
     if held is not None:
         # This folder already has files from this run in one root: the rest of it goes there too.
@@ -7961,6 +7991,34 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
     return "\n".join(parts)
 
 
+def _lift_plan_clock() -> None:
+    """Planning has a wall-clock ceiling; the work an approval starts does not inherit it.
+
+    A request that starts in plan mode gets plan_mode_timeout_seconds (300s) because
+    max_turn_seconds is off by default. The budget is built once, when the request
+    starts, and the approved plan then runs inside that same request, so the build
+    died at 300s in total ("Time budget exceeded") however long the user's own
+    limits allowed. An approval ends the planning phase: hand the request back to
+    max_turn_seconds, which is 0 (off) unless the user set it. A user-set
+    max_turn_seconds was already the budget, so it is left alone.
+    """
+    budget = _active_budget
+    if (budget is not None and not MAX_TURN_SECONDS
+            and budget.max_seconds == PLAN_MODE_TIMEOUT_SECONDS):
+        budget.max_seconds = 0
+
+
+def _plan_retry_limit_message(attempts: int) -> str:
+    """What the user is told when plan mode gives up on a model that keeps trying to write.
+
+    The session is left in plan mode with no plan, so the message says what to type
+    next instead of only what went wrong."""
+    return (f"Plan mode stopped after {attempts} invalid mutation attempts. "
+            "Nothing was written or run. Reply with a short message such as "
+            "\"present the plan now\" to ask the model to present its plan with "
+            "present_plan, or leave plan mode (/mode full-auto) before retrying.")
+
+
 def _exec_present_plan(args: dict, depth: int = 0) -> str:
     """Show a finished plan and ask the user to approve it.
 
@@ -7996,19 +8054,37 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     # transcript scrolled away, so an approved plan had no file behind it and
     # a teammate had nothing to read. Written before the approval prompt, so
     # it is on disk whether the plan is approved, revised or rejected.
-    plan_path = PROJECT_ROOT / "PLAN.md"
-    try:
-        plan_path.write_text(plan_text.rstrip() + "\n", encoding="utf-8")
-    except OSError as exc:
-        _log.warning("could not write %s: %s", plan_path, exc)
-        plan_path = None
+    # Save a proposal without ever replacing a user's plan (including links).
+    # Exclusive creation also closes the exists/write race. The plan-only tool
+    # may create this draft, but must obey the workspace's path protections.
+    for attempt in range(4):
+        plan_path = PROJECT_ROOT / ("PLAN.md" if attempt == 0 else
+                                    f"PLAN.proposal-{uuid.uuid4().hex[:12]}.md")
+        if os.path.lexists(plan_path):
+            continue
+        try:
+            target = plan_path.resolve()
+            if (not _path_is_allowed(target) or _is_sensitive_path(str(target))
+                    or _is_shell_startup_file(str(target))
+                    or _check_path_zone(target) == "blocked"):
+                return f"Error: cannot save a plan proposal at the protected path {plan_path}. Nothing was approved or run."
+            with plan_path.open("x", encoding="utf-8") as draft:
+                draft.write(plan_text.rstrip() + "\n")
+            break
+        except FileExistsError:
+            continue
+        except (OSError, ValueError) as exc:
+            return f"Error: could not save the plan proposal at {plan_path}: {exc}. Nothing was approved or run."
+    else:
+        return "Error: could not create a new plan proposal. Nothing was approved or run."
     with _human_wait():
         chosen = _plan_on_approval(plan_text)
     if not chosen:
         return ("Plan not approved — still in plan mode. Revise the plan and call "
                 "present_plan again, or answer the user's questions about it. "
-                "Nothing has been written or run.")
+                f"Proposal saved at {plan_path}. No plan steps were run.")
     set_permission_mode(chosen)
+    _lift_plan_clock()
     _plan_approved = True
     _plan_approved_text = plan_text
     message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
@@ -10116,6 +10192,22 @@ GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 # container enforcing sandbox_allowed_domains, the list the native runtime
 # enforces. Any other value is passed to `docker run --network` unfiltered.
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none").strip() or "none"
+# sandbox_network=open lets sandboxed commands reach anything this computer can:
+# the internet, its own services (IMAP, databases, dev servers) and the LAN.
+# Off by default. The native Linux/macOS runtime cannot open its network (it
+# removes the namespace and filters through a proxy), so auto mode runs commands
+# in Docker (host networking on Linux, bridge on macOS); file-write limits apply.
+SANDBOX_NETWORK_OPEN = APP_CONFIG.get("sandbox_network", "").strip().lower() == "open"
+
+
+def _open_docker_network() -> str:
+    # Host networking is what makes `localhost` the computer; Docker Desktop
+    # (macOS/Windows) reaches the computer as host.docker.internal instead.
+    return "host" if sys.platform.startswith("linux") else "bridge"
+
+
+if SANDBOX_NETWORK_OPEN:
+    DOCKER_NETWORK = _open_docker_network()
 _EGRESS_PROXY_IMAGE = "python:3.11-slim"
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
@@ -10345,6 +10437,49 @@ def _docker_available() -> bool:
         return False
 
 
+# Docker Desktop is installed but not running: the sandbox fallback and the
+# managed SearXNG then fail although nothing is wrong (feature suggestion:
+# self-launch Docker; issue sheet row 33). Linux needs root to start the daemon,
+# so it is left to the operator there. docker_autostart=0 turns this off.
+_DOCKER_DESKTOP_APPS = {
+    "win32": [Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+              / "Docker" / "Docker" / "Docker Desktop.exe"],
+    "darwin": [Path("/Applications/Docker.app")],
+}
+_docker_start_lock = threading.Lock()
+
+
+def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep) -> bool:
+    """Make sure the Docker daemon answers, launching Docker Desktop if needed."""
+    if _docker_available():
+        return True
+    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", "1")
+    if str(setting).strip() == "0" or not _which_executable("docker"):
+        return False
+    app = next((p for p in _DOCKER_DESKTOP_APPS.get(sys.platform, []) if p.exists()), None)
+    if app is None:
+        return False
+    with _docker_start_lock:
+        if _docker_available():
+            return True
+        _log.info("Docker is not running; starting %s", app)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-g", "-a", str(app)])
+            else:
+                subprocess.Popen([str(app)], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except OSError as exc:
+            _log.warning("could not start Docker Desktop: %s", exc)
+            return False
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            sleep(3)
+            if _docker_available():
+                return True
+    _log.warning("Docker Desktop did not become ready within %ss", wait_seconds)
+    return False
+
+
 def _docker_usable() -> bool:
     """Docker is installed, reachable, and has not failed a real sandbox run.
 
@@ -10364,6 +10499,8 @@ def _resolve_sandbox_backend() -> str:
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_usable() else "unavailable"
+    if _open_network_prefers_docker() and _docker_usable():
+        return "docker"
     if native_available:
         if _native_sandbox_broken:
             return "docker" if _docker_usable() else "unavailable"
@@ -10383,6 +10520,12 @@ def _native_enforces_network() -> bool:
     sandbox_allowed_domains. Docker runs with no network regardless of OS.
     """
     return sys.platform != "win32"
+
+
+def _open_network_prefers_docker() -> bool:
+    """sandbox_network=open in auto mode, where native would still filter."""
+    return (SANDBOX_NETWORK_OPEN and _native_enforces_network()
+            and SANDBOX_BACKEND not in ("native", "docker"))
 
 
 def sandbox_status() -> dict:
@@ -10856,6 +10999,12 @@ def verify_sandbox_backend() -> dict:
     install_native_sandbox().
     """
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if _open_network_prefers_docker():
+        _start_docker_desktop()
+    if _open_network_prefers_docker() and _docker_sandbox_ready(ARTIFACTS_ROOT):
+        status = sandbox_status()
+        _report_sandbox(status)
+        return status
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
             _probe_piped_child_spawn(ARTIFACTS_ROOT)
@@ -10863,6 +11012,7 @@ def verify_sandbox_backend() -> dict:
             _report_sandbox(status)
             return status
     if requested != "native" or _native_sandbox_broken:
+        _start_docker_desktop()
         _docker_sandbox_ready(ARTIFACTS_ROOT)
     status = sandbox_status()
     _report_sandbox(status)
@@ -12570,6 +12720,19 @@ def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
     if bearer_env:
         config["bearer_token_env"] = bearer_env
 
+    # A model that cannot see a server's tools tends to "add" it again under the
+    # same name, and the write below replaced the working entry: one run lost
+    # every mail tool to a package that did not exist (issue sheet row 48).
+    previous = MCP_RUNTIME.server_config(server_name)
+    replace = str(args.get("replace") or "").strip().lower() in ("1", "true", "yes")
+    if previous is not None and not replace:
+        status = MCP_RUNTIME.statuses.get(server_name, {})
+        tools = ", ".join(status.get("tools", [])) or "none reported"
+        return (f"Error: an MCP server named '{server_name}' is already configured "
+                f"(state: {status.get('state', 'unknown')}; tools: {tools}). Nothing was "
+                "changed. Use its tools directly (describe_tool explains one), choose "
+                "another name for a second server, or pass replace=true to swap it out.")
+
     display = f"add_mcp_server: {server_name} ({transport}) -> {display_cmd}"
     if not check_permission("shell", display, host=True, approval_key=approval_key):
         _audit("escalation_requested", tool=name, mode="shell",
@@ -12588,6 +12751,15 @@ def _run_mcp_manage_tool(name: str, args: dict, approval_key: str) -> str:
     status = MCP_RUNTIME.statuses.get(server_name, {})
     state = status.get("state", "unknown")
     tools = ", ".join(status.get("tools", [])) or status.get("error", "")
+    if previous is not None and state != "connected":
+        # The replacement did not come up: put the working server back.
+        try:
+            MCP_RUNTIME.set_server(server_name, previous, project=bool(args.get("project")))
+            reload_mcp_tools()
+        except Exception as exc:  # noqa: BLE001
+            return f"Error: the replacement failed ({tools}) and restoring '{server_name}' failed: {exc}"
+        return (f"Error: the replacement for '{server_name}' did not connect ({state}: {tools}). "
+                "The previous configuration was restored.")
     return (f"Added '{server_name}' ({transport}). Connection state: {state}"
             + (f" -- {tools}" if tools else ""))
 
@@ -16461,6 +16633,8 @@ def resolve_auto_search_provider(probe=None) -> str:
     configured value is AUTO, so calling it twice is harmless.
     """
     configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
+    if configured in (web_search.AUTO, "searxng"):
+        _revive_managed_searxng_in_background()
     if configured != web_search.AUTO:
         # Already resolved by auto earlier in this process (the web server's
         # lifespan calls this again after cli.main did): keep auto's report.
@@ -16484,6 +16658,47 @@ def resolve_auto_search_provider(probe=None) -> str:
            decision="allowed", detail=f"auto -> {picked or 'none available'}")
     _report_search_state(picked)
     return picked
+
+
+_SEARXNG_REVIVE = {"started": False}
+
+
+def _revive_managed_searxng(wait=None) -> bool:
+    """Bring Agent8088's own SearXNG container back when Docker left it stopped.
+
+    "SearXNG doesn't work even when Docker is open" (issue sheet row 33): the
+    container was stopped (or Docker was still starting), so every search fell
+    to ddgs until someone ran /search setup. Only a loopback search_base_url is
+    ours; a remote instance is never touched. Returns True when it answers.
+    """
+    from agent8088 import searxng_provision
+    url = urllib.parse.urlparse(str(_search_config().get("search_base_url") or ""))
+    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop():
+        return False
+    if not searxng_provision.status().get("running") and not searxng_provision.resume():
+        return False
+    ready = (wait or searxng_provision.wait_ready)(port=url.port)
+    if not ready.get("ok"):
+        _log.warning("managed SearXNG did not become ready: %s", ready.get("detail"))
+        return False
+    if _search_auto_active() and _SEARCH_AUTO["pin"] != "searxng":
+        _set_auto_pin("searxng", "managed SearXNG restarted")
+        _report_search_state("searxng", reason="managed SearXNG restarted")
+    return True
+
+
+def _revive_managed_searxng_in_background() -> None:
+    # Startup must not wait on Docker: searches use ddgs until SearXNG answers.
+    if _SEARXNG_REVIVE["started"]:
+        return
+    _SEARXNG_REVIVE["started"] = True
+
+    def work():
+        try:
+            _revive_managed_searxng()
+        except Exception as exc:  # noqa: BLE001 - best-effort recovery
+            _log.debug("SearXNG revival failed: %s", exc)
+    threading.Thread(target=work, name="searxng-revive", daemon=True).start()
 
 
 def set_search_provider(name: str) -> str:
@@ -18781,6 +18996,27 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     return None
 
 
+def _secret_scan_paths(trajectory, written: list) -> list[str]:
+    """Resolve trajectory names to the files the write tool actually produced.
+
+    Recorded sandbox landings take precedence over namesakes in the project or
+    launch directory. Older trajectories without landings use the write resolver.
+    """
+    landings = dict(trajectory.redirected_writes())
+    paths = []
+    for raw in written:
+        name = str(raw)
+        try:
+            stored = Path(_from_container_path(name)).expanduser()
+            path = landings.get(name) or str(
+                stored if stored.is_absolute() else resolve_write_path(name))
+        except (OSError, ValueError):
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def _secrets_step(trajectory, written: list):
     """Scan the files this run wrote for credentials before calling the work done.
 
@@ -18795,8 +19031,9 @@ def _secrets_step(trajectory, written: list):
     Each file is scanned once per state of the work, so a rewrite is rescanned
     but an unchanged file is not re-reported every round.
     """
-    pending = trajectory.secrets_unchecked([str(p) for p in written])
-    hits = secret_scan.scan_files(pending)
+    pending = trajectory.secrets_unchecked(_secret_scan_paths(trajectory, written))
+    scanned = set()
+    hits = secret_scan.scan_files(pending, scanned=scanned)
     dirty = {path for path, _line, _finding in hits}
     # Only a file that came back clean is retired. Retiring one that still
     # holds a credential is what let a real leak disappear: the first pass
@@ -18804,7 +19041,7 @@ def _secrets_step(trajectory, written: list):
     # pending list with the file already ticked off, so nothing was reported
     # and the run ended as a plain success.
     for path in pending:
-        if path not in dirty:
+        if path in scanned and path not in dirty:
             trajectory.record_secret_scan(path)
     if not hits:
         return None
@@ -18912,7 +19149,7 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         if missing:
             reasons.append("missing or empty files: " + ", ".join(missing[:6]))
         leaked = secret_scan.scan_files(trajectory.secrets_unchecked(
-            [str(p) for p in trajectory.written_paths()]))
+            _secret_scan_paths(trajectory, trajectory.written_paths())))
         if leaked:
             names = sorted({Path(path).name for path, _l, _f in leaked})
             reasons.append("a credential is written in clear text in: "
@@ -19780,11 +20017,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             if invalid_plan:
                 plan_mutation_retries += 1
                 if plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT:
-                    answer = _guard_answer(
-                        f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                        "attempts. Nothing was written or run. Present the plan with "
-                        "present_plan, or leave plan mode before retrying."
-                    )
+                    answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
                     if on_answer:
                         on_answer(answer)
                     return answer
@@ -20391,7 +20624,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                         "This session cannot request approval, so nothing was run.")
                 else:
                     answer = _guard_answer(
-                        "Plan not approved. Nothing was written or run. "
+                        result + " " +
                         "I will wait for your changes or approval before proceeding.")
                 if on_answer:
                     on_answer(answer)
@@ -20485,11 +20718,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
 
         if (PERMISSION_MODE == "plan-only"
                 and plan_mutation_retries >= PLAN_MODE_RETRY_LIMIT):
-            answer = _guard_answer(
-                f"Plan mode stopped after {plan_mutation_retries} invalid mutation "
-                "attempts. Nothing was written or run. Present the plan with "
-                "present_plan, or leave plan mode before retrying."
-            )
+            answer = _guard_answer(_plan_retry_limit_message(plan_mutation_retries))
             if on_answer:
                 on_answer(answer)
             if trace is not None:
