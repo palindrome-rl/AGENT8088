@@ -10397,6 +10397,49 @@ def _docker_available() -> bool:
         return False
 
 
+# Docker Desktop is installed but not running: the sandbox fallback and the
+# managed SearXNG then fail although nothing is wrong (feature suggestion:
+# self-launch Docker; issue sheet row 33). Linux needs root to start the daemon,
+# so it is left to the operator there. docker_autostart=0 turns this off.
+_DOCKER_DESKTOP_APPS = {
+    "win32": [Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+              / "Docker" / "Docker" / "Docker Desktop.exe"],
+    "darwin": [Path("/Applications/Docker.app")],
+}
+_docker_start_lock = threading.Lock()
+
+
+def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep) -> bool:
+    """Make sure the Docker daemon answers, launching Docker Desktop if needed."""
+    if _docker_available():
+        return True
+    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", "1")
+    if str(setting).strip() == "0" or not _which_executable("docker"):
+        return False
+    app = next((p for p in _DOCKER_DESKTOP_APPS.get(sys.platform, []) if p.exists()), None)
+    if app is None:
+        return False
+    with _docker_start_lock:
+        if _docker_available():
+            return True
+        _log.info("Docker is not running; starting %s", app)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-g", "-a", str(app)])
+            else:
+                subprocess.Popen([str(app)], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        except OSError as exc:
+            _log.warning("could not start Docker Desktop: %s", exc)
+            return False
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            sleep(3)
+            if _docker_available():
+                return True
+    _log.warning("Docker Desktop did not become ready within %ss", wait_seconds)
+    return False
+
+
 def _docker_usable() -> bool:
     """Docker is installed, reachable, and has not failed a real sandbox run.
 
@@ -10916,6 +10959,8 @@ def verify_sandbox_backend() -> dict:
     install_native_sandbox().
     """
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if _open_network_prefers_docker():
+        _start_docker_desktop()
     if _open_network_prefers_docker() and _docker_sandbox_ready(ARTIFACTS_ROOT):
         status = sandbox_status()
         _report_sandbox(status)
@@ -10927,6 +10972,7 @@ def verify_sandbox_backend() -> dict:
             _report_sandbox(status)
             return status
     if requested != "native" or _native_sandbox_broken:
+        _start_docker_desktop()
         _docker_sandbox_ready(ARTIFACTS_ROOT)
     status = sandbox_status()
     _report_sandbox(status)
@@ -16540,6 +16586,8 @@ def resolve_auto_search_provider(probe=None) -> str:
     configured value is AUTO, so calling it twice is harmless.
     """
     configured = str(APP_CONFIG.get("web_search_provider") or "").strip().lower()
+    if configured in (web_search.AUTO, "searxng"):
+        _revive_managed_searxng_in_background()
     if configured != web_search.AUTO:
         # Already resolved by auto earlier in this process (the web server's
         # lifespan calls this again after cli.main did): keep auto's report.
@@ -16563,6 +16611,47 @@ def resolve_auto_search_provider(probe=None) -> str:
            decision="allowed", detail=f"auto -> {picked or 'none available'}")
     _report_search_state(picked)
     return picked
+
+
+_SEARXNG_REVIVE = {"started": False}
+
+
+def _revive_managed_searxng(wait=None) -> bool:
+    """Bring Agent8088's own SearXNG container back when Docker left it stopped.
+
+    "SearXNG doesn't work even when Docker is open" (issue sheet row 33): the
+    container was stopped (or Docker was still starting), so every search fell
+    to ddgs until someone ran /search setup. Only a loopback search_base_url is
+    ours; a remote instance is never touched. Returns True when it answers.
+    """
+    from agent8088 import searxng_provision
+    url = urllib.parse.urlparse(str(_search_config().get("search_base_url") or ""))
+    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop():
+        return False
+    if not searxng_provision.status().get("running") and not searxng_provision.resume():
+        return False
+    ready = (wait or searxng_provision.wait_ready)(port=url.port)
+    if not ready.get("ok"):
+        _log.warning("managed SearXNG did not become ready: %s", ready.get("detail"))
+        return False
+    if _search_auto_active() and _SEARCH_AUTO["pin"] != "searxng":
+        _set_auto_pin("searxng", "managed SearXNG restarted")
+        _report_search_state("searxng", reason="managed SearXNG restarted")
+    return True
+
+
+def _revive_managed_searxng_in_background() -> None:
+    # Startup must not wait on Docker: searches use ddgs until SearXNG answers.
+    if _SEARXNG_REVIVE["started"]:
+        return
+    _SEARXNG_REVIVE["started"] = True
+
+    def work():
+        try:
+            _revive_managed_searxng()
+        except Exception as exc:  # noqa: BLE001 - best-effort recovery
+            _log.debug("SearXNG revival failed: %s", exc)
+    threading.Thread(target=work, name="searxng-revive", daemon=True).start()
 
 
 def set_search_provider(name: str) -> str:
