@@ -35,6 +35,11 @@ _BACKOFF = (1, 6, 24)
 # How long to wait for a connection before deciding nothing is listening. A closed port answers at once; this only
 # bounds a host that drops packets, which used to cost the full request timeout on every attempt.
 _PROBE_SECONDS = 0.8
+# One embeddings request. A CPU-only Ollama needs ~20 s for the tool index (one
+# batch of every tool description); 5 s failed it every time and left tool
+# selection keyword-only. A dead endpoint never waits this long: the port probe
+# answers first. memory_embed_timeout_seconds overrides it.
+_REQUEST_SECONDS = 30
 
 _LOOPBACK = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
@@ -102,8 +107,10 @@ def endpoint_state(base_url, provider=""):
 class Embedder:
     """Wraps one embedding model. Construct freely -- the probe is cached."""
 
-    def __init__(self, client_factory, model, *, breaker_seconds=_BREAKER_SECONDS, provider=""):
+    def __init__(self, client_factory, model, *, breaker_seconds=_BREAKER_SECONDS, provider="",
+                 timeout=None):
         self._client_factory = client_factory
+        self.timeout = timeout or _REQUEST_SECONDS
         self.model = model or ""
         self.provider = provider or ""
         self._breaker_seconds = breaker_seconds
@@ -246,7 +253,7 @@ class Embedder:
                 # Embeddings are a best-effort recall aid. A missing local
                 # Ollama service must not hold a turn indefinitely.
                 response = client.embeddings.create(model=self.model, input=cleaned,
-                                                    timeout=5)
+                                                    timeout=self.timeout)
                 vectors = [list(item.embedding) for item in response.data]
             except Exception as exc:
                 self._note_failure(exc)

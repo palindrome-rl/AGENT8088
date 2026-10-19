@@ -1,12 +1,14 @@
 """A refused plan belongs to the next human turn, not another model retry."""
 
 
-def test_declined_plan_stops_after_one_approval_prompt(engine, monkeypatch):
+def test_declined_plan_stops_after_one_approval_prompt(engine, monkeypatch, tmp_path):
     # monkeypatch, not assignment: enter_plan_mode moves the module
     # global to plan-only and nothing here moved it back, so the next
     # test in the session composed a plan-only prompt and failed on a
     # tool the mode legitimately hides.
     monkeypatch.setattr(engine, "PERMISSION_MODE", "readonly")
+    monkeypatch.setattr(engine, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [tmp_path])
     engine.enter_plan_mode()
     shown = []
     monkeypatch.setattr(engine, "_plan_on_approval",
@@ -32,7 +34,9 @@ def test_declined_plan_stops_after_one_approval_prompt(engine, monkeypatch):
     assert len(completions) == 1
     assert len(shown) == 1
     assert "not approved" in answer.lower()
-    assert "Nothing was written or run" in answer
+    assert "No plan steps were run" in answer
+    assert str(tmp_path / "PLAN.md") in answer
+    assert (tmp_path / "PLAN.md").exists()
     assert engine.PERMISSION_MODE == "plan-only"
 
 

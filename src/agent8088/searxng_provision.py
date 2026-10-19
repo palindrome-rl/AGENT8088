@@ -198,6 +198,22 @@ def start(home: Path, port: int | None = None) -> dict:
             "base_url": base_url(port)}
 
 
+def resume() -> bool:
+    """Start the managed container again if it exists but is stopped.
+
+    Leaves alone a container that is running or was removed (`/search stop`
+    removes it): only one that Docker merely left stopped is brought back.
+    """
+    docker = _docker()
+    state = status()
+    if not docker or state.get("running") or state.get("detail") == "container does not exist":
+        return False
+    try:
+        return _run([docker, "start", CONTAINER_NAME], timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def stop() -> dict:
     docker = _docker()
     if not docker:

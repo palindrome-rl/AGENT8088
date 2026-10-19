@@ -4,6 +4,9 @@ import os
 os.environ["ANONYMIZED_TELEMETRY"] = "false"
 os.environ["BROWSER_USE_CLOUD_SYNC"] = "false"
 os.environ["POSTHOG_DISABLED"] = "1"
+# Startup may launch Docker Desktop; a test run must never start the developer's
+# Docker. Tests of the launcher set this back to 1.
+os.environ["AGENT8088_DOCKER_AUTOSTART"] = "0"
 import sys
 from pathlib import Path
 
