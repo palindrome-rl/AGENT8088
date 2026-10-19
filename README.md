@@ -96,6 +96,21 @@ $env:AGENT8088_BRANCH = "staging-1.3"; iex (irm https://raw.githubusercontent.co
 These staging commands intentionally fetch the branch-specific installers;
 the Pages installer URL serves the development channel.
 
+### Install with an AI agent
+
+Let an AI agent do the install: Claude Code, OpenCode, Codex, Hermes Agent, Cursor, or any agent that can run shell commands. Paste this into it:
+
+```text
+Install Agent8088 for me. Fetch the guide with
+  gh api "repos/palindrome-rl/AGENT8088/contents/docs/install-for-agents.md?ref=staging-1.3" -H "Accept: application/vnd.github.raw"
+(use the command above, not a web-fetch tool, so no step is summarized away) and follow it exactly.
+Ask me before anything that needs my choice; never ask me to paste an API key into this chat.
+```
+
+The agent asks a few questions (branch, optional Mem0 and LibreOffice, which model provider), runs the installer without the interactive wizard, checks the result with `agent8088 --doctor`, and leaves one step for you: `agent8088 --setup`, where you enter your API key yourself. The steps it follows are in [docs/install-for-agents.md](docs/install-for-agents.md).
+
+### Manual install notes
+
 Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
