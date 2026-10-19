@@ -67,6 +67,16 @@ smaller models, limited context, and explicit operational boundaries.
       <sub>Efficient prompts, minimized tool schemas, model-aware routing, and local-model support make capable local models practical.</sub>
     </td>
     <td width="33%" valign="top">
+      <strong>Tool intelligence</strong><br>
+      <sub>Hybrid tool selection, tolerant call parsing, validated arguments, and shaped tool results help models choose and use the right tools.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Robust context management</strong><br>
+      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
       <strong>Verification-gated completion</strong><br>
       <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported.</sub>
     </td>
@@ -74,15 +84,19 @@ smaller models, limited context, and explicit operational boundaries.
       <strong>Grounded execution</strong><br>
       <sub>A persistent control loop plans, acts through structured tools, observes the result, and recovers when execution fails.</sub>
     </td>
+    <td width="33%" valign="top">
+      <strong>Reliable by design</strong><br>
+      <sub>Rollback of failed changes, resumable tasks, loop and stall detection, and forced replanning keep long runs recoverable.</sub>
+    </td>
   </tr>
   <tr>
     <td width="33%" valign="top">
-      <strong>Robust context management</strong><br>
-      <sub>Pre-call budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters.</sub>
-    </td>
-    <td width="33%" valign="top">
       <strong>Transparent, safe and controlled</strong><br>
       <sub>Permission modes, usage visibility, audit trails, credential protection, SSRF and egress security controls, and OS-level sandboxing keep actions accountable.</sub>
+    </td>
+    <td width="33%" valign="top">
+      <strong>Efficiency and cost</strong><br>
+      <sub>Token budgeting, lean prompts, selective verification, and per-role usage reporting keep reliability affordable on small models.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Low-friction and extensible</strong><br>
