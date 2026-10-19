@@ -4427,6 +4427,15 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     return selected
 
 
+def _mcp_tool_names(allowed) -> set[str]:
+    """Every connected MCP tool the run may use. Ranked one by one, a server
+    showed only its best-scoring tool: a mail server offered forward_email
+    without list or read, so the model judged the server useless and replaced
+    it with add_mcp_server. A server is offered whole or not at all."""
+    # ponytail: all MCP schemas every turn; cap per server if a large server bloats the prompt.
+    return {name for name in allowed if TOOL_SPECS.get(name, {}).get("mode") == "mcp"}
+
+
 _TOOL_SELECTION_FALLBACK_LOGGED: set[str] = set()
 
 
@@ -4452,7 +4461,8 @@ def _keyword_tool_selection(query: str, names: list[str], texts: list[str],
     if semantic:
         ranked = list(dict.fromkeys(ranked + semantic[:top_k]))
     picked = {names[index] for index in ranked}
-    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED
+                | _mcp_tool_names(allowed)) & set(allowed)
     return _apply_tool_intent_guards(query, selected, set(allowed))
 
 
@@ -4501,7 +4511,8 @@ def select_tool_names_for_request(query: str, allowed: set[str], *, mode: str | 
         for position, index in enumerate(ranking, 1):
             scores[index] += 1 / (60 + position)
     picked = {names[index] for index, _ in scores.most_common(TOOL_SELECTION_TOP_K)}
-    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED) & set(allowed)
+    selected = (picked | _TOOL_SELECTION_ALWAYS | _TOOL_SELECTION_PINNED
+                | _mcp_tool_names(allowed)) & set(allowed)
     return _apply_tool_intent_guards(query, selected, set(allowed))
 
 
