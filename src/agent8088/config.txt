@@ -225,6 +225,13 @@ sandbox_runtime_version=0.0.73
 # Docker fallback network: `none` (default), `allowlist` (only the hosts above,
 # through a small proxy container), or a Docker network name (unfiltered).
 # docker_network=none
+# `open` lets sandboxed commands reach anything this computer can: the internet,
+# its own services (mail, databases, dev servers on localhost) and the local
+# network. File-write limits still apply. On Linux/macOS commands then run in
+# Docker on the host network, because the native sandbox cannot open its network.
+# Off by default: a command steered by a malicious page or email could send
+# project files anywhere.
+# sandbox_network=open
 # Seconds allowed for pulling a missing container image. This is deliberately
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.

@@ -10135,6 +10135,22 @@ GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
 # container enforcing sandbox_allowed_domains, the list the native runtime
 # enforces. Any other value is passed to `docker run --network` unfiltered.
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none").strip() or "none"
+# sandbox_network=open lets sandboxed commands reach anything this computer can:
+# the internet, its own services (IMAP, databases, dev servers) and the LAN.
+# Off by default. The native Linux/macOS runtime cannot open its network (it
+# removes the namespace and filters through a proxy), so auto mode runs commands
+# in Docker on the host network there; file-write limits still apply.
+SANDBOX_NETWORK_OPEN = APP_CONFIG.get("sandbox_network", "").strip().lower() == "open"
+
+
+def _open_docker_network() -> str:
+    # Host networking is what makes `localhost` the computer; Docker Desktop
+    # (macOS/Windows) reaches the computer as host.docker.internal instead.
+    return "host" if sys.platform.startswith("linux") else "bridge"
+
+
+if SANDBOX_NETWORK_OPEN:
+    DOCKER_NETWORK = _open_docker_network()
 _EGRESS_PROXY_IMAGE = "python:3.11-slim"
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
@@ -10383,6 +10399,8 @@ def _resolve_sandbox_backend() -> str:
         return "native" if native_available else "unavailable"
     if requested == "docker":
         return "docker" if _docker_usable() else "unavailable"
+    if _open_network_prefers_docker() and _docker_usable():
+        return "docker"
     if native_available:
         if _native_sandbox_broken:
             return "docker" if _docker_usable() else "unavailable"
@@ -10402,6 +10420,12 @@ def _native_enforces_network() -> bool:
     sandbox_allowed_domains. Docker runs with no network regardless of OS.
     """
     return sys.platform != "win32"
+
+
+def _open_network_prefers_docker() -> bool:
+    """sandbox_network=open in auto mode, where native would still filter."""
+    return (SANDBOX_NETWORK_OPEN and _native_enforces_network()
+            and SANDBOX_BACKEND not in ("native", "docker"))
 
 
 def sandbox_status() -> dict:
@@ -10875,6 +10899,10 @@ def verify_sandbox_backend() -> dict:
     install_native_sandbox().
     """
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if _open_network_prefers_docker() and _docker_sandbox_ready(ARTIFACTS_ROOT):
+        status = sandbox_status()
+        _report_sandbox(status)
+        return status
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
             _probe_piped_child_spawn(ARTIFACTS_ROOT)
