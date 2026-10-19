@@ -39,6 +39,19 @@ def test_release_version_license_and_update_channel_are_preserved():
     assert 'UPDATE_BRANCH = "AGENT8088-v1.3"' in cli
 
 
+def test_ai_install_guide_fetches_the_public_branch_without_github_credentials():
+    guide = (ROOT / "docs/install-for-agents.md").read_text(encoding="utf-8")
+    slugs = {slug.removesuffix(".git") for slug in _SLUG.findall(guide)}
+    assert slugs == {PUBLIC}
+    assert f"{PUBLIC}/{BRANCH}/install.sh" in guide
+    assert f"{PUBLIC}/{BRANCH}/install.ps1" in guide
+    assert f"AGENT8088_BRANCH={BRANCH}" in guide
+    assert f'AGENT8088_BRANCH = "{BRANCH}"' in guide
+    assert "gh auth login" not in guide and "gh api" not in guide
+    assert "never ask them to paste a key" in guide
+    assert "-ErrorAction Stop" in guide and "set -o pipefail" in guide
+
+
 def test_windows_config_acl_uses_absolute_system_binary():
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     body = re.search(r"(?ms)^function Protect-ConfigFile \{.*?^\}", source).group()

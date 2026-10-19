@@ -32,6 +32,8 @@ requests. No admin rights are needed for the base install.
 These commands install the public **AGENT8088-v1.3** branch.
 `agent8088 --update` continues to follow that branch.
 
+For an AI agent helping you install, use the [AI-assisted installation guide](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/docs/install-for-agents.md). It keeps secrets out of chat and leaves API-key entry to your own setup wizard.
+
 **macOS / Linux / WSL2**
 
 ```sh

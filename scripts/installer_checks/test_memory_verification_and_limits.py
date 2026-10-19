@@ -16,13 +16,14 @@ def runtime(monkeypatch, tmp_path):
 
 def test_new_defaults_and_public_channel(runtime):
     from agent8088 import cli
-    assert runtime.DEFAULT_MAX_TURNS == 150
+    assert runtime.DEFAULT_MAX_TURNS == 300
     assert runtime.DYNAMIC_TURNS_CEILING_MULTIPLIER == 3
+    assert runtime._turn_policy(runtime.DEFAULT_MAX_TURNS).ceiling == 900
     assert runtime.MAX_TOOL_TIMEOUT_SECONDS == 1200
     assert cli.UPDATE_BRANCH == "AGENT8088-v1.3"
     template = Path(runtime.__file__).with_name("config.txt").read_text(encoding="utf-8")
     assert "\nmemory_engine=native\n" in template
-    assert "\nmax_turns=150\n" in template
+    assert "\nmax_turns=300\n" in template
     assert "/limits" in dict(cli._ESSENTIAL_COMMANDS)
 
 
