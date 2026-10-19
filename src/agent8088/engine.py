@@ -11592,6 +11592,40 @@ def _exec_sandbox_command(command: str, timeout: int = 25,
     return f"{result}\n{note}" if note and isinstance(result, str) else result
 
 
+# Names Windows reserves for devices, with or without an extension ("nul", "NUL.txt"). A command such as
+# `dir > nul` run through a Unix-style shell leaves a real file with one of these names in the workspace, and
+# copying it raises "are the same file", because the destination resolves to the device itself.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{n}" for n in range(1, 10)} | {f"lpt{n}" for n in range(1, 10)})
+
+
+def _is_windows_device_name(name: str) -> bool:
+    return name.split(".", 1)[0].rstrip(" ").lower() in _WINDOWS_DEVICE_NAMES
+
+
+def _audit_copy_ignore(base_ignore):
+    """Keep normal ignore patterns; reserve device names only on Windows."""
+    def ignore(directory, names):
+        skipped = set(base_ignore(directory, names))
+        if sys.platform == "win32":
+            skipped.update(name for name in names if _is_windows_device_name(name))
+        return skipped
+    return ignore
+
+
+def _cleanup_audit_workspace(temporary) -> str:
+    """Cleanup must not replace a command result or mask the original error."""
+    try:
+        temporary.cleanup()
+    except OSError as exc:
+        note = (f"Warning: could not remove the temporary read-only workspace "
+                f"{temporary.name}: {str(exc)[:300]}. Remove it when no longer in use.")
+        _log.warning("%s", note)
+        return note
+    return ""
+
+
 def _run_sandbox_command(command: str, timeout: int = 25,
                          python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
@@ -11607,19 +11641,27 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     if _sandbox_readonly:
         temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
         workspace = Path(temporary.name)
-        shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(
-                            ".env*", "*.pem", "*.key", "*.p12", "__pycache__",
-                            "node_modules", ".venv", "venv", ".git", "dist", "build"))
+        try:
+            shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
+                            ignore=_audit_copy_ignore(shutil.ignore_patterns(
+                                ".env*", "*.pem", "*.key", "*.p12", "__pycache__",
+                                "node_modules", ".venv", "venv", ".git", "dist", "build")))
+        except (shutil.Error, OSError) as exc:
+            # Never let a file the workspace happens to hold end the whole request.
+            cleanup_note = _cleanup_audit_workspace(temporary)
+            return (f"Error: could not copy the workspace for the read-only sandbox: {str(exc)[:300]}. "
+                    "Nothing was run." + (f"\n{cleanup_note}" if cleanup_note else ""))
         command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
+    cleanup_note = ""
     try:
-        return _explain_sandbox_denial(
+        result = _explain_sandbox_denial(
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
             workspace if temporary is None else workspace, command)
     finally:
         if temporary:
-            temporary.cleanup()
+            cleanup_note = _cleanup_audit_workspace(temporary)
+    return f"{result}\n{cleanup_note}" if cleanup_note else result
 
 
 def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
