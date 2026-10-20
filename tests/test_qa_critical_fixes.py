@@ -27,7 +27,7 @@ def test_configured_max_turns_still_wins(monkeypatch):
 def test_gateway_uses_the_shared_starting_allowance(monkeypatch):
     from agent8088.gateway import agent_bridge
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {})
-    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 300
+    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 400
     assert agent_bridge._turn_max_turns("plan-only") == max(engine.DEFAULT_MAX_TURNS, agent_bridge.PLAN_MODE_MIN_TURNS)
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {"max_turns": "7"})
     assert agent_bridge._turn_max_turns("full-auto") == 7
@@ -121,10 +121,10 @@ def _policy(max_turns=50, **kwargs):
     return engine._turn_policy(max_turns, **kwargs)
 
 
-def test_default_run_starts_at_300_and_can_grow_to_900():
+def test_default_run_starts_at_400_and_can_grow_to_1200():
     policy = _policy(engine.DEFAULT_MAX_TURNS)
-    assert policy.limit == 300
-    assert policy.ceiling == 900 == 300 * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
+    assert policy.limit == 400
+    assert policy.ceiling == 1200 == 400 * engine.DYNAMIC_TURNS_CEILING_MULTIPLIER
     assert policy.ceiling > policy.limit, "growth disabled at the new default"
 
 
