@@ -565,7 +565,7 @@ MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
 # Shared starting allowance for CLI, Web UI, gateways and direct engine calls.
-DEFAULT_MAX_TURNS = 300
+DEFAULT_MAX_TURNS = 400
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
