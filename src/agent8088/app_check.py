@@ -320,7 +320,8 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
 
 # Whether a click on a control is expected to change the page. A filter, an undo, an export or an
 # "Add" button next to an empty field can all do nothing by design, so a click that changes nothing
-# says something about the page only when the control is one that must act.
+# says something about the page only when the control is one that must act. A control that is already the current
+# tab is not one. An action button or a pressed toggle can still be expected to act.
 _COMMITTAL_JS = """
   const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme)\\b/i;
   const emptyField = x => {
@@ -343,9 +344,20 @@ _COMMITTAL_JS = """
     return false;
   };
   const labelOf = el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
+  // Selected navigation may be a no-op. Styling alone must not excuse a dead action button;
+  // aria-pressed describes an on/off toggle, which should still react to a click.
+  const isCurrent = el => {
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const classes = typeof el.className === 'string' ? el.className : '';
+    const tab = role === 'tab' || /(^|\\s)tab($|[\\s_-])/i.test(classes);
+    const current = el.getAttribute('aria-current');
+    return el.getAttribute('aria-selected') === 'true'
+      || (!!current && current !== 'false' && (tab || role === 'link' || el.tagName === 'A'))
+      || (tab && /(^|\\s)(?:(?:is|tab)[_-])?(active|selected|current)($|\\s)/i.test(classes));
+  };
   const committal = el => el.tagName !== 'SELECT' && el.getAttribute('aria-disabled') !== 'true'
     && !/disabled/i.test(typeof el.className === 'string' ? el.className : '')
-    && !NOOP_OK.test(labelOf(el)) && !emptyFieldNear(el);
+    && !NOOP_OK.test(labelOf(el)) && !emptyFieldNear(el) && !isCurrent(el);
 """
 
 _FIRST_CONTROL_JS = """() => {

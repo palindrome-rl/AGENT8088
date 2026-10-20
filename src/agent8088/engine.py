@@ -565,7 +565,7 @@ MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
 # Shared starting allowance for CLI, Web UI, gateways and direct engine calls.
-DEFAULT_MAX_TURNS = 300
+DEFAULT_MAX_TURNS = 400
 
 # --- Turn budget: bounds a single run_agent() call. 0 disables the check. ---
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
@@ -672,7 +672,7 @@ PROSE_CUTOFF_MAX = 2
 # "Retry until the clock runs out" is replaced by a deterministic ending that
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
 LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
-PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
+PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 600))
 PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 4))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
@@ -7994,7 +7994,7 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
 def _lift_plan_clock() -> None:
     """Planning has a wall-clock ceiling; the work an approval starts does not inherit it.
 
-    A request that starts in plan mode gets plan_mode_timeout_seconds (300s) because
+    A request that starts in plan mode gets plan_mode_timeout_seconds (600s by default) because
     max_turn_seconds is off by default. The budget is built once, when the request
     starts, and the approved plan then runs inside that same request, so the build
     died at 300s in total ("Time budget exceeded") however long the user's own
@@ -12552,6 +12552,24 @@ def _tool_path(spec: dict, args: dict) -> str:
     path_arg = spec.get("path_arg") or "filename"
     return (args.get(path_arg) or args.get("filename") or args.get("file")
             or args.get("file_path") or args.get("filepath") or args.get("path") or "")
+
+
+_PLAN_TEXT_NUDGE = (
+    "You are in plan mode and have written a plan as ordinary text. A plan is only approved through the "
+    "present_plan tool, and nothing can be built until then. Call present_plan(plan=\"...\") now with that plan "
+    "written out as markdown, so the user can approve it. If you still need to look something up first, say so "
+    "in one line and keep researching.")
+_PLAN_STEP_LINE = re.compile(r"^\s*(?:\d+[.)]|[-*\u2022]|#{1,4}\s)", re.MULTILINE)
+_PLAN_WORDS = re.compile(r"\b(plan|approve|approval|proceed|go ahead|steps?)\b", re.IGNORECASE)
+
+
+def _looks_like_a_plan(text: str) -> bool:
+    """A reply that reads as a plan: structured (several list items or headings), long enough to be one, and
+    talking about a plan or asking for approval. Deterministic, no model call. A short answer, a question or a
+    one-line status is not a plan."""
+    text = text or ""
+    return (len(text) >= 300 and len(_PLAN_STEP_LINE.findall(text)) >= 3
+            and bool(_PLAN_WORDS.search(text)))
 
 
 def _plan_mode_block_message() -> str:
@@ -19148,11 +19166,13 @@ def _delivered_evidence(written) -> str | None:
 
 
 def _missing_required_files(trajectory, reply: str, request: str) -> list:
-    return completion_checks.missing_outputs(
+    mirrors = [ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else []
+    missing = completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
-        mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [],
+        mirror_roots=mirrors,
         start_files=trajectory.start_files,
         landed=trajectory.data.get("redirected_writes") or [])
+    return completion_checks.annotate_missing(missing, [PROJECT_ROOT, Path.cwd()], mirrors) if mirrors else missing
 
 
 def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth: int) -> list:
@@ -19481,6 +19501,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     tool_failed = False  # any tool call this run returned an error
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
+    plan_text_nudged = False  # a plan written as text has been sent back to present_plan once
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
@@ -20216,6 +20237,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     messages.append(_harness_turn(chunk_note))
                     post_check_rounds = 0
                     continue
+            if (gates_open and depth == 0 and not plan_text_nudged and PERMISSION_MODE == "plan-only"
+                    and not _plan_tool_ran and _looks_like_a_plan(answer)):
+                # A plan written as chat text is never approved, and the session stays in plan mode with
+                # nothing built. Send it to present_plan once; the user's approval is still the only way out.
+                plan_text_nudged = True
+                messages.append(_harness_turn(_PLAN_TEXT_NUDGE))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "plan_text_nudge"})
+                continue
             if gates_open:
                 nudge = _next_completion_nudge(
                     completion_budget, trajectory, reply=answer, request=request_text,

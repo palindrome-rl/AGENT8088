@@ -275,8 +275,8 @@ them and ends where it is.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `max_turns` | `300` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
-| `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns` (default 300 x 3 = 900 rounds). `1` disables growth and restores a fixed limit. |
+| `max_turns` | `400` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
+| `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns` (default 400 x 3 = 1200 rounds). `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 | `stall_rounds` | `6` | Rounds in a row that bring nothing new (no new call that worked, no file changed, no check newly passing, no part finished) before the main agent is asked once to finish with what it has or change approach. A second stretch of the same length with nothing ends the run with the usual summary. Reading or fetching something new always counts as progress. `0` turns the watch off. |
 | `verification_loop_rounds` | `8` | Once the work is built, its checks pass and no part is open, this many rounds in a row that change no file are answered once with a message that finishing is the next step (at most twice per request). It never ends the run. `0` turns it off. |
@@ -322,7 +322,7 @@ number of rounds. All default to `0`, meaning disabled.
 | `write_output_cap` | `16384` | Largest cap a cut-off tool call (a file being written) may earn on its retry. Beyond this, write the file in parts with `write_file mode=append`. `0` removes the ceiling (the provider's limit still applies). |
 | `thinking_off_sticky_calls` | `3` | After a cut-off whose whole budget went to reasoning (no answer, no tool call), this many following ordinary calls also run with thinking off, at the normal cap, so a file the model drafted in its thinking is written straight into the tool call. Thinking returns to normal afterwards. `0` keeps only the one retry. |
 | `reasoning_budget_tokens` | `0` | Tokens a model may spend thinking on an ordinary turn, where the provider can be told (see `provider.<name>.reasoning_budget_extra_body`). `0` leaves the provider's default. Prefer this to raising the output cap: a larger cap makes every runaway call proportionally longer without making an answer more likely. |
-| `plan_mode_timeout_seconds` | `300` | Default wall-clock ceiling for the planning phase when `max_turn_seconds` is unset. It ends when the plan is approved; the work that follows is limited only by `max_turn_seconds` (off by default). |
+| `plan_mode_timeout_seconds` | `600` | Default wall-clock ceiling for the planning phase when `max_turn_seconds` is unset. It ends when the plan is approved; the work that follows is limited only by `max_turn_seconds` (off by default). |
 | `plan_mode_retry_limit` | `4` | Invalid mutation attempts allowed before plan mode stops safely. |
 | `max_turn_tokens` | `0` | Token ceiling (input + output) for one request. |
 | `max_turn_cost_usd` | `0` | USD ceiling. Needs the two price keys below. |

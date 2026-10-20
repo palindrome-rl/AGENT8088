@@ -478,6 +478,59 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
     return missing
 
 
+def _mirror_equivalent(path: str, roots: Iterable[Path], mirrors: Iterable[Path]) -> Path | None:
+    """The same path inside a mirror root (the artifacts folder), when it holds something there.
+
+    A run's own writes land in the artifacts folder by default, so a folder a plan names at the project root can
+    hold the finished work one level over. The path may be absolute (the plan spelled it out) or relative."""
+    p = Path(os.path.expanduser(path))
+    relatives: list[Path] = []
+    if p.is_absolute():
+        for root in roots:
+            try:
+                relatives.append(p.resolve().relative_to(Path(root).resolve()))
+            except (OSError, RuntimeError, ValueError):
+                continue
+    else:
+        relatives = [p]
+    for relative in relatives:
+        for mirror in mirrors:
+            try:
+                mirror_root = Path(mirror).resolve()
+                candidate = (mirror_root / relative).resolve()
+                candidate.relative_to(mirror_root)
+            except (OSError, RuntimeError, ValueError):
+                continue  # traversal or a link outside the mirror is not artifact content
+            if _has_content(candidate) or _nonempty_file(candidate):
+                return candidate
+    return None
+
+
+def annotate_missing(missing: list[str], roots: Iterable[Path], mirrors: Iterable[Path]) -> list[str]:
+    """Add "its content is at <place>" to a missing output whose content exists in the mirror folder.
+
+    Without it the nudge only says the path is missing, and a model that knows it built the thing in the artifacts
+    folder spends rounds looking for what the controller means. Entries that already say where the file is found are
+    left alone."""
+    roots, mirrors = list(roots), list(mirrors)
+    out = []
+    for entry in missing:
+        if "found only in" in entry or "its content is at" in entry:
+            out.append(entry)
+            continue
+        if entry.endswith("/ (missing or empty)"):
+            base = entry[: -len("/ (missing or empty)")]
+            found = _mirror_equivalent(base, roots, mirrors)
+            out.append(entry.replace("(missing or empty)", f"(missing or empty; but its content is at {found})")
+                       if found else entry)
+        elif " (" not in entry:
+            found = _mirror_equivalent(entry, roots, mirrors)
+            out.append(f"{entry} (its content is at {found})" if found else entry)
+        else:
+            out.append(entry)
+    return out
+
+
 # A test file is named in the reply but was never written. Narrow on purpose:
 # only conventional test filenames, because any reply mentioning any filename
 # would otherwise trip this and a check that fires on ordinary prose is worse

@@ -384,7 +384,7 @@ def _error(message: str, status: int = 400, **extra) -> JSONResponse:
 
 # An agent turn is bounded by max_turns; anything past this is a runaway loop,
 # and a negative value silently disabled the loop entirely.
-_MAX_TURNS_CEILING = 1000
+_MAX_TURNS_CEILING = 1500
 
 # The port this server was started on. Set by run_web_server; the default is
 # the documented one so a TestClient-hosted app (which never calls it) still

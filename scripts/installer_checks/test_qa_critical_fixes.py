@@ -15,7 +15,7 @@ from agent8088 import engine
 def test_default_max_turns_uses_the_shared_allowance(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli.A, "APP_CONFIG", {}, raising=False)
-    assert cli.Session().max_turns == engine.DEFAULT_MAX_TURNS == 300
+    assert cli.Session().max_turns == engine.DEFAULT_MAX_TURNS == 400
 
 
 def test_configured_max_turns_still_wins(monkeypatch):
@@ -27,7 +27,7 @@ def test_configured_max_turns_still_wins(monkeypatch):
 def test_gateway_uses_the_shared_starting_allowance(monkeypatch):
     from agent8088.gateway import agent_bridge
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {})
-    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 300
+    assert agent_bridge._turn_max_turns("full-auto") == engine.DEFAULT_MAX_TURNS == 400
     assert agent_bridge._turn_max_turns("plan-only") == max(engine.DEFAULT_MAX_TURNS, agent_bridge.PLAN_MODE_MIN_TURNS)
     monkeypatch.setattr(agent_bridge.A, "APP_CONFIG", {"max_turns": "7"})
     assert agent_bridge._turn_max_turns("full-auto") == 7
