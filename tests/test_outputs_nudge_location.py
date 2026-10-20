@@ -85,3 +85,18 @@ def test_the_engine_wrapper_uses_it(tmp_path, monkeypatch):
     missing = engine._missing_required_files(Trajectory(), "done", "anything")
     assert missing == [entry.replace("(missing or empty)",
                                      f"(missing or empty; but its content is at {artifacts / 'app'})")], missing
+
+
+def test_a_relative_parent_escape_is_not_artifacts_content(tmp_path):
+    project, artifacts = tmp_path / "work", tmp_path / "work" / "artifacts"
+    artifacts.mkdir(parents=True)
+    _write(project / "outside.txt", "existing input, not an artifact")
+    entry = "../outside.txt"
+    assert C.annotate_missing([entry], [project], [artifacts]) == [entry]
+
+
+def test_a_legal_dot_prefixed_folder_is_not_confused_with_parent_traversal(tmp_path):
+    project, artifacts = tmp_path / "work", tmp_path / "work" / "artifacts"
+    _write(artifacts / "..cache" / "out.txt")
+    entry = f"{project / '..cache'}/ (missing or empty)"
+    assert "its content is at" in C.annotate_missing([entry], [project], [artifacts])[0]

@@ -488,15 +488,19 @@ def _mirror_equivalent(path: str, roots: Iterable[Path], mirrors: Iterable[Path]
     if p.is_absolute():
         for root in roots:
             try:
-                relatives.append(Path(os.path.relpath(p, Path(root))))
-            except ValueError:      # another drive
+                relatives.append(p.resolve().relative_to(Path(root).resolve()))
+            except (OSError, RuntimeError, ValueError):
                 continue
-        relatives = [r for r in relatives if not str(r).startswith("..")]
     else:
         relatives = [p]
     for relative in relatives:
         for mirror in mirrors:
-            candidate = Path(mirror) / relative
+            try:
+                mirror_root = Path(mirror).resolve()
+                candidate = (mirror_root / relative).resolve()
+                candidate.relative_to(mirror_root)
+            except (OSError, RuntimeError, ValueError):
+                continue  # traversal or a link outside the mirror is not artifact content
             if _has_content(candidate) or _nonempty_file(candidate):
                 return candidate
     return None
