@@ -5,6 +5,7 @@ was already showing, and a working game got the verdict "failed". A control that
 control that may do nothing by design: it fails the page only if no other control did anything either."""
 from agent8088 import app_check
 from tests.test_app_check import _page, chromium, needs_chromium  # noqa: F401
+import pytest
 
 ACTIVE_CLASS_TAB = """<!doctype html><html><body>
 <nav><button id="tab-player" class="tab active">Your Team</button><button id="tab-ai" class="tab"
@@ -71,4 +72,18 @@ def test_a_class_that_only_contains_the_word_does_not_count_as_current(tmp_path)
 
 def test_the_current_control_rule_is_in_the_script():
     assert "isCurrent" in app_check._COMMITTAL_JS
-    assert "aria-selected" in app_check._COMMITTAL_JS and "aria-pressed" in app_check._COMMITTAL_JS
+    assert "aria-selected" in app_check._COMMITTAL_JS
+
+
+@needs_chromium
+@pytest.mark.parametrize("attrs", [
+    'class="active"', 'class="not-active"', 'class="tab not-active"',
+    'aria-pressed="true"', 'aria-current="true"',
+])
+def test_a_state_or_style_does_not_excuse_a_dead_action_button(tmp_path, attrs):
+    html = ('<!doctype html><html><body>'
+            f'<button {attrs}>Launch</button>'
+            '<button onclick="document.getElementById(\'v\').textContent=\'worked\'">Other action</button>'
+            '<p id="v">ready</p></body></html>')
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.failed, report.text()
