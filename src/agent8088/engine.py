@@ -672,7 +672,7 @@ PROSE_CUTOFF_MAX = 2
 # "Retry until the clock runs out" is replaced by a deterministic ending that
 # leaves partial work in place. 0 disables the ladder (restores unbounded retry).
 LENGTH_CUTOFF_MAX_RETRIES = max(0, _config_int("length_cutoff_max_retries", 4))
-PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 300))
+PLAN_MODE_TIMEOUT_SECONDS = max(1, _config_int("plan_mode_timeout_seconds", 600))
 PLAN_MODE_RETRY_LIMIT = max(1, _config_int("plan_mode_retry_limit", 4))
 MAX_TURN_TOKENS = _config_int("max_turn_tokens", 0)
 # USD ceiling; needs cost_per_1k_input / cost_per_1k_output to be set too.
@@ -7983,7 +7983,7 @@ def _audit_tool_call(tool_name: str, tool_args: dict, result: str,
 def _lift_plan_clock() -> None:
     """Planning has a wall-clock ceiling; the work an approval starts does not inherit it.
 
-    A request that starts in plan mode gets plan_mode_timeout_seconds (300s) because
+    A request that starts in plan mode gets plan_mode_timeout_seconds (600s by default) because
     max_turn_seconds is off by default. The budget is built once, when the request
     starts, and the approved plan then runs inside that same request, so the build
     died at 300s in total ("Time budget exceeded") however long the user's own
