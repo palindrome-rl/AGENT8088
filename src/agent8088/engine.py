@@ -5960,7 +5960,7 @@ def _transfer_file(name: str, source: Path, target: Path, args: dict) -> str:
     _turn_writes += 1
     _last_write_diff = None  # binary-safe copy -- a text diff would be noise
     result = (f"{'Moved' if name == 'move_file' else 'Copied'} {size} bytes from "
-              f"{source} to {target}" + _docker_shell_path_hint(target))
+              f"{source} to {target}" + _shell_path_hint(target))
     asked = Path(_from_container_path(str(args.get("destination") or ""))).expanduser()
     asked = (asked if asked.is_absolute() else PROJECT_ROOT / asked)
     if ARTIFACTS_ROOT in target.parents and ARTIFACTS_ROOT not in asked.parents:
@@ -11137,6 +11137,32 @@ def _docker_shell_path_hint(target) -> str:
     return f" (shell commands see it as /workspace/{relative.as_posix()})"
 
 
+def _shell_path_hint(target) -> str:
+    """How a shell command reaches a file the file tools just wrote.
+
+    The file tools and the shell do not share a folder: a bare filename the model invents is stored in artifacts/,
+    a path the user typed stays in the project folder, and the shell runs in the sandbox workspace (artifacts/,
+    or the project folder once the user's own path was written). A model told only "Wrote N bytes to <path>" had to
+    guess whether `python x.py` would find it. Docker already said where it is mounted; this says the same for the
+    native sandbox, only when a bare name would not work from the shell's folder, so most writes add nothing."""
+    entry = capabilities.get(capabilities.SANDBOX)
+    if entry is None:
+        return ""
+    if entry.active == "docker":
+        return _docker_shell_path_hint(target)
+    if entry.active != "native":
+        return ""
+    workspace = Path(_shell_workspace_root or ARTIFACTS_ROOT).resolve()
+    try:
+        relative = Path(target).resolve().relative_to(workspace)
+    except ValueError:
+        return (f" (shell commands run in {workspace}, outside this file's folder: "
+                f"use its full path {target} there)")
+    if workspace != ARTIFACTS_ROOT.resolve() and relative.parts and relative.parts[0] == ARTIFACTS_ROOT.name:
+        return f" (from the shell's folder {workspace} this file is {relative})"
+    return ""
+
+
 def _sandbox_model_note() -> str:
     """The Docker caveat for a sandboxed command's result, or "". Reads the
     registry only (no `docker info` per command)."""
@@ -13854,7 +13880,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             target.write_bytes(fetched)
             _last_write_diff = None  # binary output -- a text diff would be noise
             result = (f"Wrote {len(fetched)} bytes to {target} (fetched from {source_url})"
-                      + _docker_shell_path_hint(target))
+                      + _shell_path_hint(target))
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
@@ -13944,7 +13970,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             _last_write_diff = _make_diff(original, edit.text, str(target))
             added, removed = diffview.diff_counts(_last_write_diff)
             result = (f"Updated {target} with {added} addition{'s' if added != 1 else ''} "
-                      f"and {removed} removal{'s' if removed != 1 else ''}")
+                      f"and {removed} removal{'s' if removed != 1 else ''}" + _shell_path_hint(target))
             if edit.strategy == "normalized":
                 result += (" — old_string matched after normalising trailing whitespace "
                            "and tabs; copy the file's exact text next time")
@@ -13971,7 +13997,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 total = target.stat().st_size
             except OSError:
                 total = len(old_content.encode("utf-8")) + written
-            result = f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+            result = (f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+                      + _shell_path_hint(target))
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
@@ -14010,7 +14037,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         if name == "write_file":
             # A later append continues from here; an older series on this path is over.
             _turn_chunked[str(target)] = len(content.encode("utf-8"))
-        result = f"Wrote {len(content)} bytes to {target}" + _docker_shell_path_hint(target)
+        result = f"Wrote {len(content)} bytes to {target}" + _shell_path_hint(target)
         if cleaned_code:
             result += " (reasoning markup was removed from the content before writing)"
         if shadowed is not None:
