@@ -19130,11 +19130,13 @@ def _delivered_evidence(written) -> str | None:
 
 
 def _missing_required_files(trajectory, reply: str, request: str) -> list:
-    return completion_checks.missing_outputs(
+    mirrors = [ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else []
+    missing = completion_checks.missing_outputs(
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
-        mirror_roots=[ARTIFACTS_ROOT] if ARTIFACTS_ROOT != PROJECT_ROOT else [],
+        mirror_roots=mirrors,
         start_files=trajectory.start_files,
         landed=trajectory.data.get("redirected_writes") or [])
+    return completion_checks.annotate_missing(missing, [PROJECT_ROOT, Path.cwd()], mirrors) if mirrors else missing
 
 
 def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth: int) -> list:
