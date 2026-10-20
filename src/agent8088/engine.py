@@ -12543,6 +12543,24 @@ def _tool_path(spec: dict, args: dict) -> str:
             or args.get("file_path") or args.get("filepath") or args.get("path") or "")
 
 
+_PLAN_TEXT_NUDGE = (
+    "You are in plan mode and have written a plan as ordinary text. A plan is only approved through the "
+    "present_plan tool, and nothing can be built until then. Call present_plan(plan=\"...\") now with that plan "
+    "written out as markdown, so the user can approve it. If you still need to look something up first, say so "
+    "in one line and keep researching.")
+_PLAN_STEP_LINE = re.compile(r"^\s*(?:\d+[.)]|[-*\u2022]|#{1,4}\s)", re.MULTILINE)
+_PLAN_WORDS = re.compile(r"\b(plan|approve|approval|proceed|go ahead|steps?)\b", re.IGNORECASE)
+
+
+def _looks_like_a_plan(text: str) -> bool:
+    """A reply that reads as a plan: structured (several list items or headings), long enough to be one, and
+    talking about a plan or asking for approval. Deterministic, no model call. A short answer, a question or a
+    one-line status is not a plan."""
+    text = text or ""
+    return (len(text) >= 300 and len(_PLAN_STEP_LINE.findall(text)) >= 3
+            and bool(_PLAN_WORDS.search(text)))
+
+
 def _plan_mode_block_message() -> str:
     """What a model is told when it reaches for a mutation inside plan mode.
 
@@ -19463,6 +19481,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     tool_failed = False  # any tool call this run returned an error
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
+    plan_text_nudged = False  # a plan written as text has been sent back to present_plan once
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
@@ -20198,6 +20217,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     messages.append(_harness_turn(chunk_note))
                     post_check_rounds = 0
                     continue
+            if (gates_open and depth == 0 and not plan_text_nudged and PERMISSION_MODE == "plan-only"
+                    and not _plan_tool_ran and _looks_like_a_plan(answer)):
+                # A plan written as chat text is never approved, and the session stays in plan mode with
+                # nothing built. Send it to present_plan once; the user's approval is still the only way out.
+                plan_text_nudged = True
+                messages.append(_harness_turn(_PLAN_TEXT_NUDGE))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "plan_text_nudge"})
+                continue
             if gates_open:
                 nudge = _next_completion_nudge(
                     completion_budget, trajectory, reply=answer, request=request_text,
