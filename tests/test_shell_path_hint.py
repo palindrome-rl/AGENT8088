@@ -3,6 +3,7 @@
 The file tools and the shell resolve paths differently (a bare invented name goes to artifacts/, a path the user typed
 stays in the project folder, and the shell runs in artifacts/ or, after the user's own path was written, in the project
 folder), so a model that wrote a file and then ran it from the shell had to guess where the shell would look."""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,10 +70,51 @@ def test_docker_keeps_its_existing_wording(engine, roots, monkeypatch):
     assert "cannot see this file" in engine._shell_path_hint(project / "x.py")
 
 
-def test_the_hint_reaches_a_write_result(engine, roots, monkeypatch):
+@pytest.mark.parametrize("backend", ["native", "docker", ""])
+@pytest.mark.parametrize("operation", ["write_file", "append", "edit_file", "fetch", "copy_file", "move_file"])
+def test_the_hint_reaches_actual_file_tool_results(engine, roots, monkeypatch, backend, operation):
+    project, artifacts = roots
+    _sandbox(engine, monkeypatch, backend)
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [project])
+    monkeypatch.setattr(engine, "_shell_workspace_root", project)
+    target = artifacts / "note.txt"
+    tool = operation
+    args = {"filename": str(target), "content": "hello"}
+    if operation == "edit_file":
+        target.write_text("old", encoding="utf-8")
+        args = {"filename": str(target), "old_string": "old", "new_string": "hello"}
+    elif operation == "append":
+        tool = "write_file"
+        args["mode"] = "append"
+    elif operation == "fetch":
+        tool = "write_file"
+        monkeypatch.setattr(engine, "_fetch_url_bytes", lambda url: (b"hello", None, "text/plain"))
+        args = {"filename": str(target), "source_url": "https://example.com/note.txt"}
+    elif operation in ("copy_file", "move_file"):
+        source = artifacts / "source.txt"
+        source.write_text("hello", encoding="utf-8")
+        args = {"source": str(source), "destination": str(target)}
+
+    result = engine.exec_tool(tool, json.dumps(args))
+    assert target.read_text(encoding="utf-8") == "hello", result
+    if backend == "native":
+        assert f"from the shell's folder {project.resolve()} this file is" in result, result
+        assert str(Path("artifacts") / "note.txt") in result, result
+    elif backend == "docker":
+        assert " (shell commands see it as /workspace/artifacts/note.txt)" in result, result
+    else:
+        assert "shell commands" not in result and "shell's folder" not in result, result
+
+
+def test_a_user_named_write_reports_the_workspace_it_just_selected(engine, roots, monkeypatch):
     project, artifacts = roots
     _sandbox(engine, monkeypatch, "native")
-    monkeypatch.setattr(engine, "_shell_workspace_root", project)
-    target = artifacts / "data.json"
-    text = f"Wrote 5 bytes to {target}" + engine._shell_path_hint(target)
-    assert text.startswith("Wrote 5 bytes to") and "this file is" in text
+    monkeypatch.setattr(engine, "PERMISSION_MODE", "full-auto")
+    monkeypatch.setattr(engine, "ALLOWED_PATHS", [project])
+    target = project / "named.txt"
+    monkeypatch.setattr(engine, "_CURRENT_RUN_MESSAGES", [{"role": "user", "content": f"Write {target}"}])
+    result = engine.exec_tool("write_file", json.dumps({"filename": str(target), "content": "hello"}))
+    assert target.read_text(encoding="utf-8") == "hello", result
+    assert engine._shell_workspace_root == project
+    assert "outside this file's folder" not in result, result

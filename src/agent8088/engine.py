@@ -13952,7 +13952,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             _last_write_diff = _make_diff(original, edit.text, str(target))
             added, removed = diffview.diff_counts(_last_write_diff)
             result = (f"Updated {target} with {added} addition{'s' if added != 1 else ''} "
-                      f"and {removed} removal{'s' if removed != 1 else ''}")
+                      f"and {removed} removal{'s' if removed != 1 else ''}" + _shell_path_hint(target))
             if edit.strategy == "normalized":
                 result += (" — old_string matched after normalising trailing whitespace "
                            "and tabs; copy the file's exact text next time")
@@ -13979,7 +13979,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 total = target.stat().st_size
             except OSError:
                 total = len(old_content.encode("utf-8")) + written
-            result = f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+            result = (f"Appended {written} bytes to {target} (the file is now {total} bytes)"
+                      + _shell_path_hint(target))
             if shadowed is not None:
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
