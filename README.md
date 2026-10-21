@@ -14,6 +14,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#inside-agent8088">Features</a> ·
   <a href="#documentation">Documentation</a> ·
+  <a href="https://palindromerl.com/blog/agent8088-agentic-harness">Blog</a> ·
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -28,7 +29,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/59%20built--in%20tools-execution%20grounded-10b981" alt="59 built-in tools">
-  <img src="https://img.shields.io/badge/verification--gated%20completion-recovery%20%2B%20reverts-059669" alt="Verification-gated completion">
+  <img src="https://img.shields.io/badge/verification--gated%20completion-optional%20audit%20%2B%20rollback-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
   <img src="https://img.shields.io/badge/39%20skill%20packages-extensible-6366f1" alt="39 skill packages">
   <img src="https://img.shields.io/badge/12%20provider%20profiles-any%20OpenAI--compatible-8b5cf6" alt="12 provider profiles">
@@ -46,19 +47,15 @@
 
 ## About
 
-Agent8088 is an open-source AI agent harness by **Palindrome Research Labs**.
-It reads files, runs tools, researches the web, and edits code through a
-permission system you control. Its goal is not simply to produce an answer,
-but to carry a task through execution, validation, and recovery when something
-goes wrong. It is designed around the constraints that make real agent work
-difficult: smaller models, limited context windows, unreliable tools, partial
-results, long-running tasks, and the need to prove that a requested outcome was
-actually produced.
+Agent8088 is an open-source agentic harness from Palindrome Research Labs, built to make small local models finish real agentic tasks reliably.
 
-Most agent harnesses are designed around large hosted models and optimistic
-execution. Agent8088 starts from a different premise: useful agents should be
-able to complete real work reliably, including long multi-step tasks, with
-smaller models, limited context, and explicit operational boundaries.
+Most harnesses assume a large model and trust whatever it reports. Agent8088 fixes the limitations and failure modes of small models through research-backed harness engineering.
+
+Small models mostly fail in specific ways. Their context overflows without warning, their tool calls are malformed or wrongly chosen, they say they are done when they are not, and long runs end up looping or losing progress.
+
+Agent8088 handles these areas around the model through Context Management, Tool Intelligence, Verification-Gated Completion, Grounded Execution, a Reliable Control Loop, Failure Recovery and code-enforced safety. Bigger models mostly show similar failures but less often, so it helps them too.
+
+Apart from focusing on small models reliability, Agent8088 is a complete agentic harness, with broad tooling, web research, documents, MCP, sub-agents, memory and a choice of terminal, web and chat front ends.
 
 <table>
   <tr>
@@ -68,17 +65,17 @@ smaller models, limited context, and explicit operational boundaries.
     </td>
     <td width="33%" valign="top">
       <strong>Tool intelligence</strong><br>
-      <sub>Hybrid tool selection, tolerant call parsing, validated arguments, and shaped tool results help models choose and use the right tools.</sub>
+      <sub>Hybrid tool selection, tolerant call parsing, validated arguments, shaped tool results, and lazy-loaded skills help models choose and use the right tools.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Robust context management</strong><br>
-      <sub>Pre-call token budgeting, overflow prevention, compaction, content handles, and persistent task state preserve what matters within the window.</sub>
+      <sub>Pre-call token budgeting, overflow prevention, compaction that keeps your instructions word for word, content handles, and persistent task state preserve what matters within the window.</sub>
     </td>
   </tr>
   <tr>
     <td width="33%" valign="top">
       <strong>Verification-gated completion</strong><br>
-      <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported.</sub>
+      <sub>Tasks are checked against their required outputs, tests, and observable tool results before completion is reported, with honest verification labels and an optional independent audit.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Grounded execution</strong><br>
@@ -86,13 +83,13 @@ smaller models, limited context, and explicit operational boundaries.
     </td>
     <td width="33%" valign="top">
       <strong>Reliable control loop</strong><br>
-      <sub>A persistent loop plans, acts, and observes, detects repeats and stalls, replans after failures, and enforces time and round limits to keep runs moving.</sub>
+      <sub>A persistent loop plans, acts, and observes, detects repeats and stalls, replans after failures, enforces time and round limits, and escalates to a stronger model only when needed to keep runs moving.</sub>
     </td>
   </tr>
   <tr>
     <td width="33%" valign="top">
       <strong>Failure recovery</strong><br>
-      <sub>Rollback of failed changes, resumable tasks, overflow and cut-off retries, and halting at the first failed step keep long runs recoverable.</sub>
+      <sub>Rollback of failed file changes, resumable tasks, overflow and cut-off retries, and halting at the first failed step keep long runs recoverable.</sub>
     </td>
     <td width="33%" valign="top">
       <strong>Transparent, safe and controlled</strong><br>
@@ -105,9 +102,11 @@ smaller models, limited context, and explicit operational boundaries.
   </tr>
 </table>
 
-Agent8088 is developed around measured failure modes rather than idealized
-demos. Its reliability work is informed by regression testing, live workflow
-analysis, academic research and community pain-points.
+<p align="center">
+  <img src="assets/failure-loop.png" alt="Agent8088 failure categories mapped onto one turn of the agent loop, with the pillars that address each one" width="900">
+</p>
+
+**Read the full write-up:** [Agent8088: Agentic Harness for Reliable AI Agents, even on small, local models](https://palindromerl.com/blog/agent8088-agentic-harness)
 
 ---
 
@@ -365,6 +364,7 @@ these versioned pages.
 
 | Read this | To learn about |
 | --- | --- |
+| [Blog](https://palindromerl.com/blog/agent8088-agentic-harness) | Why small models fail, how Agent8088 handles it, and the research behind it. |
 | [Getting started](docs/wiki/01-getting-started.md) | Installation, setup, sandboxing, and first run. |
 | [Permissions and security](docs/wiki/03-permissions-and-security.md) | Permission modes, approvals, sensitive paths, network controls, and safety floors. |
 | [Tools](docs/wiki/04-tools.md) | Every built-in tool, aliases, web-search backends, and tool-selection rules. |
