@@ -10340,6 +10340,12 @@ def _playwright_chromium_executable() -> str | None:
     return None
 
 
+# check_app and the completion smoke test launch the same Chromium browse_page
+# finds. Without this they asked only Playwright's default cache, which is not
+# where the installer puts agent8088's own browser, and reported it missing.
+app_check.locate_chromium = lambda: _playwright_chromium_executable()
+
+
 _DSH_SANDBOX_ACL_VERSION = "0.1.0-rc.7"  # pin exact - pre-1.0 package, no ranges
 
 
@@ -11663,6 +11669,53 @@ def _cleanup_audit_workspace(temporary) -> str:
     return ""
 
 
+_SHELL_NOT_FOUND_FILE_RE = re.compile(
+    r"no such file or directory|can't open file|cannot access|cannot find (?:the )?(?:path|file|module)",
+    re.IGNORECASE)
+_SHELL_PATH_WORD_RE = re.compile(r"""[^\s'"`;&|<>()]+""")
+
+
+def _shell_missing_file_note(result: str, command: str, workspace: Path) -> str:
+    """Where the file tools hold a file a shell command could not find, or "".
+
+    The shell runs in the sandbox workspace (artifacts/, or the project folder once a file the user named was
+    written there), while read_file and edit_file also look in the project folder and keep invented files in
+    artifacts/. A relative path that works for one could therefore be missing for the other, and the shell said
+    only "No such file", so the model concluded the file did not exist. This names the copy the file tools see and
+    how the shell reaches it. Only paths from the command or quoted in the error, only when they are missing from
+    the shell's folder and present in the other root."""
+    if not _SHELL_NOT_FOUND_FILE_RE.search(result or ""):
+        return ""
+    workspace = Path(workspace).resolve()
+    words = _SHELL_PATH_WORD_RE.findall(command or "") + re.findall(r"""['"]([^'"\n]{1,260})['"]""", result)
+    entry = capabilities.get(capabilities.SANDBOX)
+    docker = entry is not None and entry.active == "docker"
+    notes = []
+    for word in dict.fromkeys(words):
+        if word.startswith("-") or not re.search(r"[\\/.]", word):
+            continue
+        p = Path(_from_container_path(word))
+        if p.is_absolute():
+            try:
+                p = p.resolve().relative_to(workspace)
+            except (ValueError, OSError):
+                continue
+        if not p.parts or p.parts[0] == ".." or (workspace / p).exists():
+            continue
+        for root in (PROJECT_ROOT, ARTIFACTS_ROOT):
+            candidate = (root / p).resolve()
+            if root.resolve() == workspace or not candidate.exists() or not _path_is_allowed(candidate):
+                continue
+            how = (f"copy it into {workspace} with copy_file first; the container cannot see it" if docker
+                   else "use that full path in shell commands")
+            notes.append(f"[note: {p.as_posix()} is not in the shell's folder {workspace}, but the file tools "
+                         f"have it at {candidate}: {how}]")
+            break
+        if len(notes) == 3:
+            break
+    return "".join(f"\n{note}" for note in notes)
+
+
 def _run_sandbox_command(command: str, timeout: int = 25,
                          python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
@@ -11695,6 +11748,8 @@ def _run_sandbox_command(command: str, timeout: int = 25,
             _run_in_sandbox_backend(backend, command, timeout, python_code, image,
                                     workspace),
             workspace if temporary is None else workspace, command)
+        if temporary is None:
+            result += _shell_missing_file_note(result, command, workspace)
     finally:
         if temporary:
             cleanup_note = _cleanup_audit_workspace(temporary)
