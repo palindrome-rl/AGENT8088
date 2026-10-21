@@ -103,7 +103,7 @@ Apart from focusing on small models reliability, Agent8088 is a complete agentic
 </table>
 
 <p align="center">
-  <img src="assets/failure-loop.png" alt="Agent8088 failure categories mapped onto one turn of the agent loop, with the pillars that address each one" width="900">
+  <img src="assets/failure-loop.jpg" alt="Agent8088 failure categories mapped onto one turn of the agent loop, with the pillars that address each one" width="900">
 </p>
 
 **Read the full write-up:** [Agent8088: Agentic Harness for Reliable AI Agents, even on small, local models](https://palindromerl.com/blog/agent8088-agentic-harness)
