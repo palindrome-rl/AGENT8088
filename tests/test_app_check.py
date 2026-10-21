@@ -154,7 +154,7 @@ def test_a_missing_file_fails_without_a_browser(tmp_path):
 
 
 def test_without_chromium_the_check_is_unavailable_not_failed(tmp_path, monkeypatch):
-    monkeypatch.setattr(app_check, "chromium_available", lambda: False)
+    monkeypatch.setattr(app_check, "chromium_executable", lambda: None)
     report = app_check.check_web_page(_page(tmp_path, WORKING))
     assert report.status == app_check.UNAVAILABLE and "playwright install chromium" in report.note
     assert not report.failed
@@ -335,14 +335,33 @@ def test_error_from_a_blocked_cdn_script_is_inconclusive_not_a_false_pass(tmp_pa
     assert any("blocked external script" in w for w in report.warnings)
 
 
-def test_a_timed_out_probe_is_not_remembered(monkeypatch):
-    app_check._CHROMIUM_ANSWERS.clear()
-    answers = iter([None, True])
-    monkeypatch.setattr(app_check, "_chromium_available", lambda key: next(answers))
-    assert app_check.chromium_available() is False      # unknown this time
-    assert app_check.chromium_available() is True       # asked again, now known
-    assert app_check.chromium_available() is True       # definite answers are cached
-    app_check._CHROMIUM_ANSWERS.clear()
+def test_a_missing_browser_is_not_remembered(monkeypatch, tmp_path):
+    pytest.importorskip("playwright.sync_api")
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"")
+    answers = iter([None, str(exe)])
+    monkeypatch.setattr(app_check, "locate_chromium", lambda: next(answers))
+    assert app_check.chromium_available() is False      # not there yet
+    assert app_check.chromium_available() is True       # asked again, now installed
+
+
+def test_the_check_launches_agent8088s_own_browser(monkeypatch, tmp_path):
+    """The engine's lookup decides which Chromium runs, not Playwright's default cache."""
+    pytest.importorskip("playwright.sync_api")
+    from agent8088 import engine  # noqa: F401 -- importing it wires locate_chromium
+    exe = tmp_path / "playwright-browsers" / "chrome.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"")
+    monkeypatch.setattr(engine, "_playwright_chromium_executable", lambda: str(exe))
+    assert app_check.chromium_executable() == str(exe)
+    launched = {}
+
+    def worker(*args):
+        launched["executable"] = args[-1]
+        args[4]["error"] = "stopped by the test"
+    monkeypatch.setattr(app_check, "_web_worker", worker)
+    app_check.check_web_page(_page(tmp_path, WORKING))
+    assert launched["executable"] == str(exe)
 
 
 def test_script_that_crashes_on_start_fails(tmp_path):
