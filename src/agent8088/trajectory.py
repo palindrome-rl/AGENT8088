@@ -184,6 +184,31 @@ def command_segments(command: str, *, split_or: bool = False) -> list[str]:
     return [piece for piece in pieces if piece.strip()]
 
 
+# Asking a tool for its version or help text says nothing about the work, whichever way it exits: a
+# `pytest --version` that fails only means pytest is not installed, and one that works proves nothing.
+_PROBE_FLAG = re.compile(r"(?:^|\s)(?:--version|-V|--help|-h)\s*$", re.IGNORECASE)
+_TRAILING_REDIRECT = re.compile(r"\s*(?:\d?>>?&?\S*)\s*$")
+_SETUP_PROGRAMS = frozenset({"cd", "chdir", "pushd", "echo"})
+
+
+def _is_probe(command: str) -> bool:
+    """Whether every real step of the command only asks a tool for its version or help text."""
+    steps = [segment for segment in command_segments(command or "", split_or=True)
+             if _segment_program(segment) not in _SETUP_PROGRAMS]
+    if not steps:
+        return False
+    for step in steps:
+        text = step.strip()
+        while True:
+            stripped = _TRAILING_REDIRECT.sub("", text)
+            if stripped == text:
+                break
+            text = stripped
+        if not _PROBE_FLAG.search(text):
+            return False
+    return True
+
+
 def _segment_program(segment: str) -> str:
     words = segment.strip().split()
     while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
@@ -425,6 +450,7 @@ class TrajectoryState:
         written_now = self.data.get("written_paths")
         if (operation["verdict"] == "failed"
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
+                and not _is_probe(command)
                 and not _SANDBOX_BLOCKED.search(str(result))
                 and not _wrong_place_failure(command, result, written_now)):
             self.data["check_failing"] = True
