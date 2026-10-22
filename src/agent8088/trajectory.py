@@ -250,14 +250,22 @@ def _wrong_place_failure(command: str, result: str, written) -> bool:
 
 # A lone `&` (cmd.exe's "then run this too", not `&&`, `2>&1` or `>&`) outside quotes.
 _LONE_AMPERSAND = re.compile(r"(?<![&>])&(?![&>0-9])")
+_DIAGNOSTIC_PROGRAMS = frozenset({"dir", "ls", "type", "cat", "echo", "pwd", "where", "which",
+                                  "get-childitem", "get-content"})
 
 
 def _without_trailing_clause(text: str) -> str:
-    """The command up to its first lone `&` outside quotes, so `check & dir x` becomes `check`."""
+    """Drop only a simple diagnostic trailer, never another check or arbitrary executable."""
     for match in _LONE_AMPERSAND.finditer(text):
         before = text[:match.start()]
         if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
-            return before.strip()
+            tail = text[match.end():].strip()
+            # Be conservative about pipelines, further sequencing, substitutions and escapes:
+            # passing the first command cannot prove that any later real work succeeded.
+            if (_segment_program(tail) in _DIAGNOSTIC_PROGRAMS
+                    and not re.search(r"[&|;\r\n`^$%!()]", tail)):
+                return before.strip()
+            return text
     return text
 
 

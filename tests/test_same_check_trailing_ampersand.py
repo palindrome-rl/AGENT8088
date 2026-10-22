@@ -1,5 +1,7 @@
 """A failed check is settled when the same check runs clean later, even if the failing command line had an
 extra clause after a lone `&` (whose exit status cmd.exe reports instead of the check's)."""
+import pytest
+
 from agent8088.trajectory import TrajectoryState, _same_command
 
 COMPILE = r'cd E:\app && python -m py_compile server.py && echo SERVER_PY_OK'
@@ -54,4 +56,21 @@ def test_a_different_passing_command_does_not_clear_it():
     state = TrajectoryState({}, goal="x", message_count=1)
     _record(state, "failed", WITH_DIR, result="Command exited with status 1.")
     _record(state, "unknown", r"cd E:\app && python -m py_compile other.py && echo OK", result="OK")
+    assert state.check_failing()
+
+
+@pytest.mark.parametrize("tail", [
+    "python -m pytest tests/test_b.py", "python validate.py", "npm test",
+    "dir missing && python -m pytest tests/test_b.py", "dir missing | python validate.py",
+    "echo $(python validate.py)", "echo `python validate.py`",
+])
+def test_a_later_real_or_uncertain_command_is_not_dropped(tail):
+    assert not _same_command(COMPILE + " & " + tail, COMPILE)
+
+
+def test_passing_first_check_does_not_clear_failed_second_check():
+    state = TrajectoryState({}, goal="verify both modules", message_count=1)
+    first, second = "python -m pytest tests/test_a.py", "python -m pytest tests/test_b.py"
+    _record(state, "failed", first + " & " + second, "test_b failed. Command exited with status 1.")
+    _record(state, "unknown", first, "1 passed")
     assert state.check_failing()
