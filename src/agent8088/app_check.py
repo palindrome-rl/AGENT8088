@@ -105,49 +105,50 @@ class Report:
 
 # --- Chromium ------------------------------------------------------------------------------
 
+# Set by the engine to its own lookup (agent8088's playwright-browsers folder
+# first, then Playwright's default cache), so the page check launches the same
+# Chromium browse_page does. Unset, only Playwright's default location is asked,
+# which is not where the installer puts agent8088's browser.
+locate_chromium: Callable[[], str | None] | None = None
+
+
 def chromium_available() -> bool:
-    """Whether Playwright's Chromium is installed.
-
-    The answer depends on where Playwright looks, which the engine sets through
-    PLAYWRIGHT_BROWSERS_PATH, so it is cached per value of that variable rather
-    than once per process.
-    """
-    key = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-    if key in _CHROMIUM_ANSWERS:
-        return _CHROMIUM_ANSWERS[key]
-    answer = _chromium_available(key)
-    # A probe that timed out says nothing about the install: ask again next time
-    # instead of switching smoke tests off for the rest of the session.
-    if answer is not None:
-        _CHROMIUM_ANSWERS[key] = answer
-    return bool(answer)
+    """Whether Playwright's Chromium is installed."""
+    return chromium_executable() is not None
 
 
-_CHROMIUM_ANSWERS: dict = {}
+def chromium_executable() -> str | None:
+    """The Chromium the page check launches, or None when none was found or the
+    probe did not finish in time.
 
-
-def _chromium_available(browsers_path: str):
-    """True/False when known, None when the probe did not finish in time.
+    A miss is never remembered: a browser installed (or a lookup that timed out)
+    mid-run is found by the next check instead of smoke tests staying off for the
+    rest of the session. Hits are cheap, the engine's lookup memoizes them.
     Probed on its own thread: the sync API starts an event loop, which must not
     be the caller's."""
     try:
         import playwright.sync_api  # noqa: F401
     except ImportError:
-        return False
-    found: list[bool] = []
+        return None
+    found: list = []
 
     def probe():
-        from playwright.sync_api import sync_playwright
         try:
-            with sync_playwright() as p:
-                found.append(os.path.exists(p.chromium.executable_path))
+            found.append(locate_chromium() if locate_chromium else _default_chromium())
         except Exception:  # noqa: BLE001 -- any launch problem means "not available"
-            found.append(False)
+            found.append(None)
 
     thread = threading.Thread(target=probe, daemon=True)
     thread.start()
     thread.join(30)
-    return found[0] if found else None
+    path = found[0] if found else None
+    return path if path and os.path.exists(path) else None
+
+
+def _default_chromium() -> str | None:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        return p.chromium.executable_path
 
 
 _PARENT_REF = re.compile(r"""(?:src|href)\s*=\s*["']((?:\.\./)+)""", re.IGNORECASE)
@@ -503,7 +504,8 @@ _STATE_NO_VALUES_JS = _STATE_JS.replace(
 
 
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
-                click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False) -> None:
+                click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False,
+                executable: str | None = None) -> None:
     from playwright.sync_api import sync_playwright
 
     failures, warnings, console = [], [], []
@@ -532,7 +534,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
             # A unique command-line marker identifies only this check's browser
             # tree, including a browser still starting when the timeout fires.
             out["browser_marker"] = f"--agent8088-smoke-check={uuid.uuid4().hex}"
-            browser = p.chromium.launch(args=[out["browser_marker"]])
+            browser = p.chromium.launch(executable_path=executable, args=[out["browser_marker"]])
             out["browser_started"] = True
             if cancelled.is_set():
                 return
@@ -760,7 +762,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     path = Path(path)
     if not path.is_file():
         return Report("web", str(path), FAIL, ["the file does not exist"])
-    if not chromium_available():
+    executable = chromium_executable()
+    if executable is None:
         return Report("web", str(path), UNAVAILABLE,
                       note="Chromium is not installed; run `playwright install chromium`")
     out: dict = {"cancelled": threading.Event()}
@@ -769,7 +772,7 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     page_url = path.relative_to(root).as_posix() if root in path.parents else path.name
     started = time.time()
     steps = CLICK_THROUGH_STEPS if click_steps is None else max(0, click_steps)
-    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps, has_backend(root, path)),
+    worker = threading.Thread(target=_web_worker, args=(root, page_url, timeout, deny, out, steps, has_backend(root, path), executable),
                               daemon=True)
     worker.start()
     worker.join(timeout + 15)
