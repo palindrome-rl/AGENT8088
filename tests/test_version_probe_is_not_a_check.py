@@ -30,6 +30,8 @@ def test_these_only_ask_for_a_version_or_help_text(command):
     "python -m pytest --version && python -m pytest -q",
     "python -m py_compile app.py",
     "pytest --verbose",
+    "pytest -v",
+    "python -m pytest -v",
     "echo done",
     r"cd E:\app",
 ])
@@ -46,6 +48,12 @@ def test_a_failed_version_probe_does_not_mark_the_run_as_failing():
 def test_a_failed_test_run_still_does():
     state = TrajectoryState({}, goal="x", message_count=1)
     _record(state, "failed", "python -m pytest -q", result="1 failed, 2 passed")
+    assert state.check_failing()
+
+
+def test_a_failed_verbose_test_run_is_not_a_version_probe():
+    state = TrajectoryState({}, goal="x", message_count=1)
+    _record(state, "failed", "python -m pytest -v", result="1 failed, 2 passed")
     assert state.check_failing()
 
 

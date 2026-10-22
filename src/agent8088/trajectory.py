@@ -186,7 +186,8 @@ def command_segments(command: str, *, split_or: bool = False) -> list[str]:
 
 # Asking a tool for its version or help text says nothing about the work, whichever way it exits: a
 # `pytest --version` that fails only means pytest is not installed, and one that works proves nothing.
-_PROBE_FLAG = re.compile(r"(?:^|\s)(?:--version|-V|--help|-h)\s*$", re.IGNORECASE)
+# Short flags are case-sensitive: pytest -v runs tests verbosely, while -V prints its version.
+_PROBE_FLAG = re.compile(r"(?:^|\s)(?:--version|-V|--help|-h)\s*$")
 _TRAILING_REDIRECT = re.compile(r"\s*(?:\d?>>?&?\S*)\s*$")
 _SETUP_PROGRAMS = frozenset({"cd", "chdir", "pushd", "echo"})
 
