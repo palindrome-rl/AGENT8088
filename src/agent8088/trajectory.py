@@ -248,8 +248,29 @@ def _wrong_place_failure(command: str, result: str, written) -> bool:
             and not _is_check_run(command))
 
 
+# A lone `&` (cmd.exe's "then run this too", not `&&`, `2>&1` or `>&`) outside quotes.
+_LONE_AMPERSAND = re.compile(r"(?<![&>])&(?![&>0-9])")
+
+
+def _without_trailing_clause(text: str) -> str:
+    """The command up to its first lone `&` outside quotes, so `check & dir x` becomes `check`."""
+    for match in _LONE_AMPERSAND.finditer(text):
+        before = text[:match.start()]
+        if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+            return before.strip()
+    return text
+
+
 def _same_command(a: str, b: str) -> bool:
-    return bool(a) and " ".join(str(a).split()).lower() == " ".join(str(b).split()).lower()
+    """Whether `b` is the command `a` that failed, run again.
+
+    `b` may also be `a` without a clause tacked on after a lone `&`: in cmd.exe the exit status of
+    `check & dir x` is that of `dir x`, so the check can look failed while it passed. The other way round
+    does not count: `check & echo done` says nothing about `check`."""
+    if not a:
+        return False
+    first, second = " ".join(str(a).split()).lower(), " ".join(str(b).split()).lower()
+    return first == second or (bool(second) and _without_trailing_clause(first) == second)
 
 
 def _file_key(path: str) -> str:
