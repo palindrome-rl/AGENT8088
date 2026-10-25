@@ -19465,7 +19465,13 @@ _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
 })
-_WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
+_WAIT_COMMAND_RE = re.compile(
+    r"(?:^|[\s;&|(])sleep\s+\d"                      # sh: sleep 30
+    r"|time\.sleep\s*\("                              # python -c "import time; time.sleep(25)"
+    r"|Start-Sleep\b"                                 # PowerShell
+    r"|(?:^|[\s;&|(])timeout\s+/t\s*\d"               # cmd: timeout /t 20
+    r"|(?:^|[\s;&|(])ping\s+-n\s+\d"                  # cmd: ping -n 20 127.0.0.1
+    r"|\bsetTimeout\s*\(", re.IGNORECASE)             # node -e "setTimeout(...)"
 
 
 def _is_wait_command(name: str, args: dict) -> bool:
@@ -19476,6 +19482,21 @@ def _is_wait_command(name: str, args: dict) -> bool:
     still bounds how long a poll can go on.
     """
     return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(str(args.get("command") or "")))
+
+
+# A shell command repeated after this many seconds is a new observation, not a spin: a download's size, a server's
+# health or a log's tail changes while the model thinks. 0 turns the refresh off (every identical repeat is answered
+# from the earlier result, as before). Only a command that succeeded is refreshed, and only a few times in a row.
+REPEAT_REFRESH_SECONDS = max(0, _config_int("repeat_refresh_seconds", 20))
+REPEAT_REFRESH_MAX = 12
+
+
+def _poll_refresh_due(name: str, result: str, finished_at: float, refreshed: int) -> bool:
+    if (name != "execute_shell" or not REPEAT_REFRESH_SECONDS or refreshed >= REPEAT_REFRESH_MAX
+            or time.monotonic() - finished_at < REPEAT_REFRESH_SECONDS):
+        return False
+    head = (result or "")[:600]
+    return not (head.startswith("Error") or "Command exited with status" in head or "Command timed out" in head)
 
 
 def _consult_llmrouter(config, messages, eligible):
@@ -19540,7 +19561,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    last_completed = None  # consecutive identical call -> (signature, output)
+    last_completed = None  # consecutive identical call -> (signature, output, finished at)
+    poll_refreshes: dict = {}  # signature -> times a repeated shell command was re-run because time had passed
     action_results = {}  # opaque external actions cannot be replayed within this request
     seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
@@ -20507,6 +20529,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
+                if _poll_refresh_due(name, last_completed[1], last_completed[2], poll_refreshes.get(sig, 0)):
+                    # Time has passed since the same successful command ran: poll again, it is not a spin.
+                    poll_refreshes[sig] = poll_refreshes.get(sig, 0) + 1
+                    repeated, previous_output = False, None
             if repeated and _is_wait_command(name, args):
                 repeated, previous_output = False, None
             # Only these built-in observation queries are safe to refresh.
@@ -20805,7 +20831,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # stands: an unusable search must be retryable, not latched.
             if ("__parse_error__" not in args
                     and not (name == "web_search" and not _search_was_usable(result))):
-                last_completed = (sig, result)
+                last_completed = (sig, result, time.monotonic())
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
