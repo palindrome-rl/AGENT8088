@@ -1289,13 +1289,14 @@ def is_reference_page(path: Path, roots: Iterable[Path] = ()) -> bool:
     return bool({part.lower() for part in folders} & REFERENCE_DIRS)
 
 
-def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3) -> list[Path]:
+def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3,
+                        reference_pages: Iterable[str] = ()) -> list[Path]:
     """Pages and runnable scripts this run wrote that exist, pages first, newest last.
 
     Tests, files under node_modules or a virtualenv, scratch dirs, and the model's own
-    throwaway helpers (_fix.py, tmp_check.js) are skipped. Pages saved in reference folders (data/, research/,
-    docs/, cache/ ...) are skipped too when the run wrote a page anywhere else: a downloaded docs page that
-    fails the check says nothing about the page that was built, yet it turned the verdict into "failed".
+    throwaway helpers (_fix.py, tmp_check.js) are skipped. A page in a reference folder is skipped only
+    when download provenance identifies it as source material and another page was built. Folder names
+    alone cannot distinguish a saved document from an authored documentation site or app data page.
     """
     roots = [Path(r) for r in roots]
     found: list[Path] = []
@@ -1315,7 +1316,11 @@ def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: in
         if path.suffix.lower() in WEB_SUFFIXES | PYTHON_SUFFIXES | NODE_SUFFIXES:
             found.append(path)
     pages = [p for p in found if p.suffix.lower() in WEB_SUFFIXES]
-    built = [p for p in pages if not is_reference_page(p, roots)]
+    references = set()
+    for raw in reference_pages:
+        candidates = [Path(raw)] if Path(raw).is_absolute() else [r / raw for r in roots]
+        references.update(p.resolve() for p in candidates if p.is_file())
+    built = [p for p in pages if not (p.resolve() in references and is_reference_page(p, roots))]
     pages = built or pages     # only reference pages were written: keep them, there is nothing else to judge
     scripts = [p for p in found if p.suffix.lower() not in WEB_SUFFIXES]
     return (pages + scripts)[:limit]

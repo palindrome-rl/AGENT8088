@@ -332,6 +332,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "verification_requests": 0,
         "untested_changes": [],
         "written_paths": [],
+        "reference_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
         "check_failing": False,
@@ -431,7 +432,7 @@ class TrajectoryState:
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
                    path: str = "", command: str = "", existed: bool = False,
-                   partial_path: str = "", written_to: str = "") -> None:
+                   partial_path: str = "", written_to: str = "", reference: bool = False) -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         if operation["status"] == "done" and (
                 operation["tool"] in RESEARCH_TOOLS
@@ -457,6 +458,12 @@ class TrajectoryState:
             self.data["partial_files"] = [p for p in self.data["partial_files"]
                                           if p.get("key", _file_key(p.get("path", ""))) != name]
         if mutated and path and operation["status"] == "done":
+            references = self.data.setdefault("reference_paths", [])
+            keys = {_file_key(path), _file_key(written_to)} - {""}
+            references[:] = [p for p in references if _file_key(p) not in keys]
+            if reference:
+                references.extend(p for p in dict.fromkeys([path, written_to]) if p)
+                del references[:-MAX_WRITTEN]
             # Where the work actually landed. The answer quotes this, because a
             # run whose writes were redirected into the sandbox workspace reads
             # as a false completion claim when the user checks the folder they

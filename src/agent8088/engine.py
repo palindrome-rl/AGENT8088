@@ -19074,7 +19074,8 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     `report_only` records the notes and never returns a follow-up (the run is ending).
     """
     roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
-    targets = app_check.deliverable_targets(written, roots)
+    targets = app_check.deliverable_targets(
+        written, roots, reference_pages=getattr(trajectory, "data", {}).get("reference_paths", []))
     pending = trajectory.smoke_unchecked([str(t) for t in targets])
     failures = []
     unverified = []
@@ -20630,6 +20631,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                     written_to=_write_landing(name, args),
+                    reference=name == "write_file" and "(fetched from " in str(result),
                 )
                 if name == "check_app":
                     trajectory.settle_check_app(result, path=check_app_path)
