@@ -33,7 +33,7 @@ def test_missing_chromium_says_why_and_what_to_do(eng, tmp_path, monkeypatch):
     assert "python -m playwright install chromium" in out
     assert "browser check was unavailable" in out
     assert "Do not build DOM or browser emulators" in out and "node --check" in out
-    assert "not loaded in a browser" in out
+    assert "browser behavior was not verified" in out
 
 
 def test_the_guidance_is_full_once_and_short_after(eng, tmp_path, monkeypatch):
@@ -83,9 +83,12 @@ def test_a_page_that_hangs_is_not_declared_a_machine_fault(tmp_path):
     page = tmp_path / "index.html"
     page.write_text("<html><script>while(true) {}</script></html>", encoding="utf-8")
     report = app_check.check_web_page(page, timeout=0.2, click_steps=0)
-    assert report.status == app_check.UNAVAILABLE
+    # Navigation can time out directly (FAIL) or the worker can hit its outer
+    # deadline (UNAVAILABLE). Neither proves that Chromium is missing/broken.
+    assert report.status in {app_check.UNAVAILABLE, app_check.FAIL}
     assert not app_check.environment_unavailable(report)
-    assert app_check.browser_unavailable(report)
+    if report.status == app_check.UNAVAILABLE:
+        assert app_check.browser_unavailable(report)
 
 
 @pytest.mark.parametrize("report", [

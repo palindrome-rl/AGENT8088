@@ -744,7 +744,7 @@ UNAVAILABLE_GUIDANCE = (
     "distinguish a page defect from an environment problem. Do not build DOM or browser emulators (Node or VM scripts that stub document, fetch or "
     "canvas) to stand in for it: they cost many turns and still cannot show the page. Instead run `node --check` on each "
     "script, re-read the HTML for ids and script paths that do not match, test any pure logic in one small file, and say "
-    "plainly in your answer that the page was not loaded in a browser and which file the user should open to confirm.")
+    "plainly in your answer that browser behavior was not verified and which file the user should open to confirm.")
 UNAVAILABLE_GUIDANCE_SHORT = ("Browser verification is still unavailable (see the earlier note): do not build emulators; "
                               "say in your answer that browser behavior was not verified.")
 
