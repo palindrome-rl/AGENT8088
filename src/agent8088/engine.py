@@ -19088,6 +19088,8 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
         trajectory.record_smoke(str(target), report.summary(), report.failed, report.output,
                                 passed=report.status == app_check.PASS,
                                 unverified=report.status == app_check.UNAVAILABLE and report.ask)
+        if any("asked the server for" in str(w) for w in report.warnings):
+            trajectory.note_backend_asked(str(target))   # the page's own server was not run by this check
         if report.failed:
             failures.append(report)
         elif report.ask:
@@ -19400,6 +19402,8 @@ def _not_verified_reasons(trajectory) -> list:
     if trajectory is None:
         return []
     reasons = []
+    if trajectory.no_runnable_app():
+        reasons.append("no runnable app (a page or a server) was produced for a request to build a web app")
     failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
     if failed:
         reasons.append("the page/script check failed (" + ", ".join(failed[:3]) + ")")
@@ -19441,6 +19445,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and (backend := trajectory.backend_note()):
+        notes.append(f"Not verified: {backend}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):
         notes.append("Not completed: " + "; ".join(open_parts[:6])
                      + ("; ..." if len(open_parts) > 6 else ""))

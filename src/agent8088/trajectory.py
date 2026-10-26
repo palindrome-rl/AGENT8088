@@ -132,6 +132,16 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+# A request to build a web app or page, and the files that count as its entry point.
+_WEB_APP_REQUEST = re.compile(r"\b(web[\s-]?app(lication)?s?|web[\s-]?sites?|web[\s-]?pages?|html page|browser game|front-?end|web-based)\b", re.I)
+_BUILD_VERB = re.compile(r"\b(create|build|make|develop|write|implement|generate|design)\b", re.I)
+# Folders that hold pages the run saved for itself (downloaded docs, scraped results), not pages it built.
+_REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
+                             "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
+_SERVER_ENTRY_NAMES = frozenset({"server.py", "server.js", "app.py", "main.py", "manage.py", "wsgi.py", "asgi.py", "index.js",
+                                 "start-server.js", "server.mjs", "index.mjs"})
+
+
 # A shell command that runs something to find out whether it works. A command that only looks around
 # (a listing, a copy, a probe) and exits non-zero did not fail a check, so it must not leave the
 # run marked "the latest automated check failed" for good.
@@ -347,6 +357,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_checked": {},
         "smoke_passed_at": {},
         "smoke_unverified": {},
+        "backend_asked": [],
         "weak_secret_asked": False,
         "smoke_asked": [],
         "consecutive_setbacks": 0,
@@ -905,8 +916,45 @@ class TrajectoryState:
             level = "inspected"
         else:
             level = "unchecked"
+        if level in ("tested", "exercised") and self.no_runnable_app():
+            # Scripts ran, but there is no page or server to run: the thing asked for does not exist, so the
+            # strongest honest level is that files were written. This only lowers a claim.
+            level = "inspected"
         data["assurance"] = level
         return level
+
+    def wants_web_app(self) -> bool:
+        """The request is to build a web app or page (judged from the start of the request, which is all that is kept)."""
+        goal = str(self.data.get("goal") or "")
+        return bool(_WEB_APP_REQUEST.search(goal) and _BUILD_VERB.search(goal))
+
+    def has_app_entry(self) -> bool:
+        """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
+        for path in self.written_paths():
+            parts = PurePath(str(path).replace("\\", "/")).parts
+            name = parts[-1].lower() if parts else ""
+            if name in _SERVER_ENTRY_NAMES:
+                return True
+            if name.endswith((".html", ".htm")) and not ({p.lower() for p in parts[:-1]} & _REFERENCE_DIRS):
+                return True
+        return False
+
+    def no_runnable_app(self) -> bool:
+        return bool(int(self.data.get("mutation_count") or 0) and self.wants_web_app() and not self.has_app_entry())
+
+    def note_backend_asked(self, path: str) -> None:
+        """The page check saw the page ask its own server for data, which the check cannot run."""
+        asked = self.data.setdefault("backend_asked", [])
+        if path not in asked:
+            asked.append(path)
+            del asked[:-4]
+
+    def backend_note(self) -> str:
+        names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
+        if not names:
+            return ""
+        return ("the page calls its own server (" + ", ".join(names[:3]) + "), which the page check cannot run, so how "
+                "the page behaves with its backend was not verified")
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
