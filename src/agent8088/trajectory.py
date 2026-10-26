@@ -444,6 +444,11 @@ class TrajectoryState:
                    path: str = "", command: str = "", existed: bool = False,
                    partial_path: str = "", written_to: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
+        if (operation["tool"] == "check_app" and path and not blocked
+                and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service"))):
+            # Manual check_app calls must retain the same caveat as completion smoke checks.
+            # Read the full result before operation summaries are clipped.
+            self.note_backend_asked(path)
         if operation["status"] == "done" and (
                 operation["tool"] in RESEARCH_TOOLS
                 or (operation["tool"] == "execute_shell" and re.search(r"https?://", command or ""))):

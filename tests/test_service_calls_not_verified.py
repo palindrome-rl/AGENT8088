@@ -46,3 +46,14 @@ def test_the_server_warning_keeps_the_phrase_the_answer_note_keys_on(tmp_path):
     source = (app_check.__file__)
     text = open(source, encoding="utf-8").read()
     assert "asked the server for" in text and "that call was NOT" in text and "shell command" in text
+
+
+@pytest.mark.parametrize("warning", [SERVER_WARNING, LOCAL_WARNING])
+def test_manual_check_app_keeps_the_backend_caveat(engine, warning):
+    state = TrajectoryState({}, goal="Create a web app", message_count=1)
+    state.data.update(mutation_count=1, ran_ok_at=1, written_paths=["index.html"])
+    result = _report(warning).text()
+    state.after_tool(state.before_tool("check_app"), result, failed=False, blocked=False,
+                     mutated=False, path="E:/w/index.html")
+    state.settle_check_app(result, path="E:/w/index.html")
+    assert "Not verified: the page calls its own server or a local service" in engine._with_task_notes("Done.", state)
