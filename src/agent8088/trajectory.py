@@ -317,6 +317,21 @@ def _same_command(a: str, b: str) -> bool:
     return first == second or (bool(second) and _without_trailing_clause(first) == second)
 
 
+def _revised_command(failed: str, rerun: str) -> bool:
+    """Whether `rerun` is the check `failed`, edited and run again.
+
+    A check that failed because of how it was written (`... | head -1` on Windows, the wrong tool for one file)
+    is fixed by editing the command, not by running it again unchanged. The edited command still has to be a
+    check and has to keep most of the original's words, so an unrelated check does not settle the failure."""
+    if not failed or not _is_check_run(rerun):
+        return False
+    words = lambda text: re.findall(r"[\w./\\:=-]+", _command_core(text).lower())
+    before, after = words(failed), set(words(rerun))
+    # Dropping the clause that failed is not an edit of it: the rerun must also say something the original did not.
+    return (len(before) >= 4 and sum(w in after for w in before) >= 0.7 * len(before)
+            and not after <= set(before))
+
+
 def _file_key(path: str) -> str:
     import os
     import posixpath
@@ -531,8 +546,9 @@ class TrajectoryState:
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
                 and self.data.get("check_failing")
                 and not _TRACEBACK.search(str(result))
-                and _same_command(self.data.get("failing_command"), command)):
-            # The very command that failed has now run without failing.
+                and (_same_command(self.data.get("failing_command"), command)
+                     or _revised_command(self.data.get("failing_command"), command))):
+            # The very command that failed, or that command edited, has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
