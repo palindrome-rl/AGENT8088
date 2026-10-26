@@ -431,6 +431,7 @@ class TrajectoryState:
             self.data["smoke_unverified"] = {}
             self.data["weak_secret_asked"] = False
             self.data["smoke_asked"] = []
+            self.data["backend_check"] = {}
             self.data["grounding_asked"] = False
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
@@ -987,17 +988,22 @@ class TrajectoryState:
 
     def backend_check_status(self) -> str:
         """off (nothing recorded), not applicable, unavailable, passed or failed."""
-        return str((self.data.get("backend_check") or {}).get("status") or "off")
+        record = self.data.get('backend_check') or {}
+        if record and record.get('at') != self.mutation_count():
+            return 'unavailable'
+        return str(record.get('status') or 'off')
 
     def backend_check_line(self) -> str:
         record = self.data.get("backend_check") or {}
         if not record:
             return ""
+        if record.get('at') != self.mutation_count():
+            return 'Backend check: unavailable - the project changed after the recorded check'
         return f"Backend check: {record.get('status')} - {record.get('detail')}"
 
     def backend_note(self) -> str:
-        if self.backend_check_status() == "passed":
-            return ""    # the page's own server was run: the "not verified" note would be wrong
+        # A separate GET/status probe is not proof of the page's actual service
+        # calls (POSTs, other local services, UI integration). Keep that caveat.
         names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
         if not names:
             return ""

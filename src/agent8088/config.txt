@@ -131,6 +131,9 @@ tool_selection=hybrid
 # answer as a separate line, `Backend check: not applicable | unavailable | passed | failed - <detail>`, and never changes the
 # verification level. A port already in use, a missing dependency or a write the read-only sandbox refuses is `unavailable`,
 # never `failed`.
+# Enable only for trusted project code: the Windows native sandbox restricts writes,
+# not all file reads or network access. Host probes stay on their literal loopback
+# origin and never follow redirects; a GET/status pass does not verify page integration.
 # backend_check=0
 # backend_check_startup_seconds=30
 

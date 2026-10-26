@@ -607,7 +607,8 @@ SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CL
 # Optional, off by default: start the project's own server in the sandbox, probe the endpoints its page uses, and record the
 # result in a separate "backend check" field of the answer. Never changes the verification level (see backend_check.py).
 BACKEND_CHECK = str(APP_CONFIG.get("backend_check", "0")).strip().lower() in ("1", "true", "yes", "on")
-BACKEND_CHECK_STARTUP = max(5, _config_int("backend_check_startup_seconds", int(backend_check.STARTUP_SECONDS)))
+BACKEND_CHECK_STARTUP = max(1, min(MAX_TOOL_TIMEOUT_SECONDS,
+                                 _config_int("backend_check_startup_seconds", int(backend_check.STARTUP_SECONDS))))
 COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
 # Rounds in a row that bring nothing new before the model is asked to decide: finish with what it
 # has, or change approach. Twice that many ends the run with a summary. 0 turns the watch off.
@@ -19099,26 +19100,41 @@ def _backend_server_launcher():
         return None
 
     def launch(entry, port, root):
+        root, cwd = Path(root).resolve(), Path(entry.cwd).resolve()
+        # Discovery is not authorization: recheck immediately before spawning.
+        if (not cwd.is_relative_to(root) or not _path_is_allowed(cwd)
+                or backend_check._safe_file(Path(entry.script), cwd, _is_sensitive_path) is None):
+            raise RuntimeError("the server entry is outside the permitted project")
         runner = _native_sandbox_argv()
         if not runner:
             raise RuntimeError("the sandbox runtime is not installed")
         if not _native_sandbox_ready(Path(entry.cwd), readonly=True, quiet=True):
             raise RuntimeError("the native sandbox is not ready")
         node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
-        libs = next((str(d) for d in Path(entry.cwd).rglob("pylibs") if d.is_dir()), "")   # packages the model installed beside the app
-        exe = f'"{node}"' if (entry.kind == "node" and node) else ("node" if entry.kind == "node" else "python")
-        command = ((f'set "PATH={Path(node).parent};%PATH%" && ' if node else "") + f'set "PORT={port}" && '
-                   + (f'set "PYTHONPATH={libs}" && ' if libs else "")
-                   + f'{exe} "{entry.script}"' + (f" {port}" if entry.port_arg else ""))
+        if entry.kind == 'node' and not node:
+            raise RuntimeError('Node.js is not installed here')
+        argv = [node] if entry.kind == 'node' else [sys.executable, '-B']
+        argv += [str(Path(entry.script).resolve())] + ([str(port)] if entry.port_arg else [])
+        # No shell interpolation and no API keys, NODE_OPTIONS or ambient Python
+        # startup hooks in generated code. Missing app-specific environment is
+        # reported as unavailable rather than borrowing host credentials.
+        keep = {'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'PROGRAMFILES', 'PROGRAMFILES(X86)'}
+        env = {key: value for key, value in os.environ.items() if key.upper() in keep}
+        env.update(PORT=str(port), HOME=str(cwd), USERPROFILE=str(cwd), PYTHONDONTWRITEBYTECODE='1')
+        libs = cwd / 'pylibs'
+        if libs.is_dir() and libs.resolve().is_relative_to(cwd):
+            env['PYTHONPATH'] = str(libs.resolve())
+        bridge = ('import json, subprocess, sys\n'
+                  'spec = json.loads(sys.argv[1])\n'
+                  'raise SystemExit(subprocess.run(spec["argv"], cwd=spec["cwd"], check=False).returncode)\n')
+        payload = json.dumps({'argv': argv, 'cwd': str(cwd)})
         sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
         sandbox_tmp.mkdir(parents=True, exist_ok=True)
-        wrapped = _native_sandbox_shell_argv(command, cwd=entry.cwd)
-        full = runner + ["--workspace", str(entry.cwd), "--temp", str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
-        log = tempfile.NamedTemporaryFile(prefix="agent8088-backend-", suffix=".log", delete=False)
-        proc = subprocess.Popen(full, cwd=str(entry.cwd), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        proc.output_file = log.name
-        log.close()
+        wrapped = [sys.executable, '-I', '-B', '-c', bridge, payload]
+        full = runner + ["--workspace", str(cwd), "--temp", str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+        proc = subprocess.Popen(full, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        backend_check.capture_output(proc)
         return proc
     return launch
 
@@ -19130,12 +19146,23 @@ def _backend_check_step(trajectory, targets) -> None:
     for target in targets:
         if Path(target).suffix.lower() not in app_check.WEB_SUFFIXES:
             continue
-        root = app_check.serve_root(Path(target))
-        if trajectory.backend_check_current(str(root)):
-            return
         try:
-            report = backend_check.run_backend_check(root, Path(target), _backend_server_launcher(), startup=BACKEND_CHECK_STARTUP)
+            page = Path(target).resolve()
+            roots = [Path(p).resolve() for p in [ARTIFACTS_ROOT, PROJECT_ROOT, *ALLOWED_PATHS]]
+            permitted = [p for p in roots if page.is_relative_to(p) and _path_is_allowed(p)]
+            if not permitted or _is_sensitive_path(str(page)):
+                raise ValueError('the page is outside the permitted project')
+            boundary = max(permitted, key=lambda p: len(p.parts))
+            root = app_check.serve_root(page).resolve()
+            if not root.is_relative_to(boundary):
+                root = page.parent
+            if trajectory.backend_check_current(str(root)):
+                return
+            report = backend_check.run_backend_check(root, page, _backend_server_launcher(), startup=BACKEND_CHECK_STARTUP,
+                                                    boundary=boundary, deny=_is_sensitive_path,
+                                                    cancelled=lambda: _active_budget is not None and _active_budget.exceeded())
         except Exception as error:  # noqa: BLE001 -- a problem in this optional check must never end the run
+            root = Path(target).parent
             report = backend_check.BackendReport(backend_check.UNAVAILABLE, f"the backend check could not run: {str(error)[:100]}")
         trajectory.record_backend_check(str(root), report.status, report.summary())
         return

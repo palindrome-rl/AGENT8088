@@ -83,7 +83,7 @@ def test_endpoints_are_plain_gets_the_page_uses(tmp_path):
         "const x = new XMLHttpRequest(); x.open('GET', '/api/e');\n", encoding="utf-8")
     page = tmp_path / "index.html"
     page.write_text("<script src='app.js'></script><script>fetch('/api/inline')</script>", encoding="utf-8")
-    assert set(bc.find_endpoints(tmp_path, page)) == {"/api/inline", "/api/a", "/api/b", "/api/c", "/api/d", "/api/e"}
+    assert set(bc.find_endpoints(tmp_path, page)) == {"/api/inline", "/api/a", "/api/b?x=1", "/api/c", "/api/d", "/api/e"}
 
 
 def test_the_number_of_endpoints_is_bounded(tmp_path):
@@ -214,6 +214,8 @@ def test_off_records_nothing_and_adds_no_line(engine, tmp_path, monkeypatch):
 
 def test_on_records_the_result_without_changing_the_level(engine, tmp_path, monkeypatch):
     root, page = project(tmp_path)
+    monkeypatch.setattr(engine, 'PROJECT_ROOT', root)
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [root])
     monkeypatch.setattr(engine, "BACKEND_CHECK", True)
     monkeypatch.setattr(engine, "BACKEND_CHECK_STARTUP", 15)
     monkeypatch.setattr(engine, "_backend_server_launcher", lambda: host_launcher)
@@ -230,6 +232,8 @@ def test_on_records_the_result_without_changing_the_level(engine, tmp_path, monk
 
 def test_a_failed_check_is_a_line_and_not_a_failed_run(engine, tmp_path, monkeypatch):
     root, page = project(tmp_path, page="<script>fetch('/api/missing')</script>")
+    monkeypatch.setattr(engine, 'PROJECT_ROOT', root)
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [root])
     monkeypatch.setattr(engine, "BACKEND_CHECK", True)
     monkeypatch.setattr(engine, "BACKEND_CHECK_STARTUP", 15)
     monkeypatch.setattr(engine, "_backend_server_launcher", lambda: host_launcher)
@@ -240,7 +244,7 @@ def test_a_failed_check_is_a_line_and_not_a_failed_run(engine, tmp_path, monkeyp
     assert "Backend check: failed" in engine._with_task_notes("Done.", state)
 
 
-def test_passed_replaces_the_not_verified_note_and_other_results_keep_it(engine):
+def test_get_status_pass_is_separate_from_page_integration_evidence(engine):
     state = _state()
     state.note_backend_asked("index.html")
     assert "Not verified" in engine._with_task_notes("Done.", state)
@@ -249,7 +253,7 @@ def test_passed_replaces_the_not_verified_note_and_other_results_keep_it(engine)
     assert "Backend check: unavailable" in answer and "Not verified" in answer
     state.record_backend_check("k", "passed", "the server started")
     answer = engine._with_task_notes("Done.", state)
-    assert "Backend check: passed" in answer and "Not verified" not in answer
+    assert "Backend check: passed" in answer and "Not verified" in answer
 
 
 def test_a_problem_inside_the_check_never_ends_the_run(engine, tmp_path, monkeypatch):
