@@ -19472,7 +19472,13 @@ _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
 })
-_WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
+_WAIT_COMMAND_RE = re.compile(
+    r"(?:^|[\s;&|(])sleep\s+\d"                      # sh: sleep 30
+    r"|time\.sleep\s*\("                              # python -c "import time; time.sleep(25)"
+    r"|Start-Sleep\b"                                 # PowerShell
+    r"|(?:^|[\s;&|(])timeout\s+/t\s*\d"               # cmd: timeout /t 20
+    r"|(?:^|[\s;&|(])ping\s+-n\s+\d"                  # cmd: ping -n 20 127.0.0.1
+    r"|\bsetTimeout\s*\(", re.IGNORECASE)             # node -e "setTimeout(...)"
 
 
 def _is_wait_command(name: str, args: dict) -> bool:
@@ -19482,7 +19488,88 @@ def _is_wait_command(name: str, args: dict) -> bool:
     not the model spinning, so it re-runs and counts as progress. max_turns
     still bounds how long a poll can go on.
     """
-    return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(str(args.get("command") or "")))
+    command = str(args.get("command") or "")
+    return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(command)) and _safe_poll_command(command)
+
+
+def _safe_poll_command(command: str) -> bool:
+    """Conservative replay policy, not a permission gate. Unknown code is never replayed.
+
+    In particular, a successful POST, install, append or mixed wait/write must not
+    run twice merely because time passed. Keep ordinary observations and small
+    literal Python file-size/existence probes; reject substitutions and redirects.
+    """
+    if not command or re.search(r"[`$%!^\r\n]", command):
+        return False
+    masked = _mask_quoted_operators(command)
+    if masked is None or re.search(r"[<>|]", masked):
+        # The conventional cmd delay discards ping output, never writes a file.
+        return bool(re.fullmatch(r"ping\s+-n\s+\d+\s+127\.0\.0\.1\s*>\s*nul", command, re.I))
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|py", program) and len(words) == 3 and words[1] == "-c":
+        try:
+            tree = ast.parse(words[2])
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+        allowed = (ast.Module, ast.Import, ast.alias, ast.Expr, ast.Call,
+                   ast.Name, ast.Load, ast.Attribute, ast.Constant)
+        calls = {"print", "time.sleep", "os.path.getsize", "os.path.exists", "os.path.isfile", "os.path.isdir"}
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed):
+                return False
+            if isinstance(node, ast.Import) and any(a.name not in {"os", "time"} or a.asname for a in node.names):
+                return False
+            if isinstance(node, ast.Call) and ast.unparse(node.func) not in calls:
+                return False
+            if isinstance(node, ast.Attribute) and ast.unparse(node) not in calls | {"os.path"}:
+                return False
+        return True
+    if program in {"node", "nodejs"}:
+        return (len(words) == 3 and words[1] == "-e"
+                and bool(re.fullmatch(r"\s*setTimeout\(\s*\(\)\s*=>\s*\{\s*\}\s*,\s*\d+\s*\)\s*;?\s*", words[2])))
+    if program in {"powershell", "pwsh"}:
+        return len(words) >= 3 and words[1].lower() in {"-c", "-command"} and _safe_poll_command(" ".join(words[2:]))
+    if re.search(r"[;&]", masked):
+        stages = re.split(r"\s*(?:&&|;)\s*", command)
+        return len(stages) > 1 and all(_safe_poll_command(stage) for stage in stages)
+    if re.search(r"[(){}]", masked):
+        return False
+    if program == "timeout":
+        return bool(re.fullmatch(r"timeout\s+/t\s+\d+(?:\s+/nobreak)?", command, re.I))
+    if program == "curl":
+        # HTTP GET/HEAD health probes only: no uploads, request bodies, output files,
+        # config files, redirects, credentials or arbitrary protocol handlers.
+        operands = [word for word in words[1:] if not word.startswith("-")]
+        flags = [word for word in words[1:] if word.startswith("-")]
+        return (len(operands) == 1 and bool(re.fullmatch(r"(?:https?://[^\s]+|localhost(?::\d+)?(?:/[^\s]*)?)", operands[0]))
+                and all(flag in {"--silent", "--show-error", "--fail", "--head"}
+                        or bool(re.fullmatch(r"-[sSfI]+", flag)) for flag in flags))
+    return program in {"ls", "dir", "pwd", "cat", "head", "tail", "wc", "stat", "sleep",
+                       "cd", "get-content", "get-childitem", "get-item", "test-path", "get-process", "get-date", "start-sleep"}
+
+
+def _poll_result_ok(result: str) -> bool:
+    return not re.search(r"(?im)^Error\b|Command exited with status|Command timed out|timed out after", result or "")
+
+
+# A shell command repeated after this many seconds is a new observation, not a spin: a download's size, a server's
+# health or a log's tail changes while the model thinks. 0 turns the refresh off (every identical repeat is answered
+# from the earlier result, as before). Only a command that succeeded is refreshed, and only a few times in a row.
+REPEAT_REFRESH_SECONDS = max(0, _config_int("repeat_refresh_seconds", 20))
+REPEAT_REFRESH_MAX = 12
+
+
+def _poll_refresh_due(name: str, result: str, finished_at: float, refreshed: int, command: str = "") -> bool:
+    if (name != "execute_shell" or not REPEAT_REFRESH_SECONDS or refreshed >= REPEAT_REFRESH_MAX
+            or time.monotonic() - finished_at < REPEAT_REFRESH_SECONDS):
+        return False
+    return _poll_result_ok(result) and _safe_poll_command(command)
 
 
 def _consult_llmrouter(config, messages, eligible):
@@ -19547,7 +19634,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    last_completed = None  # consecutive identical call -> (signature, output)
+    last_completed = None  # consecutive identical call -> (signature, output, finished at)
+    poll_refreshes: dict = {}  # signature -> times a repeated shell command was re-run because time had passed
     action_results = {}  # opaque external actions cannot be replayed within this request
     seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
@@ -20514,7 +20602,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
-            if repeated and _is_wait_command(name, args):
+                if _poll_refresh_due(name, last_completed[1], last_completed[2], poll_refreshes.get(sig, 0), str(args.get("command") or "")):
+                    # Time has passed since the same successful command ran: poll again, it is not a spin.
+                    poll_refreshes[sig] = poll_refreshes.get(sig, 0) + 1
+                    repeated, previous_output = False, None
+            if (repeated and _is_wait_command(name, args) and _poll_result_ok(previous_output)
+                    and poll_refreshes.get(sig, 0) < REPEAT_REFRESH_MAX):
+                poll_refreshes[sig] = poll_refreshes.get(sig, 0) + 1
                 repeated, previous_output = False, None
             # Only these built-in observation queries are safe to refresh.
             if repeated and name in _REPEAT_OBSERVATIONS:
@@ -20812,7 +20906,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # stands: an unusable search must be retryable, not latched.
             if ("__parse_error__" not in args
                     and not (name == "web_search" and not _search_was_usable(result))):
-                last_completed = (sig, result)
+                last_completed = (sig, result, time.monotonic())
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
