@@ -9989,6 +9989,9 @@ def _html_to_text(html: str) -> str:
     return f"Title: {title}\n\n{text}" if title else text
 
 
+_check_app_guidance_given = [False]   # the "no browser here" guidance was already shown in this session
+
+
 def _browser_install_hint(missing: str) -> str:
     python = sys.executable or "python"
     if missing == "playwright":
@@ -13805,9 +13808,19 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             # to another host aborted; a script is only syntax-checked.
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
-            return app_check.check_target(
+            report = app_check.check_target(
                 read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
-                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS).text()
+                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
+            text = report.text()
+            if app_check.environment_unavailable(report):
+                # The machine cannot load a page. Without this the model reads "unavailable" as "I cannot see the app" and
+                # spends many turns on Node scripts that stub the browser. Full guidance once, a reminder after that.
+                text += "\n\n" + (app_check.UNAVAILABLE_GUIDANCE_SHORT if _check_app_guidance_given[0]
+                                  else app_check.UNAVAILABLE_GUIDANCE)
+                _check_app_guidance_given[0] = True
+                if str(report.note).startswith("Chromium is not installed"):
+                    _report_browser("chromium")
+            return text
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()

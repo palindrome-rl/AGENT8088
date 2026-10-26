@@ -736,6 +736,26 @@ def _abandon(out: dict, started: float) -> None:
         pass
 
 
+# Why a page check can be unavailable because of the machine rather than the page. A report whose note starts with one of
+# these says nothing about the page, and the model is told what to do instead of building a browser stand-in.
+_ENVIRONMENT_NOTES = ("Chromium is not installed", "the browser could not run", "the browser check did not finish")
+
+UNAVAILABLE_GUIDANCE = (
+    "This is a limit of this machine, not a defect in the page: no browser could load it, so how the page looks and "
+    "behaves was NOT verified. Do not build DOM or browser emulators (Node or VM scripts that stub document, fetch or "
+    "canvas) to stand in for it: they cost many turns and still cannot show the page. Instead run `node --check` on each "
+    "script, re-read the HTML for ids and script paths that do not match, test any pure logic in one small file, and say "
+    "plainly in your answer that the page was not loaded in a browser and which file the user should open to confirm.")
+UNAVAILABLE_GUIDANCE_SHORT = ("Still no browser on this machine (see the earlier note): do not build emulators; say in your "
+                              "answer that the page was not loaded in a browser.")
+
+
+def environment_unavailable(report: Report) -> bool:
+    """The page check could not run because of the machine (no Chromium, it would not start, it hung), not because of the page."""
+    return (report.kind == "web" and report.status == UNAVAILABLE
+            and str(report.note).startswith(_ENVIRONMENT_NOTES))
+
+
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
                    deny: Callable[[str], bool] | None = None,
                    click_steps: int | None = None) -> Report:
@@ -745,7 +765,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     executable = chromium_executable()
     if executable is None:
         return Report("web", str(path), UNAVAILABLE,
-                      note="Chromium is not installed; run `playwright install chromium`")
+                      note="Chromium is not installed for Agent8088, so no page can be loaded in a browser on this machine; "
+                           "install it with `python -m playwright install chromium`")
     out: dict = {"cancelled": threading.Event()}
     # A fresh thread: Playwright's sync API refuses to run inside a running event loop.
     root = serve_root(path)
