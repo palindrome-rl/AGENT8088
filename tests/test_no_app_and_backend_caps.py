@@ -37,6 +37,17 @@ def test_a_page_is_an_entry_point(engine):
     assert not any("no runnable app" in r for r in engine._not_verified_reasons(state))
 
 
+def test_workspace_parent_names_never_hide_the_app():
+    for workspace in ("C:/Users/Developer/Temp/project", "/tmp/data/project"):
+        state = _state(paths=[workspace + "/index.html"])
+        state.data["workspace"] = workspace
+        assert state.has_app_entry()
+        assert state.assurance() == "exercised"
+        state.data["written_paths"] = [workspace + "/data/reference.html"]
+        state.data["reference_paths"] = list(state.data["written_paths"])
+        assert not state.has_app_entry()
+
+
 def test_a_server_file_is_an_entry_point(engine):
     assert not _state(paths=["pokebattle/server.py"]).no_runnable_app()
     assert not _state(paths=["srv/app.py"]).no_runnable_app()
@@ -44,8 +55,15 @@ def test_a_server_file_is_an_entry_point(engine):
 
 def test_a_saved_reference_page_is_not_an_entry_point(engine):
     state = _state(paths=["data/pikalytics.html", "research/docs.html", "fetch.py"])
+    state.data["reference_paths"] = ["data/pikalytics.html", "research/docs.html"]
     assert state.no_runnable_app()
     assert state.assurance() == "inspected"
+
+
+def test_authored_documentation_site_is_an_app_entry():
+    state = _state(paths=["docs/index.html"])
+    assert state.has_app_entry()
+    assert state.assurance() == "exercised"
 
 
 def test_other_requests_are_untouched(engine):

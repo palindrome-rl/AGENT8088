@@ -26,6 +26,7 @@ def test_local_service_call_is_called_out():
 def test_loopback_forms_are_recognised():
     for url in ("http://127.0.0.1:3000/api/x", "http://[::1]:8000/x", "http://0.0.0.0:5000/"):
         assert "local service" in app_check._blocked_request_warning(url, set())
+    assert "http://[::1]:8000/x" in app_check._blocked_request_warning("http://[::1]:8000/x", {"GET"})
 
 
 def test_ordinary_external_host_keeps_the_old_wording():
