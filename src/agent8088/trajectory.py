@@ -445,7 +445,8 @@ class TrajectoryState:
                    partial_path: str = "", written_to: str = "") -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         if (operation["tool"] == "check_app" and path and not blocked
-                and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service"))):
+                and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service",
+                                                            "service it could not reach, not verified"))):
             # Manual check_app calls must retain the same caveat as completion smoke checks.
             # Read the full result before operation summaries are clipped.
             self.note_backend_asked(path)

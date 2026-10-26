@@ -57,3 +57,12 @@ def test_manual_check_app_keeps_the_backend_caveat(engine, warning):
                      mutated=False, path="E:/w/index.html")
     state.settle_check_app(result, path="E:/w/index.html")
     assert "Not verified: the page calls its own server or a local service" in engine._with_task_notes("Done.", state)
+
+
+def test_manual_check_keeps_caveat_when_individual_warning_is_clipped(engine):
+    state = TrajectoryState({}, goal="Create a web app", message_count=1)
+    result = _report(*["unrelated warning" for _ in range(6)], LOCAL_WARNING).text()
+    assert LOCAL_WARNING not in result
+    state.after_tool(state.before_tool("check_app"), result, failed=False, blocked=False,
+                     mutated=False, path="index.html")
+    assert "Not verified: the page calls its own server or a local service" in engine._with_task_notes("Done.", state)
