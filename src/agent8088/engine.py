@@ -19535,8 +19535,16 @@ def _safe_poll_command(command: str) -> bool:
         return False
     if program == "timeout":
         return bool(re.fullmatch(r"timeout\s+/t\s+\d+(?:\s+/nobreak)?", command, re.I))
+    if program == "curl":
+        # HTTP GET/HEAD health probes only: no uploads, request bodies, output files,
+        # config files, redirects, credentials or arbitrary protocol handlers.
+        operands = [word for word in words[1:] if not word.startswith("-")]
+        flags = [word for word in words[1:] if word.startswith("-")]
+        return (len(operands) == 1 and bool(re.fullmatch(r"(?:https?://[^\s]+|localhost(?::\d+)?(?:/[^\s]*)?)", operands[0]))
+                and all(flag in {"--silent", "--show-error", "--fail", "--head"}
+                        or bool(re.fullmatch(r"-[sSfI]+", flag)) for flag in flags))
     return program in {"ls", "dir", "pwd", "cat", "head", "tail", "wc", "stat", "sleep",
-                       "get-content", "get-childitem", "get-item", "test-path", "get-process", "get-date", "start-sleep"}
+                       "cd", "get-content", "get-childitem", "get-item", "test-path", "get-process", "get-date", "start-sleep"}
 
 
 def _poll_result_ok(result: str) -> bool:
