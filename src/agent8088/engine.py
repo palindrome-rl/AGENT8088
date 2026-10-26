@@ -9989,7 +9989,7 @@ def _html_to_text(html: str) -> str:
     return f"Title: {title}\n\n{text}" if title else text
 
 
-_check_app_guidance_given = [False]   # the "no browser here" guidance was already shown in this session
+_check_app_guidance_state = threading.local()   # once per request; never shared between Web UI sessions
 
 
 def _browser_install_hint(missing: str) -> str:
@@ -13812,12 +13812,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
                 run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
             text = report.text()
-            if app_check.environment_unavailable(report):
-                # The machine cannot load a page. Without this the model reads "unavailable" as "I cannot see the app" and
-                # spends many turns on Node scripts that stub the browser. Full guidance once, a reminder after that.
-                text += "\n\n" + (app_check.UNAVAILABLE_GUIDANCE_SHORT if _check_app_guidance_given[0]
+            if app_check.browser_unavailable(report):
+                # No browser verification was obtained; do not invent its cause or emulate a DOM.
+                # Full guidance once per request, a reminder after that.
+                text += "\n\n" + (app_check.UNAVAILABLE_GUIDANCE_SHORT if getattr(_check_app_guidance_state, "given", False)
                                   else app_check.UNAVAILABLE_GUIDANCE)
-                _check_app_guidance_given[0] = True
+                _check_app_guidance_state.given = True
                 if str(report.note).startswith("Chromium is not installed"):
                     _report_browser("chromium")
             return text
@@ -19539,6 +19539,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     Pass a list as `trace` to collect a step-by-step record for training data.
     Returns the final answer string.
     """
+    _check_app_guidance_state.given = False
     spin = spin or (lambda msg: nullcontext())
 
     def _retry_notice(message):

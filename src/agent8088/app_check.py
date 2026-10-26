@@ -736,24 +736,29 @@ def _abandon(out: dict, started: float) -> None:
         pass
 
 
-# Why a page check can be unavailable because of the machine rather than the page. A report whose note starts with one of
-# these says nothing about the page, and the model is told what to do instead of building a browser stand-in.
-_ENVIRONMENT_NOTES = ("Chromium is not installed", "the browser could not run", "the browser check did not finish")
+# Known browser startup failures. A check that hangs after startup has an unknown cause instead.
+_ENVIRONMENT_NOTES = ("Chromium is not installed", "the browser could not run")
 
 UNAVAILABLE_GUIDANCE = (
-    "This is a limit of this machine, not a defect in the page: no browser could load it, so how the page looks and "
-    "behaves was NOT verified. Do not build DOM or browser emulators (Node or VM scripts that stub document, fetch or "
+    "The browser check was unavailable, so how the page looks and behaves was NOT verified. A timeout alone cannot "
+    "distinguish a page defect from an environment problem. Do not build DOM or browser emulators (Node or VM scripts that stub document, fetch or "
     "canvas) to stand in for it: they cost many turns and still cannot show the page. Instead run `node --check` on each "
     "script, re-read the HTML for ids and script paths that do not match, test any pure logic in one small file, and say "
     "plainly in your answer that the page was not loaded in a browser and which file the user should open to confirm.")
-UNAVAILABLE_GUIDANCE_SHORT = ("Still no browser on this machine (see the earlier note): do not build emulators; say in your "
-                              "answer that the page was not loaded in a browser.")
+UNAVAILABLE_GUIDANCE_SHORT = ("Browser verification is still unavailable (see the earlier note): do not build emulators; "
+                              "say in your answer that browser behavior was not verified.")
 
 
 def environment_unavailable(report: Report) -> bool:
-    """The page check could not run because of the machine (no Chromium, it would not start, it hung), not because of the page."""
+    """Chromium is missing or could not start; a page timeout is not proof of either."""
     return (report.kind == "web" and report.status == UNAVAILABLE
             and str(report.note).startswith(_ENVIRONMENT_NOTES))
+
+
+def browser_unavailable(report: Report) -> bool:
+    """Include page hangs, without claiming their cause is the machine."""
+    return (environment_unavailable(report) or (report.kind == "web" and report.status == UNAVAILABLE
+            and str(report.note).startswith(("the browser check did not finish", "the browser check could not finish"))))
 
 
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
@@ -781,7 +786,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
         _abandon(out, started)
         return Report("web", str(path), UNAVAILABLE, note=f"the browser check did not finish in {timeout + 15:.0f}s")
     if "error" in out:
-        return Report("web", str(path), UNAVAILABLE, note=f"the browser could not run: {out['error']}")
+        cause = "the browser check could not finish" if out.get("browser_started") else "the browser could not run"
+        return Report("web", str(path), UNAVAILABLE, note=f"{cause}: {out['error']}")
     failures = list(dict.fromkeys(out.get("failures", [])))
     status = FAIL if failures else UNAVAILABLE if out.get("unavailable") else PASS
     return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []),
