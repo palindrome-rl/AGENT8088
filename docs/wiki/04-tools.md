@@ -45,7 +45,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `repo_map` | `repomap` | `focus`*, `budget`*, `detail_level`* | ✅ | Outline the repository's most depended-on classes and functions, ranked by dependents. Definition lines only. |
 | `generate_tests` | `autotest` | `filename`, `focus`* | prompt | Write and run tests for a source file via a sub-agent that may not change the code under test; the file is hashed and restored if it was. |
 | `run_tests` | `shell` | `path`* | depends | Detect the project's test framework and run it. Prefer over `execute_shell`. |
-| `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
+| `execute_shell` | `shell` | `command` | safe list only | Run a shell command; shipped timeout 60 seconds. Override with `tool_timeout.execute_shell` or a per-call `timeout`, bounded by `max_tool_timeout_seconds`. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
@@ -207,6 +207,17 @@ disposable container, and `file_backups=0` turns it off.
 ## `check_app`
 
 A deterministic smoke test of something the agent built; no model call.
+
+Calls to a page's backend or a blocked local service are **not verified** by
+the static page check. Its summary counts those calls, and the final answer
+retains the caveat for both manual and completion checks. It does not start
+the service or relax network blocking. A missing browser or timed-out check
+never counts as a pass; a timeout alone does not establish whether the page
+or the environment caused it. Browser-emulation scripts are not a substitute.
+
+Completion checks can skip known downloaded reference HTML in reference
+folders when another page was built. A folder name alone does not exclude an
+authored documentation or data page.
 
 - **Web page** (`.html`, or a folder with `index.html`): loaded in headless
   Chromium from a throwaway static server on `127.0.0.1` that serves only the
