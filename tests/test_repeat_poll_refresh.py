@@ -73,7 +73,7 @@ def test_refresh_can_be_turned_off(engine, monkeypatch):
 
 
 def test_refresh_is_bounded_and_only_for_shell(engine):
-    due = engine._poll_refresh_due
+    due = lambda *args: engine._poll_refresh_due(*args, command="dir")
     long_ago = real_time.monotonic() - 3600
     assert due("execute_shell", "ok", long_ago, 0)
     assert not due("execute_shell", "ok", long_ago, engine.REPEAT_REFRESH_MAX)
@@ -89,3 +89,34 @@ def test_waits_written_in_other_languages_are_recognised(engine):
         assert wait("execute_shell", {"command": command}), command
     assert not wait("execute_shell", {"command": "python -c \"print('sleepy')\""})
     assert not wait("execute_shell", {"command": "grep -n timeout config.txt"})
+
+
+def test_mutations_and_mixed_waits_are_never_replayed(engine, monkeypatch):
+    import sys
+    for command in ("echo charged >> ledger.txt", "curl -X POST http://localhost/api",
+                    'python -c "import os,time; os.remove(\'x\'); time.sleep(20)"',
+                    "sleep 20; touch charged", "powershell -c Start-Sleep 20; Remove-Item x",
+                    'node -e "charge(); setTimeout(()=>{},9000)"'):
+        monkeypatch.setattr(sys.modules[__name__], "CALL", "\u273fFUNCTION\u273f: execute_shell \u273fARGS\u273f: " + json.dumps({"command": command}))
+        _clock(engine, monkeypatch, step=30)
+        _, executed, _ = _run(engine, monkeypatch, ["ok"], calls=2)
+        assert len(executed) == 1, command
+
+
+def test_long_failure_output_and_failed_waits_are_not_replayed(engine, monkeypatch):
+    import sys
+    result = "output\n" * 150 + "Command exited with status 1."
+    assert not engine._poll_refresh_due("execute_shell", result, real_time.monotonic() - 3600, 0, command="dir")
+    monkeypatch.setattr(sys.modules[__name__], "CALL", "\u273fFUNCTION\u273f: execute_shell \u273fARGS\u273f: " + json.dumps({"command": "sleep 20; tail job.log"}))
+    _clock(engine, monkeypatch, step=30)
+    _, executed, _ = _run(engine, monkeypatch, [result], calls=2)
+    assert len(executed) == 1
+
+
+def test_explicit_wait_refreshes_are_also_bounded(engine, monkeypatch):
+    import sys
+    monkeypatch.setattr(engine, "REPEAT_REFRESH_MAX", 1)
+    monkeypatch.setattr(sys.modules[__name__], "CALL", "\u273fFUNCTION\u273f: execute_shell \u273fARGS\u273f: " + json.dumps({"command": "sleep 20; tail job.log"}))
+    _clock(engine, monkeypatch, step=0.001)
+    _, executed, _ = _run(engine, monkeypatch, ["ok"], calls=3)
+    assert len(executed) == 2
