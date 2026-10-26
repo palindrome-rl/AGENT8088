@@ -1265,11 +1265,37 @@ def is_helper_script(path: Path) -> bool:
     return (stem.startswith("_") and len(stem) > 1) or bool(_HELPER_NAME.match(stem))
 
 
+# Folders that hold material the run saved for itself (a downloaded docs page, a scraped result), not something it built.
+REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
+                            "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
+
+
+def is_reference_page(path: Path, roots: Iterable[Path] = ()) -> bool:
+    """A web page sitting in a reference folder: saved source material, not the page the person asked for.
+
+    Only the folders below the project root count: a project that lives under a temp or data directory
+    would otherwise have every page of it skipped. With no root to measure from, only the parent folder counts.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in WEB_SUFFIXES:
+        return False
+    folders = [path.parent.name]
+    for root in roots:
+        try:
+            folders = list(path.parent.relative_to(Path(root)).parts)
+            break
+        except ValueError:
+            continue
+    return bool({part.lower() for part in folders} & REFERENCE_DIRS)
+
+
 def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3) -> list[Path]:
     """Pages and runnable scripts this run wrote that exist, pages first, newest last.
 
     Tests, files under node_modules or a virtualenv, scratch dirs, and the model's own
-    throwaway helpers (_fix.py, tmp_check.js) are skipped.
+    throwaway helpers (_fix.py, tmp_check.js) are skipped. Pages saved in reference folders (data/, research/,
+    docs/, cache/ ...) are skipped too when the run wrote a page anywhere else: a downloaded docs page that
+    fails the check says nothing about the page that was built, yet it turned the verdict into "failed".
     """
     roots = [Path(r) for r in roots]
     found: list[Path] = []
@@ -1289,5 +1315,7 @@ def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: in
         if path.suffix.lower() in WEB_SUFFIXES | PYTHON_SUFFIXES | NODE_SUFFIXES:
             found.append(path)
     pages = [p for p in found if p.suffix.lower() in WEB_SUFFIXES]
+    built = [p for p in pages if not is_reference_page(p, roots)]
+    pages = built or pages     # only reference pages were written: keep them, there is nothing else to judge
     scripts = [p for p in found if p.suffix.lower() not in WEB_SUFFIXES]
     return (pages + scripts)[:limit]
