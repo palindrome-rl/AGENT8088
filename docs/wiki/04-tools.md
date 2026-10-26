@@ -219,6 +219,25 @@ Completion checks can skip known downloaded reference HTML in reference
 folders when another page was built. A folder name alone does not exclude an
 authored documentation or data page.
 
+With `backend_check=1` (off by default), completion checks can also start the
+project's server through the **Windows native read-only sandbox** and probe up
+to eight discovered literal GET endpoints. A separate `Backend check` line
+reports `not applicable`, `unavailable`, `passed` or `failed`; it never changes
+the verification level. No unsandboxed fallback is used on other platforms.
+
+Discovery stays inside the authorized project, skips protected files and
+escaped symlinks, and does not interpret npm hooks or shell commands. Probes
+go only to the literal loopback port owned by the launched process tree,
+without environment proxies, redirects, request bodies or response-body reads.
+Unknown methods, computed paths and request options are skipped rather than
+guessed. Server output is bounded and the process tree is stopped afterwards.
+
+This checks response **status**, not response data or browser integration.
+A pass does not clear the page's backend/local-service caveat. Busy ports,
+missing dependencies, denied writes and unsupported environments are
+`unavailable`, not proof of an app defect. Enable only for trusted code:
+Windows native confinement restricts writes, not all reads or network access.
+
 - **Web page** (`.html`, or a folder with `index.html`): loaded in headless
   Chromium from a throwaway static server on `127.0.0.1` that serves only the
   page's folder, or the ancestor needed by its relative asset links (no folder
