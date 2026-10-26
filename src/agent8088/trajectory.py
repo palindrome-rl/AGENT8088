@@ -953,8 +953,8 @@ class TrajectoryState:
         names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
         if not names:
             return ""
-        return ("the page calls its own server (" + ", ".join(names[:3]) + "), which the page check cannot run, so how "
-                "the page behaves with its backend was not verified")
+        return ("the page calls its own server or a local service (" + ", ".join(names[:3]) + "), which the page check "
+                "cannot run or reach, so how the page behaves with it was not verified")
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""

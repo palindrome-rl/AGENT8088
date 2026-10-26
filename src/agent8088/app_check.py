@@ -79,6 +79,11 @@ class Report:
         name = Path(self.target).name or self.target
         if self.status == PASS:
             tail = f" ({len(self.warnings)} warning{'s' if len(self.warnings) != 1 else ''})" if self.warnings else ""
+            # A page that calls a server or a local service this check cannot reach passed without that call being tried.
+            # "(5 warnings)" hid it, so the count is named.
+            calls = sum(1 for w in self.warnings if "asked the server for" in str(w) or "calls a local service" in str(w))
+            if calls:
+                tail = tail[:-1] + f"; {calls} call{'s' if calls != 1 else ''} to a service it could not reach, not verified)"
             # "compiles; not executed" is a pass only in status; say so, or the
             # summary reads as if the script had been run.
             ran = f" - {self.note}" if "not executed" in self.note else ""
@@ -619,9 +624,12 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         if response.status_text:
                             backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
-                            f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
-                            "serves static files only, so the backend was not running. Call the server after a "
-                            "click and handle a failure quietly, and the page will load cleanly without it")
+                            f"the page asked the server for {path.split('?')[0]} ({response.request.method}, {response.status}); "
+                            "this check serves static files only, so the backend was not running and that call was NOT "
+                            "verified. Start the server and send the same request with a shell command to see what it "
+                            "returns, and in the page call the server after a click and handle a failure quietly, so the "
+                            "page loads cleanly without it. Say in your answer that the page's behaviour with its backend "
+                            "was not verified")
                         return
                     failures.append(f"missing or failing file: {path} returned {response.status}")
 
