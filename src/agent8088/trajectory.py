@@ -337,6 +337,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         ],
         "evidence": [],
         "mutation_count": 0,
+        "request_mutation_start": 0,
         "verification": "not_needed",
         "verification_requested": False,
         "verification_requests": 0,
@@ -413,6 +414,7 @@ class TrajectoryState:
             # Unresolved state carries over to the next request; the reminder
             # budget is per request and must not, or the session goes silent.
             self.data["verification_requests"] = 0
+            self.data["request_mutation_start"] = self.mutation_count()   # changes before this point belong to earlier requests
             self.data["unmet_checks"] = []
             self.data["smoke_failures"] = 0
             self.data["failing_nudges"] = 0
@@ -1036,11 +1038,21 @@ class TrajectoryState:
         self.data["failing_nudges"] = int(self.data.get("failing_nudges") or 0) + 1
         return True
 
+    def changed_this_request(self) -> bool:
+        """The run changed something since the current request began.
+
+        Unresolved state carries over to the next request (see _normalise), with the reminder budget reset. Without this,
+        a plain question asked after unverified edits ("tell what you did") got up to two fresh "changed work has no
+        verification evidence" reminders about work from an earlier request; the model started verifying again, and its
+        answer to the question stayed in its thoughts."""
+        return self.mutation_count() > int(self.data.get("request_mutation_start") or 0)
+
     def request_verification(self) -> bool:
         # Each write re-arms the reminder, and a model that answers it by
         # writing yet another check re-arms it again; capped, an unresolved
         # change is still disclosed by the final answer's verification note.
-        if (not self.needs_verification() or self.data.get("verification_requested")
+        # Only for changes made in THIS request: older unverified work is still disclosed by that note.
+        if (not self.needs_verification() or self.data.get("verification_requested") or not self.changed_this_request()
                 or int(self.data.get("verification_requests") or 0) >= MAX_VERIFICATION_REQUESTS):
             return False
         self.data["verification_requested"] = True
