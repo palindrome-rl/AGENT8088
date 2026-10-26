@@ -931,7 +931,16 @@ class TrajectoryState:
     def has_app_entry(self) -> bool:
         """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
         for path in self.written_paths():
-            parts = PurePath(str(path).replace("\\", "/")).parts
+            page = PurePath(str(path).replace("\\", "/"))
+            workspace = str(self.data.get("workspace") or "").replace("\\", "/")
+            if workspace:
+                try:
+                    # Release installs and Windows test workspaces commonly live under Temp.
+                    # Only folders inside this project can indicate reference material.
+                    page = page.relative_to(PurePath(workspace))
+                except ValueError:
+                    pass
+            parts = page.parts
             name = parts[-1].lower() if parts else ""
             if name in _SERVER_ENTRY_NAMES:
                 return True
