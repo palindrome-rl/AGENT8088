@@ -9989,6 +9989,9 @@ def _html_to_text(html: str) -> str:
     return f"Title: {title}\n\n{text}" if title else text
 
 
+_check_app_guidance_state = threading.local()   # once per request; never shared between Web UI sessions
+
+
 def _browser_install_hint(missing: str) -> str:
     python = sys.executable or "python"
     if missing == "playwright":
@@ -13812,9 +13815,19 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             # to another host aborted; a script is only syntax-checked.
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
-            return app_check.check_target(
+            report = app_check.check_target(
                 read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
-                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS).text()
+                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
+            text = report.text()
+            if app_check.browser_unavailable(report):
+                # No browser verification was obtained; do not invent its cause or emulate a DOM.
+                # Full guidance once per request, a reminder after that.
+                text += "\n\n" + (app_check.UNAVAILABLE_GUIDANCE_SHORT if getattr(_check_app_guidance_state, "given", False)
+                                  else app_check.UNAVAILABLE_GUIDANCE)
+                _check_app_guidance_state.given = True
+                if str(report.note).startswith("Chromium is not installed"):
+                    _report_browser("chromium")
+            return text
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()
@@ -19627,6 +19640,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     Pass a list as `trace` to collect a step-by-step record for training data.
     Returns the final answer string.
     """
+    _check_app_guidance_state.given = False
     spin = spin or (lambda msg: nullcontext())
 
     def _retry_notice(message):
