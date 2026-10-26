@@ -132,6 +132,16 @@ def _text(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
 
+# A request to build a web app or page, and the files that count as its entry point.
+_WEB_APP_REQUEST = re.compile(r"\b(web[\s-]?app(lication)?s?|web[\s-]?sites?|web[\s-]?pages?|html page|browser game|front-?end|web-based)\b", re.I)
+_BUILD_VERB = re.compile(r"\b(create|build|make|develop|write|implement|generate|design)\b", re.I)
+# Folders that hold pages the run saved for itself (downloaded docs, scraped results), not pages it built.
+_REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
+                             "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
+_SERVER_ENTRY_NAMES = frozenset({"server.py", "server.js", "app.py", "main.py", "manage.py", "wsgi.py", "asgi.py", "index.js",
+                                 "start-server.js", "server.mjs", "index.mjs"})
+
+
 # A shell command that runs something to find out whether it works. A command that only looks around
 # (a listing, a copy, a probe) and exits non-zero did not fail a check, so it must not leave the
 # run marked "the latest automated check failed" for good.
@@ -332,6 +342,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "verification_requests": 0,
         "untested_changes": [],
         "written_paths": [],
+        "reference_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
         "check_failing": False,
@@ -347,6 +358,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_checked": {},
         "smoke_passed_at": {},
         "smoke_unverified": {},
+        "backend_asked": [],
         "weak_secret_asked": False,
         "smoke_asked": [],
         "consecutive_setbacks": 0,
@@ -431,8 +443,14 @@ class TrajectoryState:
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
                    path: str = "", command: str = "", existed: bool = False,
-                   partial_path: str = "", written_to: str = "") -> None:
+                   partial_path: str = "", written_to: str = "", reference: bool = False) -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
+        if (operation["tool"] == "check_app" and path and not blocked
+                and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service",
+                                                            "service it could not reach, not verified"))):
+            # Manual check_app calls must retain the same caveat as completion smoke checks.
+            # Read the full result before operation summaries are clipped.
+            self.note_backend_asked(path)
         if operation["status"] == "done" and (
                 operation["tool"] in RESEARCH_TOOLS
                 or (operation["tool"] == "execute_shell" and re.search(r"https?://", command or ""))):
@@ -457,6 +475,12 @@ class TrajectoryState:
             self.data["partial_files"] = [p for p in self.data["partial_files"]
                                           if p.get("key", _file_key(p.get("path", ""))) != name]
         if mutated and path and operation["status"] == "done":
+            references = self.data.setdefault("reference_paths", [])
+            keys = {_file_key(path), _file_key(written_to)} - {""}
+            references[:] = [p for p in references if _file_key(p) not in keys]
+            if reference:
+                references.extend(p for p in dict.fromkeys([path, written_to]) if p)
+                del references[:-MAX_WRITTEN]
             # Where the work actually landed. The answer quotes this, because a
             # run whose writes were redirected into the sandbox workspace reads
             # as a false completion claim when the user checks the folder they
@@ -905,8 +929,56 @@ class TrajectoryState:
             level = "inspected"
         else:
             level = "unchecked"
+        if level in ("tested", "exercised") and self.no_runnable_app():
+            # Scripts ran, but there is no page or server to run: the thing asked for does not exist, so the
+            # strongest honest level is that files were written. This only lowers a claim.
+            level = "inspected"
         data["assurance"] = level
         return level
+
+    def wants_web_app(self) -> bool:
+        """The request is to build a web app or page (judged from the start of the request, which is all that is kept)."""
+        goal = str(self.data.get("goal") or "")
+        return bool(_WEB_APP_REQUEST.search(goal) and _BUILD_VERB.search(goal))
+
+    def has_app_entry(self) -> bool:
+        """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
+        references = {_file_key(path) for path in self.data.get("reference_paths", [])}
+        for path in self.written_paths():
+            page = PurePath(str(path).replace("\\", "/"))
+            workspace = str(self.data.get("workspace") or "").replace("\\", "/")
+            if workspace:
+                try:
+                    # Release installs and Windows test workspaces commonly live under Temp.
+                    # Only folders inside this project can indicate reference material.
+                    page = page.relative_to(PurePath(workspace))
+                except ValueError:
+                    pass
+            parts = page.parts
+            name = parts[-1].lower() if parts else ""
+            if name in _SERVER_ENTRY_NAMES:
+                return True
+            reference = _file_key(path) in references and bool({p.lower() for p in parts[:-1]} & _REFERENCE_DIRS)
+            if name.endswith((".html", ".htm")) and not reference:
+                return True
+        return False
+
+    def no_runnable_app(self) -> bool:
+        return bool(int(self.data.get("mutation_count") or 0) and self.wants_web_app() and not self.has_app_entry())
+
+    def note_backend_asked(self, path: str) -> None:
+        """The page check saw the page ask its own server for data, which the check cannot run."""
+        asked = self.data.setdefault("backend_asked", [])
+        if path not in asked:
+            asked.append(path)
+            del asked[:-4]
+
+    def backend_note(self) -> str:
+        names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
+        if not names:
+            return ""
+        return ("the page calls its own server or a local service (" + ", ".join(names[:3]) + "), which the page check "
+                "cannot run or reach, so how the page behaves with it was not verified")
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""

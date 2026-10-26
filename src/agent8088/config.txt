@@ -126,6 +126,9 @@ tool_selection=hybrid
 # stream_idle_seconds=120
 # tool_selection_models=custom:your-model-name
 # max_tool_timeout_seconds=1200
+# Seconds a shell command may run before it is stopped (default 60; a call can ask for more with its own
+# `timeout`, up to max_tool_timeout_seconds). Raise it when your tasks download or build for minutes:
+# tool_timeout.execute_shell=60
 # browser_max_steps=25
 # browser_task_timeout_seconds=600
 # Optional JSON forwarded only to browser-use model calls, for example:

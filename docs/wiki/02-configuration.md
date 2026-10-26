@@ -279,6 +279,7 @@ them and ends where it is.
 | `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns` (default 400 x 3 = 1200 rounds). `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 | `stall_rounds` | `6` | Rounds in a row that bring nothing new (no new call that worked, no file changed, no check newly passing, no part finished) before the main agent is asked once to finish with what it has or change approach. A second stretch of the same length with nothing ends the run with the usual summary. Reading or fetching something new always counts as progress. `0` turns the watch off. |
+| `repeat_refresh_seconds` | `20` | Refresh a consecutive identical, successful shell observation after this many seconds, at most 12 refreshes per command per request. Only supported read-only probes qualify; writes, unknown commands and failures stay cached. Explicit supported waits can refresh sooner but share the same cap. `0` disables timed refresh, not explicit waits. |
 | `verification_loop_rounds` | `8` | Once the work is built, its checks pass and no part is open, this many rounds in a row that change no file are answered once with a message that finishing is the next step (at most twice per request). It never ends the run. `0` turns it off. |
 
 Growth applies to the top-level request and to delegated sub-agents. It does

@@ -79,6 +79,11 @@ class Report:
         name = Path(self.target).name or self.target
         if self.status == PASS:
             tail = f" ({len(self.warnings)} warning{'s' if len(self.warnings) != 1 else ''})" if self.warnings else ""
+            # A page that calls a server or a local service this check cannot reach passed without that call being tried.
+            # "(5 warnings)" hid it, so the count is named.
+            calls = sum(1 for w in self.warnings if "asked the server for" in str(w) or "calls a local service" in str(w))
+            if calls:
+                tail = tail[:-1] + f"; {calls} call{'s' if calls != 1 else ''} to a service it could not reach, not verified)"
             # "compiles; not executed" is a pass only in status; say so, or the
             # summary reads as if the script had been run.
             ran = f" - {self.note}" if "not executed" in self.note else ""
@@ -503,6 +508,28 @@ _STATE_NO_VALUES_JS = _STATE_JS.replace(
     "const values = [];")
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _blocked_request_warning(url: str, methods) -> str:
+    """The warning for a request this check aborted.
+
+    A page that calls a service on this machine (Ollama on :11434, a local API) is not an ordinary hotlinked font: the check
+    cannot reach that service, so whether the call works is not known. Say so, and tell the model how to find out, because a
+    page that swallows a failed call and falls back to something else still looks fine in this check.
+    """
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() in _LOOPBACK_HOSTS and parts.port:
+        verbs = "/".join(sorted(methods)) or "GET"
+        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+        return (f"the page calls a local service ({parts.scheme}://{host}:{parts.port}{parts.path[:60]}, {verbs}); "
+                "this check blocks it, so that call was NOT verified. Send the same request with a shell command and check "
+                "the reply; if the page ignores a failed reply and falls back to something else, the page can look "
+                "fine while the service is never used. Say in the answer whether the call worked")
+    return f"blocked request to an external host: {url[:120]}"
+
+
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False,
                 executable: str | None = None) -> None:
@@ -514,6 +541,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
     backend_codes: list[int] = []       # and their status codes (404)
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
+    external_methods: dict[str, set] = {}   # blocked url -> the HTTP methods the page tried
     external_scripts: list[str] = []
     dialogs: list[str] = []
     effects: list[str] = []   # visible effects that are not a change of the page: dialogs, downloads, new tabs
@@ -555,6 +583,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 else:
                     if url not in external:
                         external.append(url)
+                    external_methods.setdefault(url, set()).add(request_route.request.method)
                     if request_route.request.resource_type == "script" and url not in external_scripts:
                         external_scripts.append(url)
                     request_route.abort()
@@ -616,9 +645,12 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                         if response.status_text:
                             backend_texts.append(response.status_text.strip().lower())
                         warnings.append(
-                            f"the page asked the server for {path.split('?')[0]} ({response.status}); this check "
-                            "serves static files only, so the backend was not running. Call the server after a "
-                            "click and handle a failure quietly, and the page will load cleanly without it")
+                            f"the page asked the server for {path.split('?')[0]} ({response.request.method}, {response.status}); "
+                            "this check serves static files only, so the backend was not running and that call was NOT "
+                            "verified. Start the server and send the same request with a shell command to see what it "
+                            "returns, and in the page call the server after a click and handle a failure quietly, so the "
+                            "page loads cleanly without it. Say in your answer that the page's behaviour with its backend "
+                            "was not verified")
                         return
                     failures.append(f"missing or failing file: {path} returned {response.status}")
 
@@ -710,7 +742,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 if uncertain and not failures:
                     out["unavailable"] = "blocked external scripts prevented verification of JavaScript behavior"
             for url in external[:MAX_ITEMS]:
-                warnings.append(f"blocked request to an external host: {url[:120]}")
+                warnings.append(_blocked_request_warning(url, external_methods.get(url, ())))
             if len(external) > MAX_ITEMS:
                 warnings.append(f"... and {len(external) - MAX_ITEMS} more external requests")
             out.update(failures=failures, warnings=warnings, console=console)
@@ -756,6 +788,31 @@ def _abandon(out: dict, started: float) -> None:
         pass
 
 
+# Known browser startup failures. A check that hangs after startup has an unknown cause instead.
+_ENVIRONMENT_NOTES = ("Chromium is not installed", "the browser could not run")
+
+UNAVAILABLE_GUIDANCE = (
+    "The browser check was unavailable, so how the page looks and behaves was NOT verified. A timeout alone cannot "
+    "distinguish a page defect from an environment problem. Do not build DOM or browser emulators (Node or VM scripts that stub document, fetch or "
+    "canvas) to stand in for it: they cost many turns and still cannot show the page. Instead run `node --check` on each "
+    "script, re-read the HTML for ids and script paths that do not match, test any pure logic in one small file, and say "
+    "plainly in your answer that browser behavior was not verified and which file the user should open to confirm.")
+UNAVAILABLE_GUIDANCE_SHORT = ("Browser verification is still unavailable (see the earlier note): do not build emulators; "
+                              "say in your answer that browser behavior was not verified.")
+
+
+def environment_unavailable(report: Report) -> bool:
+    """Chromium is missing or could not start; a page timeout is not proof of either."""
+    return (report.kind == "web" and report.status == UNAVAILABLE
+            and str(report.note).startswith(_ENVIRONMENT_NOTES))
+
+
+def browser_unavailable(report: Report) -> bool:
+    """Include page hangs, without claiming their cause is the machine."""
+    return (environment_unavailable(report) or (report.kind == "web" and report.status == UNAVAILABLE
+            and str(report.note).startswith(("the browser check did not finish", "the browser check could not finish"))))
+
+
 def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
                    deny: Callable[[str], bool] | None = None,
                    click_steps: int | None = None) -> Report:
@@ -765,7 +822,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
     executable = chromium_executable()
     if executable is None:
         return Report("web", str(path), UNAVAILABLE,
-                      note="Chromium is not installed; run `playwright install chromium`")
+                      note="Chromium is not installed for Agent8088, so no page can be loaded in a browser on this machine; "
+                           "install it with `python -m playwright install chromium`")
     out: dict = {"cancelled": threading.Event()}
     # A fresh thread: Playwright's sync API refuses to run inside a running event loop.
     root = serve_root(path)
@@ -780,7 +838,8 @@ def check_web_page(path: Path, timeout: float = DEFAULT_TIMEOUT,
         _abandon(out, started)
         return Report("web", str(path), UNAVAILABLE, note=f"the browser check did not finish in {timeout + 15:.0f}s")
     if "error" in out:
-        return Report("web", str(path), UNAVAILABLE, note=f"the browser could not run: {out['error']}")
+        cause = "the browser check could not finish" if out.get("browser_started") else "the browser could not run"
+        return Report("web", str(path), UNAVAILABLE, note=f"{cause}: {out['error']}")
     failures = list(dict.fromkeys(out.get("failures", [])))
     status = FAIL if failures else UNAVAILABLE if out.get("unavailable") else PASS
     return Report("web", str(path), status, failures, out.get("warnings", []), out.get("console", []),
@@ -1285,11 +1344,38 @@ def is_helper_script(path: Path) -> bool:
     return (stem.startswith("_") and len(stem) > 1) or bool(_HELPER_NAME.match(stem))
 
 
-def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3) -> list[Path]:
+# Folders that hold material the run saved for itself (a downloaded docs page, a scraped result), not something it built.
+REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
+                            "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
+
+
+def is_reference_page(path: Path, roots: Iterable[Path] = ()) -> bool:
+    """A web page sitting in a reference folder: saved source material, not the page the person asked for.
+
+    Only the folders below the project root count: a project that lives under a temp or data directory
+    would otherwise have every page of it skipped. With no root to measure from, only the parent folder counts.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in WEB_SUFFIXES:
+        return False
+    folders = [path.parent.name]
+    for root in roots:
+        try:
+            folders = list(path.parent.relative_to(Path(root)).parts)
+            break
+        except ValueError:
+            continue
+    return bool({part.lower() for part in folders} & REFERENCE_DIRS)
+
+
+def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: int = 3,
+                        reference_pages: Iterable[str] = ()) -> list[Path]:
     """Pages and runnable scripts this run wrote that exist, pages first, newest last.
 
     Tests, files under node_modules or a virtualenv, scratch dirs, and the model's own
-    throwaway helpers (_fix.py, tmp_check.js) are skipped.
+    throwaway helpers (_fix.py, tmp_check.js) are skipped. A page in a reference folder is skipped only
+    when download provenance identifies it as source material and another page was built. Folder names
+    alone cannot distinguish a saved document from an authored documentation site or app data page.
     """
     roots = [Path(r) for r in roots]
     found: list[Path] = []
@@ -1309,5 +1395,11 @@ def deliverable_targets(written: Iterable[str], roots: Iterable[Path], limit: in
         if path.suffix.lower() in WEB_SUFFIXES | PYTHON_SUFFIXES | NODE_SUFFIXES:
             found.append(path)
     pages = [p for p in found if p.suffix.lower() in WEB_SUFFIXES]
+    references = set()
+    for raw in reference_pages:
+        candidates = [Path(raw)] if Path(raw).is_absolute() else [r / raw for r in roots]
+        references.update(p.resolve() for p in candidates if p.is_file())
+    built = [p for p in pages if not (p.resolve() in references and is_reference_page(p, roots))]
+    pages = built or pages     # only reference pages were written: keep them, there is nothing else to judge
     scripts = [p for p in found if p.suffix.lower() not in WEB_SUFFIXES]
     return (pages + scripts)[:limit]

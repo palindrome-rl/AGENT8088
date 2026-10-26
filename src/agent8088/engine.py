@@ -10000,6 +10000,9 @@ def _html_to_text(html: str) -> str:
     return f"Title: {title}\n\n{text}" if title else text
 
 
+_check_app_guidance_state = threading.local()   # once per request; never shared between Web UI sessions
+
+
 def _browser_install_hint(missing: str) -> str:
     python = sys.executable or "python"
     if missing == "playwright":
@@ -10370,11 +10373,18 @@ def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
     """
     import base64
 
+    # Git for Windows' MSYS tools (head, find, timeout, grep, ... in Git\usr\bin) die in the
+    # restricted token with "couldn't create signal pipe, Win32 error 5", so the shell the
+    # model gets does not see that folder. git.exe lives in Git\cmd and stays.
     bridge = (
-        "import base64, subprocess, sys\n"
+        "import base64, os, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
-        "raise SystemExit(subprocess.run(command, shell=True, cwd=cwd).returncode)\n"
+        "env = dict(os.environ)\n"
+        "key = next((k for k in env if k.lower() == 'path'), 'PATH')\n"
+        "env[key] = os.pathsep.join(p for p in env.get(key, '').split(os.pathsep) if not\n"
+        "    p.strip().strip('\"').rstrip('\\\\/').lower().replace('/', '\\\\').endswith('\\\\git\\\\usr\\\\bin'))\n"
+        "raise SystemExit(subprocess.run(command, shell=True, cwd=cwd, env=env).returncode)\n"
     )
     payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
     argv = [sys.executable, "-c", bridge, payload]
@@ -13823,9 +13833,19 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             # to another host aborted; a script is only syntax-checked.
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
-            return app_check.check_target(
+            report = app_check.check_target(
                 read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
-                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS).text()
+                run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
+            text = report.text()
+            if app_check.browser_unavailable(report):
+                # No browser verification was obtained; do not invent its cause or emulate a DOM.
+                # Full guidance once per request, a reminder after that.
+                text += "\n\n" + (app_check.UNAVAILABLE_GUIDANCE_SHORT if getattr(_check_app_guidance_state, "given", False)
+                                  else app_check.UNAVAILABLE_GUIDANCE)
+                _check_app_guidance_state.given = True
+                if str(report.note).startswith("Chromium is not installed"):
+                    _report_browser("chromium")
+            return text
         if name == "document_read":
             from . import document_access
             context, completion = _active_model_token_limits()
@@ -19092,7 +19112,8 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     `report_only` records the notes and never returns a follow-up (the run is ending).
     """
     roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
-    targets = app_check.deliverable_targets(written, roots)
+    targets = app_check.deliverable_targets(
+        written, roots, reference_pages=getattr(trajectory, "data", {}).get("reference_paths", []))
     pending = trajectory.smoke_unchecked([str(t) for t in targets])
     failures = []
     unverified = []
@@ -19106,6 +19127,8 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
         trajectory.record_smoke(str(target), report.summary(), report.failed, report.output,
                                 passed=report.status == app_check.PASS,
                                 unverified=report.status == app_check.UNAVAILABLE and report.ask)
+        if any("asked the server for" in str(w) or "calls a local service" in str(w) for w in report.warnings):
+            trajectory.note_backend_asked(str(target))   # the page's own server was not run by this check
         if report.failed:
             failures.append(report)
         elif report.ask:
@@ -19418,6 +19441,8 @@ def _not_verified_reasons(trajectory) -> list:
     if trajectory is None:
         return []
     reasons = []
+    if trajectory.no_runnable_app():
+        reasons.append("no runnable app (a page or a server) was produced for a request to build a web app")
     failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
     if failed:
         reasons.append("the page/script check failed (" + ", ".join(failed[:3]) + ")")
@@ -19459,6 +19484,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and (backend := trajectory.backend_note()):
+        notes.append(f"Not verified: {backend}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):
         notes.append("Not completed: " + "; ".join(open_parts[:6])
                      + ("; ..." if len(open_parts) > 6 else ""))
@@ -19483,7 +19510,13 @@ _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
     "cli_anything_info", "cli_anything_skill",
 })
-_WAIT_COMMAND_RE = re.compile(r"(?:^|[\s;&|(])sleep\s+\d")
+_WAIT_COMMAND_RE = re.compile(
+    r"(?:^|[\s;&|(])sleep\s+\d"                      # sh: sleep 30
+    r"|time\.sleep\s*\("                              # python -c "import time; time.sleep(25)"
+    r"|Start-Sleep\b"                                 # PowerShell
+    r"|(?:^|[\s;&|(])timeout\s+/t\s*\d"               # cmd: timeout /t 20
+    r"|(?:^|[\s;&|(])ping\s+-n\s+\d"                  # cmd: ping -n 20 127.0.0.1
+    r"|\bsetTimeout\s*\(", re.IGNORECASE)             # node -e "setTimeout(...)"
 
 
 def _is_wait_command(name: str, args: dict) -> bool:
@@ -19493,7 +19526,88 @@ def _is_wait_command(name: str, args: dict) -> bool:
     not the model spinning, so it re-runs and counts as progress. max_turns
     still bounds how long a poll can go on.
     """
-    return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(str(args.get("command") or "")))
+    command = str(args.get("command") or "")
+    return name == "execute_shell" and bool(_WAIT_COMMAND_RE.search(command)) and _safe_poll_command(command)
+
+
+def _safe_poll_command(command: str) -> bool:
+    """Conservative replay policy, not a permission gate. Unknown code is never replayed.
+
+    In particular, a successful POST, install, append or mixed wait/write must not
+    run twice merely because time passed. Keep ordinary observations and small
+    literal Python file-size/existence probes; reject substitutions and redirects.
+    """
+    if not command or re.search(r"[`$%!^\r\n]", command):
+        return False
+    masked = _mask_quoted_operators(command)
+    if masked is None or re.search(r"[<>|]", masked):
+        # The conventional cmd delay discards ping output, never writes a file.
+        return bool(re.fullmatch(r"ping\s+-n\s+\d+\s+127\.0\.0\.1\s*>\s*nul", command, re.I))
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|py", program) and len(words) == 3 and words[1] == "-c":
+        try:
+            tree = ast.parse(words[2])
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+        allowed = (ast.Module, ast.Import, ast.alias, ast.Expr, ast.Call,
+                   ast.Name, ast.Load, ast.Attribute, ast.Constant)
+        calls = {"print", "time.sleep", "os.path.getsize", "os.path.exists", "os.path.isfile", "os.path.isdir"}
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed):
+                return False
+            if isinstance(node, ast.Import) and any(a.name not in {"os", "time"} or a.asname for a in node.names):
+                return False
+            if isinstance(node, ast.Call) and ast.unparse(node.func) not in calls:
+                return False
+            if isinstance(node, ast.Attribute) and ast.unparse(node) not in calls | {"os.path"}:
+                return False
+        return True
+    if program in {"node", "nodejs"}:
+        return (len(words) == 3 and words[1] == "-e"
+                and bool(re.fullmatch(r"\s*setTimeout\(\s*\(\)\s*=>\s*\{\s*\}\s*,\s*\d+\s*\)\s*;?\s*", words[2])))
+    if program in {"powershell", "pwsh"}:
+        return len(words) >= 3 and words[1].lower() in {"-c", "-command"} and _safe_poll_command(" ".join(words[2:]))
+    if re.search(r"[;&]", masked):
+        stages = re.split(r"\s*(?:&&|;)\s*", command)
+        return len(stages) > 1 and all(_safe_poll_command(stage) for stage in stages)
+    if re.search(r"[(){}]", masked):
+        return False
+    if program == "timeout":
+        return bool(re.fullmatch(r"timeout\s+/t\s+\d+(?:\s+/nobreak)?", command, re.I))
+    if program == "curl":
+        # HTTP GET/HEAD health probes only: no uploads, request bodies, output files,
+        # config files, redirects, credentials or arbitrary protocol handlers.
+        operands = [word for word in words[1:] if not word.startswith("-")]
+        flags = [word for word in words[1:] if word.startswith("-")]
+        return (len(operands) == 1 and bool(re.fullmatch(r"(?:https?://[^\s]+|localhost(?::\d+)?(?:/[^\s]*)?)", operands[0]))
+                and all(flag in {"--silent", "--show-error", "--fail", "--head"}
+                        or bool(re.fullmatch(r"-[sSfI]+", flag)) for flag in flags))
+    return program in {"ls", "dir", "pwd", "cat", "head", "tail", "wc", "stat", "sleep",
+                       "cd", "get-content", "get-childitem", "get-item", "test-path", "get-process", "get-date", "start-sleep"}
+
+
+def _poll_result_ok(result: str) -> bool:
+    return not re.search(r"(?im)^Error\b|Command exited with status|Command timed out|timed out after", result or "")
+
+
+# A shell command repeated after this many seconds is a new observation, not a spin: a download's size, a server's
+# health or a log's tail changes while the model thinks. 0 turns the refresh off (every identical repeat is answered
+# from the earlier result, as before). Only a command that succeeded is refreshed, and only a few times in a row.
+REPEAT_REFRESH_SECONDS = max(0, _config_int("repeat_refresh_seconds", 20))
+REPEAT_REFRESH_MAX = 12
+
+
+def _poll_refresh_due(name: str, result: str, finished_at: float, refreshed: int, command: str = "") -> bool:
+    if (name != "execute_shell" or not REPEAT_REFRESH_SECONDS or refreshed >= REPEAT_REFRESH_MAX
+            or time.monotonic() - finished_at < REPEAT_REFRESH_SECONDS):
+        return False
+    return _poll_result_ok(result) and _safe_poll_command(command)
 
 
 def _consult_llmrouter(config, messages, eligible):
@@ -19544,6 +19658,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     Pass a list as `trace` to collect a step-by-step record for training data.
     Returns the final answer string.
     """
+    _check_app_guidance_state.given = False
     spin = spin or (lambda msg: nullcontext())
 
     def _retry_notice(message):
@@ -19558,7 +19673,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
     tools_def = tools_def if tools_def is not None else TOOLS_DEF
     allowed_tools = allowed_tools if allowed_tools is not None else TOOL_NAMES
-    last_completed = None  # consecutive identical call -> (signature, output)
+    last_completed = None  # consecutive identical call -> (signature, output, finished at)
+    poll_refreshes: dict = {}  # signature -> times a repeated shell command was re-run because time had passed
     action_results = {}  # opaque external actions cannot be replayed within this request
     seen_signatures = set()  # every call this run has already made, for the policy
     read_results = {}  # bounded to this run; invalidated by non-read operations
@@ -20525,7 +20641,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             elif ("__parse_error__" not in args and last_completed
                     and sig == last_completed[0]):
                 previous_output, repeated = last_completed[1], True
-            if repeated and _is_wait_command(name, args):
+                if _poll_refresh_due(name, last_completed[1], last_completed[2], poll_refreshes.get(sig, 0), str(args.get("command") or "")):
+                    # Time has passed since the same successful command ran: poll again, it is not a spin.
+                    poll_refreshes[sig] = poll_refreshes.get(sig, 0) + 1
+                    repeated, previous_output = False, None
+            if (repeated and _is_wait_command(name, args) and _poll_result_ok(previous_output)
+                    and poll_refreshes.get(sig, 0) < REPEAT_REFRESH_MAX):
+                poll_refreshes[sig] = poll_refreshes.get(sig, 0) + 1
                 repeated, previous_output = False, None
             # Only these built-in observation queries are safe to refresh.
             if repeated and name in _REPEAT_OBSERVATIONS:
@@ -20648,6 +20770,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     command=str(args.get("command") or ""),
                     existed=existed_before,
                     written_to=_write_landing(name, args),
+                    reference=name == "write_file" and "(fetched from " in str(result),
                 )
                 if name == "check_app":
                     trajectory.settle_check_app(result, path=check_app_path)
@@ -20823,7 +20946,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
             # stands: an unusable search must be retryable, not latched.
             if ("__parse_error__" not in args
                     and not (name == "web_search" and not _search_was_usable(result))):
-                last_completed = (sig, result)
+                last_completed = (sig, result, time.monotonic())
 
             if turn_tools is not None:
                 step = {"name": name, "arguments": args, "result": result[:3000]}
