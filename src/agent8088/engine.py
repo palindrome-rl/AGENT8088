@@ -10359,11 +10359,18 @@ def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
     """
     import base64
 
+    # Git for Windows' MSYS tools (head, find, timeout, grep, ... in Git\usr\bin) die in the
+    # restricted token with "couldn't create signal pipe, Win32 error 5", so the shell the
+    # model gets does not see that folder. git.exe lives in Git\cmd and stays.
     bridge = (
-        "import base64, subprocess, sys\n"
+        "import base64, os, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
-        "raise SystemExit(subprocess.run(command, shell=True, cwd=cwd).returncode)\n"
+        "env = dict(os.environ)\n"
+        "key = next((k for k in env if k.lower() == 'path'), 'PATH')\n"
+        "env[key] = os.pathsep.join(p for p in env.get(key, '').split(os.pathsep) if not\n"
+        "    p.strip().strip('\"').rstrip('\\\\/').lower().replace('/', '\\\\').endswith('\\\\git\\\\usr\\\\bin'))\n"
+        "raise SystemExit(subprocess.run(command, shell=True, cwd=cwd, env=env).returncode)\n"
     )
     payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
     argv = [sys.executable, "-c", bridge, payload]
