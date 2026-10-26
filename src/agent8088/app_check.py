@@ -483,6 +483,28 @@ _STATE_NO_VALUES_JS = _STATE_JS.replace(
     "const values = [];")
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _blocked_request_warning(url: str, methods) -> str:
+    """The warning for a request this check aborted.
+
+    A page that calls a service on this machine (Ollama on :11434, a local API) is not an ordinary hotlinked font: the check
+    cannot reach that service, so whether the call works is not known. Say so, and tell the model how to find out, because a
+    page that swallows a failed call and falls back to something else still looks fine in this check.
+    """
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() in _LOOPBACK_HOSTS and parts.port:
+        verbs = "/".join(sorted(methods)) or "GET"
+        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+        return (f"the page calls a local service ({parts.scheme}://{host}:{parts.port}{parts.path[:60]}, {verbs}); "
+                "this check blocks it, so that call was NOT verified. Send the same request with a shell command and check "
+                "the reply; if the page ignores a failed reply and falls back to something else, the page can look "
+                "fine while the service is never used. Say in the answer whether the call worked")
+    return f"blocked request to an external host: {url[:120]}"
+
+
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False,
                 executable: str | None = None) -> None:
@@ -494,6 +516,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
     backend_codes: list[int] = []       # and their status codes (404)
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
+    external_methods: dict[str, set] = {}   # blocked url -> the HTTP methods the page tried
     external_scripts: list[str] = []
     dialogs: list[str] = []
     effects: list[str] = []   # visible effects that are not a change of the page: dialogs, downloads, new tabs
@@ -535,6 +558,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 else:
                     if url not in external:
                         external.append(url)
+                    external_methods.setdefault(url, set()).add(request_route.request.method)
                     if request_route.request.resource_type == "script" and url not in external_scripts:
                         external_scripts.append(url)
                     request_route.abort()
@@ -690,7 +714,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 if uncertain and not failures:
                     out["unavailable"] = "blocked external scripts prevented verification of JavaScript behavior"
             for url in external[:MAX_ITEMS]:
-                warnings.append(f"blocked request to an external host: {url[:120]}")
+                warnings.append(_blocked_request_warning(url, external_methods.get(url, ())))
             if len(external) > MAX_ITEMS:
                 warnings.append(f"... and {len(external) - MAX_ITEMS} more external requests")
             out.update(failures=failures, warnings=warnings, console=console)
