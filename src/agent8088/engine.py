@@ -19109,7 +19109,7 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
         trajectory.record_smoke(str(target), report.summary(), report.failed, report.output,
                                 passed=report.status == app_check.PASS,
                                 unverified=report.status == app_check.UNAVAILABLE and report.ask)
-        if any("asked the server for" in str(w) for w in report.warnings):
+        if any("asked the server for" in str(w) or "calls a local service" in str(w) for w in report.warnings):
             trajectory.note_backend_asked(str(target))   # the page's own server was not run by this check
         if report.failed:
             failures.append(report)

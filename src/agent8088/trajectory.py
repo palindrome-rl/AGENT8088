@@ -445,6 +445,12 @@ class TrajectoryState:
                    path: str = "", command: str = "", existed: bool = False,
                    partial_path: str = "", written_to: str = "", reference: bool = False) -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
+        if (operation["tool"] == "check_app" and path and not blocked
+                and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service",
+                                                            "service it could not reach, not verified"))):
+            # Manual check_app calls must retain the same caveat as completion smoke checks.
+            # Read the full result before operation summaries are clipped.
+            self.note_backend_asked(path)
         if operation["status"] == "done" and (
                 operation["tool"] in RESEARCH_TOOLS
                 or (operation["tool"] == "execute_shell" and re.search(r"https?://", command or ""))):
@@ -971,8 +977,8 @@ class TrajectoryState:
         names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
         if not names:
             return ""
-        return ("the page calls its own server (" + ", ".join(names[:3]) + "), which the page check cannot run, so how "
-                "the page behaves with its backend was not verified")
+        return ("the page calls its own server or a local service (" + ", ".join(names[:3]) + "), which the page check "
+                "cannot run or reach, so how the page behaves with it was not verified")
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""

@@ -90,7 +90,7 @@ def test_backend_note_reaches_the_answer(engine):
     state.note_backend_asked("E:/w/pokemon-battle/public/index.html")
     assert "not verified" in state.backend_note() and "index.html" in state.backend_note()
     answer = engine._with_task_notes("Done.", state)
-    assert "Not verified: the page calls its own server" in answer
+    assert "Not verified: the page calls its own server or a local service" in answer
     assert answer.count("index.html") == 1
 
 
