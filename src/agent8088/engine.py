@@ -20,7 +20,7 @@ from openai import OpenAI
 from agent8088.mcp import MCPRuntime
 from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
-from agent8088 import (app_check, cli_anything, completion as completion_checks, diffview,
+from agent8088 import (app_check, backend_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
                        memory, patching, providers, routing, secret_scan, testing_support,
                        tool_output,
@@ -604,6 +604,10 @@ COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds"
 # After the first control, the page check clicks this many more visible controls (within
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
+# Optional, off by default: start the project's own server in the sandbox, probe the endpoints its page uses, and record the
+# result in a separate "backend check" field of the answer. Never changes the verification level (see backend_check.py).
+BACKEND_CHECK = str(APP_CONFIG.get("backend_check", "0")).strip().lower() in ("1", "true", "yes", "on")
+BACKEND_CHECK_STARTUP = max(5, _config_int("backend_check_startup_seconds", int(backend_check.STARTUP_SECONDS)))
 COMPLETION_SMOKE_MAX_FAILURES = max(0, _config_int("completion_smoke_max_failures", 2))
 # Rounds in a row that bring nothing new before the model is asked to decide: finish with what it
 # has, or change approach. Twice that many ends the run with a summary. 0 turns the watch off.
@@ -19086,6 +19090,57 @@ def _smoke_script_runner(target):
     return run
 
 
+def _backend_server_launcher():
+    """A function that starts a project's server in the read-only native sandbox and returns the running wrapper, or None.
+
+    The caller (backend_check) keeps the wrapper alive while it probes the server and stops it afterwards; the wrapper's
+    kill-on-close job object then ends the server and everything it started. Windows native sandbox only so far."""
+    if sys.platform != "win32" or _resolve_sandbox_backend() != "native":
+        return None
+
+    def launch(entry, port, root):
+        runner = _native_sandbox_argv()
+        if not runner:
+            raise RuntimeError("the sandbox runtime is not installed")
+        if not _native_sandbox_ready(Path(entry.cwd), readonly=True, quiet=True):
+            raise RuntimeError("the native sandbox is not ready")
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
+        libs = next((str(d) for d in Path(entry.cwd).rglob("pylibs") if d.is_dir()), "")   # packages the model installed beside the app
+        exe = f'"{node}"' if (entry.kind == "node" and node) else ("node" if entry.kind == "node" else "python")
+        command = ((f'set "PATH={Path(node).parent};%PATH%" && ' if node else "") + f'set "PORT={port}" && '
+                   + (f'set "PYTHONPATH={libs}" && ' if libs else "")
+                   + f'{exe} "{entry.script}"' + (f" {port}" if entry.port_arg else ""))
+        sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+        sandbox_tmp.mkdir(parents=True, exist_ok=True)
+        wrapped = _native_sandbox_shell_argv(command, cwd=entry.cwd)
+        full = runner + ["--workspace", str(entry.cwd), "--temp", str(sandbox_tmp), "--mode", "read-only", "--"] + wrapped
+        log = tempfile.NamedTemporaryFile(prefix="agent8088-backend-", suffix=".log", delete=False)
+        proc = subprocess.Popen(full, cwd=str(entry.cwd), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        proc.output_file = log.name
+        log.close()
+        return proc
+    return launch
+
+
+def _backend_check_step(trajectory, targets) -> None:
+    """The optional backend check, once per state of the work, for the first page that was checked."""
+    if not BACKEND_CHECK:
+        return
+    for target in targets:
+        if Path(target).suffix.lower() not in app_check.WEB_SUFFIXES:
+            continue
+        root = app_check.serve_root(Path(target))
+        if trajectory.backend_check_current(str(root)):
+            return
+        try:
+            report = backend_check.run_backend_check(root, Path(target), _backend_server_launcher(), startup=BACKEND_CHECK_STARTUP)
+        except Exception as error:  # noqa: BLE001 -- a problem in this optional check must never end the run
+            report = backend_check.BackendReport(backend_check.UNAVAILABLE, f"the backend check could not run: {str(error)[:100]}")
+        trajectory.record_backend_check(str(root), report.status, report.summary())
+        return
+
+
 def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     """Smoke-test the pages and scripts this run wrote, once per state of the work.
 
@@ -19115,6 +19170,7 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
             failures.append(report)
         elif report.ask:
             unverified.append(report)
+    _backend_check_step(trajectory, targets)
     if report_only:
         return None
     if (failures and COMPLETION_SMOKE_TEST == "enforce"
@@ -19466,6 +19522,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(f"Task-state note: {unmet}")
     if trajectory is not None and (smoke := trajectory.smoke_review()):
         notes.append(f"Smoke test: {smoke}")
+    if trajectory is not None and (backend_line := trajectory.backend_check_line()):
+        notes.append(backend_line)
     if trajectory is not None and (backend := trajectory.backend_note()):
         notes.append(f"Not verified: {backend}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):

@@ -359,6 +359,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_passed_at": {},
         "smoke_unverified": {},
         "backend_asked": [],
+        "backend_check": {},
         "weak_secret_asked": False,
         "smoke_asked": [],
         "consecutive_setbacks": 0,
@@ -973,7 +974,28 @@ class TrajectoryState:
             asked.append(path)
             del asked[:-4]
 
+    def record_backend_check(self, key: str, status: str, detail: str) -> None:
+        """The optional backend check's result: its own field, never part of the verification level."""
+        self.data["backend_check"] = {"key": key, "status": status, "detail": _text(detail), "at": self.mutation_count()}
+
+    def backend_check_current(self, key: str) -> bool:
+        """The backend check already ran for this project at the current state of the work."""
+        record = self.data.get("backend_check") or {}
+        return bool(record) and record.get("key") == key and record.get("at") == self.mutation_count()
+
+    def backend_check_status(self) -> str:
+        """off (nothing recorded), not applicable, unavailable, passed or failed."""
+        return str((self.data.get("backend_check") or {}).get("status") or "off")
+
+    def backend_check_line(self) -> str:
+        record = self.data.get("backend_check") or {}
+        if not record:
+            return ""
+        return f"Backend check: {record.get('status')} - {record.get('detail')}"
+
     def backend_note(self) -> str:
+        if self.backend_check_status() == "passed":
+            return ""    # the page's own server was run: the "not verified" note would be wrong
         names = [PurePath(str(p)).name for p in self.data.get("backend_asked") or []]
         if not names:
             return ""
