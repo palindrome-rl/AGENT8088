@@ -930,6 +930,7 @@ class TrajectoryState:
 
     def has_app_entry(self) -> bool:
         """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
+        references = {_file_key(path) for path in self.data.get("reference_paths", [])}
         for path in self.written_paths():
             page = PurePath(str(path).replace("\\", "/"))
             workspace = str(self.data.get("workspace") or "").replace("\\", "/")
@@ -944,7 +945,8 @@ class TrajectoryState:
             name = parts[-1].lower() if parts else ""
             if name in _SERVER_ENTRY_NAMES:
                 return True
-            if name.endswith((".html", ".htm")) and not ({p.lower() for p in parts[:-1]} & _REFERENCE_DIRS):
+            reference = _file_key(path) in references and bool({p.lower() for p in parts[:-1]} & _REFERENCE_DIRS)
+            if name.endswith((".html", ".htm")) and not reference:
                 return True
         return False
 
