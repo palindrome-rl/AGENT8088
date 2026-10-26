@@ -497,7 +497,8 @@ def _blocked_request_warning(url: str, methods) -> str:
     parts = urlsplit(url)
     if (parts.hostname or "").lower() in _LOOPBACK_HOSTS and parts.port:
         verbs = "/".join(sorted(methods)) or "GET"
-        return (f"the page calls a local service ({parts.scheme}://{parts.hostname}:{parts.port}{parts.path[:60]}, {verbs}); "
+        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+        return (f"the page calls a local service ({parts.scheme}://{host}:{parts.port}{parts.path[:60]}, {verbs}); "
                 "this check blocks it, so that call was NOT verified. Send the same request with a shell command and check "
                 "the reply; if the page ignores a failed reply and falls back to something else, the page can look "
                 "fine while the service is never used. Say in the answer whether the call worked")
