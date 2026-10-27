@@ -182,10 +182,17 @@ class Agent8088ChatModel(ChatLiteLLM):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.min_completion_tokens < 1 or self.max_completion_tokens < 1:
+            raise ValueError("completion-token floor and ceiling must be positive")
         # Whether the caller set an explicit max_tokens at all: None means
         # ChatLiteLLM's own default behavior, which we must not override.
         self._seeded_max_tokens = self.max_tokens
-        self._adaptive_cap = max(self.min_completion_tokens, self.max_tokens or 0)
+        self._adaptive_cap = self._clamp_cap(self.max_tokens or 0)
+
+    def _clamp_cap(self, value):
+        # A configured/provider ceiling wins even when the default floor is
+        # larger. In particular a 1024-token model must never receive 2048.
+        return min(self.max_completion_tokens, max(self.min_completion_tokens, value))
 
     def _record_completion_usage(self, finish_reason, completion_tokens):
         """Adapt the working cap to what this call actually needed."""
@@ -198,8 +205,7 @@ class Agent8088ChatModel(ChatLiteLLM):
             # Finished on its own: what it used, plus headroom, was enough.
             target = max(self.min_completion_tokens, int(completion_tokens * self.usage_headroom))
             self._adaptive_cap = int(max(target, self._adaptive_cap * 0.75))
-        self._adaptive_cap = max(self.min_completion_tokens,
-                                 min(self._adaptive_cap, self.max_completion_tokens))
+        self._adaptive_cap = self._clamp_cap(self._adaptive_cap)
 
     def _completion_cap(self) -> Optional[int]:
         return self._adaptive_cap if self._seeded_max_tokens is not None else None

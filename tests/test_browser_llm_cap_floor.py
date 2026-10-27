@@ -6,6 +6,7 @@ step that thought for longer was cut; the browsing library reports an empty acti
 failures ends the sub-agent. The floor is now 2048 (half the starting cap) and the cap shrinks toward 2.5x what a finished call
 used, not 1.5x. A model that sets its own floor and starting cap behaves as before."""
 from agent8088.browser_llm import Agent8088ChatModel
+import pytest
 
 
 def _model(**kw):
@@ -68,3 +69,46 @@ def test_a_starting_cap_below_the_floor_starts_at_the_floor():
 
 def test_the_engine_default_matches(engine):
     assert engine.BROWSER_LLM_MIN_TOKENS == 2048
+
+
+@pytest.mark.parametrize('start, floor, ceiling', [(1024, 2048, 1024), (4096, 2048, 1024),
+                                                 (50000, 2048, 6000), (1, 8192, 256)])
+def test_the_ceiling_wins_on_initial_and_later_requests(start, floor, ceiling):
+    model = Agent8088ChatModel(model='openai/gpt-4o', max_tokens=start,
+                              min_completion_tokens=floor, max_completion_tokens=ceiling)
+    assert 1 <= model._completion_cap() <= ceiling
+    for reason, tokens in [('length', ceiling), ('stop', 100), ('length', ceiling), ('stop', 0)]:
+        model._record_completion_usage(reason, tokens)
+        assert 1 <= model._completion_cap() <= ceiling
+
+
+def test_an_unset_starting_cap_remains_unset():
+    assert Agent8088ChatModel(model='openai/gpt-4o', max_tokens=None)._completion_cap() is None
+
+
+@pytest.mark.parametrize('setting', ['min_completion_tokens', 'max_completion_tokens'])
+def test_invalid_bounds_fail_before_a_provider_request(setting):
+    with pytest.raises(ValueError, match='must be positive'):
+        _model(**{setting: 0})
+
+
+@pytest.mark.asyncio
+async def test_actual_provider_arguments_respect_a_small_ceiling(monkeypatch):
+    from types import SimpleNamespace
+    from pydantic import BaseModel
+
+    class Output(BaseModel):
+        answer: str
+
+    calls = []
+    async def complete(**kwargs):
+        calls.append(kwargs['max_tokens'])
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"answer":"ok"}', reasoning_content=None),
+            finish_reason='length')], usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1024))
+    monkeypatch.setattr('litellm.acompletion', complete)
+    model = Agent8088ChatModel(model='openai/gpt-4o', max_tokens=1024,
+                              max_completion_tokens=1024, extra_body={'fixture': True})
+    await model.ainvoke([], output_format=Output)
+    await model.ainvoke([], output_format=Output)
+    assert calls == [1024, 1024]
