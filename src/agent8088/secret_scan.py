@@ -18,6 +18,7 @@ check everyone learns to ignore.
 """
 
 import re
+from urllib.parse import unquote
 from pathlib import Path
 
 # Shapes that can only be a credential. Anchored on a literal vendor
@@ -82,6 +83,13 @@ _PATHY_RE = re.compile(r"^(?:\.{0,2}/|~/)|[A-Za-z0-9_-]\.[a-z]{1,5}$")
 # Python-urllib/3.11. The name is words, so a random-looking key with a trailing /5.0 does not match.
 _PRODUCT_VERSION_RE = re.compile(
     r"[A-Za-z][A-Za-z_-]{2,}[0-9]{0,2}/v?[0-9]+(?:\.[0-9]+){0,3}(?:[-+][\w.]+)?")
+_RELATIVE_URL_RE = re.compile(r'''(?<![\w])(?:/[^\s'"<>]+|[\w.-]+\.[A-Za-z]{1,8}\?[^\s'"<>]+)''')
+_LINK_VERSION_RE = re.compile(
+    r'''(?P<prefix>(?:/[^\s'"<>?]+|[\w.-]+\.[A-Za-z]{1,8})\?(?:[^\s'"<>]*&)?'''
+    r'''(?:v|ver|version|rev|build|cb)=)[0-9A-Fa-f]{6,64}(?=[&\s'"<>#)]|$)''')
+_USER_AGENT_RE = re.compile(
+    r'''["']?User-Agent["']?\s*:\s*(?:["'](?P<quoted>[^"'\r\n]*)["']|(?P<plain>[^\r\n]+))''', re.IGNORECASE)
+_UA_PRODUCT_RE = re.compile(r"(?P<name>[A-Za-z][\w-]*)/v?[0-9]+(?:\.[0-9]+){0,3}")
 # Plain words joined by slashes, plus signs, dashes or dots: "moves/items/partners", "application/xhtml+xml",
 # "atkMult/defMult". No digit, and every part is letters with at most two capitals (a word, a Capitalised
 # word or lowerCamel). A random key has digits, or about half its letters in capitals.
@@ -277,7 +285,29 @@ def find_secrets(text: str) -> list:
 
     # The opaque-string pass judges what is left once URLs are taken out: a percent-encoded address would
     # otherwise be cut at every "%" into pieces that no longer look like part of a URL.
-    for raw in _TOKEN_SPLIT_RE.split(_URL_TEXT_RE.sub(" ", text)):
+    # Keep encoded credentials intact outside URLs. Decode URL escapes instead
+    # of deleting them: a font separator becomes '|', while an encoded key is
+    # reassembled rather than broken into short, undetectable pieces.
+    opaque_text = _URL_TEXT_RE.sub(" ", text)
+    opaque_text = _RELATIVE_URL_RE.sub(lambda m: unquote(m.group(0)), opaque_text)
+    # Only URL query context excuses version hashes; a standalone v=<hex>
+    # assignment remains eligible for the credential detector.
+    opaque_text = _LINK_VERSION_RE.sub(lambda m: m.group('prefix') + 'public-version', opaque_text)
+
+    def user_agent(match):
+        value = match.group('quoted') or match.group('plain') or ''
+        def product(item):
+            name = item.group('name')
+            # Admit readable product names with one short number (agent8088,
+            # Pokedex2Tool), never arbitrary mixed-case key/version strings.
+            readable = (_identifier_like(name) or _wordlike(re.sub(r'\d+', '', name)))
+            if readable and len(re.findall(r'\d+', name)) <= 1 and sum(c.isdigit() for c in name) <= 4:
+                return 'public-product'
+            return item.group(0)
+        return match.group(0).replace(value, _UA_PRODUCT_RE.sub(product, value), 1) if value else match.group(0)
+
+    opaque_text = _USER_AGENT_RE.sub(user_agent, opaque_text)
+    for raw in _TOKEN_SPLIT_RE.split(opaque_text):
         token = raw.strip(_EDGE_PUNCT)
         if len(token) < _MIN_MIXED or token in seen or _is_noise(token):
             continue

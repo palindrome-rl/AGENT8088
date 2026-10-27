@@ -19601,17 +19601,25 @@ _ASSURANCE_LINES = {
 }
 
 
+_NO_AUTOMATED_PASS_SENTENCE = "Changed work was inspected, but no automated verification passed."
+
+
 def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
-    if trajectory is not None and (line := _ASSURANCE_LINES.get(trajectory.assurance())):
-        notes.append(line)
+    assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
+    if assurance_line:
+        notes.append(assurance_line)
     if trajectory is not None and trajectory.needs_verification():
         notes.append("Verification note: changes were made, but no fresh automated "
                      "verification evidence was recorded.")
     elif trajectory is not None and (review := trajectory.review()):
-        notes.append(f"Task-state note: {review}")
+        if assurance_line:
+            # "Verification: exercised ... no test run passed" already says it; say it once.
+            review = review.replace(_NO_AUTOMATED_PASS_SENTENCE, "").strip()
+        if review:
+            notes.append(f"Task-state note: {review}")
     if (trajectory is not None and trajectory.needs_verification()
             and (unmet := trajectory.unmet_review())):
         notes.append(f"Task-state note: {unmet}")
