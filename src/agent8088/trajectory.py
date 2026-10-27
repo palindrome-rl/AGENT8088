@@ -1146,6 +1146,38 @@ class TrajectoryState:
         """A program this run wrote was run and finished without an error, at the current state of the work."""
         self.data["ran_ok_at"] = self.mutation_count()
 
+    def status_lines(self) -> list[tuple[str, str]]:
+        """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
+
+        Empty when the session has no task yet."""
+        data = self.data
+        goal = str(data.get("goal") or "").strip()
+        changed = int(data.get("mutation_count") or 0)
+        if not goal and not changed:
+            return []
+        rows: list[tuple[str, str]] = []
+        if goal:
+            rows.append(("Task", goal if len(goal) <= 90 else goal[:89] + "…"))
+        steps = [s for s in data.get("checklist") or [] if s.get("status") != "not_needed"]
+        if steps:
+            done = sum(1 for s in steps if s.get("status") == "done")
+            current = next((s.get("name") for s in steps if s.get("status") != "done"), "")
+            rows.append(("Steps", f"{done} of {len(steps)} done" + (f" · next: {current}" if current else "")))
+        if changed:
+            paths = [PurePath(str(p).replace("\\", "/")).name for p in data.get("written_paths") or []]
+            shown = ", ".join(paths[-4:]) + (f" (+{len(paths) - 4} more)" if len(paths) > 4 else "")
+            rows.append(("Changed", f"{len(paths)} file{'s' if len(paths) != 1 else ''}: {shown}" if paths else f"{changed} change(s)"))
+            rows.append(("Verification", self.assurance() or "nothing changed"))
+        if self.check_failing():
+            rows.append(("Latest check", f"FAILING · {self.failing_check_detail() or 'see the last command'}"))
+        elif failed_smoke := [str(note) for note in data.get("smoke_notes") or [] if "smoke test FAILED" in str(note)]:
+            rows.append(("Latest check", f"FAILING · {failed_smoke[-1]}"))
+        elif int(data.get("passed_checks") or 0):
+            rows.append(("Latest check", f"passed ({int(data.get('passed_checks') or 0)} passing run(s) so far)"))
+        elif changed:
+            rows.append(("Latest check", "none passed yet"))
+        return rows
+
     def assurance(self) -> str:
         """How much the run's own evidence supports calling the changed work done, strongest first:
 

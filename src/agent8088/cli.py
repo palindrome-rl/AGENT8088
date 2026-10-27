@@ -2709,7 +2709,7 @@ COMMAND_SPECS = (
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
     ("sandbox", "/sandbox [auto|native|docker|setup]", "Show or configure command isolation", ()),
-    ("status", "/status", "Show model, context, tool, skill, and session status", ()),
+    ("status", "/status", "Show model, context, tool, skill, session and current-task status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
     ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
     ("local", "/local [check|list|available [query]|pull <name>|remove <name>]", "Probe hardware, show installed Ollama models or browse pullable ones", ()),
@@ -2787,7 +2787,7 @@ COMMAND_DETAILS = {
     "sandbox": "/sandbox shows the sandbox backend, whether it is verified, and its network "
                "access; /sandbox auto|native|docker picks the backend; /sandbox setup installs "
                "the native sandbox runtime.",
-    "status": "Shows the model, context use, tools, skills and session state.",
+    "status": "Shows the model, context use, tools, skills and session state, and the current task: goal, plan steps, changed files, verification level and latest check (read from what was recorded; no model call).",
     "doctor": "/doctor checks the model endpoint, auth and config, tools and skills; /doctor "
               "--fix also repairs a broken web-search install.",
     "review": "/review lists stored reviews; /review --from REF --to REF (or --commit SHA) "
@@ -4245,7 +4245,23 @@ def cmd_status(_):
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
+    for label, value in _task_status_rows():
+        t.add_row(label, Text(value))
     console.print(t)
+
+
+def _task_status_rows():
+    """What the harness recorded about the current task (goal, steps, changed files, verification level, latest check).
+    Read from a copy of the saved state, with no model call, so /status can be asked at any time and never changes the run."""
+    from copy import deepcopy
+    from agent8088.trajectory import TrajectoryState
+    try:
+        state = deepcopy(S.trajectory_state) if isinstance(S.trajectory_state, dict) else {}
+        # Viewing a snapshot is not a new request. The live history contains
+        # tool/assistant messages added after the request's starting count.
+        return TrajectoryState(state, goal="", message_count=int(state.get("message_count") or 0)).status_lines()
+    except Exception:  # noqa: BLE001  a damaged saved state must not break /status
+        return []
 
 
 def _model_status_value(configured):
