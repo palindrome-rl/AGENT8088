@@ -9134,12 +9134,12 @@ BROWSER_HITL = APP_CONFIG.get("browser_hitl", "1").strip().lower() in (
 BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
 # Clamp bounds for the adaptive completion cap (see Agent8088ChatModel):
 # the working cap starts at browser_llm_max_tokens, doubles when a response
-# is cut off by the cap, decays toward ~1.5x observed usage when responses
+# is cut off by the cap, decays toward ~2.5x observed usage when responses
 # finish on their own, and always stays inside
 # [browser_llm_min_tokens, browser_llm_max_completion_tokens]. The floor
 # keeps the first call from failing on a verbose model; the ceiling bounds a
 # pathological loop the adaptation can't see.
-BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 1024)
+BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 2048)
 BROWSER_LLM_MAX_COMPLETION_TOKENS = _int_config(
     "browser_llm_max_completion_tokens", min(16384, MAX_COMPLETION_TOKENS))
 # How the browsing model's structured (action-JSON) calls request their

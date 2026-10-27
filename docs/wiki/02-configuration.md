@@ -234,8 +234,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `browser_hitl` | `1` | Human-in-the-loop interrupts (`ask_human`) for captchas, passwords and user input. |
 | `browser_flash_mode` | `0` | Much smaller system prompt (~2.4 KB vs ~22 KB) and leaner action schema — each step 2-4x faster on a small model. Off by default: A/B it on your model first. |
 | `browser_structured_output_mode` | `auto` | `auto` tries JSON schema then JSON object; `json_object` skips the first attempt — set it for a provider known to ignore schemas (e.g. Ollama Cloud serving GLM). |
-| `browser_llm_max_tokens` | `4096` | Starting completion cap for the browsing model's own calls. Adaptive: doubles when cut off, decays toward ~1.5x actual use. |
-| `browser_llm_min_tokens` | `1024` | Floor for the adaptive cap. |
+| `browser_llm_max_tokens` | `4096` | Starting completion cap for the browsing model's own calls. Adaptive: doubles when cut off at the cap, decays toward ~2.5x actual use, and stays within the configured bounds. |
+| `browser_llm_min_tokens` | `2048` | Floor for the adaptive cap. A lower completion ceiling takes precedence, including on the first request. Explicit floor values remain supported. |
 | `browser_llm_max_completion_tokens` | `16384` | Ceiling for the adaptive cap. |
 | `browser_llm_extra_body` | (empty) | JSON fields sent only to browser-use model calls; use `{"chat_template_kwargs":{"enable_thinking":false}}` for Qwen served by vLLM. |
 
