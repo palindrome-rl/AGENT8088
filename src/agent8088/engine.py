@@ -638,6 +638,11 @@ MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
 # writing a tool call earns a larger cap on its retry (see cap_hint). 0 = always
 # use the provider's full completion limit.
 INITIAL_COMPLETION_CAP = max(0, _config_int("initial_completion_cap", 8192))
+# Unset, the first-call cap, its floor and the thinking-off cap scale with the model's context window
+# (_output_cap_defaults): a reasoning-heavy 27B model spends its first 4-8K tokens thinking, so a
+# fixed 8192 / 4096 gave empty replies and cut-off file writes, while a small context cannot afford more.
+_INITIAL_CAP_SET = str(APP_CONFIG.get("initial_completion_cap", "")).strip() != ""
+_MIN_TOKENS_SET = str(APP_CONFIG.get("main_llm_min_tokens", "")).strip() != ""
 # The cap above is a ceiling. With this on, an ordinary call is capped at twice
 # the median size of the last few normal replies, never below main_llm_min_tokens
 # and never above initial_completion_cap, so a runaway call stops after a few
@@ -663,7 +668,8 @@ REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
 # Completion cap for a call that runs with thinking off (the retry after an empty or
 # reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
 # tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
-THINKING_OFF_MAX_TOKENS = 4096
+THINKING_OFF_MAX_TOKENS = max(1, _config_int("thinking_off_max_tokens", 4096))
+_THINKING_OFF_SET = str(APP_CONFIG.get("thinking_off_max_tokens", "")).strip() != ""
 # A reasoning-only cut-off (the model drafted a large file inside its thinking) tends
 # to repeat on the next calls: in our runs these cost 10-17 minutes per run, about 60%
 # of all cut-off time. After one, this many following ordinary calls also run with
@@ -3118,6 +3124,23 @@ def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
                 "balance": None}
     except (TypeError, ValueError):
         return None
+
+
+def _output_cap_defaults(context: int) -> tuple[int, int, int]:
+    """(first-call cap, floor after a cut-off, cap with thinking off) for a context window.
+
+    Unset, the first-call cap is a quarter of the context, between 2048 and 16384; the floor is half of that
+    (at least 2048) and the thinking-off cap equals the floor. A 32K context gives 8192 / 4096 / 4096, the
+    old fixed values; 64K and above give 16384 / 8192 / 8192. initial_completion_cap, main_llm_min_tokens and
+    thinking_off_max_tokens each override their own value; initial_completion_cap=0 keeps meaning "no cap".
+    """
+    scaled = max(2048, min(16384, int(context or 0) // 4)) if context else 8192
+    first = INITIAL_COMPLETION_CAP if _INITIAL_CAP_SET else scaled
+    floor = MAIN_LLM_MIN_TOKENS if _MIN_TOKENS_SET else max(2048, scaled // 2)
+    if first:
+        floor = min(floor, first)
+    off = THINKING_OFF_MAX_TOKENS if _THINKING_OFF_SET else floor
+    return first, floor, off
 
 
 def _adaptive_first_cap(recent: list, ceiling: int, floor: int) -> int:
@@ -9122,12 +9145,12 @@ BROWSER_HITL = APP_CONFIG.get("browser_hitl", "1").strip().lower() in (
 BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
 # Clamp bounds for the adaptive completion cap (see Agent8088ChatModel):
 # the working cap starts at browser_llm_max_tokens, doubles when a response
-# is cut off by the cap, decays toward ~1.5x observed usage when responses
+# is cut off by the cap, decays toward ~2.5x observed usage when responses
 # finish on their own, and always stays inside
 # [browser_llm_min_tokens, browser_llm_max_completion_tokens]. The floor
 # keeps the first call from failing on a verbose model; the ceiling bounds a
 # pathological loop the adaptation can't see.
-BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 1024)
+BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 2048)
 BROWSER_LLM_MAX_COMPLETION_TOKENS = _int_config(
     "browser_llm_max_completion_tokens", min(16384, MAX_COMPLETION_TOKENS))
 # How the browsing model's structured (action-JSON) calls request their
@@ -18896,6 +18919,51 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
     return _strip_reasoning(message.content or "").strip() or None
 
 
+HOLD_ASK = ("The user has put this session on hold: no tools will run and nothing is executed now. Answer their "
+            "last message in plain text from what already exists in this conversation. Say plainly what is done, "
+            "what is not, and what you would do next if told to continue. Do not call a tool and do not say you "
+            "will run something.")
+FINISH_ASK = ("The user asked you to finish now: no more tools will run. Give your final answer from what already "
+              "exists: what is done and works, what is not done or not verified, and what is broken. Do not claim "
+              "the work is complete or verified unless you saw it pass. Do not ask to continue and do not request "
+              "a tool.")
+
+
+def reply_without_tools(messages, *, kind, trajectory_state=None, system_prompt=None, temperature=0.1,
+                        on_token=None, interrupt_check=None, trace=None, record_ask=None):
+    """The one model call behind a held message (kind="hold") or /finish (kind="finish"): no tools are offered.
+
+    A hold answers the user's last message in text. A finish writes the final answer and adds the harness's own end-of-run
+    notes (verification level, unverified changes, unfinished files, failing check), so the model's summary cannot
+    overrule the evidence. The answer is appended to `messages`; `record_ask` is added first as the user's turn when the
+    conversation does not already end on one (a /finish has no message of its own).
+    """
+    if kind not in {"hold", "finish"}:
+        raise ValueError("kind must be hold or finish")
+    ask = FINISH_ASK if kind == "finish" else HOLD_ASK
+    prompt = system_prompt() if callable(system_prompt) else system_prompt
+    if prompt is None:
+        prompt = compose_system_prompt(specs={}, skills={})
+    answer = _answer_from_context(
+        messages, system_prompt=prompt,
+        temperature=temperature, budget=None, on_token=on_token, interrupt_check=interrupt_check,
+        trace=trace, turn=0, client=None, provider_name=None, model_name=None, ask=ask)
+    answer = _guard_answer(answer or "No answer was produced; the model returned nothing.")
+    if kind == "finish":
+        from copy import deepcopy
+        notes_state = deepcopy(trajectory_state) if isinstance(trajectory_state, dict) else {}
+        # A final report inspects this request; it must not trigger the
+        # constructor's new-request reset from the longer conversation history.
+        run_trajectory = trajectory.TrajectoryState(
+            notes_state, "", int(notes_state.get("message_count") or 0))
+        answer = _with_task_notes(f"{answer}\n\n[Finished early at your request: no further work was done.]",
+                                  run_trajectory, read_only=True)
+    if record_ask and (not messages or messages[-1].get("role") != "user"):
+        messages.append({"role": "user", "content": record_ask})
+    messages.append({"role": "assistant", "content": answer})
+    return answer
+
+
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
@@ -19029,7 +19097,7 @@ def _mirror_redirected_writes(trajectory) -> str:
     return " ".join(parts)
 
 
-def _workspace_note(trajectory) -> str:
+def _workspace_note(trajectory, *, probe_backend: bool = True) -> str:
     """One line saying where this run's output actually is, or "".
 
     Write tools report the file they touched, so those are named exactly. A
@@ -19044,7 +19112,7 @@ def _workspace_note(trajectory) -> str:
         extra = f" (and {len(locations) - 3} more)" if len(locations) > 3 else ""
         return (f"Files written to: {shown}{extra} -- the sandbox workspace, "
                 f"not {PROJECT_ROOT}.")
-    if trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
+    if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
         return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
                 f"with a relative path is there, not under {PROJECT_ROOT}.")
     return ""
@@ -19318,13 +19386,16 @@ def _secrets_step(trajectory, written: list):
 
 
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
-    """The reply says the work is unfinished AND the run shows it (or promised work)."""
+    """The reply says the work is unfinished AND the run shows it (or promised work, or no app yet)."""
     if not completion_checks.admits_unfinished_work(reply):
         return False
     promised = (bool(_CHANGE_REQUEST.search(request))
                 and not completion_checks.is_advice_request(request)
                 and not trajectory.mutation_count())
-    return bool(trajectory.has_open_items() or promised)
+    # A request to build a web app, files written, and no page or server entry among them: the thing asked for does not
+    # exist yet, however tidy the run looks. Without this a "still in progress, I'll continue next" status ended a run
+    # that had written 109 files and no page.
+    return bool(trajectory.has_open_items() or promised or trajectory.no_runnable_app())
 
 
 def _reply_hands_back(trajectory, reply: str, request: str) -> bool:
@@ -19551,17 +19622,25 @@ _ASSURANCE_LINES = {
 }
 
 
-def _with_task_notes(answer: str, trajectory) -> str:
+_NO_AUTOMATED_PASS_SENTENCE = "Changed work was inspected, but no automated verification passed."
+
+
+def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
-    if trajectory is not None and (line := _ASSURANCE_LINES.get(trajectory.assurance())):
-        notes.append(line)
+    assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
+    if assurance_line:
+        notes.append(assurance_line)
     if trajectory is not None and trajectory.needs_verification():
         notes.append("Verification note: changes were made, but no fresh automated "
                      "verification evidence was recorded.")
     elif trajectory is not None and (review := trajectory.review()):
-        notes.append(f"Task-state note: {review}")
+        if assurance_line:
+            # "Verification: exercised ... no test run passed" already says it; say it once.
+            review = review.replace(_NO_AUTOMATED_PASS_SENTENCE, "").strip()
+        if review:
+            notes.append(f"Task-state note: {review}")
     if (trajectory is not None and trajectory.needs_verification()
             and (unmet := trajectory.unmet_review())):
         notes.append(f"Task-state note: {unmet}")
@@ -19571,6 +19650,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(backend_line)
     if trajectory is not None and (backend := trajectory.backend_note()):
         notes.append(f"Not verified: {backend}.")
+    if trajectory is not None and (limit := trajectory.environment_note()):
+        notes.append(f"Not verified: {limit}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):
         notes.append("Not completed: " + "; ".join(open_parts[:6])
                      + ("; ..." if len(open_parts) > 6 else ""))
@@ -19580,9 +19661,10 @@ def _with_task_notes(answer: str, trajectory) -> str:
                      "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
         notes.append(CHECKS_FAILED_NOTE)
-    if mirror_note := _mirror_redirected_writes(trajectory):
+    if not read_only and (mirror_note := _mirror_redirected_writes(trajectory)):
         notes.append(mirror_note)
-    if location_note := _workspace_note(trajectory):
+    location_note = (_workspace_note(trajectory, probe_backend=False) if read_only else _workspace_note(trajectory))
+    if location_note:
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
@@ -20026,14 +20108,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   + len(json.dumps(round_tools_def or [], default=str)))})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
-        normal_cap = (min(turn_completion_limit, INITIAL_COMPLETION_CAP)
-                      if INITIAL_COMPLETION_CAP else turn_completion_limit)
-        if INITIAL_COMPLETION_CAP:
-            normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, MAIN_LLM_MIN_TOKENS)
+        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window)
+        normal_cap = (min(turn_completion_limit, initial_cap)
+                      if initial_cap else turn_completion_limit)
+        if initial_cap:
+            normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, min_tokens)
         turn_max_tokens = (
             normal_cap if not length_retries else
             min(turn_completion_limit,
-                max(MAIN_LLM_MIN_TOKENS, cap_hint, min(turn_completion_limit, 2 * last_call_tokens)))
+                max(min_tokens, cap_hint, min(turn_completion_limit, 2 * last_call_tokens)))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
@@ -20052,9 +20135,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                               "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
         if retry_kwargs and not sticky_only and last_cutoff_kind != "tool_call":
             # Thinking is off for this call, so it only has to write a short answer
-            # or one call: cap it at 4096 (or a lower initial_completion_cap).
-            turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
-                                  INITIAL_COMPLETION_CAP or THINKING_OFF_MAX_TOKENS)
+            # or one call: use the context-scaled/configured thinking-off cap
+            # (or a lower initial completion cap).
+            turn_max_tokens = min(turn_max_tokens, thinking_off_cap,
+                                  initial_cap or thinking_off_cap)
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",

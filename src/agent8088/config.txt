@@ -152,11 +152,11 @@ tool_selection=hybrid
 # browser_llm_max_tokens=4096
 # The completion cap is ADAPTIVE, not fixed: it starts at
 # browser_llm_max_tokens, doubles when a response is cut off by the cap, and
-# decays toward ~1.5x what responses actually use, always clamped inside
+# decays toward ~2.5x what responses actually use, always clamped inside
 # [browser_llm_min_tokens, browser_llm_max_completion_tokens]. So a task
 # that needs more room gets it automatically, and a looping model still
 # fails fast.
-# browser_llm_min_tokens=1024
+# browser_llm_min_tokens=2048
 # browser_llm_max_completion_tokens=16384
 # The step ceiling adapts to the task too: read/extract tasks get half the
 # configured ceiling (a wandering read-only run fails fast instead of
@@ -206,6 +206,14 @@ browser_headless=1
 # Global fallbacks when no per-provider value is set:
 # context_window=32768
 # max_completion_tokens=8192
+# Output caps for the main model. Unset, they follow the context window: the first-call cap is a quarter of it
+# (2048 to 16384), the floor after a cut-off is half of that, and a call with thinking off gets the floor.
+# A 32K context gives 8192 / 4096 / 4096; 64K and larger give 16384 / 8192 / 8192. A model that reasons at length
+# needs the room: at 4-8K it can spend the whole reply thinking and return nothing. Each key overrides its own value
+# (initial_completion_cap=0 means no cap).
+# initial_completion_cap=16384
+# main_llm_min_tokens=8192
+# thinking_off_max_tokens=8192
 # How many document chunks `document_read` action=process keeps in flight.
 # Chunk requests are independent, so this multiplies throughput on a large
 # document almost linearly until the provider starts rate-limiting. Raise it

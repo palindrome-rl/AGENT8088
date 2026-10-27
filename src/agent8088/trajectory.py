@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import shlex
 from copy import deepcopy
@@ -203,8 +204,81 @@ _TRAILING_REDIRECT = re.compile(r"\s*(?:\d?>>?&?\S*)\s*$")
 _SETUP_PROGRAMS = frozenset({"cd", "chdir", "pushd", "echo"})
 
 
+# Asking whether something is installed says nothing about the work either: `where chrome`, `pip show x`,
+# `python -c "import playwright"` and `node -e "require.resolve('playwright')"` fail when the thing is missing and
+# prove nothing when it is there. Only commands made of nothing else count, so any real call keeps the command a check.
+_WHICH_STEP = re.compile(r'^(?:where|which|get-command|gcm)(?:\.exe)?(?:\s+(?:[-\w./\\:*?,]+|"[-\w. /\\:*?,]+"))+\s*$', re.IGNORECASE)
+_PACKAGE_QUERY = re.compile(
+    r"(?:(?:(?:python[\d.]*|py)(?:\.exe)?\s+-m\s+)?pip[\d.]*\s+(?:show|list|freeze|--version|-V)"
+    r"|(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:ls|list|view|info|--version|-v))"
+    r"(?:\s+[-\w.@/\\:=*]+)*\s*", re.IGNORECASE)
+_PY_CODE = re.compile(r"^(?:python[\d.]*|py)(?:\.exe)?\s+-c\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
+_NODE_CODE = re.compile(r"^(?:node|nodejs)(?:\.exe)?\s+(?:-e|-p|--eval|--print)\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+_JS_STRING = r'''(?:'[^'\\\r\n]*'|"[^"\\\r\n]*")'''
+_JS_PACKAGE = r'''(?:'(?:node:)?[A-Za-z@][\w@/-]*'|"(?:node:)?[A-Za-z@][\w@/-]*")'''
+_JS_QUERY = rf'(?:require\.resolve\(\s*{_JS_STRING}\s*\)|require\(\s*{_JS_PACKAGE}\s*\))'
+_JS_LOG = rf'console\.log\(\s*(?:{_JS_STRING}|{_JS_QUERY})(?:\s*,\s*{_JS_STRING})*\s*\)'
+_JS_STEP = rf'(?:{_JS_QUERY}|{_JS_LOG}|process\.exit\(\s*[01]\s*\))'
+_JS_BODY = rf'(?:{_JS_STEP}\s*;?\s*)+'
+_JS_TRY = rf'try\s*\{{\s*{_JS_BODY}\}}\s*catch\s*\(\s*\w+\s*\)\s*\{{\s*{_JS_BODY}\}}'
+_JS_PROBE = re.compile(rf'\s*(?:(?:{_JS_STEP}|{_JS_TRY})\s*;?\s*)+\s*')
+
+
+def _python_availability_code(code: str) -> bool:
+    try:
+        statements = ast.parse(code).body
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    imported = set()
+    for statement in statements:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            if isinstance(statement, ast.ImportFrom) and statement.level:
+                return False
+            for item in statement.names:
+                name = item.asname or item.name.split('.')[0]
+                # A rebound print could be os.remove, eval, or any other call.
+                if name in {'print', '*'}:
+                    return False
+                imported.add(name)
+        elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            if not isinstance(call.func, ast.Name) or call.func.id != 'print' or call.keywords:
+                return False
+            for value in call.args:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    continue
+                if not isinstance(value, (ast.Name, ast.Attribute)):
+                    return False
+                attribute = value.attr if isinstance(value, ast.Attribute) else value.id
+                while isinstance(value, ast.Attribute):
+                    value = value.value
+                if (attribute not in {'__version__', 'version', '__file__'}
+                        or not isinstance(value, ast.Name) or value.id not in imported):
+                    return False
+        else:
+            return False
+    return bool(imported)
+
+
+def _is_availability_step(text: str) -> bool:
+    if _WHICH_STEP.fullmatch(text) or _PACKAGE_QUERY.fullmatch(text):
+        return True
+    python = _PY_CODE.match(text)
+    if python:
+        return _python_availability_code(python.group(2))
+    node = _NODE_CODE.match(text)
+    if node:
+        code = re.sub(r'\s+', ' ', node.group(2)).strip()
+        # Token whitelists permit arbitrary calls through quoted/computed
+        # properties, e.g. require('fs')['writeFileSync'](...). Recognize the
+        # complete, narrow query grammar instead.
+        return bool(_JS_PROBE.fullmatch(code) and re.search(r'\brequire\b', _QUOTED.sub('', code)))
+    return False
+
+
 def _is_probe(command: str) -> bool:
-    """Whether every real step of the command only asks a tool for its version or help text."""
+    """Whether every real step of the command only asks a tool for its version or help text, or whether it is installed."""
     steps = [segment for segment in command_segments(command or "", split_or=True)
              if _segment_program(segment) not in _SETUP_PROGRAMS]
     if not steps:
@@ -216,7 +290,7 @@ def _is_probe(command: str) -> bool:
             if stripped == text:
                 break
             text = stripped
-        if not _PROBE_FLAG.search(text):
+        if not (_PROBE_FLAG.search(text) or _is_availability_step(text)):
             return False
     return True
 
@@ -226,6 +300,42 @@ def _segment_program(segment: str) -> str:
     while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
         words = words[1:]
     return PurePath(words[0].strip("\"'")).name.lower().removesuffix(".exe") if words else ""
+
+
+# A check that could not run because the machine or the sandbox would not let it (no browser could be started, a process
+# could not be spawned) did not fail: it never ran to a result, so the run must not end "the latest check failed ...
+# treat the result as unfinished". It is reported as not verified instead, and a real test failure in the same output
+# keeps it a failure.
+_SPAWN_BLOCKED = re.compile(r"spawn EPERM|EPERM: operation not permitted, spawn", re.IGNORECASE)
+_BROWSER_LAUNCH = re.compile(
+    r"mojo[^\n]*Access is denied|^\s*(?:Error:\s*)?NO\s+CHROM(?:E|IUM)\s*$"
+    r"|Executable doesn't exist at[^\n]*(?:chrome|chromium|msedge)"
+    r"|browserType\.launch:[^\n]*(?:Executable doesn't exist|not found|not installed|Access is denied)",
+    re.IGNORECASE | re.MULTILINE)
+_ACCESS_DENIED = re.compile(r"Access is denied|WinError 5", re.IGNORECASE)
+_BROWSER_WORD = re.compile(r"playwright|puppeteer|chromium|msedge|chrome\.exe|selenium", re.IGNORECASE)
+_REAL_TEST_FAILURE = re.compile(
+    r"\b[1-9]\d*\s+(?:tests?\s+)?failed\b|\b(?:AssertionError|TypeError|ReferenceError|ValueError|SyntaxError|NameError|KeyError)\b"
+    r"|^\s*(?:---\s*)?FAIL\b|^\s*FAILED\s*(?:\(|:|tests?[/\\])|^\s*tests?\s+failed\b",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _environment_limit(result) -> str:
+    """Why a check could not run here ("" when it ran): the sandbox refused to start a process or no browser could be started."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return ""
+    if _SPAWN_BLOCKED.search(text):
+        return "the sandbox did not allow a process to be started"
+    # Access denied for a data file is not evidence of a browser-launch limit,
+    # even if the traceback mentions Playwright elsewhere.
+    targets = re.findall(r'''Access is denied:\s*['"]([^'"\n]+)['"]''', text, re.IGNORECASE)
+    denied_browser = all(re.search(r'(?:chrome|chromium|msedge)(?:\.exe)?$', p, re.IGNORECASE) for p in targets)
+    transport = re.search(r'playwright[/\\][^\n]*_transport\.py|puppeteer[^\n]*(?:launch|BrowserLauncher)', text, re.IGNORECASE)
+    if (_BROWSER_LAUNCH.search(text)
+            or (_ACCESS_DENIED.search(text) and denied_browser and (transport or (targets and _BROWSER_WORD.search(text))))):
+        return "no browser could be started here"
+    return ""
 
 
 def _is_check_run(command: str) -> bool:
@@ -304,6 +414,105 @@ def _without_trailing_clause(text: str) -> str:
                 return before.strip()
             return text
     return text
+
+
+# A test script the run wrote for itself (`node battle_test.js`) usually ends with its own pass line, not a runner summary with
+# counts, so detect_verdict reads it as unknown and the run ended "exercised ... no test run passed" over a battle test that
+# passed. The line has to name tests or checks and say they passed; anything that looks like a failure anywhere in the output
+# keeps it unknown.
+_OWN_PASS_LINE = re.compile(
+    r"^[^\w?\r\n]*(?:all\s+)?(?:tests?|checks?|assertions?|specs?|e2e(?:\s+tests?)?)\s*[:=-]?\s*(?:all\s+)?"
+    r"(?:passed|succeeded|successful|ok)[.!✓✅]*$", re.IGNORECASE)
+_FAILURE_WORDS = re.compile(
+    r"\b(?:fail(?:ed|ure|ures|s)?|errors?|exceptions?|traceback|assertionerror|skipped|incomplete|"
+    r"not\s+(?:ok|passed|verified|successful|run|tested))\b", re.IGNORECASE)
+_ZERO_TESTS = re.compile(r"\b(?:0\s+(?:tests?|checks?|assertions?|specs?)|no\s+(?:tests|checks|assertions|specs)\s+ran)\b", re.IGNORECASE)
+_OUTPUT_WRAPPER = re.compile(
+    r"(?:<<<EXTERNAL_UNTRUSTED_CONTENT\b.*>>>|<<<END_UNTRUSTED_CONTENT>>>|Command exited with status 0\.?)",
+    re.IGNORECASE)
+
+
+def _own_script_ran(command: str, written, workspace: str) -> bool:
+    """Require one literal script invocation, optionally preceded by directory changes.
+
+    A basename appearing in an echo, inline program, another directory, pipeline
+    or compound command is not evidence that the run's written script passed.
+    """
+    chain = _check_chain(command, original=False)
+    if not chain:
+        return False
+
+    def absolute(path):
+        return posixpath.isabs(path) or bool(re.match(r"^[A-Za-z]:/", path))
+
+    cwd = workspace.replace("\\", "/")
+    for words in chain[:-1]:
+        if words[0].lower() not in {"cd", "chdir", "pushd"}:
+            return False
+        args = words[1:]
+        if args[:1] == ["/d"]:
+            args = args[1:]
+        if len(args) != 1:
+            return False
+        directory = args[0].replace("\\", "/")
+        if not absolute(directory) and not cwd:
+            return False
+        cwd = posixpath.normpath(directory if absolute(directory) else posixpath.join(cwd, directory))
+    words = chain[-1]
+    program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    if not re.fullmatch(r"python[\d.]*|py|node|nodejs|bun|ruby|php|perl|bash|sh|ts-node|tsx|deno|go|java|dotnet|pwsh|powershell", program):
+        return False
+    args = words[1:]
+    if program in {"go", "deno"}:
+        if args[:1] != ["run"]:
+            return False
+        args = args[1:]
+    elif program in {"pwsh", "powershell"}:
+        while args and args[0].lower() in {"-noprofile", "-noninteractive"}:
+            args = args[1:]
+        if not args or args[0].lower() != "-file":
+            return False
+        args = args[1:]
+    while args and args[0] in {"-u", "-B", "-E", "-s", "-S", "--no-warnings"}:
+        args = args[1:]
+    if (not args or args[0].startswith("-")
+            or any(arg in {"--help", "-h", "--version", "-V", "--collect-only", "--list-tests"} for arg in args[1:])):
+        return False
+    script = args[0].replace("\\", "/")
+    if re.search(r"[*?\[\]{}~]", script + cwd):
+        return False
+    if not absolute(script):
+        if cwd:
+            script = posixpath.join(cwd, script)
+        else:
+            # Legacy states lack a workspace. Accept only a bare filename,
+            # never a path that could name another directory's copy.
+            return ("/" not in script and sum(
+                posixpath.basename(str(path).replace("\\", "/")) == script for path in written or []) == 1)
+    script = posixpath.normpath(script)
+    for path in written or []:
+        target = str(path).replace("\\", "/")
+        if not absolute(target):
+            if not workspace:
+                continue
+            target = posixpath.join(workspace.replace("\\", "/"), target)
+        if script == posixpath.normpath(target):
+            return True
+    return False
+
+
+def _own_script_passed(command: str, result: str, written, workspace: str = "") -> bool:
+    """Whether the run's own test script ran and ended on a clear pass line with no failure anywhere in its output."""
+    if not command or not _own_script_ran(command, written, workspace):
+        return False
+    text = str(result or "")
+    # Inspect the complete output before removing transport wrappers. A line
+    # prefixed '[agent8088]' or resembling a wrapper can still contain a failure.
+    if (_FAILURE_WORDS.search(text) or _ZERO_TESTS.search(text) or _RUN_FAILED_RE.search(text)
+            or re.search(r"Command exited with status (?!0\b)-?\d+|timed out|cancelled|canceled", text, re.IGNORECASE)):
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not _OUTPUT_WRAPPER.fullmatch(ln.strip())]
+    return any(_OWN_PASS_LINE.fullmatch(ln) for ln in lines[-3:])
 
 
 def _same_command(a: str, b: str) -> bool:
@@ -480,6 +689,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "reference_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
+        "env_limits": [],
         "check_failing": False,
         "failing_check": "",
         "failing_nudges": 0,
@@ -492,6 +702,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_failures": 0,
         "smoke_checked": {},
         "smoke_passed_at": {},
+        "inspected_by_page_check": None,
         "smoke_unverified": {},
         "backend_asked": [],
         "backend_check": {},
@@ -595,6 +806,9 @@ class TrajectoryState:
             self.data["research_used"] = True
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
+        if (operation["verdict"] == "unknown" and operation["status"] == "done" and operation["tool"] == "execute_shell"
+                and _own_script_passed(command, result, self.data.get("written_paths"), self.data.get("workspace", ""))):
+            operation["verdict"] = "passed"
         if operation["status"] == "done":
             self._set_step("Inspect the current state", "done")
             self.data["consecutive_setbacks"] = 0
@@ -640,9 +854,26 @@ class TrajectoryState:
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
         written_now = self.data.get("written_paths")
+        probe_only = _is_probe(command) and not _REAL_TEST_FAILURE.search(str(result))
+        limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
+        if (limit and not probe_only
+                and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
+            self._note_environment_limit(command, limit)
+        elif (command and not _environment_limit(result)
+              and (operation["verdict"] in {"passed", "failed"}
+                   or (operation["status"] == "done" and not _TRACEBACK.search(str(result))
+                       and not _RUN_FAILED_RE.search(str(result))))
+              and not _SANDBOX_BLOCKED.search(str(result))):
+            # The same check has now reached a result (passing or failing).
+            # Do not leave an earlier 'could not run' note beside it.
+            notes = self.data.get("env_limits") or []
+            notes[:] = [n for n in notes if not (
+                " ".join(str(n.get("command") or n.get("what") or "").split()) == " ".join(command.split())
+                or _revised_command(n.get("command") or n.get("what"), command))]
         if (operation["verdict"] == "failed"
+                and not limit
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
-                and not _is_probe(command)
+                and not probe_only
                 and not _SANDBOX_BLOCKED.search(str(result))
                 and not _wrong_place_failure(command, result, written_now)):
             self.data["check_failing"] = True
@@ -685,19 +916,27 @@ class TrajectoryState:
             scratch = bool(path) and _is_scratch_path(path, self.data.get("workspace", ""))
             if not scratch:
                 self.data["verification"] = "pending"
+                self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
-            if self.needs_verification():
+            # A passing test run after the last change verifies it, whether the work was still pending or had only been
+            # read back or run since (inspected). Only pending counted before, so a read-back or a page check ahead of
+            # the tests kept the level at "inspected" however many tests passed afterwards.
+            if self.data.get("verification") in ("pending", "inspected"):
                 self.data["verification"] = "verified"
+                self.data["inspected_by_page_check"] = None
                 self._set_step("Verify changed work", "done")
-        elif (self.needs_verification() and operation["status"] == "done"
+        elif ((self.needs_verification() or (self.data.get("verification") == "inspected"
+                                            and self.data.get("inspected_by_page_check") == self.mutation_count()))
+              and operation["status"] == "done" and operation["verdict"] != "failed"
               and not mutated and operation["tool"] in {"read_text", "execute_shell", "git_diff"}
               and self._touches_changed_work(operation["tool"], path, command)):
             self.data["verification"] = "inspected"
+            self.data["inspected_by_page_check"] = None
             self._set_step("Verify changed work", "inspected")
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
@@ -936,8 +1175,26 @@ class TrajectoryState:
         passed_at = self.data.setdefault("smoke_passed_at", {})
         if passed and not failed and not unverified:
             passed_at[path] = self.mutation_count()
+            if self.needs_verification():
+                # The changed work was loaded or run on its latest state without an error: that is evidence, and the level
+                # already reads "exercised" for it. Leaving the work "pending" made the footer add "no fresh automated
+                # verification evidence was recorded" under a line saying it was exercised, and kept the verify reminder
+                # going. It stays below "verified": only a passing test run makes the work that.
+                self.data["verification"] = "inspected"
+                self.data["inspected_by_page_check"] = self.mutation_count()
+                self._set_step("Verify changed work", "inspected")
+                self.data["evidence"].append({"tool": "check_app", "result": _text(summary)})
+                del self.data["evidence"][:-MAX_EVIDENCE]
         else:
             passed_at.pop(path, None)
+            if (self.data.get("inspected_by_page_check") == self.mutation_count()
+                    and self.data.get("verification") == "inspected"
+                    and not any(at == self.mutation_count() for at in passed_at.values())):
+                # The pass that cleared "pending" no longer stands (a newer result for it failed or could not verify),
+                # and nothing else passed on this state of the work: it is unchecked again.
+                self.data["verification"] = "pending"
+                self.data["inspected_by_page_check"] = None
+                self._set_step("Verify changed work", "pending")
         if output:
             # Raw start-up output of a failed script check, for diagnosis. Kept out of
             # the notes the model and the person read; bounded to the last few files.
@@ -1042,6 +1299,41 @@ class TrajectoryState:
     def note_ran_ok(self) -> None:
         """A program this run wrote was run and finished without an error, at the current state of the work."""
         self.data["ran_ok_at"] = self.mutation_count()
+        # Independent successful execution still supports inspection if a
+        # previously passing page check is later superseded.
+        self.data["inspected_by_page_check"] = None
+
+    def status_lines(self) -> list[tuple[str, str]]:
+        """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
+
+        Empty when the session has no task yet."""
+        data = self.data
+        goal = str(data.get("goal") or "").strip()
+        changed = int(data.get("mutation_count") or 0)
+        if not goal and not changed:
+            return []
+        rows: list[tuple[str, str]] = []
+        if goal:
+            rows.append(("Task", goal if len(goal) <= 90 else goal[:89] + "…"))
+        steps = [s for s in data.get("checklist") or [] if s.get("status") != "not_needed"]
+        if steps:
+            done = sum(1 for s in steps if s.get("status") == "done")
+            current = next((s.get("name") for s in steps if s.get("status") != "done"), "")
+            rows.append(("Steps", f"{done} of {len(steps)} done" + (f" · next: {current}" if current else "")))
+        if changed:
+            paths = [PurePath(str(p).replace("\\", "/")).name for p in data.get("written_paths") or []]
+            shown = ", ".join(paths[-4:]) + (f" (+{len(paths) - 4} more)" if len(paths) > 4 else "")
+            rows.append(("Changed", f"{len(paths)} file{'s' if len(paths) != 1 else ''}: {shown}" if paths else f"{changed} change(s)"))
+            rows.append(("Verification", self.assurance() or "nothing changed"))
+        if self.check_failing():
+            rows.append(("Latest check", f"FAILING · {self.failing_check_detail() or 'see the last command'}"))
+        elif failed_smoke := [str(note) for note in data.get("smoke_notes") or [] if "smoke test FAILED" in str(note)]:
+            rows.append(("Latest check", f"FAILING · {failed_smoke[-1]}"))
+        elif int(data.get("passed_checks") or 0):
+            rows.append(("Latest check", f"passed ({int(data.get('passed_checks') or 0)} passing run(s) so far)"))
+        elif changed:
+            rows.append(("Latest check", "none passed yet"))
+        return rows
 
     def assurance(self) -> str:
         """How much the run's own evidence supports calling the changed work done, strongest first:
@@ -1144,6 +1436,20 @@ class TrajectoryState:
             return ""
         return ("the page calls its own server or a local service (" + ", ".join(names[:3]) + "), which the page check "
                 "cannot run or reach, so how the page behaves with it was not verified")
+
+    def _note_environment_limit(self, command: str, reason: str) -> None:
+        what = " ".join(_command_core(command).split())[:80]
+        notes = self.data.setdefault("env_limits", [])
+        if not any(n.get("reason") == reason and n.get("what") == what for n in notes):
+            notes.append({"reason": reason, "what": what, "command": " ".join(command.split())})
+            del notes[:-3]
+
+    def environment_note(self) -> str:
+        """What could not be checked because of the machine or the sandbox, for the end-of-run notes."""
+        notes = self.data.get("env_limits") or []
+        if not notes:
+            return ""
+        return "; ".join(f"{n['reason']} (so `{n['what']}` did not run to a result)" for n in notes[-2:])
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
