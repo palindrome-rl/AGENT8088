@@ -18878,6 +18878,43 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
     return _strip_reasoning(message.content or "").strip() or None
 
 
+HOLD_ASK = ("The user has put this session on hold: no tools will run and nothing is executed now. Answer their "
+            "last message in plain text from what already exists in this conversation. Say plainly what is done, "
+            "what is not, and what you would do next if told to continue. Do not call a tool and do not say you "
+            "will run something.")
+FINISH_ASK = ("The user asked you to finish now: no more tools will run. Give your final answer from what already "
+              "exists: what is done and works, what is not done or not verified, and what is broken. Do not claim "
+              "the work is complete or verified unless you saw it pass. Do not ask to continue and do not request "
+              "a tool.")
+
+
+def reply_without_tools(messages, *, kind, trajectory_state=None, system_prompt=None, temperature=0.1,
+                        on_token=None, interrupt_check=None, trace=None, record_ask=None):
+    """The one model call behind a held message (kind="hold") or /finish (kind="finish"): no tools are offered.
+
+    A hold answers the user's last message in text. A finish writes the final answer and adds the harness's own end-of-run
+    notes (verification level, unverified changes, unfinished files, failing check), so the model's summary cannot
+    overrule the evidence. The answer is appended to `messages`; `record_ask` is added first as the user's turn when the
+    conversation does not already end on one (a /finish has no message of its own).
+    """
+    ask = FINISH_ASK if kind == "finish" else HOLD_ASK
+    answer = _answer_from_context(
+        messages, system_prompt=(system_prompt() if callable(system_prompt) else system_prompt),
+        temperature=temperature, budget=None, on_token=on_token, interrupt_check=interrupt_check,
+        trace=trace, turn=0, client=None, provider_name=None, model_name=None, ask=ask)
+    answer = _guard_answer(answer or "No answer was produced; the model returned nothing.")
+    if kind == "finish":
+        from copy import deepcopy
+        notes_state = deepcopy(trajectory_state) if isinstance(trajectory_state, dict) else {}
+        run_trajectory = trajectory.TrajectoryState(notes_state, str(notes_state.get("goal") or ""), len(messages),
+                                                    workspace=str(PROJECT_ROOT))
+        answer = _with_task_notes(f"{answer}\n\n[Finished early at your request: no further work was done.]", run_trajectory)
+    if record_ask and (not messages or messages[-1].get("role") != "user"):
+        messages.append({"role": "user", "content": record_ask})
+    messages.append({"role": "assistant", "content": answer})
+    return answer
+
+
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.

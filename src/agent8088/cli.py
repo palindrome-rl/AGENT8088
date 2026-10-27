@@ -286,6 +286,7 @@ class Session:
         config = A.APP_CONFIG
         self.messages = []
         self.trajectory_state = {}
+        self.hold = False  # /hold: tools are off and replies are text only until /continue
         try:
             self.temperature = float(config.get("temperature", "0.1"))
         except ValueError:
@@ -501,6 +502,7 @@ def build_session_data(name, previous=None):
         "updated_at": now,
         "messages": S.messages,
         "trajectory_state": S.trajectory_state,
+        "hold": S.hold,
         "temperature": S.temperature,
         "max_turns": S.max_turns,
         "show_trace": S.show_trace,
@@ -2452,6 +2454,9 @@ def do_chat(query):
     _ensure_autosave_session(query)
     _warn_pasted_credential(query)
     S.messages.append({"role": "user", "content": query})
+    if S.hold:
+        _answer_on_hold()
+        return
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
@@ -2718,7 +2723,10 @@ COMMAND_SPECS = (
     ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
     ("new", "/new <name>", "Create a named persistent session", ()),
     ("sessions", "/sessions", "List named sessions", ()),
-    ("resume", "/resume <name>", "Load a named session", ()),
+    ("resume", "/resume [name]", "Load a named session; with no name, release a /hold", ()),
+    ("hold", "/hold", "Stop executing: no tools run and replies are text only until /continue", ()),
+    ("continue", "/continue", "Release a /hold and let the agent work again", ()),
+    ("finish", "/finish", "Wind up now: no more tools, a final answer with the verification verdict", ()),
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
@@ -2808,7 +2816,10 @@ COMMAND_DETAILS = {
             "(edit is an alias for full-auto). Plan mode is started with /plan, not /mode.",
     "new": "/new <name> creates a named session that is saved and can be resumed later.",
     "sessions": "Lists named sessions, newest first, with their message counts.",
-    "resume": "/resume <name> loads a named session (see /sessions).",
+    "resume": "/resume <name> loads a named session (see /sessions); /resume with no name releases a /hold, like /continue.",
+    "hold": "/hold puts the session on hold: tools are not offered and nothing is executed, replies are text only, so you can ask for an update or a question. It lasts until /continue (or /resume with no name) or /finish, and is saved with the session.",
+    "continue": "/continue releases a /hold; the next message runs normally with all tools.",
+    "finish": "/finish asks the model for a final answer now with no tools, and adds the harness notes: verification level, unverified changes, unfinished files and any failing check. It does not run or fix anything, and it ends the hold.",
     "reset": "Clears the current conversation, asking first if it has messages, and keeps the "
              "session name.",
     "compact": "/compact [keep] summarizes older messages and keeps the newest <keep> (default "
@@ -6080,6 +6091,7 @@ def cmd_new(rest):
     _save_active_session()
     S.messages.clear()
     S.trajectory_state.clear()
+    S.hold = False
     S.last_trace = None
     S.last_usage = None
     S.name = name
@@ -6116,6 +6128,9 @@ def cmd_sessions(_):
 
 
 def cmd_resume(rest):
+    if not rest.strip() and S.hold:
+        cmd_continue("")
+        return
     try:
         name = _session_name(rest)
     except ValueError as exc:
@@ -6138,6 +6153,7 @@ def cmd_resume(rest):
     S.messages[:] = messages
     S.trajectory_state = (data.get("trajectory_state", {})
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
+    S.hold = bool(data.get("hold", False))
     S.name = name
     S.temperature = float(data.get("temperature", 0.1))
     # Fall back to what this session already has, not to a literal: a session
@@ -6165,6 +6181,7 @@ def cmd_reset(_):
         return
     S.messages.clear()
     S.trajectory_state.clear()
+    S.hold = False
     S.last_trace = None
     S.conversation_trace.clear()
     S.trace_path = ""
@@ -6375,6 +6392,64 @@ def cmd_temp(rest):
     S.temperature = value
     console.print(f"temperature = [#237dd7]{S.temperature}[/#237dd7]")
     _save_preferences()
+
+
+def _answer_on_hold():
+    """One text-only model call for a message sent while the session is on hold. No tool is offered, so nothing can run."""
+    try:
+        with console.status("thinking (on hold)...", spinner="dots"):
+            answer = A.reply_without_tools(S.messages, kind="hold", trajectory_state=S.trajectory_state,
+                                           system_prompt=_session_system_prompt, temperature=S.temperature)
+    except KeyboardInterrupt:
+        console.print("[dim]⏹ interrupted[/dim]")
+        _save_session_safely()
+        return
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]could not answer on hold:[/red] {exc}")
+        _save_session_safely()
+        return
+    render_answer(answer)
+    console.print("[dim]on hold: no tools ran. /continue to resume, /finish to wrap up[/dim]")
+    _save_session_safely()
+
+
+def cmd_hold(_):
+    if S.hold:
+        console.print("[dim]already on hold: /continue to resume, /finish to wrap up[/dim]")
+        return
+    S.hold = True
+    console.print("[#237dd7]on hold[/#237dd7]: tools will not run and replies are text only. "
+                  "[dim]/continue to resume · /finish to wrap up · /status for where things stand[/dim]")
+    _save_session_safely()
+
+
+def cmd_continue(_):
+    if not S.hold:
+        console.print("[dim]not on hold[/dim]")
+        return
+    S.hold = False
+    console.print("[#237dd7]resumed[/#237dd7]: the next message runs normally.")
+    _save_session_safely()
+
+
+def cmd_finish(_):
+    if not S.messages:
+        console.print("[dim]nothing to finish: no request in this session yet[/dim]")
+        return
+    try:
+        with console.status("wrapping up (no tools)...", spinner="dots"):
+            answer = A.reply_without_tools(S.messages, kind="finish", trajectory_state=S.trajectory_state,
+                                           system_prompt=_session_system_prompt, temperature=S.temperature,
+                                           record_ask="/finish")
+    except KeyboardInterrupt:
+        console.print("[dim]⏹ interrupted[/dim]")
+        return
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]could not finish:[/red] {exc}")
+        return
+    S.hold = False
+    render_answer(answer)
+    _save_session_safely()
 
 
 def cmd_maxturns(rest):
@@ -7281,6 +7356,7 @@ COMMANDS = {
     "local": cmd_local,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
+    "hold": cmd_hold, "continue": cmd_continue, "finish": cmd_finish,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "thoughts": cmd_thoughts,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
