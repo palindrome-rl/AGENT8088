@@ -20058,7 +20058,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                               "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
         if retry_kwargs and not sticky_only and last_cutoff_kind != "tool_call":
             # Thinking is off for this call, so it only has to write a short answer
-            # or one call: cap it at 4096 (or a lower initial_completion_cap).
+            # or one call: use the context-scaled/configured thinking-off cap
+            # (or a lower initial completion cap).
             turn_max_tokens = min(turn_max_tokens, thinking_off_cap,
                                   initial_cap or thinking_off_cap)
         if length_retries and trace is not None:
