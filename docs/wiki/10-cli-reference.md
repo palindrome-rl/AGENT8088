@@ -150,7 +150,10 @@ sensitive-file floor still applies unconditionally.
 | `/help` | List all commands |
 | `/new [name]` | Start a fresh session, optionally named |
 | `/sessions` | List saved named sessions |
-| `/resume <name>` | Reload a named session (restores skill state too) |
+| `/resume [name]` | Reload a named session, including its hold and skill state. With no name, release a hold; otherwise show usage. |
+| `/hold` | Hold the session: subsequent chat replies use no tools, execution-capable commands are blocked and new attachments are not processed until released. The hold is saved with the session. |
+| `/continue` | Release a hold; the next message can run normally. |
+| `/finish` | Request a text-only final answer with the recorded verification, unfinished-work and failure notes. Does not run checks, copy outputs or repair anything. Releases the hold. |
 | `/reset` | Clear the current conversation |
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
@@ -158,6 +161,13 @@ sensitive-file floor still applies unconditionally.
 | `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
+
+While held, reporting and session controls such as `/status`, `/history`,
+`/help`, `/resume`, `/new` and `/reset` remain available. Use `/continue` before
+commands that execute tools, launch tasks or change runtime setup. A fresh
+session starts unheld. These commands are processed between turns: interrupt
+an in-flight turn first (ESC in the CLI, Stop in the Web UI). They do not kill
+an already-running external process or cancel independent background tasks.
 
 ### Model
 

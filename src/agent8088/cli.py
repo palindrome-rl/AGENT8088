@@ -596,6 +596,8 @@ def _active_skills(session=None):
 
 
 def _active_tool_specs(session=None):
+    if getattr(session or S, "hold", False):
+        return {}
     skill_tools = {tool for skill in A.SKILL_PACKAGES.values()
                    for tool in skill.get("tools", {})}
     active_skill_tools = {tool for skill in _active_skills(session).values()
@@ -2454,7 +2456,7 @@ def do_chat(query):
     _ensure_autosave_session(query)
     _warn_pasted_credential(query)
     S.messages.append({"role": "user", "content": query})
-    if S.hold:
+    if getattr(S, "hold", False):
         _answer_on_hold()
         return
     # Filled by the capture thread via the engine hook; read back on this thread.
@@ -3176,6 +3178,8 @@ def cmd_cli_anything(rest):
 
 def cmd_task(rest):
     """Start, resume, or inspect a restart-safe model task."""
+    if _refuse_held_execution():
+        return
     from agent8088.task_runtime import TaskStore, run_task, store_path
     store = TaskStore(A.APP_CONFIG.get("task_db_path") or store_path(A.CONFIG_PATH))
     parts = (rest or "").strip().split(None, 1)
@@ -3589,6 +3593,8 @@ def cmd_agents(rest):
 
 
 def cmd_tool(rest):
+    if _refuse_held_execution():
+        return
     parts = rest.split(None, 1)
     if parts and parts[0] == 'describe':
         console.print(Text(A.describe_tool(parts[1] if len(parts) > 1 else '', _active_tool_specs())))
@@ -3854,6 +3860,8 @@ def _detect_pasted_file(line: str):
 
 
 def _handle_pasted_file(path, question, original=None):
+    if getattr(S, "hold", False):
+        return False
     # `original` is the line as typed. A text file's instruction is that line
     # with the path still in it: cutting it out turned "grep … artifacts/t.html"
     # into a grep with no file. Images keep the split — cmd_image gets the path.
@@ -6434,6 +6442,9 @@ def cmd_continue(_):
 
 def cmd_finish(_):
     if not S.messages:
+        if S.hold:
+            S.hold = False
+            _save_session_safely()
         console.print("[dim]nothing to finish: no request in this session yet[/dim]")
         return
     try:
@@ -10207,9 +10218,26 @@ def _first_run_check():
 # fight an interactive picker, so only these get one.
 _SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
 
+# Only reporting and session controls remain available while held. Commands
+# that can run tools, start durable tasks, repair/install, or read attachments
+# require the user to release the hold explicitly first.
+_HOLD_COMMANDS = frozenset({"help", "status", "hold", "continue", "finish", "resume", "sessions",
+                            "new", "reset", "history", "trace", "thoughts"})
+
+
+def _refuse_held_execution() -> bool:
+    if not getattr(S, "hold", False):
+        return False
+    console.print("[dim]on hold: no execution. Use /continue before running this command; /status is available.[/dim]")
+    return True
+
 
 def _run_repl_command(handler, rest, name=""):
     try:
+        command = name or next((key for key, value in COMMANDS.items() if value is handler), "")
+        if getattr(S, "hold", False) and command not in _HOLD_COMMANDS:
+            _refuse_held_execution()
+            return
         with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
             handler(rest)
     except KeyboardInterrupt:
@@ -10260,7 +10288,7 @@ def _repl_turns():
             else:
                 console.print(_unknown_command_message(cmd))
             continue
-        pasted = _detect_pasted_file(line)
+        pasted = None if getattr(S, "hold", False) else _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:
