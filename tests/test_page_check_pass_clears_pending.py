@@ -167,3 +167,36 @@ def test_a_test_that_passed_before_the_last_edit_does_not_verify_it():
     _edit(state)
     _read_back(state)
     assert state.data["verification"] == "inspected" and state.assurance() == "inspected"
+
+
+def test_a_superseded_page_pass_keeps_independent_read_back_evidence(engine):
+    state = _state()
+    _edit(state)
+    _page_check(state)
+    _read_back(state)
+    state.record_smoke(PAGE, 'index.html: could not verify', failed=False, unverified=True)
+    assert not state.needs_verification()
+    assert state.assurance() == 'inspected'
+    assert not any('no fresh automated verification evidence' in line for line in _footer(engine, state))
+
+
+def test_a_superseded_page_pass_keeps_a_successful_script_run(engine):
+    state = _state()
+    _edit(state)
+    _page_check(state)
+    state.note_ran_ok()
+    operation = state.before_tool('execute_shell')
+    state.after_tool(operation, 'ready', failed=False, blocked=False, mutated=False, command='node app.js')
+    state.record_smoke(PAGE, 'index.html: could not verify', failed=False, unverified=True)
+    assert not state.needs_verification() and state.assurance() == 'exercised'
+    assert not any('no fresh automated verification evidence' in line for line in _footer(engine, state))
+
+
+def test_a_failed_read_does_not_supply_independent_inspection():
+    state = _state()
+    _edit(state)
+    _page_check(state)
+    operation = state.before_tool('read_text')
+    state.after_tool(operation, 'Error: denied', failed=False, blocked=False, mutated=False, verdict='failed', path=APP)
+    state.record_smoke(PAGE, 'index.html: could not verify', failed=False, unverified=True)
+    assert state.needs_verification()

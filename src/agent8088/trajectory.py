@@ -789,6 +789,7 @@ class TrajectoryState:
             scratch = bool(path) and _is_scratch_path(path, self.data.get("workspace", ""))
             if not scratch:
                 self.data["verification"] = "pending"
+                self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
         if operation["verdict"] == "passed":
@@ -800,11 +801,15 @@ class TrajectoryState:
             # the tests kept the level at "inspected" however many tests passed afterwards.
             if self.data.get("verification") in ("pending", "inspected"):
                 self.data["verification"] = "verified"
+                self.data["inspected_by_page_check"] = None
                 self._set_step("Verify changed work", "done")
-        elif (self.needs_verification() and operation["status"] == "done"
+        elif ((self.needs_verification() or (self.data.get("verification") == "inspected"
+                                            and self.data.get("inspected_by_page_check") == self.mutation_count()))
+              and operation["status"] == "done" and operation["verdict"] != "failed"
               and not mutated and operation["tool"] in {"read_text", "execute_shell", "git_diff"}
               and self._touches_changed_work(operation["tool"], path, command)):
             self.data["verification"] = "inspected"
+            self.data["inspected_by_page_check"] = None
             self._set_step("Verify changed work", "inspected")
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
@@ -1167,6 +1172,9 @@ class TrajectoryState:
     def note_ran_ok(self) -> None:
         """A program this run wrote was run and finished without an error, at the current state of the work."""
         self.data["ran_ok_at"] = self.mutation_count()
+        # Independent successful execution still supports inspection if a
+        # previously passing page check is later superseded.
+        self.data["inspected_by_page_check"] = None
 
     def status_lines(self) -> list[tuple[str, str]]:
         """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
