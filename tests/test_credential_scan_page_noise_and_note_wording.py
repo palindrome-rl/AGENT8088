@@ -26,13 +26,13 @@ def test_page_and_script_noise_is_not_a_credential(text):
 
 
 @pytest.mark.parametrize("text", [
-    "api_key=9f86d081884c7d659a2feaa0c55ad015",
-    "token=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146",
-    "secret = Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg",
+    "api_key=9f86d081884c7d659a2feaa0c55ad015",  # gitleaks:allow -- fabricated scanner fixture
+    "token=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146",  # gitleaks:allow -- fabricated scanner fixture
+    "secret = Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg",  # gitleaks:allow -- fabricated scanner fixture
     "key sk-proj-abcdefghijklmnopqrstuvwx1234567890",
     "v=Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg",                    # only hex is excused behind v=
     "agent=Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg/1.0",
-    "%7Cpassword=Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg",           # an escape in front does not hide the key
+    "%7Cpassword=Xk9fQ2mZp7LwR4tYb8NcV3hJd6sA1eUg",  # gitleaks:allow -- fabricated scanner fixture
 ])
 def test_real_looking_keys_are_still_reported(text):
     assert _masked(text)
@@ -74,11 +74,11 @@ def test_without_an_assurance_line_the_sentence_stays(engine):
 @pytest.mark.parametrize('text', [
     'Abc9Xq7Lp4Vm2Ns8Rt5Zu0Yd3Kf6Gh1W/1.0',
     'User-Agent: Abc9Xq7Lp4Vm2Ns8Rt5Zu0Yd3Kf6Gh1W/1.0',
-    'key=Abc9Xq%41Vm2Ns8Rt5Zu',
+    'key=Abc9Xq%41Vm2Ns8Rt5Zu',  # gitleaks:allow -- fabricated scanner fixture
     'v=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146',
     'version=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146',
-    '//example.com/api?token=Abc9Xq%41Vm2Ns8Rt5Zu',
-    '/api/data?api_key=Abc9Xq%41Vm2Ns8Rt5Zu',
+    '//example.com/api?token=Abc9Xq%41Vm2Ns8Rt5Zu',  # gitleaks:allow -- fabricated scanner fixture
+    '/api/data?api_key=Abc9Xq%41Vm2Ns8Rt5Zu',  # gitleaks:allow -- fabricated scanner fixture
     'api_key=agent8088-demo/1.0',
 ])
 def test_noise_exemptions_do_not_hide_credential_shapes(text):
