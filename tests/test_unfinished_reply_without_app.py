@@ -63,3 +63,35 @@ def test_open_items_still_count_as_before(engine):
     state.data["verification"] = "pending"
     assert state.has_open_items()
     assert engine._reply_admits_unfinished(state, UNFINISHED, REQUEST)
+
+
+def test_missing_app_continuation_uses_existing_budget_and_records_exhaustion(engine):
+    state = _state()
+    budget = engine.completion_checks.ContinuationBudget(limit=2)
+    for _ in range(2):
+        nudge = engine._next_completion_nudge(
+            budget, state, reply=UNFINISHED, request=REQUEST, depth=0)
+        assert nudge.kind == "unfinished"
+        assert "Continue the task now" in nudge.text
+    assert engine._next_completion_nudge(
+        budget, state, reply=UNFINISHED, request=REQUEST, depth=0) is None
+    assert budget.total == 2
+    assert "the reply says the work is unfinished" in state.data["unmet_checks"]
+
+
+def test_disabled_completion_checks_do_not_continue_missing_app(engine):
+    budget = engine.completion_checks.ContinuationBudget(limit=0)
+    assert engine._next_completion_nudge(
+        budget, _state(), reply=UNFINISHED, request=REQUEST, depth=0) is None
+    assert budget.total == 0
+
+
+def test_report_only_records_unfinished_missing_app_without_spending_budget(engine, monkeypatch):
+    state = _state()
+    budget = engine.completion_checks.ContinuationBudget(limit=2)
+    monkeypatch.setattr(engine, "COMPLETION_SMOKE_TEST", "off")
+    monkeypatch.setattr(engine, "_missing_required_files", lambda *_a: [])
+    reasons = engine._record_unmet_checks(
+        budget, state, reply=UNFINISHED, request=REQUEST, depth=0)
+    assert "the reply says the work is unfinished" in reasons
+    assert budget.total == 0
