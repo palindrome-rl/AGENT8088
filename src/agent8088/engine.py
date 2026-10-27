@@ -638,6 +638,11 @@ MAIN_LLM_MIN_TOKENS = max(1, _config_int("main_llm_min_tokens", 4096))
 # writing a tool call earns a larger cap on its retry (see cap_hint). 0 = always
 # use the provider's full completion limit.
 INITIAL_COMPLETION_CAP = max(0, _config_int("initial_completion_cap", 8192))
+# Unset, the first-call cap, its floor and the thinking-off cap scale with the model's context window
+# (_output_cap_defaults): a reasoning-heavy 27B model spends its first 4-8K tokens thinking, so a
+# fixed 8192 / 4096 gave empty replies and cut-off file writes, while a small context cannot afford more.
+_INITIAL_CAP_SET = str(APP_CONFIG.get("initial_completion_cap", "")).strip() != ""
+_MIN_TOKENS_SET = str(APP_CONFIG.get("main_llm_min_tokens", "")).strip() != ""
 # The cap above is a ceiling. With this on, an ordinary call is capped at twice
 # the median size of the last few normal replies, never below main_llm_min_tokens
 # and never above initial_completion_cap, so a runaway call stops after a few
@@ -663,7 +668,8 @@ REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
 # Completion cap for a call that runs with thinking off (the retry after an empty or
 # reasoning-heavy cut-off). Without reasoning it only needs room for an answer or one
 # tool call. A growing tool call that was cut off is exempt: it keeps its cap_hint.
-THINKING_OFF_MAX_TOKENS = 4096
+THINKING_OFF_MAX_TOKENS = max(1, _config_int("thinking_off_max_tokens", 4096))
+_THINKING_OFF_SET = str(APP_CONFIG.get("thinking_off_max_tokens", "")).strip() != ""
 # A reasoning-only cut-off (the model drafted a large file inside its thinking) tends
 # to repeat on the next calls: in our runs these cost 10-17 minutes per run, about 60%
 # of all cut-off time. After one, this many following ordinary calls also run with
@@ -3107,6 +3113,23 @@ def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
                 "balance": None}
     except (TypeError, ValueError):
         return None
+
+
+def _output_cap_defaults(context: int) -> tuple[int, int, int]:
+    """(first-call cap, floor after a cut-off, cap with thinking off) for a context window.
+
+    Unset, the first-call cap is a quarter of the context, between 2048 and 16384; the floor is half of that
+    (at least 2048) and the thinking-off cap equals the floor. A 32K context gives 8192 / 4096 / 4096, the
+    old fixed values; 64K and above give 16384 / 8192 / 8192. initial_completion_cap, main_llm_min_tokens and
+    thinking_off_max_tokens each override their own value; initial_completion_cap=0 keeps meaning "no cap".
+    """
+    scaled = max(2048, min(16384, int(context or 0) // 4)) if context else 8192
+    first = INITIAL_COMPLETION_CAP if _INITIAL_CAP_SET else scaled
+    floor = MAIN_LLM_MIN_TOKENS if _MIN_TOKENS_SET else max(2048, scaled // 2)
+    if first:
+        floor = min(floor, first)
+    off = THINKING_OFF_MAX_TOKENS if _THINKING_OFF_SET else floor
+    return first, floor, off
 
 
 def _adaptive_first_cap(recent: list, ceiling: int, floor: int) -> int:
@@ -20008,14 +20031,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   + len(json.dumps(round_tools_def or [], default=str)))})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
-        normal_cap = (min(turn_completion_limit, INITIAL_COMPLETION_CAP)
-                      if INITIAL_COMPLETION_CAP else turn_completion_limit)
-        if INITIAL_COMPLETION_CAP:
-            normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, MAIN_LLM_MIN_TOKENS)
+        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window)
+        normal_cap = (min(turn_completion_limit, initial_cap)
+                      if initial_cap else turn_completion_limit)
+        if initial_cap:
+            normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, min_tokens)
         turn_max_tokens = (
             normal_cap if not length_retries else
             min(turn_completion_limit,
-                max(MAIN_LLM_MIN_TOKENS, cap_hint, min(turn_completion_limit, 2 * last_call_tokens)))
+                max(min_tokens, cap_hint, min(turn_completion_limit, 2 * last_call_tokens)))
         )
         if length_retries and LENGTH_RETRY_MAX_TOKENS:
             turn_max_tokens = min(turn_max_tokens, LENGTH_RETRY_MAX_TOKENS)
@@ -20034,9 +20058,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                               "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
         if retry_kwargs and not sticky_only and last_cutoff_kind != "tool_call":
             # Thinking is off for this call, so it only has to write a short answer
-            # or one call: cap it at 4096 (or a lower initial_completion_cap).
-            turn_max_tokens = min(turn_max_tokens, THINKING_OFF_MAX_TOKENS,
-                                  INITIAL_COMPLETION_CAP or THINKING_OFF_MAX_TOKENS)
+            # or one call: use the context-scaled/configured thinking-off cap
+            # (or a lower initial completion cap).
+            turn_max_tokens = min(turn_max_tokens, thinking_off_cap,
+                                  initial_cap or thinking_off_cap)
         if length_retries and trace is not None:
             trace.append({"turn": turn, "type": "retry_mode",
                           "mode": "reduced_thinking" if retry_kwargs else "small_cap",

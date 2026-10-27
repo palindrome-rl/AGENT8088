@@ -2,6 +2,15 @@
 with thinking off from the first cut-off; a growing tool call keeps thinking on
 and its larger cap; a prose loop keeps today's behaviour.
 """
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fixed_output_caps(engine, monkeypatch):
+    """These tests are about the retry ladder at the old fixed caps (8192 / 4096 / 4096); the context-scaled defaults have their own tests."""
+    for flag in ("_INITIAL_CAP_SET", "_MIN_TOKENS_SET", "_THINKING_OFF_SET"):
+        monkeypatch.setattr(engine, flag, True)
+
 
 
 def _length_response(content, reasoning=""):
@@ -43,7 +52,7 @@ def test_first_empty_cutoff_retries_with_thinking_off(monkeypatch, engine):
     calls = _run_two_calls(monkeypatch, engine, lambda mt: _length_response(""))
 
     assert calls[1]["thinking"] == "length_retry"
-    assert calls[1]["max"] <= engine.THINKING_OFF_MAX_TOKENS
+    assert calls[1]["max"] <= engine._output_cap_defaults(engine._active_model_token_limits()[0])[2]
     assert "call one tool or answer right away" in calls[1]["nudge"].lower()
 
 
