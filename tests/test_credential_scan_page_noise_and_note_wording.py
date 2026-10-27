@@ -69,3 +69,22 @@ def test_without_an_assurance_line_the_sentence_stays(engine):
     state.data["smoke_passed_at"] = {}
     assert state.assurance() == "inspected"
     assert "no automated verification passed" in engine._with_task_notes("Built it.", state)
+
+
+@pytest.mark.parametrize('text', [
+    'Abc9Xq7Lp4Vm2Ns8Rt5Zu0Yd3Kf6Gh1W/1.0',
+    'User-Agent: Abc9Xq7Lp4Vm2Ns8Rt5Zu0Yd3Kf6Gh1W/1.0',
+    'key=Abc9Xq%41Vm2Ns8Rt5Zu',
+    'v=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146',
+    'version=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146',
+    '//example.com/api?token=Abc9Xq%41Vm2Ns8Rt5Zu',
+    '/api/data?api_key=Abc9Xq%41Vm2Ns8Rt5Zu',
+    'api_key=agent8088-demo/1.0',
+])
+def test_noise_exemptions_do_not_hide_credential_shapes(text):
+    assert ss.find_secrets(text)
+
+
+def test_cache_version_exemption_keeps_other_query_credentials():
+    text = '/static/app.js?token=Abc9Xq7Lp4Vm2Ns8Rt5Zu0Yd3Kf6Gh1W&v=c0e0ed65d7a4b3f1e2a9c8b7a6d5e4f30146'
+    assert ss.find_secrets(text)
