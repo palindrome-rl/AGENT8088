@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import shlex
 from copy import deepcopy
@@ -306,6 +307,105 @@ def _without_trailing_clause(text: str) -> str:
     return text
 
 
+# A test script the run wrote for itself (`node battle_test.js`) usually ends with its own pass line, not a runner summary with
+# counts, so detect_verdict reads it as unknown and the run ended "exercised ... no test run passed" over a battle test that
+# passed. The line has to name tests or checks and say they passed; anything that looks like a failure anywhere in the output
+# keeps it unknown.
+_OWN_PASS_LINE = re.compile(
+    r"^[^\w?\r\n]*(?:all\s+)?(?:tests?|checks?|assertions?|specs?|e2e(?:\s+tests?)?)\s*[:=-]?\s*(?:all\s+)?"
+    r"(?:passed|succeeded|successful|ok)[.!✓✅]*$", re.IGNORECASE)
+_FAILURE_WORDS = re.compile(
+    r"\b(?:fail(?:ed|ure|ures|s)?|errors?|exceptions?|traceback|assertionerror|skipped|incomplete|"
+    r"not\s+(?:ok|passed|verified|successful|run|tested))\b", re.IGNORECASE)
+_ZERO_TESTS = re.compile(r"\b(?:0\s+(?:tests?|checks?|assertions?|specs?)|no\s+(?:tests|checks|assertions|specs)\s+ran)\b", re.IGNORECASE)
+_OUTPUT_WRAPPER = re.compile(
+    r"(?:<<<EXTERNAL_UNTRUSTED_CONTENT\b.*>>>|<<<END_UNTRUSTED_CONTENT>>>|Command exited with status 0\.?)",
+    re.IGNORECASE)
+
+
+def _own_script_ran(command: str, written, workspace: str) -> bool:
+    """Require one literal script invocation, optionally preceded by directory changes.
+
+    A basename appearing in an echo, inline program, another directory, pipeline
+    or compound command is not evidence that the run's written script passed.
+    """
+    chain = _check_chain(command, original=False)
+    if not chain:
+        return False
+
+    def absolute(path):
+        return posixpath.isabs(path) or bool(re.match(r"^[A-Za-z]:/", path))
+
+    cwd = workspace.replace("\\", "/")
+    for words in chain[:-1]:
+        if words[0].lower() not in {"cd", "chdir", "pushd"}:
+            return False
+        args = words[1:]
+        if args[:1] == ["/d"]:
+            args = args[1:]
+        if len(args) != 1:
+            return False
+        directory = args[0].replace("\\", "/")
+        if not absolute(directory) and not cwd:
+            return False
+        cwd = posixpath.normpath(directory if absolute(directory) else posixpath.join(cwd, directory))
+    words = chain[-1]
+    program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+    if not re.fullmatch(r"python[\d.]*|py|node|nodejs|bun|ruby|php|perl|bash|sh|ts-node|tsx|deno|go|java|dotnet|pwsh|powershell", program):
+        return False
+    args = words[1:]
+    if program in {"go", "deno"}:
+        if args[:1] != ["run"]:
+            return False
+        args = args[1:]
+    elif program in {"pwsh", "powershell"}:
+        while args and args[0].lower() in {"-noprofile", "-noninteractive"}:
+            args = args[1:]
+        if not args or args[0].lower() != "-file":
+            return False
+        args = args[1:]
+    while args and args[0] in {"-u", "-B", "-E", "-s", "-S", "--no-warnings"}:
+        args = args[1:]
+    if (not args or args[0].startswith("-")
+            or any(arg in {"--help", "-h", "--version", "-V", "--collect-only", "--list-tests"} for arg in args[1:])):
+        return False
+    script = args[0].replace("\\", "/")
+    if re.search(r"[*?\[\]{}~]", script + cwd):
+        return False
+    if not absolute(script):
+        if cwd:
+            script = posixpath.join(cwd, script)
+        else:
+            # Legacy states lack a workspace. Accept only a bare filename,
+            # never a path that could name another directory's copy.
+            return ("/" not in script and sum(
+                posixpath.basename(str(path).replace("\\", "/")) == script for path in written or []) == 1)
+    script = posixpath.normpath(script)
+    for path in written or []:
+        target = str(path).replace("\\", "/")
+        if not absolute(target):
+            if not workspace:
+                continue
+            target = posixpath.join(workspace.replace("\\", "/"), target)
+        if script == posixpath.normpath(target):
+            return True
+    return False
+
+
+def _own_script_passed(command: str, result: str, written, workspace: str = "") -> bool:
+    """Whether the run's own test script ran and ended on a clear pass line with no failure anywhere in its output."""
+    if not command or not _own_script_ran(command, written, workspace):
+        return False
+    text = str(result or "")
+    # Inspect the complete output before removing transport wrappers. A line
+    # prefixed '[agent8088]' or resembling a wrapper can still contain a failure.
+    if (_FAILURE_WORDS.search(text) or _ZERO_TESTS.search(text) or _RUN_FAILED_RE.search(text)
+            or re.search(r"Command exited with status (?!0\b)-?\d+|timed out|cancelled|canceled", text, re.IGNORECASE)):
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not _OUTPUT_WRAPPER.fullmatch(ln.strip())]
+    return any(_OWN_PASS_LINE.fullmatch(ln) for ln in lines[-3:])
+
+
 def _same_command(a: str, b: str) -> bool:
     """Whether `b` is the command `a` that failed, run again.
 
@@ -595,6 +695,9 @@ class TrajectoryState:
             self.data["research_used"] = True
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
+        if (operation["verdict"] == "unknown" and operation["status"] == "done" and operation["tool"] == "execute_shell"
+                and _own_script_passed(command, result, self.data.get("written_paths"), self.data.get("workspace", ""))):
+            operation["verdict"] = "passed"
         if operation["status"] == "done":
             self._set_step("Inspect the current state", "done")
             self.data["consecutive_setbacks"] = 0
