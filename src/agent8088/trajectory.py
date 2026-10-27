@@ -702,6 +702,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "smoke_failures": 0,
         "smoke_checked": {},
         "smoke_passed_at": {},
+        "inspected_by_page_check": None,
         "smoke_unverified": {},
         "backend_asked": [],
         "backend_check": {},
@@ -915,19 +916,27 @@ class TrajectoryState:
             scratch = bool(path) and _is_scratch_path(path, self.data.get("workspace", ""))
             if not scratch:
                 self.data["verification"] = "pending"
+                self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
-            if self.needs_verification():
+            # A passing test run after the last change verifies it, whether the work was still pending or had only been
+            # read back or run since (inspected). Only pending counted before, so a read-back or a page check ahead of
+            # the tests kept the level at "inspected" however many tests passed afterwards.
+            if self.data.get("verification") in ("pending", "inspected"):
                 self.data["verification"] = "verified"
+                self.data["inspected_by_page_check"] = None
                 self._set_step("Verify changed work", "done")
-        elif (self.needs_verification() and operation["status"] == "done"
+        elif ((self.needs_verification() or (self.data.get("verification") == "inspected"
+                                            and self.data.get("inspected_by_page_check") == self.mutation_count()))
+              and operation["status"] == "done" and operation["verdict"] != "failed"
               and not mutated and operation["tool"] in {"read_text", "execute_shell", "git_diff"}
               and self._touches_changed_work(operation["tool"], path, command)):
             self.data["verification"] = "inspected"
+            self.data["inspected_by_page_check"] = None
             self._set_step("Verify changed work", "inspected")
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
@@ -1166,8 +1175,26 @@ class TrajectoryState:
         passed_at = self.data.setdefault("smoke_passed_at", {})
         if passed and not failed and not unverified:
             passed_at[path] = self.mutation_count()
+            if self.needs_verification():
+                # The changed work was loaded or run on its latest state without an error: that is evidence, and the level
+                # already reads "exercised" for it. Leaving the work "pending" made the footer add "no fresh automated
+                # verification evidence was recorded" under a line saying it was exercised, and kept the verify reminder
+                # going. It stays below "verified": only a passing test run makes the work that.
+                self.data["verification"] = "inspected"
+                self.data["inspected_by_page_check"] = self.mutation_count()
+                self._set_step("Verify changed work", "inspected")
+                self.data["evidence"].append({"tool": "check_app", "result": _text(summary)})
+                del self.data["evidence"][:-MAX_EVIDENCE]
         else:
             passed_at.pop(path, None)
+            if (self.data.get("inspected_by_page_check") == self.mutation_count()
+                    and self.data.get("verification") == "inspected"
+                    and not any(at == self.mutation_count() for at in passed_at.values())):
+                # The pass that cleared "pending" no longer stands (a newer result for it failed or could not verify),
+                # and nothing else passed on this state of the work: it is unchecked again.
+                self.data["verification"] = "pending"
+                self.data["inspected_by_page_check"] = None
+                self._set_step("Verify changed work", "pending")
         if output:
             # Raw start-up output of a failed script check, for diagnosis. Kept out of
             # the notes the model and the person read; bounded to the last few files.
@@ -1272,6 +1299,9 @@ class TrajectoryState:
     def note_ran_ok(self) -> None:
         """A program this run wrote was run and finished without an error, at the current state of the work."""
         self.data["ran_ok_at"] = self.mutation_count()
+        # Independent successful execution still supports inspection if a
+        # previously passing page check is later superseded.
+        self.data["inspected_by_page_check"] = None
 
     def status_lines(self) -> list[tuple[str, str]]:
         """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
