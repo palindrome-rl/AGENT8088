@@ -887,6 +887,27 @@ def _final_line(output: str) -> str:
     return lines[-1] if lines else ""
 
 
+_MISSING_MODULE = re.compile(
+    r"ModuleNotFoundError: No module named ['\"]([\w.]+)['\"]|Error: Cannot find module ['\"]([A-Za-z@][\w./@-]*)['\"]")
+
+
+def _missing_installed_module(output: str, path: Path) -> str:
+    """The third-party package the check's interpreter lacks, or "".
+
+    The check starts the script with its own python or node, which may not be the one the script was written for
+    (a virtualenv, another install). A missing package then says nothing about the script. A module that is a
+    sibling file or folder of the script is the script's own import, and stays a crash."""
+    match = _MISSING_MODULE.search(_SANDBOX_NOTE.sub("", output))
+    name = (match.group(1) or match.group(2)) if match else ""
+    if not name:
+        return ""
+    top = name.split(".")[0] if match.group(1) else name.split("/")[0]
+    folder = path.parent
+    if any((folder / (top + suffix)).exists() for suffix in ("", ".py", ".js", ".mjs", ".cjs")):
+        return ""
+    return name
+
+
 def _run_briefly(path: Path, run: Callable[[str, int], str],
                  unavailable: list[str] | None = None,
                  captured: list[str] | None = None,
@@ -920,6 +941,11 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
         if captured is not None:
             captured.append(clip_output(output))
         final = _final_line(_SANDBOX_NOTE.sub("", output))
+        missing = _missing_installed_module(output, path)
+        if soft is not None and missing:
+            soft.append(f"the interpreter this check uses has no module '{missing}', so the script could not be started here"
+                        "; whether it works was not verified")
+            return []
         if soft is not None and ((not crashed) or _ENVIRONMENT_FINAL.search(final)):
             status = exited.group(1) if exited else "?"
             soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
