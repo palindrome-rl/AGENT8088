@@ -19576,6 +19576,8 @@ def _with_task_notes(answer: str, trajectory) -> str:
         notes.append(backend_line)
     if trajectory is not None and (backend := trajectory.backend_note()):
         notes.append(f"Not verified: {backend}.")
+    if trajectory is not None and (limit := trajectory.environment_note()):
+        notes.append(f"Not verified: {limit}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):
         notes.append("Not completed: " + "; ".join(open_parts[:6])
                      + ("; ..." if len(open_parts) > 6 else ""))

@@ -204,8 +204,42 @@ _TRAILING_REDIRECT = re.compile(r"\s*(?:\d?>>?&?\S*)\s*$")
 _SETUP_PROGRAMS = frozenset({"cd", "chdir", "pushd", "echo"})
 
 
+# Asking whether something is installed says nothing about the work either: `where chrome`, `pip show x`,
+# `python -c "import playwright"` and `node -e "require.resolve('playwright')"` fail when the thing is missing and
+# prove nothing when it is there. Only commands made of nothing else count, so any real call keeps the command a check.
+_WHICH_STEP = re.compile(r"^(?:where|which|get-command|gcm)(?:\.exe)?\s+\S+", re.IGNORECASE)
+_PACKAGE_QUERY = re.compile(
+    r"^(?:(?:python[\d.]*|py)(?:\.exe)?\s+-m\s+)?pip[\d.]*\s+(?:show|list|freeze|--version|-V)\b"
+    r"|^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:ls|list|view|info|--version|-v)\b", re.IGNORECASE)
+_PY_CODE = re.compile(r"^(?:python[\d.]*|py)(?:\.exe)?\s+-c\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
+_NODE_CODE = re.compile(r"^(?:node|nodejs)(?:\.exe)?\s+(?:-e|-p|--eval|--print)\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
+_PY_IMPORT_CLAUSE = re.compile(
+    r"^(?:import\s+[\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*"
+    r"|from\s+[\w.]+\s+import\s+[\w.*, ]+"
+    r"|print\((?:'[^']*'|\"[^\"]*\"|[\w.]*__version__|[\w.]*\.version|[\w.]*__file__|\s|,)*\))$")
+_NODE_PROBE_WORDS = frozenset({"try", "catch", "e", "err", "require", "resolve", "console", "log", "process", "exit",
+                               "version", "versions", "node"})
+_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _is_availability_step(text: str) -> bool:
+    if _WHICH_STEP.match(text) or _PACKAGE_QUERY.match(text):
+        return True
+    python = _PY_CODE.match(text)
+    if python:
+        clauses = [c.strip() for c in re.split(r"[;\n]", python.group(2)) if c.strip()]
+        return bool(clauses) and any(c.startswith(("import ", "from ")) for c in clauses) \
+            and all(_PY_IMPORT_CLAUSE.match(c) for c in clauses)
+    node = _NODE_CODE.match(text)
+    if node:
+        code = _QUOTED.sub("", node.group(2))
+        words = set(re.findall(r"[A-Za-z_$][\w$]*", code))
+        return "require" in words and words <= _NODE_PROBE_WORDS
+    return False
+
+
 def _is_probe(command: str) -> bool:
-    """Whether every real step of the command only asks a tool for its version or help text."""
+    """Whether every real step of the command only asks a tool for its version or help text, or whether it is installed."""
     steps = [segment for segment in command_segments(command or "", split_or=True)
              if _segment_program(segment) not in _SETUP_PROGRAMS]
     if not steps:
@@ -217,7 +251,7 @@ def _is_probe(command: str) -> bool:
             if stripped == text:
                 break
             text = stripped
-        if not _PROBE_FLAG.search(text):
+        if not (_PROBE_FLAG.search(text) or _is_availability_step(text)):
             return False
     return True
 
@@ -227,6 +261,31 @@ def _segment_program(segment: str) -> str:
     while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
         words = words[1:]
     return PurePath(words[0].strip("\"'")).name.lower().removesuffix(".exe") if words else ""
+
+
+# A check that could not run because the machine or the sandbox would not let it (no browser could be started, a process
+# could not be spawned) did not fail: it never ran to a result, so the run must not end "the latest check failed ...
+# treat the result as unfinished". It is reported as not verified instead, and a real test failure in the same output
+# keeps it a failure.
+_SPAWN_BLOCKED = re.compile(r"spawn EPERM|EPERM: operation not permitted, spawn", re.IGNORECASE)
+_BROWSER_LAUNCH = re.compile(
+    r"mojo[^\n]*Access is denied|Executable doesn't exist at|browserType\.launch|Failed to launch[^\n]*(?:browser|chrom)"
+    r"|\bno\s+chrom(?:e|ium)\b", re.IGNORECASE)
+_ACCESS_DENIED = re.compile(r"Access is denied|WinError 5", re.IGNORECASE)
+_BROWSER_WORD = re.compile(r"playwright|puppeteer|chromium|msedge|chrome\.exe|selenium", re.IGNORECASE)
+_REAL_TEST_FAILURE = re.compile(r"\b[1-9]\d*\s+(?:tests?\s+)?failed\b|AssertionError|^\s*(?:---\s*)?FAIL\b", re.IGNORECASE | re.MULTILINE)
+
+
+def _environment_limit(result) -> str:
+    """Why a check could not run here ("" when it ran): the sandbox refused to start a process or no browser could be started."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return ""
+    if _SPAWN_BLOCKED.search(text):
+        return "the sandbox did not allow a process to be started"
+    if _BROWSER_LAUNCH.search(text) or (_ACCESS_DENIED.search(text) and _BROWSER_WORD.search(text)):
+        return "no browser could be started here"
+    return ""
 
 
 def _is_check_run(command: str) -> bool:
@@ -580,6 +639,7 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "reference_paths": [],
         "tests_requested": False,
         "passed_checks": 0,
+        "env_limits": [],
         "check_failing": False,
         "failing_check": "",
         "failing_nudges": 0,
@@ -743,7 +803,12 @@ class TrajectoryState:
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
         written_now = self.data.get("written_paths")
+        limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
+        if (limit and not _is_probe(command)
+                and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
+            self._note_environment_limit(command, limit)
         if (operation["verdict"] == "failed"
+                and not limit
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
                 and not _is_probe(command)
                 and not _SANDBOX_BLOCKED.search(str(result))
@@ -1247,6 +1312,20 @@ class TrajectoryState:
             return ""
         return ("the page calls its own server or a local service (" + ", ".join(names[:3]) + "), which the page check "
                 "cannot run or reach, so how the page behaves with it was not verified")
+
+    def _note_environment_limit(self, command: str, reason: str) -> None:
+        what = " ".join(_command_core(command).split())[:80]
+        notes = self.data.setdefault("env_limits", [])
+        if not any(n.get("reason") == reason and n.get("what") == what for n in notes):
+            notes.append({"reason": reason, "what": what})
+            del notes[:-3]
+
+    def environment_note(self) -> str:
+        """What could not be checked because of the machine or the sandbox, for the end-of-run notes."""
+        notes = self.data.get("env_limits") or []
+        if not notes:
+            return ""
+        return "; ".join(f"{n['reason']} (so `{n['what']}` did not run to a result)" for n in notes[-2:])
 
     def check_failing(self) -> bool:
         """True until a subsequent passing check resolves the latest failure."""
