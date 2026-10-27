@@ -1641,6 +1641,33 @@ def _shell_fetches_web(command: str) -> bool:
     return _shell_web_urls(command) is not None
 
 
+def _is_local_url(url: str) -> bool:
+    """A URL on this machine or a private network (localhost, 127.x, ::1, 10.x, 172.16-31.x, 192.168.x).
+
+    Judged by the host as written: "localhost.example.com" and "127.0.0.1.evil.com" are not local."""
+    import ipaddress
+    host = (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
+
+
+def _shell_fetches_remote_web(command: str) -> bool:
+    """A shell command that fetches from the web: fetch-shaped with no explicit URL, or with any non-local URL.
+
+    A curl to localhost:11434 (the local model server) or a dev server on the machine is a service call, not research."""
+    urls = _shell_web_urls(command)
+    if urls is None:
+        return False
+    return not urls or not all(_is_local_url(url) for url in urls)
+
+
 # Commands that name a web client without running it: lookups, text search,
 # printing. Everything else that names one is treated as running it.
 _WEB_MENTION_LOOKUPS = frozenset([
@@ -18200,7 +18227,7 @@ def _is_fetch_followup(messages, name: str, args: dict) -> bool:
                     or _user_requested_tool(messages, name))
     if name == "execute_shell":
         command = str(args.get("command") or "")
-        return _shell_fetches_web(command) and not _user_requested_tool(
+        return _shell_fetches_remote_web(command) and not _user_requested_tool(
             messages, "execute_shell")
     if (TOOL_SPECS.get(name) or {}).get("mode") == "mcp":
         return bool(_MCP_FETCH_NAME.search(name)) and not _user_requested_tool(
