@@ -7,6 +7,13 @@ the same unchanged budget, which just reproduces the same failure.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _fixed_output_caps(engine, monkeypatch):
+    """These tests are about the retry ladder at the old fixed caps (8192 / 4096 / 4096); the context-scaled defaults have their own tests."""
+    for flag in ("_INITIAL_CAP_SET", "_MIN_TOKENS_SET", "_THINKING_OFF_SET"):
+        monkeypatch.setattr(engine, flag, True)
+
+
 def _length_response(content):
     return type("R", (), {"choices": [type("C", (), {
         "message": type("M", (), {"content": content})(),
@@ -87,8 +94,9 @@ def test_retry_after_length_cutoff_gets_a_small_adaptive_cap(monkeypatch, engine
     # source the engine uses, or this test only passes when the probe happens
     # to agree with the defaults.
     context_window, completion_limit = engine._active_model_token_limits()
-    assert calls[0] == min(completion_limit, engine.INITIAL_COMPLETION_CAP)
-    assert calls[1] == min(completion_limit, engine.MAIN_LLM_MIN_TOKENS)  # the floor
+    first_cap, floor, _ = engine._output_cap_defaults(context_window)   # unset caps follow the context window
+    assert calls[0] == min(completion_limit, first_cap)
+    assert calls[1] == min(completion_limit, floor)  # the floor
 
 
 @pytest.mark.parametrize("ctx,comp", [("1048576", "131072"), ("262144", "32768")])
