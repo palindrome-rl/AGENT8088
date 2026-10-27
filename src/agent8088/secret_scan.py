@@ -81,7 +81,13 @@ _PATHY_RE = re.compile(r"^(?:\.{0,2}/|~/)|[A-Za-z0-9_-]\.[a-z]{1,5}$")
 # A product and its version, the shape of every User-Agent part: HarborWatch/1.0, Chrome/118.0.0.0,
 # Python-urllib/3.11. The name is words, so a random-looking key with a trailing /5.0 does not match.
 _PRODUCT_VERSION_RE = re.compile(
-    r"[A-Za-z][A-Za-z_-]{2,}[0-9]{0,2}/v?[0-9]+(?:\.[0-9]+){0,3}(?:[-+][\w.]+)?")
+    r"[A-Za-z]{3,}[\w-]*/v?[0-9]+(?:\.[0-9]+){0,3}(?:[-+][\w.]+)?")
+# A cache-busting version in a link (?v=c0e0ed65d7a4...), which saved web pages are full of: the name says what it is,
+# and only hex is excused, so v=<random mixed-case key> and token=<hex> are still reported.
+_VERSION_PARAM_RE = re.compile(r"(?:v|ver|version|rev|build|cb)=[0-9A-Fa-f]{6,64}")
+# %7C and its kind: the escapes of a URL that carries no scheme (//fonts.googleapis.com/css?family=A%7CB), which would
+# otherwise be cut at every % into pieces that look like keys.
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 # Plain words joined by slashes, plus signs, dashes or dots: "moves/items/partners", "application/xhtml+xml",
 # "atkMult/defMult". No digit, and every part is letters with at most two capitals (a word, a Capitalised
 # word or lowerCamel). A random key has digits, or about half its letters in capitals.
@@ -250,7 +256,7 @@ def _is_noise(token: str) -> bool:
         return True
     if _PATHY_RE.search(token):
         return True
-    if _PRODUCT_VERSION_RE.fullmatch(token):
+    if _PRODUCT_VERSION_RE.fullmatch(token) or _VERSION_PARAM_RE.fullmatch(token):
         return True
     if token.lower() in _HASHISH_WORDS:
         return True
@@ -277,7 +283,7 @@ def find_secrets(text: str) -> list:
 
     # The opaque-string pass judges what is left once URLs are taken out: a percent-encoded address would
     # otherwise be cut at every "%" into pieces that no longer look like part of a URL.
-    for raw in _TOKEN_SPLIT_RE.split(_URL_TEXT_RE.sub(" ", text)):
+    for raw in _TOKEN_SPLIT_RE.split(_PERCENT_ESCAPE_RE.sub(" ", _URL_TEXT_RE.sub(" ", text))):
         token = raw.strip(_EDGE_PUNCT)
         if len(token) < _MIN_MIXED or token in seen or _is_noise(token):
             continue
