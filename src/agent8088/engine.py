@@ -18901,6 +18901,51 @@ def _answer_from_context(messages, *, system_prompt, temperature, budget, on_tok
     return _strip_reasoning(message.content or "").strip() or None
 
 
+HOLD_ASK = ("The user has put this session on hold: no tools will run and nothing is executed now. Answer their "
+            "last message in plain text from what already exists in this conversation. Say plainly what is done, "
+            "what is not, and what you would do next if told to continue. Do not call a tool and do not say you "
+            "will run something.")
+FINISH_ASK = ("The user asked you to finish now: no more tools will run. Give your final answer from what already "
+              "exists: what is done and works, what is not done or not verified, and what is broken. Do not claim "
+              "the work is complete or verified unless you saw it pass. Do not ask to continue and do not request "
+              "a tool.")
+
+
+def reply_without_tools(messages, *, kind, trajectory_state=None, system_prompt=None, temperature=0.1,
+                        on_token=None, interrupt_check=None, trace=None, record_ask=None):
+    """The one model call behind a held message (kind="hold") or /finish (kind="finish"): no tools are offered.
+
+    A hold answers the user's last message in text. A finish writes the final answer and adds the harness's own end-of-run
+    notes (verification level, unverified changes, unfinished files, failing check), so the model's summary cannot
+    overrule the evidence. The answer is appended to `messages`; `record_ask` is added first as the user's turn when the
+    conversation does not already end on one (a /finish has no message of its own).
+    """
+    if kind not in {"hold", "finish"}:
+        raise ValueError("kind must be hold or finish")
+    ask = FINISH_ASK if kind == "finish" else HOLD_ASK
+    prompt = system_prompt() if callable(system_prompt) else system_prompt
+    if prompt is None:
+        prompt = compose_system_prompt(specs={}, skills={})
+    answer = _answer_from_context(
+        messages, system_prompt=prompt,
+        temperature=temperature, budget=None, on_token=on_token, interrupt_check=interrupt_check,
+        trace=trace, turn=0, client=None, provider_name=None, model_name=None, ask=ask)
+    answer = _guard_answer(answer or "No answer was produced; the model returned nothing.")
+    if kind == "finish":
+        from copy import deepcopy
+        notes_state = deepcopy(trajectory_state) if isinstance(trajectory_state, dict) else {}
+        # A final report inspects this request; it must not trigger the
+        # constructor's new-request reset from the longer conversation history.
+        run_trajectory = trajectory.TrajectoryState(
+            notes_state, "", int(notes_state.get("message_count") or 0))
+        answer = _with_task_notes(f"{answer}\n\n[Finished early at your request: no further work was done.]",
+                                  run_trajectory, read_only=True)
+    if record_ask and (not messages or messages[-1].get("role") != "user"):
+        messages.append({"role": "user", "content": record_ask})
+    messages.append({"role": "assistant", "content": answer})
+    return answer
+
+
 # Modes whose identical repeat is worth re-running: their result reflects
 # external state this process does not own, so a cached answer can be stale in
 # a way a re-read cannot. They still do not count as progress -- see the loop.
@@ -19034,7 +19079,7 @@ def _mirror_redirected_writes(trajectory) -> str:
     return " ".join(parts)
 
 
-def _workspace_note(trajectory) -> str:
+def _workspace_note(trajectory, *, probe_backend: bool = True) -> str:
     """One line saying where this run's output actually is, or "".
 
     Write tools report the file they touched, so those are named exactly. A
@@ -19049,7 +19094,7 @@ def _workspace_note(trajectory) -> str:
         extra = f" (and {len(locations) - 3} more)" if len(locations) > 3 else ""
         return (f"Files written to: {shown}{extra} -- the sandbox workspace, "
                 f"not {PROJECT_ROOT}.")
-    if trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
+    if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
         return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
                 f"with a relative path is there, not under {PROJECT_ROOT}.")
     return ""
@@ -19556,7 +19601,7 @@ _ASSURANCE_LINES = {
 }
 
 
-def _with_task_notes(answer: str, trajectory) -> str:
+def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
@@ -19587,9 +19632,10 @@ def _with_task_notes(answer: str, trajectory) -> str:
                      "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
         notes.append(CHECKS_FAILED_NOTE)
-    if mirror_note := _mirror_redirected_writes(trajectory):
+    if not read_only and (mirror_note := _mirror_redirected_writes(trajectory)):
         notes.append(mirror_note)
-    if location_note := _workspace_note(trajectory):
+    location_note = (_workspace_note(trajectory, probe_backend=False) if read_only else _workspace_note(trajectory))
+    if location_note:
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
