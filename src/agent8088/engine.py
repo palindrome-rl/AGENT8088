@@ -19368,13 +19368,16 @@ def _secrets_step(trajectory, written: list):
 
 
 def _reply_admits_unfinished(trajectory, reply: str, request: str) -> bool:
-    """The reply says the work is unfinished AND the run shows it (or promised work)."""
+    """The reply says the work is unfinished AND the run shows it (or promised work, or no app yet)."""
     if not completion_checks.admits_unfinished_work(reply):
         return False
     promised = (bool(_CHANGE_REQUEST.search(request))
                 and not completion_checks.is_advice_request(request)
                 and not trajectory.mutation_count())
-    return bool(trajectory.has_open_items() or promised)
+    # A request to build a web app, files written, and no page or server entry among them: the thing asked for does not
+    # exist yet, however tidy the run looks. Without this a "still in progress, I'll continue next" status ended a run
+    # that had written 109 files and no page.
+    return bool(trajectory.has_open_items() or promised or trajectory.no_runnable_app())
 
 
 def _reply_hands_back(trajectory, reply: str, request: str) -> bool:
