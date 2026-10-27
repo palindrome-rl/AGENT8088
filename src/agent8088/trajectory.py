@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 from copy import deepcopy
@@ -317,6 +318,139 @@ def _same_command(a: str, b: str) -> bool:
     return first == second or (bool(second) and _without_trailing_clause(first) == second)
 
 
+def _check_chain(command: str, *, original: bool) -> list[list[str]] | None:
+    """Parse only an AND chain; unfamiliar shell syntax supplies no retry evidence.
+
+    Do not interpret or execute shell/Python text. Preserve quoted arguments and
+    path case. A failed original may have the known Windows `| head -1` mistake;
+    a successful retry must propagate every check's exit status itself.
+    """
+    if not command or re.search(r"[`$%!^\r\n]|\\[\"']", command):
+        return None
+    parts, current, quote, i = [], [], "", 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            current.append(ch)
+        elif command[i:i + 4] == "2>&1":
+            current.append(" ")
+            i += 3
+        elif command[i:i + 2] == "&&":
+            parts.append("".join(current))
+            current = []
+            i += 1
+        elif ch in "&|;<>#()\\":
+            # Backslashes in unquoted Windows paths are literal, except the
+            # shell's escaped metacharacters, which this parser cannot prove.
+            if ch == "\\" and i + 1 < len(command) and command[i + 1] not in "\"'&|;<>#() ":
+                current.append(ch)
+            elif original and ch == "|" and re.fullmatch(r"\|\s*head\s+-1\s*", command[i:]):
+                break
+            else:
+                return None
+        else:
+            current.append(ch)
+        i += 1
+    if quote:
+        return None
+    parts.append("".join(current))
+    result = []
+    for part in parts:
+        try:
+            lexer = shlex.shlex(part, posix=False)
+            lexer.whitespace_split, lexer.commenters = True, ""
+            words = list(lexer)
+        except ValueError:
+            return None
+        if not words:
+            return None
+        # cmd.exe treats single quotes as filename characters, unlike POSIX
+        # shells. Without a known shell, that spelling is ambiguous.
+        if any(word.startswith("'") for word in words):
+            return None
+        result.append([word[1:-1] if word[:1] in {"'", '"'} and word[-1:] == word[:1]
+                       else word for word in words])
+    return result
+
+
+def _syntax_targets(words: list[str]) -> tuple[tuple[str, str], ...] | None:
+    """Recognize specific syntax checks, including Node mistakenly given Python.
+
+    Inline Python is accepted only for the exact import-and-parse expression,
+    never for a conditional, caught exception, early exit, or mocked parser.
+    """
+    program, args = words[0].lower().removesuffix(".exe"), words[1:]
+    if program == "node" and len(args) == 2 and args[0] == "--check":
+        kind = "python-parse" if args[1].endswith((".py", ".pyw")) else "node-syntax"
+        return ((kind, args[1]),) if not args[1].startswith("-") else None
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|py", program):
+        return None
+    if len(args) >= 3 and args[:2] == ["-m", "py_compile"]:
+        targets, kind = args[2:], "python-compile"
+    elif len(args) == 2 and args[0] == "-c":
+        try:
+            tree = ast.parse(args[1])
+            target = tree.body[1].value.args[0].func.value.args[0].value
+            if not isinstance(target, str):
+                return None
+            expected = ast.parse(f"import ast; ast.parse(open({target!r}).read())")
+            if ast.dump(tree) != ast.dump(expected):
+                return None
+            targets, kind = [target], "python-parse"
+        except (SyntaxError, ValueError, IndexError, AttributeError, TypeError, RecursionError):
+            return None
+    else:
+        return None
+    return tuple((kind, t) for t in targets) if all(
+        t.endswith((".py", ".pyw")) and not t.startswith("-") for t in targets) else None
+
+
+def _revised_command(failed: str, rerun: str) -> bool:
+    """A supported edited check must retain every check target and its scope.
+
+    Word overlap cannot establish this: an echo, test filter or `|| true` can
+    retain all the words without checking the failed work. Compare ordered
+    check signatures instead, and leave ambiguous rewrites visibly unresolved.
+    """
+    before, after = _check_chain(failed, original=True), _check_chain(rerun, original=False)
+    if before is None or after is None:
+        return False
+
+    def signature(chain):
+        steps, has_check = [], False
+        for words in chain:
+            program = words[0].lower()
+            if program in {"echo", "dir", "ls", "pwd"}:
+                continue
+            targets = _syntax_targets(words)
+            if targets:
+                steps.extend(targets)
+                has_check = True
+            elif program in {"cd", "chdir", "pushd"}:
+                args = words[1:]
+                if args[:1] == ["/d"]:
+                    args = args[1:]
+                if len(args) != 1:
+                    return None
+                steps.append(("cwd", args[0]))
+            elif _is_check_run(" ".join(words)) and not _is_probe(" ".join(words)):
+                steps.append(("command", tuple(words)))
+                has_check = True
+            else:
+                return None
+        return steps if has_check else None
+
+    first, second = signature(before), signature(after)
+    return (first is not None and second is not None and len(first) == len(second)
+            and all(a == b or (a[0] == "python-parse" and b[0] == "python-compile" and a[1] == b[1])
+                    for a, b in zip(first, second)))
+
+
 def _file_key(path: str) -> str:
     import os
     import posixpath
@@ -531,8 +665,9 @@ class TrajectoryState:
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
                 and self.data.get("check_failing")
                 and not _TRACEBACK.search(str(result))
-                and _same_command(self.data.get("failing_command"), command)):
-            # The very command that failed has now run without failing.
+                and (_same_command(self.data.get("failing_command"), command)
+                     or _revised_command(self.data.get("failing_command"), command))):
+            # The very command that failed, or that command edited, has now run without failing.
             self.data["check_failing"] = False
             self.data["failing_check"] = ""
         elif (operation["status"] == "done" and operation["verdict"] != "failed" and command
