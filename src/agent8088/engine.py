@@ -9134,12 +9134,12 @@ BROWSER_HITL = APP_CONFIG.get("browser_hitl", "1").strip().lower() in (
 BROWSER_LLM_MAX_TOKENS = _int_config("browser_llm_max_tokens", 4096)
 # Clamp bounds for the adaptive completion cap (see Agent8088ChatModel):
 # the working cap starts at browser_llm_max_tokens, doubles when a response
-# is cut off by the cap, decays toward ~1.5x observed usage when responses
+# is cut off by the cap, decays toward ~2.5x observed usage when responses
 # finish on their own, and always stays inside
 # [browser_llm_min_tokens, browser_llm_max_completion_tokens]. The floor
 # keeps the first call from failing on a verbose model; the ceiling bounds a
 # pathological loop the adaptation can't see.
-BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 1024)
+BROWSER_LLM_MIN_TOKENS = _int_config("browser_llm_min_tokens", 2048)
 BROWSER_LLM_MAX_COMPLETION_TOKENS = _int_config(
     "browser_llm_max_completion_tokens", min(16384, MAX_COMPLETION_TOKENS))
 # How the browsing model's structured (action-JSON) calls request their
@@ -19604,17 +19604,25 @@ _ASSURANCE_LINES = {
 }
 
 
+_NO_AUTOMATED_PASS_SENTENCE = "Changed work was inspected, but no automated verification passed."
+
+
 def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
-    if trajectory is not None and (line := _ASSURANCE_LINES.get(trajectory.assurance())):
-        notes.append(line)
+    assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
+    if assurance_line:
+        notes.append(assurance_line)
     if trajectory is not None and trajectory.needs_verification():
         notes.append("Verification note: changes were made, but no fresh automated "
                      "verification evidence was recorded.")
     elif trajectory is not None and (review := trajectory.review()):
-        notes.append(f"Task-state note: {review}")
+        if assurance_line:
+            # "Verification: exercised ... no test run passed" already says it; say it once.
+            review = review.replace(_NO_AUTOMATED_PASS_SENTENCE, "").strip()
+        if review:
+            notes.append(f"Task-state note: {review}")
     if (trajectory is not None and trajectory.needs_verification()
             and (unmet := trajectory.unmet_review())):
         notes.append(f"Task-state note: {unmet}")
@@ -19624,6 +19632,8 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(backend_line)
     if trajectory is not None and (backend := trajectory.backend_note()):
         notes.append(f"Not verified: {backend}.")
+    if trajectory is not None and (limit := trajectory.environment_note()):
+        notes.append(f"Not verified: {limit}.")
     if trajectory is not None and (open_parts := trajectory.open_subgoals()):
         notes.append("Not completed: " + "; ".join(open_parts[:6])
                      + ("; ..." if len(open_parts) > 6 else ""))

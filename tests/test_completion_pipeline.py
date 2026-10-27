@@ -203,6 +203,9 @@ def test_repeated_empty_replies_end_with_the_fixed_message(eng, monkeypatch):
 # -- 5. verification and tests -----------------------------------------------------------------
 
 def test_the_verification_reminder_says_continue_and_run_it(eng, monkeypatch):
+    # The harness's own smoke run of app.py would already count as a check (a passing page or script check ends the
+    # "pending" state); it is off here so the wording of the reminder is the subject.
+    monkeypatch.setattr(eng, "COMPLETION_SMOKE_TEST", "off")
     script = Script(eng, monkeypatch, [
         _call("write_file", filename="app.py", content="print(1)"),
         "I wrote app.py.",

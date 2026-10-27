@@ -608,7 +608,7 @@ def test_cap_never_grows_past_the_ceiling():
 
 def test_cap_decays_toward_observed_usage_but_never_below_the_floor():
     """Healthy responses prove what the task actually uses; the cap shrinks
-    toward ~1.5x that (geometrically, so a later long final answer still has
+    toward ~2.5x that (geometrically, so a later long final answer still has
     room), but never below the configured floor."""
     model = Agent8088ChatModel(model="openai/gpt-4o", max_tokens=4096,
                                min_completion_tokens=1024)
