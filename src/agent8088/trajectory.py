@@ -1164,12 +1164,14 @@ class TrajectoryState:
             current = next((s.get("name") for s in steps if s.get("status") != "done"), "")
             rows.append(("Steps", f"{done} of {len(steps)} done" + (f" · next: {current}" if current else "")))
         if changed:
-            paths = [PurePath(str(p)).name for p in data.get("written_paths") or []]
+            paths = [PurePath(str(p).replace("\\", "/")).name for p in data.get("written_paths") or []]
             shown = ", ".join(paths[-4:]) + (f" (+{len(paths) - 4} more)" if len(paths) > 4 else "")
             rows.append(("Changed", f"{len(paths)} file{'s' if len(paths) != 1 else ''}: {shown}" if paths else f"{changed} change(s)"))
             rows.append(("Verification", self.assurance() or "nothing changed"))
         if self.check_failing():
             rows.append(("Latest check", f"FAILING · {self.failing_check_detail() or 'see the last command'}"))
+        elif failed_smoke := [str(note) for note in data.get("smoke_notes") or [] if "smoke test FAILED" in str(note)]:
+            rows.append(("Latest check", f"FAILING · {failed_smoke[-1]}"))
         elif int(data.get("passed_checks") or 0):
             rows.append(("Latest check", f"passed ({int(data.get('passed_checks') or 0)} passing run(s) so far)"))
         elif changed:

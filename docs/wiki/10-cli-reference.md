@@ -155,7 +155,7 @@ sensitive-file floor still applies unconditionally.
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
-| `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
+| `/status` | Model, mode, tools, skills, token usage; current task goal, steps, changed files, verification level and recorded check results. Task rows read a copy of the saved snapshot without a model call or starting a new request. `Limited` rows describe fallbacks ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)). |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
 

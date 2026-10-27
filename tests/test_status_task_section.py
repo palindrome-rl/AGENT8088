@@ -62,3 +62,51 @@ def test_a_damaged_state_gives_no_rows_and_no_crash(monkeypatch):
     from agent8088 import cli
     monkeypatch.setattr(cli, "S", SimpleNamespace(trajectory_state="not a dict", messages=[]))
     assert cli._task_status_rows() == []
+
+
+def test_completed_work_and_pass_evidence_survive_a_longer_history(monkeypatch):
+    from agent8088 import cli
+    state = _state_after_a_change()
+    op = state.before_tool('execute_shell')
+    state.after_tool(op, '3 passed', failed=False, blocked=False, mutated=False, verdict='passed', command='pytest')
+    saved = state.snapshot()
+    before = copy.deepcopy(saved)
+    monkeypatch.setattr(cli, 'S', SimpleNamespace(trajectory_state=saved, messages=[{}] * 12))
+    rows = dict(cli._task_status_rows())
+    assert rows['Verification'] == 'tested'
+    assert '2 files' in rows['Changed'] and 'passed' in rows['Latest check']
+    assert saved == before
+
+
+def test_failed_smoke_and_open_subgoals_are_not_reset_while_viewing(monkeypatch):
+    from agent8088 import cli
+    state = _state_after_a_change()
+    state.set_subgoals(['Add a legend', 'Add the arcs'])
+    op = state.before_tool('execute_shell')
+    state.after_tool(op, '3 passed', failed=False, blocked=False, mutated=False, verdict='passed', command='pytest')
+    state.record_smoke('globe.js', 'globe.js: smoke test FAILED - broken control', failed=True)
+    saved = state.snapshot()
+    before = copy.deepcopy(saved)
+    monkeypatch.setattr(cli, 'S', SimpleNamespace(trajectory_state=saved, messages=[{}] * 12))
+    rows = dict(cli._task_status_rows())
+    assert rows['Verification'] == 'failed'
+    assert rows['Latest check'].startswith('FAILING') and 'broken control' in rows['Latest check']
+    assert 'of 5' in rows['Steps']
+    assert saved == before
+
+
+def test_filename_display_accepts_both_platform_path_styles():
+    state = _state_after_a_change()
+    state.data['written_paths'] = [r'C:\w\globe.js', '/tmp/arcs.js']
+    changed = dict(state.status_lines())['Changed']
+    assert changed == '2 files: globe.js, arcs.js'
+
+
+def test_malformed_snapshot_counts_fail_without_changing_saved_data(monkeypatch):
+    from agent8088 import cli
+    saved = _state_after_a_change().snapshot()
+    saved['message_count'] = 'broken'
+    before = copy.deepcopy(saved)
+    monkeypatch.setattr(cli, 'S', SimpleNamespace(trajectory_state=saved, messages=[]))
+    assert cli._task_status_rows() == []
+    assert saved == before

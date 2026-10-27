@@ -4246,7 +4246,7 @@ def cmd_status(_):
     t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
     for label, value in _task_status_rows():
-        t.add_row(label, value)
+        t.add_row(label, Text(value))
     console.print(t)
 
 
@@ -4255,9 +4255,11 @@ def _task_status_rows():
     Read from a copy of the saved state, with no model call, so /status can be asked at any time and never changes the run."""
     from copy import deepcopy
     from agent8088.trajectory import TrajectoryState
-    state = deepcopy(S.trajectory_state) if isinstance(S.trajectory_state, dict) else {}
     try:
-        return TrajectoryState(state, goal=str(state.get("goal") or ""), message_count=len(S.messages)).status_lines()
+        state = deepcopy(S.trajectory_state) if isinstance(S.trajectory_state, dict) else {}
+        # Viewing a snapshot is not a new request. The live history contains
+        # tool/assistant messages added after the request's starting count.
+        return TrajectoryState(state, goal="", message_count=int(state.get("message_count") or 0)).status_lines()
     except Exception:  # noqa: BLE001  a damaged saved state must not break /status
         return []
 
