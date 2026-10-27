@@ -317,6 +317,7 @@ _OWN_PASS_LINE = re.compile(
 _FAILURE_WORDS = re.compile(
     r"\b(?:fail(?:ed|ure|ures|s)?|errors?|exceptions?|traceback|assertionerror|skipped|incomplete|"
     r"not\s+(?:ok|passed|verified|successful|run|tested))\b", re.IGNORECASE)
+_ZERO_TESTS = re.compile(r"\b(?:0\s+(?:tests?|checks?|assertions?|specs?)|no\s+(?:tests|checks|assertions|specs)\s+ran)\b", re.IGNORECASE)
 _OUTPUT_WRAPPER = re.compile(
     r"(?:<<<EXTERNAL_UNTRUSTED_CONTENT\b.*>>>|<<<END_UNTRUSTED_CONTENT>>>|Command exited with status 0\.?)",
     re.IGNORECASE)
@@ -398,7 +399,7 @@ def _own_script_passed(command: str, result: str, written, workspace: str = "") 
     text = str(result or "")
     # Inspect the complete output before removing transport wrappers. A line
     # prefixed '[agent8088]' or resembling a wrapper can still contain a failure.
-    if (_FAILURE_WORDS.search(text) or _RUN_FAILED_RE.search(text)
+    if (_FAILURE_WORDS.search(text) or _ZERO_TESTS.search(text) or _RUN_FAILED_RE.search(text)
             or re.search(r"Command exited with status (?!0\b)-?\d+|timed out|cancelled|canceled", text, re.IGNORECASE)):
         return False
     lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not _OUTPUT_WRAPPER.fullmatch(ln.strip())]

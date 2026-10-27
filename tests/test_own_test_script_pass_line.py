@@ -112,6 +112,7 @@ def test_ambiguous_invocations_never_receive_pass_credit(command):
     'TEST PASSED\nCommand exited with status -1.',
     'TEST PASSED\ntimed out', 'TEST PASSED\nCancelled', '0 errors\nTEST PASSED',
     'TEST PASSED\nnot verified', 'TEST PASSED\nTests skipped',
+    '0 tests\nTEST PASSED', 'TEST PASSED\n0 assertions', 'No tests ran\nTEST PASSED',
 ])
 def test_negative_zero_count_and_failure_outputs_stay_unverified(output):
     assert not _passes(output)
