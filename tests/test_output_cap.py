@@ -45,6 +45,9 @@ class Script:
         monkeypatch.setattr(engine, "_create_completion_with_fallback", fake)
         monkeypatch.setattr(engine, "_active_model_token_limits", lambda *a, **k: (131072, 32768))
         monkeypatch.setattr(engine, "INITIAL_COMPLETION_CAP", 8192)
+        # these tests are about the retry mechanics at the old fixed caps (8192 / 4096 / 4096); the scaled defaults have their own tests
+        for flag in ("_INITIAL_CAP_SET", "_MIN_TOKENS_SET", "_THINKING_OFF_SET"):
+            monkeypatch.setattr(engine, flag, True)
         monkeypatch.setattr(engine, "exec_tool", lambda name, arguments, depth=0: "ok")
 
 
