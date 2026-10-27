@@ -512,9 +512,17 @@ async def get_tools():
     return tools
 
 
+def _held_execution_error():
+    if getattr(getattr(_cl(), "S", None), "hold", False):
+        return _error("On hold: no execution. Use /continue first.", 409)
+    return None
+
+
 @app.post("/api/tool/{name}")
 async def invoke_tool(name: str, body: dict = None):
     """Execute a single tool directly (parity with /tool <name> <args>)."""
+    if (held := _held_execution_error()) is not None:
+        return held
     A = _eng()
     args = body or {}
     if not isinstance(args, dict):
@@ -552,6 +560,8 @@ async def invoke_tool(name: str, body: dict = None):
 @app.post("/api/tool/approval/{approval_id}")
 async def approve_direct_tool(approval_id: str, body: dict = None):
     """Retry one approval-gated direct tool through the engine permission layer."""
+    if bool((body or {}).get("approved")) and (held := _held_execution_error()) is not None:
+        return held
     entry = _pending_direct_tools.pop(approval_id, None)
     if entry is None or time.time() - entry["created"] > 300:
         return _error("approval request expired", 410)
@@ -667,6 +677,8 @@ async def get_agents():
 @app.post("/api/agent/{name}")
 async def run_agent(name: str, body: dict = None):
     """Launch a sub-agent (parity with /agent <name> <task>)."""
+    if (held := _held_execution_error()) is not None:
+        return held
     A = _eng()
     task = (body or {}).get("task", "")
     # Sub-agents run multi-turn conversations — must not block the event loop.
@@ -813,6 +825,8 @@ async def get_task(task_id: str):
 
 @app.post("/api/tasks")
 async def start_task(body: dict = None):
+    if (held := _held_execution_error()) is not None:
+        return held
     goal = str((body or {}).get("goal") or "").strip()
     if not goal:
         return _error("A task goal is required.", 400)
@@ -828,6 +842,8 @@ async def start_task(body: dict = None):
 
 @app.post("/api/tasks/{task_id}/resume")
 async def resume_task(task_id: str):
+    if (held := _held_execution_error()) is not None:
+        return held
     store = _task_store()
     try:
         try:
@@ -1195,6 +1211,7 @@ def _save_session(C, S) -> None:
         "name": S.name,
         "messages": S.messages,
         "trajectory_state": S.trajectory_state,
+        "hold": bool(getattr(S, "hold", False)),
         "temperature": S.temperature,
         "max_turns": S.max_turns,
         "show_trace": S.show_trace,
@@ -1213,6 +1230,7 @@ def _blank_session(C, name: str = ""):
     S = copy.copy(C.S)
     S.messages = []
     S.trajectory_state = {}
+    S.hold = False
     S.last_trace = None
     S.conversation_trace = []
     S.trace_path = ""
@@ -1231,6 +1249,7 @@ def _load_session(C, name: str, data: dict):
     S.messages = list(messages) if isinstance(messages, list) else []
     state = data.get("trajectory_state", {})
     S.trajectory_state = state if isinstance(state, dict) else {}
+    S.hold = bool(data.get("hold", False))
     S.temperature = float(data.get("temperature", 0.1))
     # Same as the CLI's loader: keep the live value when the file predates
     # the setting, rather than resetting it to a literal.
@@ -2633,6 +2652,10 @@ async def _handle_chat(ws: WebSocket, msg: dict, A, C):
         await ws.send_json({"type": "error", "session_id": msg.get("session_id"),
                             "message": "That chat no longer exists, so this message was not sent."})
         return
+    if getattr(S, "hold", False) and msg.get("attachments"):
+        await ws.send_json({"type": "error", "session_id": _sid(S),
+                            "message": "On hold: attachments are not opened. Use /continue first."})
+        return
     try:
         attachments = _validated_attachments(msg.get("attachments", []), A, C, S)
     except ValueError as exc:
@@ -2916,25 +2939,32 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
             A._plan_on_step = _plan_on_step
             A._plan_on_escalation = _plan_on_escalation
             A._plan_on_approval = _plan_on_approval
-            A.run_agent(
-                S.messages,
-                document_root=_attachment_index(A, C, S).parent.resolve(),
-                max_turns=C._turn_max_turns(A.PERMISSION_MODE, S),
-                temperature=S.temperature,
-                memory_run_id=S.name or None,
-                memory_source_channel="web",
-                memory_background=True,
-                spin=spin, on_calls=on_calls, on_tool=on_tool,
-                on_result=on_result, on_escalation=on_escalation,
-                on_answer=on_answer, on_token=on_token,
-                on_status=on_status, on_stream_reset=on_stream_reset,
-                interrupt_check=interrupt.is_set, trace=trace,
-                system_prompt=lambda: C._session_system_prompt(S),
-                tools_def=lambda: A.build_tools_def(C._active_tool_specs(S)),
-                allowed_tools=lambda: set(C._active_tool_specs(S)),
-                trajectory_state=S.trajectory_state,
-                on_trajectory_state=lambda _state: _save_session(C, S),
-            )
+            if getattr(S, "hold", False):
+                answer = A.reply_without_tools(
+                    S.messages, kind="hold", trajectory_state=S.trajectory_state,
+                    system_prompt=lambda: C._session_system_prompt(S), temperature=S.temperature,
+                    on_token=on_token, interrupt_check=interrupt.is_set, trace=trace)
+                on_answer(answer)
+            else:
+                A.run_agent(
+                    S.messages,
+                    document_root=_attachment_index(A, C, S).parent.resolve(),
+                    max_turns=C._turn_max_turns(A.PERMISSION_MODE, S),
+                    temperature=S.temperature,
+                    memory_run_id=S.name or None,
+                    memory_source_channel="web",
+                    memory_background=True,
+                    spin=spin, on_calls=on_calls, on_tool=on_tool,
+                    on_result=on_result, on_escalation=on_escalation,
+                    on_answer=on_answer, on_token=on_token,
+                    on_status=on_status, on_stream_reset=on_stream_reset,
+                    interrupt_check=interrupt.is_set, trace=trace,
+                    system_prompt=lambda: C._session_system_prompt(S),
+                    tools_def=lambda: A.build_tools_def(C._active_tool_specs(S)),
+                    allowed_tools=lambda: set(C._active_tool_specs(S)),
+                    trajectory_state=S.trajectory_state,
+                    on_trajectory_state=lambda _state: _save_session(C, S),
+                )
             elapsed = time.time() - turn_start
             S.last_usage = {"seconds": elapsed,
                              "tokens": tokens_ref[0],
@@ -3050,6 +3080,10 @@ async def _handle_command_impl(ws: WebSocket, msg: dict, A, C):
         return
     command = str(msg.get("command", "")).strip().lstrip("/")
     args = msg.get("args", "")
+    if getattr(C.S, "hold", False) and command.lower() not in C._HOLD_COMMANDS:
+        await _send_command_event(ws, msg, {"type": "command_result", "command": command,
+                                           "result": "On hold: no execution. Use /continue first; /status is available."})
+        return
     if command.lower() == "plan":
         # cmd_plan() delegates inline tasks to the terminal-only do_chat().
         # The web runner owns the equivalent streamed path.

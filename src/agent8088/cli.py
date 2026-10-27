@@ -286,6 +286,7 @@ class Session:
         config = A.APP_CONFIG
         self.messages = []
         self.trajectory_state = {}
+        self.hold = False  # /hold: tools are off and replies are text only until /continue
         try:
             self.temperature = float(config.get("temperature", "0.1"))
         except ValueError:
@@ -501,6 +502,7 @@ def build_session_data(name, previous=None):
         "updated_at": now,
         "messages": S.messages,
         "trajectory_state": S.trajectory_state,
+        "hold": S.hold,
         "temperature": S.temperature,
         "max_turns": S.max_turns,
         "show_trace": S.show_trace,
@@ -594,6 +596,8 @@ def _active_skills(session=None):
 
 
 def _active_tool_specs(session=None):
+    if getattr(session or S, "hold", False):
+        return {}
     skill_tools = {tool for skill in A.SKILL_PACKAGES.values()
                    for tool in skill.get("tools", {})}
     active_skill_tools = {tool for skill in _active_skills(session).values()
@@ -2455,6 +2459,9 @@ def do_chat(query):
     _ensure_autosave_session(query)
     _warn_pasted_credential(query)
     S.messages.append({"role": "user", "content": query})
+    if getattr(S, "hold", False):
+        _answer_on_hold()
+        return
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
@@ -2712,7 +2719,7 @@ COMMAND_SPECS = (
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
     ("sandbox", "/sandbox [auto|native|docker|setup]", "Show or configure command isolation", ()),
-    ("status", "/status", "Show model, context, tool, skill, and session status", ()),
+    ("status", "/status", "Show model, context, tool, skill, session and current-task status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
     ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
     ("local", "/local [check|list|available [query]|pull <name>|remove <name>]", "Probe hardware, show installed Ollama models or browse pullable ones", ()),
@@ -2721,7 +2728,10 @@ COMMAND_SPECS = (
     ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
     ("new", "/new <name>", "Create a named persistent session", ()),
     ("sessions", "/sessions", "List named sessions", ()),
-    ("resume", "/resume <name>", "Load a named session", ()),
+    ("resume", "/resume [name]", "Load a named session; with no name, release a /hold", ()),
+    ("hold", "/hold", "Stop executing: no tools run and replies are text only until /continue", ()),
+    ("continue", "/continue", "Release a /hold and let the agent work again", ()),
+    ("finish", "/finish", "Wind up now: no more tools, a final answer with the verification verdict", ()),
     ("reset", "/reset", "Clear the active session while retaining its name", ()),
     ("compact", "/compact [keep]", "Summarize older turns and retain the newest messages (default: 6)", ()),
     ("limits", "/limits [key value]", "Show or change turn, budget, sub-agent and tool limits (persists)", ()),
@@ -2790,7 +2800,7 @@ COMMAND_DETAILS = {
     "sandbox": "/sandbox shows the sandbox backend, whether it is verified, and its network "
                "access; /sandbox auto|native|docker picks the backend; /sandbox setup installs "
                "the native sandbox runtime.",
-    "status": "Shows the model, context use, tools, skills and session state.",
+    "status": "Shows the model, context use, tools, skills and session state, and the current task: goal, plan steps, changed files, verification level and latest check (read from what was recorded; no model call).",
     "doctor": "/doctor checks the model endpoint, auth and config, tools and skills; /doctor "
               "--fix also repairs a broken web-search install.",
     "review": "/review lists stored reviews; /review --from REF --to REF (or --commit SHA) "
@@ -2811,7 +2821,10 @@ COMMAND_DETAILS = {
             "(edit is an alias for full-auto). Plan mode is started with /plan, not /mode.",
     "new": "/new <name> creates a named session that is saved and can be resumed later.",
     "sessions": "Lists named sessions, newest first, with their message counts.",
-    "resume": "/resume <name> loads a named session (see /sessions).",
+    "resume": "/resume <name> loads a named session (see /sessions); /resume with no name releases a /hold, like /continue.",
+    "hold": "/hold puts the session on hold: tools are not offered and nothing is executed, replies are text only, so you can ask for an update or a question. It lasts until /continue (or /resume with no name) or /finish, and is saved with the session.",
+    "continue": "/continue releases a /hold; the next message runs normally with all tools.",
+    "finish": "/finish asks the model for a final answer now with no tools, and adds the harness notes: verification level, unverified changes, unfinished files and any failing check. It does not run or fix anything, and it ends the hold.",
     "reset": "Clears the current conversation, asking first if it has messages, and keeps the "
              "session name.",
     "compact": "/compact [keep] summarizes older messages and keeps the newest <keep> (default "
@@ -3168,6 +3181,8 @@ def cmd_cli_anything(rest):
 
 def cmd_task(rest):
     """Start, resume, or inspect a restart-safe model task."""
+    if _refuse_held_execution():
+        return
     from agent8088.task_runtime import TaskStore, run_task, store_path
     store = TaskStore(A.APP_CONFIG.get("task_db_path") or store_path(A.CONFIG_PATH))
     parts = (rest or "").strip().split(None, 1)
@@ -3581,6 +3596,8 @@ def cmd_agents(rest):
 
 
 def cmd_tool(rest):
+    if _refuse_held_execution():
+        return
     parts = rest.split(None, 1)
     if parts and parts[0] == 'describe':
         console.print(Text(A.describe_tool(parts[1] if len(parts) > 1 else '', _active_tool_specs())))
@@ -3846,6 +3863,8 @@ def _detect_pasted_file(line: str):
 
 
 def _handle_pasted_file(path, question, original=None):
+    if getattr(S, "hold", False):
+        return False
     # `original` is the line as typed. A text file's instruction is that line
     # with the path still in it: cutting it out turned "grep … artifacts/t.html"
     # into a grep with no file. Images keep the split — cmd_image gets the path.
@@ -4248,7 +4267,23 @@ def cmd_status(_):
     t.add_row("Session", f"{S.name or 'ephemeral'} · temperature {S.temperature} · max turns {S.max_turns}")
     t.add_row("Detail", f"tools {A.TOOL_SELECTION} · verbose {S.verbose} · trace {'on' if S.show_trace else 'off'} · "
               f"reasoning {'on' if S.show_reasoning else 'off'} · usage {S.usage_mode}")
+    for label, value in _task_status_rows():
+        t.add_row(label, Text(value))
     console.print(t)
+
+
+def _task_status_rows():
+    """What the harness recorded about the current task (goal, steps, changed files, verification level, latest check).
+    Read from a copy of the saved state, with no model call, so /status can be asked at any time and never changes the run."""
+    from copy import deepcopy
+    from agent8088.trajectory import TrajectoryState
+    try:
+        state = deepcopy(S.trajectory_state) if isinstance(S.trajectory_state, dict) else {}
+        # Viewing a snapshot is not a new request. The live history contains
+        # tool/assistant messages added after the request's starting count.
+        return TrajectoryState(state, goal="", message_count=int(state.get("message_count") or 0)).status_lines()
+    except Exception:  # noqa: BLE001  a damaged saved state must not break /status
+        return []
 
 
 def _model_status_value(configured):
@@ -6140,6 +6175,7 @@ def cmd_new(rest):
     _save_active_session()
     S.messages.clear()
     S.trajectory_state.clear()
+    S.hold = False
     S.last_trace = None
     S.last_usage = None
     S.name = name
@@ -6176,6 +6212,9 @@ def cmd_sessions(_):
 
 
 def cmd_resume(rest):
+    if not rest.strip() and S.hold:
+        cmd_continue("")
+        return
     try:
         name = _session_name(rest)
     except ValueError as exc:
@@ -6198,6 +6237,7 @@ def cmd_resume(rest):
     S.messages[:] = messages
     S.trajectory_state = (data.get("trajectory_state", {})
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
+    S.hold = bool(data.get("hold", False))
     S.name = name
     S.temperature = float(data.get("temperature", 0.1))
     # Fall back to what this session already has, not to a literal: a session
@@ -6225,6 +6265,7 @@ def cmd_reset(_):
         return
     S.messages.clear()
     S.trajectory_state.clear()
+    S.hold = False
     S.last_trace = None
     S.conversation_trace.clear()
     S.trace_path = ""
@@ -6435,6 +6476,67 @@ def cmd_temp(rest):
     S.temperature = value
     console.print(f"temperature = [#237dd7]{S.temperature}[/#237dd7]")
     _save_preferences()
+
+
+def _answer_on_hold():
+    """One text-only model call for a message sent while the session is on hold. No tool is offered, so nothing can run."""
+    try:
+        with console.status("thinking (on hold)...", spinner="dots"):
+            answer = A.reply_without_tools(S.messages, kind="hold", trajectory_state=S.trajectory_state,
+                                           system_prompt=_session_system_prompt, temperature=S.temperature)
+    except KeyboardInterrupt:
+        console.print("[dim]⏹ interrupted[/dim]")
+        _save_session_safely()
+        return
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]could not answer on hold:[/red] {exc}")
+        _save_session_safely()
+        return
+    render_answer(answer)
+    console.print("[dim]on hold: no tools ran. /continue to resume, /finish to wrap up[/dim]")
+    _save_session_safely()
+
+
+def cmd_hold(_):
+    if S.hold:
+        console.print("[dim]already on hold: /continue to resume, /finish to wrap up[/dim]")
+        return
+    S.hold = True
+    console.print("[#237dd7]on hold[/#237dd7]: tools will not run and replies are text only. "
+                  "[dim]/continue to resume · /finish to wrap up · /status for where things stand[/dim]")
+    _save_session_safely()
+
+
+def cmd_continue(_):
+    if not S.hold:
+        console.print("[dim]not on hold[/dim]")
+        return
+    S.hold = False
+    console.print("[#237dd7]resumed[/#237dd7]: the next message runs normally.")
+    _save_session_safely()
+
+
+def cmd_finish(_):
+    if not S.messages:
+        if S.hold:
+            S.hold = False
+            _save_session_safely()
+        console.print("[dim]nothing to finish: no request in this session yet[/dim]")
+        return
+    try:
+        with console.status("wrapping up (no tools)...", spinner="dots"):
+            answer = A.reply_without_tools(S.messages, kind="finish", trajectory_state=S.trajectory_state,
+                                           system_prompt=_session_system_prompt, temperature=S.temperature,
+                                           record_ask="/finish")
+    except KeyboardInterrupt:
+        console.print("[dim]⏹ interrupted[/dim]")
+        return
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]could not finish:[/red] {exc}")
+        return
+    S.hold = False
+    render_answer(answer)
+    _save_session_safely()
 
 
 def cmd_maxturns(rest):
@@ -7341,6 +7443,7 @@ COMMANDS = {
     "local": cmd_local,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
+    "hold": cmd_hold, "continue": cmd_continue, "finish": cmd_finish,
     "compact": cmd_compact,
     "history": cmd_history, "trace": cmd_trace, "reasoning": cmd_reasoning, "thoughts": cmd_thoughts,
     "verbose": cmd_verbose, "usage": cmd_usage, "temp": cmd_temp,
@@ -10195,9 +10298,26 @@ def _first_run_check():
 # fight an interactive picker, so only these get one.
 _SPINNER_COMMANDS = frozenset({"doctor", "dump", "status", "tools", "skills"})
 
+# Only reporting and session controls remain available while held. Commands
+# that can run tools, start durable tasks, repair/install, or read attachments
+# require the user to release the hold explicitly first.
+_HOLD_COMMANDS = frozenset({"help", "status", "hold", "continue", "finish", "resume", "sessions",
+                            "new", "reset", "history", "trace", "thoughts"})
+
+
+def _refuse_held_execution() -> bool:
+    if not getattr(S, "hold", False):
+        return False
+    console.print("[dim]on hold: no execution. Use /continue before running this command; /status is available.[/dim]")
+    return True
+
 
 def _run_repl_command(handler, rest, name=""):
     try:
+        command = name or next((key for key, value in COMMANDS.items() if value is handler), "")
+        if getattr(S, "hold", False) and command not in _HOLD_COMMANDS:
+            _refuse_held_execution()
+            return
         with (status_cm(f"running /{name}...") if name in _SPINNER_COMMANDS else nullcontext()):
             handler(rest)
     except KeyboardInterrupt:
@@ -10248,7 +10368,7 @@ def _repl_turns():
             else:
                 console.print(_unknown_command_message(cmd))
             continue
-        pasted = _detect_pasted_file(line)
+        pasted = None if getattr(S, "hold", False) else _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:

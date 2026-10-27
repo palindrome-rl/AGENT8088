@@ -186,12 +186,15 @@ sensitive-file floor still applies unconditionally.
 | `/help` | List all commands |
 | `/new [name]` | Start a fresh session, optionally named |
 | `/sessions` | List saved chats, including their CLI/web source and model |
-| `/resume <name>` | Reload a named session (restores skill state too) |
+| `/resume [name]` | Reload a named session, including its hold and skill state. With no name, release a hold; otherwise show usage. |
+| `/hold` | Hold the session: subsequent chat replies use no tools, execution-capable commands are blocked and new attachments are not processed until released. The hold is saved with the session. |
+| `/continue` | Release a hold; the next message can run normally. |
+| `/finish` | Request a text-only final answer with the recorded verification, unfinished-work and failure notes. Does not run checks, copy outputs or repair anything. Releases the hold. |
 | `/reset` | Clear the current conversation |
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
 | `/save [file]` | Export conversation + trace to JSON (mode `0600`). Without a name it writes `agent8088_session-<date>-<time>.json`, so earlier saves are never overwritten |
-| `/status` | Model, mode, tools, skills, token usage; `Limited` rows for anything on a fallback ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)) |
+| `/status` | Model, mode, tools, skills, token usage; current task goal, steps, changed files, verification level and recorded check results. Task rows read a copy of the saved snapshot without a model call or starting a new request. `Limited` rows describe fallbacks ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)). |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
 
@@ -201,6 +204,13 @@ saves the chat. You do not need to run `/new` first. After restarting, use
 also survives a failed or interrupted turn when the session write succeeds;
 a save failure is reported. One-shot and `--prompt-file` runs do not enable
 this interactive autosave behavior. `/save` remains a separate JSON export.
+
+While held, reporting and session controls such as `/status`, `/history`,
+`/help`, `/resume`, `/new` and `/reset` remain available. Use `/continue` before
+commands that execute tools, launch tasks or change runtime setup. A fresh
+session starts unheld. These commands are processed between turns: interrupt
+an in-flight turn first (ESC in the CLI, Stop in the Web UI). They do not kill
+an already-running external process or cancel independent background tasks.
 
 ### Model
 
