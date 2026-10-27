@@ -5,6 +5,8 @@ a `require.resolve('playwright') ... && where msedge & where chrome` probe, a Pl
 (WinError 5 / Access is denied), an e2e script that printed NO CHROMIUM, and a `node smoke.js` that died with spawn EPERM.
 A real test failure in the same output still counts."""
 import pytest
+import shutil
+import subprocess
 
 from agent8088.trajectory import TrajectoryState, _environment_limit, _is_probe
 
@@ -99,3 +101,79 @@ def test_the_final_answer_says_it_was_not_verified(engine):
     assert "Not verified: the sandbox did not allow a process to be started" in answer
     assert "NOT VERIFIED: the latest check failed" not in answer
     assert "Incomplete: the latest automated check failed" not in answer
+
+
+@pytest.mark.parametrize('command', [
+    '''node -e "require('fs')['writeFileSync']('probe-test.txt','changed');process.exit(1)"''',
+    '''node -e "require('child_process')['execSync']('npm test')"''',
+    'which node | pytest tests/test_app.py', 'where chrome | node test.js',
+    'npm list playwright | node test.js', 'pip show pytest | python test_app.py',
+    '''node -e "require('./test_app.js')"''',
+    '''node -e "require('C:/work/test_app.js')"''',
+    '''node -e "require('package/../../test_app')"''',
+    '''python -c "from os import remove as print; print('probe-test.txt')"''',
+    '''python -c "from sys import exit as print; print('test stopped')"''',
+])
+def test_real_execution_is_not_an_availability_probe(command):
+    assert not _is_probe(command)
+
+
+@pytest.mark.parametrize('output', [
+    'FAILED (failures=1)\nError: spawn EPERM',
+    'Test failed: wrong score\nNO CHROMIUM',
+    'browserType.launch succeeded\nTypeError: wrong board',
+    "Playwright test: reading fixture\nPermissionError: [WinError 5] Access is denied: 'data.json'",
+])
+def test_real_failures_are_never_excused_as_environment_limits(output):
+    assert _environment_limit(output) == ''
+    state = _state()
+    _run(state, 'node smoke.js', output)
+    assert state.check_failing()
+
+
+def test_successful_retry_removes_the_superseded_environment_note():
+    state = _state()
+    _run(state, 'node smoke.js', SPAWN)
+    _run(state, 'node smoke.js', '2 passed', verdict='passed')
+    assert state.environment_note() == ''
+    assert not state.check_failing()
+
+
+def test_a_real_failure_after_an_environment_limit_is_reported_as_the_current_result():
+    state = _state()
+    _run(state, 'node smoke.js', SPAWN)
+    _run(state, 'node smoke.js', 'AssertionError: wrong score')
+    assert state.check_failing() and state.environment_note() == ''
+
+
+def test_unrelated_success_does_not_clear_the_blocked_check():
+    state = _state()
+    _run(state, 'node smoke.js', SPAWN)
+    _run(state, 'pytest other_tests.py', '3 passed', verdict='passed')
+    assert state.environment_note()
+
+
+def test_a_differently_cased_target_is_not_the_same_check():
+    state = _state()
+    _run(state, 'node Smoke.js', SPAWN)
+    _run(state, 'node smoke.js', '2 passed', verdict='passed')
+    assert state.environment_note()
+
+
+def test_a_real_assertion_from_an_imported_test_is_not_excused_as_availability():
+    state = _state()
+    _run(state, 'python -c "import test_app"', 'AssertionError: wrong score')
+    assert state.check_failing()
+
+
+def test_actual_node_code_that_writes_and_fails_is_not_a_probe(tmp_path):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is unavailable for this subprocess regression')
+    code = "require('fs')['writeFileSync']('probe-test.txt','changed');process.exit(1)"
+    result = subprocess.run([node, '-e', code], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=10, check=False)
+    assert result.returncode == 1 and (tmp_path / 'probe-test.txt').is_file()
+    state = _state()
+    _run(state, 'node -e "' + code + '"', 'Command exited with status 1.')
+    assert state.check_failing()

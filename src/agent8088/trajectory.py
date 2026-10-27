@@ -207,34 +207,73 @@ _SETUP_PROGRAMS = frozenset({"cd", "chdir", "pushd", "echo"})
 # Asking whether something is installed says nothing about the work either: `where chrome`, `pip show x`,
 # `python -c "import playwright"` and `node -e "require.resolve('playwright')"` fail when the thing is missing and
 # prove nothing when it is there. Only commands made of nothing else count, so any real call keeps the command a check.
-_WHICH_STEP = re.compile(r"^(?:where|which|get-command|gcm)(?:\.exe)?\s+\S+", re.IGNORECASE)
+_WHICH_STEP = re.compile(r'^(?:where|which|get-command|gcm)(?:\.exe)?(?:\s+(?:[-\w./\\:*?,]+|"[-\w. /\\:*?,]+"))+\s*$', re.IGNORECASE)
 _PACKAGE_QUERY = re.compile(
-    r"^(?:(?:python[\d.]*|py)(?:\.exe)?\s+-m\s+)?pip[\d.]*\s+(?:show|list|freeze|--version|-V)\b"
-    r"|^(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:ls|list|view|info|--version|-v)\b", re.IGNORECASE)
+    r"(?:(?:(?:python[\d.]*|py)(?:\.exe)?\s+-m\s+)?pip[\d.]*\s+(?:show|list|freeze|--version|-V)"
+    r"|(?:npm|pnpm|yarn)(?:\.cmd)?\s+(?:ls|list|view|info|--version|-v))"
+    r"(?:\s+[-\w.@/\\:=*]+)*\s*", re.IGNORECASE)
 _PY_CODE = re.compile(r"^(?:python[\d.]*|py)(?:\.exe)?\s+-c\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
 _NODE_CODE = re.compile(r"^(?:node|nodejs)(?:\.exe)?\s+(?:-e|-p|--eval|--print)\s+(['\"])(.*)\1\s*$", re.IGNORECASE | re.DOTALL)
-_PY_IMPORT_CLAUSE = re.compile(
-    r"^(?:import\s+[\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*"
-    r"|from\s+[\w.]+\s+import\s+[\w.*, ]+"
-    r"|print\((?:'[^']*'|\"[^\"]*\"|[\w.]*__version__|[\w.]*\.version|[\w.]*__file__|\s|,)*\))$")
-_NODE_PROBE_WORDS = frozenset({"try", "catch", "e", "err", "require", "resolve", "console", "log", "process", "exit",
-                               "version", "versions", "node"})
 _QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+_JS_STRING = r'''(?:'[^'\\\r\n]*'|"[^"\\\r\n]*")'''
+_JS_PACKAGE = r'''(?:'(?:node:)?[A-Za-z@][\w@/-]*'|"(?:node:)?[A-Za-z@][\w@/-]*")'''
+_JS_QUERY = rf'(?:require\.resolve\(\s*{_JS_STRING}\s*\)|require\(\s*{_JS_PACKAGE}\s*\))'
+_JS_LOG = rf'console\.log\(\s*(?:{_JS_STRING}|{_JS_QUERY})(?:\s*,\s*{_JS_STRING})*\s*\)'
+_JS_STEP = rf'(?:{_JS_QUERY}|{_JS_LOG}|process\.exit\(\s*[01]\s*\))'
+_JS_BODY = rf'(?:{_JS_STEP}\s*;?\s*)+'
+_JS_TRY = rf'try\s*\{{\s*{_JS_BODY}\}}\s*catch\s*\(\s*\w+\s*\)\s*\{{\s*{_JS_BODY}\}}'
+_JS_PROBE = re.compile(rf'\s*(?:(?:{_JS_STEP}|{_JS_TRY})\s*;?\s*)+\s*')
+
+
+def _python_availability_code(code: str) -> bool:
+    try:
+        statements = ast.parse(code).body
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    imported = set()
+    for statement in statements:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            if isinstance(statement, ast.ImportFrom) and statement.level:
+                return False
+            for item in statement.names:
+                name = item.asname or item.name.split('.')[0]
+                # A rebound print could be os.remove, eval, or any other call.
+                if name in {'print', '*'}:
+                    return False
+                imported.add(name)
+        elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            if not isinstance(call.func, ast.Name) or call.func.id != 'print' or call.keywords:
+                return False
+            for value in call.args:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    continue
+                if not isinstance(value, (ast.Name, ast.Attribute)):
+                    return False
+                attribute = value.attr if isinstance(value, ast.Attribute) else value.id
+                while isinstance(value, ast.Attribute):
+                    value = value.value
+                if (attribute not in {'__version__', 'version', '__file__'}
+                        or not isinstance(value, ast.Name) or value.id not in imported):
+                    return False
+        else:
+            return False
+    return bool(imported)
 
 
 def _is_availability_step(text: str) -> bool:
-    if _WHICH_STEP.match(text) or _PACKAGE_QUERY.match(text):
+    if _WHICH_STEP.fullmatch(text) or _PACKAGE_QUERY.fullmatch(text):
         return True
     python = _PY_CODE.match(text)
     if python:
-        clauses = [c.strip() for c in re.split(r"[;\n]", python.group(2)) if c.strip()]
-        return bool(clauses) and any(c.startswith(("import ", "from ")) for c in clauses) \
-            and all(_PY_IMPORT_CLAUSE.match(c) for c in clauses)
+        return _python_availability_code(python.group(2))
     node = _NODE_CODE.match(text)
     if node:
-        code = _QUOTED.sub("", node.group(2))
-        words = set(re.findall(r"[A-Za-z_$][\w$]*", code))
-        return "require" in words and words <= _NODE_PROBE_WORDS
+        code = re.sub(r'\s+', ' ', node.group(2)).strip()
+        # Token whitelists permit arbitrary calls through quoted/computed
+        # properties, e.g. require('fs')['writeFileSync'](...). Recognize the
+        # complete, narrow query grammar instead.
+        return bool(_JS_PROBE.fullmatch(code) and re.search(r'\brequire\b', _QUOTED.sub('', code)))
     return False
 
 
@@ -269,11 +308,16 @@ def _segment_program(segment: str) -> str:
 # keeps it a failure.
 _SPAWN_BLOCKED = re.compile(r"spawn EPERM|EPERM: operation not permitted, spawn", re.IGNORECASE)
 _BROWSER_LAUNCH = re.compile(
-    r"mojo[^\n]*Access is denied|Executable doesn't exist at|browserType\.launch|Failed to launch[^\n]*(?:browser|chrom)"
-    r"|\bno\s+chrom(?:e|ium)\b", re.IGNORECASE)
+    r"mojo[^\n]*Access is denied|^\s*(?:Error:\s*)?NO\s+CHROM(?:E|IUM)\s*$"
+    r"|Executable doesn't exist at[^\n]*(?:chrome|chromium|msedge)"
+    r"|browserType\.launch:[^\n]*(?:Executable doesn't exist|not found|not installed|Access is denied)",
+    re.IGNORECASE | re.MULTILINE)
 _ACCESS_DENIED = re.compile(r"Access is denied|WinError 5", re.IGNORECASE)
 _BROWSER_WORD = re.compile(r"playwright|puppeteer|chromium|msedge|chrome\.exe|selenium", re.IGNORECASE)
-_REAL_TEST_FAILURE = re.compile(r"\b[1-9]\d*\s+(?:tests?\s+)?failed\b|AssertionError|^\s*(?:---\s*)?FAIL\b", re.IGNORECASE | re.MULTILINE)
+_REAL_TEST_FAILURE = re.compile(
+    r"\b[1-9]\d*\s+(?:tests?\s+)?failed\b|\b(?:AssertionError|TypeError|ReferenceError|ValueError|SyntaxError|NameError|KeyError)\b"
+    r"|^\s*(?:---\s*)?FAIL\b|^\s*FAILED\s*(?:\(|:|tests?[/\\])|^\s*tests?\s+failed\b",
+    re.IGNORECASE | re.MULTILINE)
 
 
 def _environment_limit(result) -> str:
@@ -283,7 +327,13 @@ def _environment_limit(result) -> str:
         return ""
     if _SPAWN_BLOCKED.search(text):
         return "the sandbox did not allow a process to be started"
-    if _BROWSER_LAUNCH.search(text) or (_ACCESS_DENIED.search(text) and _BROWSER_WORD.search(text)):
+    # Access denied for a data file is not evidence of a browser-launch limit,
+    # even if the traceback mentions Playwright elsewhere.
+    targets = re.findall(r'''Access is denied:\s*['"]([^'"\n]+)['"]''', text, re.IGNORECASE)
+    denied_browser = all(re.search(r'(?:chrome|chromium|msedge)(?:\.exe)?$', p, re.IGNORECASE) for p in targets)
+    transport = re.search(r'playwright[/\\][^\n]*_transport\.py|puppeteer[^\n]*(?:launch|BrowserLauncher)', text, re.IGNORECASE)
+    if (_BROWSER_LAUNCH.search(text)
+            or (_ACCESS_DENIED.search(text) and denied_browser and (transport or (targets and _BROWSER_WORD.search(text))))):
         return "no browser could be started here"
     return ""
 
@@ -803,14 +853,26 @@ class TrajectoryState:
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
         written_now = self.data.get("written_paths")
+        probe_only = _is_probe(command) and not _REAL_TEST_FAILURE.search(str(result))
         limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
-        if (limit and not _is_probe(command)
+        if (limit and not probe_only
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
             self._note_environment_limit(command, limit)
+        elif (command and not _environment_limit(result)
+              and (operation["verdict"] in {"passed", "failed"}
+                   or (operation["status"] == "done" and not _TRACEBACK.search(str(result))
+                       and not _RUN_FAILED_RE.search(str(result))))
+              and not _SANDBOX_BLOCKED.search(str(result))):
+            # The same check has now reached a result (passing or failing).
+            # Do not leave an earlier 'could not run' note beside it.
+            notes = self.data.get("env_limits") or []
+            notes[:] = [n for n in notes if not (
+                " ".join(str(n.get("command") or n.get("what") or "").split()) == " ".join(command.split())
+                or _revised_command(n.get("command") or n.get("what"), command))]
         if (operation["verdict"] == "failed"
                 and not limit
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
-                and not _is_probe(command)
+                and not probe_only
                 and not _SANDBOX_BLOCKED.search(str(result))
                 and not _wrong_place_failure(command, result, written_now)):
             self.data["check_failing"] = True
@@ -1349,7 +1411,7 @@ class TrajectoryState:
         what = " ".join(_command_core(command).split())[:80]
         notes = self.data.setdefault("env_limits", [])
         if not any(n.get("reason") == reason and n.get("what") == what for n in notes):
-            notes.append({"reason": reason, "what": what})
+            notes.append({"reason": reason, "what": what, "command": " ".join(command.split())})
             del notes[:-3]
 
     def environment_note(self) -> str:
