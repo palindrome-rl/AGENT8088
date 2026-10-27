@@ -306,6 +306,28 @@ def _without_trailing_clause(text: str) -> str:
     return text
 
 
+# A test script the run wrote for itself (`node battle_test.js`) usually ends with its own pass line, not a runner summary with
+# counts, so detect_verdict reads it as unknown and the run ended "exercised ... no test run passed" over a battle test that
+# passed. The line has to name tests or checks and say they passed; anything that looks like a failure anywhere in the output
+# keeps it unknown.
+_OWN_PASS_LINE = re.compile(
+    r"^\W*(?:all\s+)?(?:tests?|checks?|assertions?|specs?|e2e(?:\s+tests?)?)\W{0,3}(?:all\s+)?"
+    r"(?:passed|succeeded|successful|ok)\b[^\n]{0,80}$", re.IGNORECASE)
+_ZERO_COUNT = re.compile(r"\b0\s+(?:tests?|checks?|assertions?)\b", re.IGNORECASE)
+_FAILURE_WORDS = re.compile(r"\b(?:fail(?:ed|ure|ures|s)?|errors?|exceptions?|traceback|not\s+ok|assertionerror)\b", re.IGNORECASE)
+_OUTPUT_WRAPPER = re.compile(r"^(?:<<<.*>>>|\[agent8088\].*|Command exited with status 0.*)$", re.IGNORECASE)
+
+
+def _own_script_passed(command: str, result: str, written) -> bool:
+    """Whether the run's own test script ran and ended on a clear pass line with no failure anywhere in its output."""
+    if not command or not _runs_a_written_file(command, written):
+        return False
+    lines = [ln.strip() for ln in str(result or "").splitlines() if ln.strip() and not _OUTPUT_WRAPPER.match(ln.strip())]
+    if not lines or any(_FAILURE_WORDS.search(ln) for ln in lines):
+        return False
+    return any(_OWN_PASS_LINE.match(ln) and not _ZERO_COUNT.search(ln) for ln in lines[-3:])
+
+
 def _same_command(a: str, b: str) -> bool:
     """Whether `b` is the command `a` that failed, run again.
 
@@ -595,6 +617,9 @@ class TrajectoryState:
             self.data["research_used"] = True
         operation["result"] = _text(result)
         operation["verdict"] = verdict if verdict in {"passed", "failed"} else "unknown"
+        if (operation["verdict"] == "unknown" and operation["status"] == "done" and operation["tool"] == "execute_shell"
+                and _own_script_passed(command, result, self.data.get("written_paths"))):
+            operation["verdict"] = "passed"
         if operation["status"] == "done":
             self._set_step("Inspect the current state", "done")
             self.data["consecutive_setbacks"] = 0
