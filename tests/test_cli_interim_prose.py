@@ -138,3 +138,17 @@ def test_reasoning_and_the_update_both_stay_and_reasoning_comes_first(monkeypatc
     _chat(monkeypatch, run_agent)
     text = out.getvalue()
     assert text.find("weighing two options") < text.find("Going with the first option.") < text.find("read_text")
+
+
+@pytest.mark.parametrize('fallback', [False, True])
+def test_permanent_updates_mask_known_secrets_and_system_fingerprints(monkeypatch, out, fallback):
+    secret = 'synthetic-progress-secret-743928'
+    rule = 'Synthetic private instruction for this regression only.'
+    monkeypatch.setattr(cli.A, '_SECRET_VALUES', {secret})
+    monkeypatch.setattr(cli.A, '_SYSTEM_FINGERPRINTS', {rule})
+    if fallback:
+        monkeypatch.setattr(cli, '_AnswerMarkdown', lambda *_a: (_ for _ in ()).throw(ValueError('render')))
+    cli._print_round_prose('Checking the file. ' + secret + ' ' + rule)
+    text = out.getvalue()
+    assert 'Checking the file.' in text
+    assert secret not in text and rule not in text

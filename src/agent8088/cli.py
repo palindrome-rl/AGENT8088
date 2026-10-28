@@ -1778,7 +1778,7 @@ def _print_round_prose(text):
     Prose that comes with a tool call is a progress update for the user, but it only ever appeared in the live region,
     and that region is erased the moment the tool row replaces it. Only the final answer was printed for good, so every
     earlier update vanished as soon as it was written. /verbose controls tool detail, not what the model says."""
-    text = (text or "").strip()
+    text = A._mask_system_content(text or "").strip()
     if not text:
         return
     try:
