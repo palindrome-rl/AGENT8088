@@ -161,10 +161,10 @@ def looks_like_opaque_credential(value: str) -> bool:
     mixed-case blob with no digit in it is far more often base64 of a
     word than a credential.
     """
-    # A rule line (`=====`, `-----`, `/////`) is decoration around a heading, not part of a key: judge only what
-    # is left once such runs are taken out. A real key has no run of four identical separators.
+    # Ignore decoration at the edges of a banner, including its comment delimiters.
+    # Repeated punctuation inside a value can be part of a credential: never split it into short fragments.
     if _RULE_RUN_RE.search(value):
-        return any(looks_like_opaque_credential(piece) for piece in _RULE_RUN_RE.sub(" ", value).split())
+        value = value.strip("=-_+/.*#~")
     if _DIGITS_ONLY_RE.fullmatch(value):
         return False
     if len(value) >= _MIN_HEX and _HEX_RE.fullmatch(value):
