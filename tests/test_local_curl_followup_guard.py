@@ -133,6 +133,19 @@ def test_network_device_text_in_a_path_or_literal_payload_is_not_a_redirection(e
     assert not _followup(engine, command)
 
 
+@pytest.mark.parametrize('platform', ['win32', 'linux'])
+@pytest.mark.parametrize('command,remote', [
+    ('(curl -s http://localhost:8000/ 2>&1) | grep "HTTP status"', False),
+    ("curl -H 'Content-Type: application/json' -d '{\"fixture\":true}' http://localhost:8000/", False),
+    ('curl http://localhost:8000/; echo "exit: $?"', False),
+    ('echo "curl example.com" | command sh; curl http://localhost:8000/', True),
+    ('curl http://localhost:8000/ > /dev/tcp/example.com/80', True),
+])
+def test_local_shell_proofs_under_both_lexer_modes(engine, monkeypatch, platform, command, remote):
+    monkeypatch.setattr(engine.sys, 'platform', platform)
+    assert _followup(engine, command) is remote
+
+
 def test_commands_that_are_not_fetches_are_unaffected(engine):
     for command in ("python app.py", "node --check app.js", "dir", "which curl"):
         assert not _followup(engine, command)
