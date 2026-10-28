@@ -96,3 +96,39 @@ def test_the_existing_sentence_alone_is_kept_when_nothing_is_known(engine):
     state.data.update(check_failing=True, failing_check="")
     answer = engine._with_task_notes("Done.", state)
     assert engine.CHECKS_FAILED_NOTE in answer and "Failing check" not in answer
+
+
+def test_final_failure_notes_mask_known_credentials_in_commands(engine, monkeypatch):
+    secret = 'synthetic-check-credential-743928'
+    monkeypatch.setattr(engine, '_SECRET_VALUES', {secret})
+    state = _state()
+    _record(state, 'execute_shell', 'failed', command='pytest --api-key=' + secret, result='1 failed')
+    answer = engine._with_task_notes('Done.', state)
+    assert secret not in answer
+    assert 'Failing check:' in answer and 'pytest' in answer
+
+
+def test_new_display_fields_are_masked_before_they_are_shortened(engine, monkeypatch):
+    secret = 'Zyx9876SyntheticCheckCredential54321'
+    monkeypatch.setattr(engine, '_SECRET_VALUES', {secret})
+    state = _state()
+    op = state.before_tool('execute_shell')
+    state.after_tool(op, 'Error: ' + 'x' * 122 + secret, failed=False, blocked=False,
+                     mutated=False, verdict='failed', command='pytest ' + 'a' * 70 + secret,
+                     display_filter=engine._mask_system_content)
+    assert secret[:7] not in state.data['failing_what']
+    assert secret[:7] not in state.data['failing_error']
+    assert '[redacted]' in state.data['failing_error']
+
+
+def test_old_saved_failure_details_are_masked_before_formatting(engine, monkeypatch):
+    secret = 'synthetic-legacy-credential-743928'
+    monkeypatch.setattr(engine, '_SECRET_VALUES', {secret})
+    state = _state()
+    state.data.update(check_failing=True, failing_check='pytest --token=' + secret + ' -> Error: denied')
+    assert secret not in engine._with_task_notes('Done.', state)
+
+
+def test_redirection_in_wrapper_source_does_not_become_the_error():
+    assert _error_line('<<<EXTERNAL_UNTRUSTED_CONTENT source="pytest > failed.log">>>\n'
+                       'Command exited with status 1.\n<<<END_UNTRUSTED_CONTENT>>>') == ''
