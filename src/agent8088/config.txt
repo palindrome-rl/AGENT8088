@@ -126,6 +126,9 @@ tool_selection=hybrid
 # stream_idle_seconds=120
 # tool_selection_models=custom:your-model-name
 # max_tool_timeout_seconds=1200
+# After three distinct code/page edits without a successful check/run or local page open,
+# append a short reminder to verify the result. Per-request limit; 0 disables it.
+# edit_check_reminders=3
 # Optional backend check (off by default). When on, the page check is followed by starting the project's own server in the
 # sandbox (Windows native sandbox only so far), probing the GET endpoints its page uses, and stopping it. The result goes in the
 # answer as a separate line, `Backend check: not applicable | unavailable | passed | failed - <detail>`, and never changes the

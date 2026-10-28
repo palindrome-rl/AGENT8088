@@ -9976,8 +9976,8 @@ def _run_prompt_file(path: str, resume: str = None) -> int:
 def _run_end_reason(steps):
     """Why the last turn ended, from its trace steps (newest decisive one).
 
-    answered | checks_failed | time_budget | turn_limit | model_error | interrupted
-    | unknown
+    answered | checks_failed | time_budget | turn_limit | no_progress | model_error
+    | interrupted | unknown
     (unknown: no trace, or the turn left none of these steps).
     """
     if S.conversation_trace and S.conversation_trace[-1].get("interrupted"):
@@ -9989,7 +9989,8 @@ def _run_end_reason(steps):
         if kind == "budget_exceeded":
             return "time_budget" if "seconds elapsed" in str(step.get("content", "")) else "budget"
         if kind in {"budget_wrap_up", "max_turns"}:
-            return "turn_limit"
+            # The repeat breaker also ends a turn this way; it is not a turn limit.
+            return "no_progress" if step.get("stopped") == "no_progress" else "turn_limit"
         if kind == "final_answer":
             return "checks_failed" if step.get("incomplete") else "answered"
     return "unknown"

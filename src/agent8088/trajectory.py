@@ -8,6 +8,7 @@ import re
 import shlex
 from copy import deepcopy
 from pathlib import PurePath
+from urllib.parse import urlsplit
 
 from agent8088.completion import SUBGOAL_PREFIX
 
@@ -359,6 +360,86 @@ def _runs_a_written_file(command: str, written) -> bool:
                               command or "", re.IGNORECASE):
             return True
     return False
+
+
+# Files whose change is worth a look at the running result: code, pages and styles. Notes, data files and tests are not.
+_RUNNABLE_SUFFIXES = CODE_SUFFIXES | {".html", ".htm", ".css", ".mjs", ".cjs", ".sh"}
+
+
+def _local_page(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+    except ValueError:
+        return False
+    return ((parsed.scheme == 'file' and parsed.hostname in (None, '', 'localhost'))
+            or (parsed.scheme in ('http', 'https')
+                and parsed.hostname in ('localhost', '127.0.0.1', '::1')))
+
+
+class EditCheckReminder:
+    """An after-edit reminder to run what was just written, not another round of writing.
+
+    A run that keeps writing files without once running or opening them finds the faults only at the end, when
+    each costs a rewrite. Once `after` different code or page files have changed with nothing run or opened in
+    between, the next tool result carries one short reminder (at most `limit` per run). Running any check, any
+    file this run wrote, or a local page clears the count. Tests, scratch files and non-code files never count,
+    and nothing is said while a file is still being written in parts."""
+
+    def __init__(self, after: int = 3, limit: int = 3, workspace: str = ""):
+        self.after, self.limit, self.workspace = max(0, int(after)), max(0, int(limit)), workspace
+        self.changed: dict = {}
+        self.sent = 0
+
+    def _counts(self, path: str) -> bool:
+        local = PurePath(path)
+        if self.workspace:
+            try:
+                local = local.relative_to(self.workspace)
+            except ValueError:
+                pass
+        return (local.suffix.lower() in _RUNNABLE_SUFFIXES and not _is_test_path(str(local))
+                and not _is_scratch_path(str(local)))
+
+    def _ran(self, name: str, args: dict, result: str, run_workspace: str = '') -> bool:
+        text = str(result or "")
+        if (text.lstrip().lower().startswith(('error:', 'blocked:', 'escalation_request'))
+                or _RUN_FAILED_RE.search(text) or _REAL_TEST_FAILURE.search(text)):
+            return False
+        if name == "check_app":
+            return ': smoke test passed' in text.splitlines()[0].lower() if text.splitlines() else False
+        if name == "execute_shell":
+            command = str(args.get("command") or "")
+            return bool(command.strip() and not _is_probe(command)
+                        and (_is_check_run(command) or any(
+                            _runs_script(command, path, run_workspace or self.workspace)
+                            for path in self.changed.values())))
+        return name == 'browse_page' and any(_local_page(str(args.get(k) or '')) for k in ('url', 'path'))
+
+    def after_tool(self, name: str, args: dict, result: str, *, mutated: bool, path: str = "",
+                   partial: bool = False, can_check_app: bool = False, failed: bool = False,
+                   run_workspace: str = '') -> str:
+        """The reminder to append to this tool's result, or ""."""
+        if not self.after or not self.limit:
+            return ""
+        if not failed and self._ran(name, args, result, run_workspace):
+            self.changed.clear()
+            return ""
+        if mutated and path and self._counts(path):
+            canonical = PurePath(path)
+            if self.workspace and not canonical.is_absolute():
+                canonical = PurePath(self.workspace) / canonical
+            self.changed[_file_key(str(canonical))] = str(canonical)
+        if len(self.changed) < self.after or self.sent >= self.limit or partial:
+            return ""
+        count = len(self.changed)
+        names = [PurePath(p).name for p in self.changed.values()][-4:]
+        self.sent += 1
+        self.changed.clear()
+        how = ("use check_app on a page or script, or run it" if can_check_app else "run it or open the page")
+        return (f"You have changed {count} files (latest: {', '.join(names)}) since you last ran or opened anything. "
+                f"Before writing more, {how} through its real entry point, look at what it actually does "
+                "(for a page, use its main controls), and fix what is wrong.")
 
 
 # What a script says when it was run in the wrong place: a browser file started under Node or Python (no `document`, no
