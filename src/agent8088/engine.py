@@ -5975,6 +5975,16 @@ def _foreign_attachment(path: Path) -> bool:
             and not resolved.is_relative_to(_document_root))
 
 
+def _smoke_path_denied(path: str) -> bool:
+    """The page server must enforce the file tool's read boundaries on assets too."""
+    try:
+        resolved = Path(path).resolve()
+        return (not _path_is_allowed(resolved) or _is_sensitive_path(str(resolved))
+                or _check_path_zone(resolved) == "blocked" or _foreign_attachment(resolved))
+    except (OSError, ValueError, RuntimeError):
+        return True
+
+
 def _resolve_transfer_paths(args: dict) -> tuple[Path, Path]:
     """Source and destination of copy_file / move_file.
 
@@ -13931,7 +13941,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
             report = app_check.check_target(
-                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_smoke_path_denied,
                 run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
             text = report.text()
             if app_check.browser_unavailable(report):
@@ -19314,7 +19324,7 @@ def _backend_check_step(trajectory, targets) -> None:
             if trajectory.backend_check_current(str(root)):
                 return
             report = backend_check.run_backend_check(root, page, _backend_server_launcher(), startup=BACKEND_CHECK_STARTUP,
-                                                    boundary=boundary, deny=_is_sensitive_path,
+                                                    boundary=boundary, deny=_smoke_path_denied,
                                                     cancelled=lambda: _active_budget is not None and _active_budget.exceeded())
         except Exception as error:  # noqa: BLE001 -- a problem in this optional check must never end the run
             root = Path(target).parent
@@ -19339,7 +19349,7 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     for target in targets:
         if str(target) not in pending:
             continue
-        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_smoke_path_denied,
                                         run=_smoke_script_runner(target), click_steps=SMOKE_CLICK_STEPS)
         if report.status == app_check.SKIPPED:
             continue
