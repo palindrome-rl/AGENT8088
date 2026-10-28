@@ -580,6 +580,10 @@ MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
 MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
 REWRITE_NUDGE_AFTER = 4
+# After this many different code or page files change with nothing run or opened in between, the next tool result
+# carries a reminder to run what was written (at most EDIT_CHECK_REMINDERS per run; 0 turns it off).
+EDIT_CHECK_AFTER = 3
+EDIT_CHECK_REMINDERS = max(0, _config_int("edit_check_reminders", 3))
 # Follow-ups the completion checks may send in one request when a reply is empty,
 # admits unfinished work, leaves a named file missing, skips a part of a
 # multi-part request, or leaves changed work unverified. One budget for all of
@@ -17980,6 +17984,10 @@ def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
             "finish the most important remaining step first." + _wrap_up_ask(final))
 
 
+def _new_edit_check_reminder():
+    return trajectory.EditCheckReminder(EDIT_CHECK_AFTER, EDIT_CHECK_REMINDERS, workspace=str(ARTIFACTS_ROOT))
+
+
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
@@ -19939,6 +19947,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
+    edit_check = _new_edit_check_reminder()
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
@@ -21228,6 +21237,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     trace.append({"turn": turn, "type": "diagnostic_run",
                                   "trigger": "repeated_failure", "tool": name,
                                   "code": code, "outcome": status})
+            if not blocked:
+                check_reminder = edit_check.after_tool(
+                    name, args, result, mutated=_MUTATION_SEQ != mutation_seq_before,
+                    path=str(args.get("filename") or args.get("destination") or ""),
+                    partial=bool(trajectory is not None and trajectory.data.get("partial_files")),
+                    can_check_app="check_app" in TOOL_SPECS)
+                if check_reminder:
+                    rewrite_note += f"\n{_HARNESS_PREFIX}{check_reminder}"
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "edit_check_reminder", "tool": name})
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}{rewrite_note}"})
 

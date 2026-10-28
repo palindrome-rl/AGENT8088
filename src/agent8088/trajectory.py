@@ -361,6 +361,61 @@ def _runs_a_written_file(command: str, written) -> bool:
     return False
 
 
+# Files whose change is worth a look at the running result: code, pages and styles. Notes, data files and tests are not.
+_RUNNABLE_SUFFIXES = CODE_SUFFIXES | {".html", ".htm", ".css", ".mjs", ".cjs", ".sh"}
+_LOCAL_PAGE = re.compile(r"^(?:https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?|file://)", re.IGNORECASE)
+
+
+class EditCheckReminder:
+    """An after-edit reminder to run what was just written, not another round of writing.
+
+    A run that keeps writing files without once running or opening them finds the faults only at the end, when
+    each costs a rewrite. Once `after` different code or page files have changed with nothing run or opened in
+    between, the next tool result carries one short reminder (at most `limit` per run). Running any check, any
+    file this run wrote, or a local page clears the count. Tests, scratch files and non-code files never count,
+    and nothing is said while a file is still being written in parts."""
+
+    def __init__(self, after: int = 3, limit: int = 3, workspace: str = ""):
+        self.after, self.limit, self.workspace = max(0, int(after)), max(0, int(limit)), workspace
+        self.changed: dict = {}
+        self.sent = 0
+
+    def _counts(self, path: str) -> bool:
+        return (PurePath(path).suffix.lower() in _RUNNABLE_SUFFIXES and not _is_test_path(path)
+                and not _is_scratch_path(path, self.workspace))
+
+    def _ran(self, name: str, args: dict, result: str) -> bool:
+        text = str(result or "")
+        if text.startswith("Error:"):
+            return False
+        if name == "check_app":
+            return True
+        if name == "execute_shell":
+            command = str(args.get("command") or "")
+            return _is_check_run(command) or _runs_a_written_file(command, list(self.changed))
+        return any(_LOCAL_PAGE.match(str(args.get(k) or "")) for k in ("url", "path"))
+
+    def after_tool(self, name: str, args: dict, result: str, *, mutated: bool, path: str = "",
+                   partial: bool = False, can_check_app: bool = False) -> str:
+        """The reminder to append to this tool's result, or ""."""
+        if not self.after or not self.limit:
+            return ""
+        if self._ran(name, args, result):
+            self.changed.clear()
+            return ""
+        if mutated and path and self._counts(path):
+            self.changed[path] = True
+        if len(self.changed) < self.after or self.sent >= self.limit or partial:
+            return ""
+        names = [PurePath(p).name for p in self.changed][-4:]
+        self.sent += 1
+        self.changed.clear()
+        how = ("use check_app on a page or script, or run it" if can_check_app else "run it or open the page")
+        return (f"You have changed {len(names)} files ({', '.join(names)}) since you last ran or opened anything. "
+                f"Before writing more, {how} through its real entry point, look at what it actually does "
+                "(for a page, use its main controls), and fix what is wrong.")
+
+
 # What a script says when it was run in the wrong place: a browser file started under Node or Python (no `document`, no
 # `window`), or an ES module started as a plain script. The file may be fine where it belongs, so that run says
 # nothing about it. Only a run of a file the run wrote, with no check word in the command, is read this way: a
