@@ -5761,9 +5761,32 @@ def _from_container_path(raw_path: str) -> str:
     return str(ARTIFACTS_ROOT / relative)
 
 
+def _artifacts_twin(p: Path) -> Path | None:
+    """Where resolve_write_path put a file whose absolute project path was asked for, when that file is there.
+
+    A write to an absolute path inside the project that does not exist yet is stored under artifacts/ (see
+    resolve_write_path), so reading the same path back must look there too, or the model is told "No such file"
+    for a file it wrote a moment ago. Only used when the stated path is missing: a file that exists where it
+    was named is always the one read, as it is for writes. A task container stores files exactly where they are
+    named, so nothing is redirected there."""
+    if DISPOSABLE_CONTAINER:
+        return None
+    try:
+        resolved = p.resolve()
+        if (resolved.exists() or resolved == ARTIFACTS_ROOT or ARTIFACTS_ROOT in resolved.parents
+                or PROJECT_ROOT not in resolved.parents):
+            return None
+        twin = (ARTIFACTS_ROOT / resolved.relative_to(PROJECT_ROOT)).resolve()
+        return twin if twin.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(_from_container_path(raw_path)).expanduser()
-    if not p.is_absolute():
+    if p.is_absolute():
+        p = _artifacts_twin(p) or p
+    else:
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
         p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
@@ -6082,6 +6105,26 @@ def _transfer_file(name: str, source: Path, target: Path, args: dict) -> str:
                    f"name it, so the file is in artifacts/. Ask the user which folder "
                    f"they want, or use a folder that exists.")
     return result
+
+
+def _redirected_note(raw_path: str, target: Path) -> str:
+    """Tell the model when an absolute path inside the project was stored under artifacts/ instead.
+
+    "Wrote N bytes to <path>" names the real path, but a model that asked for another one reads that as
+    confirmation and goes on using the path it asked for. Said once, here, the later read-back and the
+    page's own links use the right path from the start."""
+    try:
+        asked = Path(_from_container_path(raw_path)).expanduser()
+        if not asked.is_absolute():
+            return ""
+        asked_parents = asked.resolve().parents
+        if (ARTIFACTS_ROOT in asked_parents or PROJECT_ROOT not in asked_parents
+                or ARTIFACTS_ROOT not in Path(target).resolve().parents):
+            return ""
+        return (f" — NOT {asked}. New files you create are stored under artifacts/; use {target} "
+                f"from now on.")
+    except (OSError, ValueError):
+        return ""
 
 
 def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
@@ -13659,6 +13702,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         except ValueError as exc:
             return f"Error: {exc}"
         shadowed = None if source else _shadowed_project_file(write_path, target)
+        moved_note = "" if source else _redirected_note(write_path, target)
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
@@ -14067,6 +14111,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += _redirected_note(write_path, target)
             return result
         global _shell_workspace_root
         if (not DISPOSABLE_CONTAINER and PROJECT_ROOT in target.parents
@@ -14160,6 +14205,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += moved_note
             hunk = "".join(_last_write_diff[2:])[:2000]
             if hunk:
                 result += f"\n{hunk}"
@@ -14185,6 +14231,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += moved_note
             return result
         # Everything above returned; reaching here is a whole-file overwrite.
         # write_file marks both content and source_url optional so either can
@@ -14226,6 +14273,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             result += (f" — NOT {shadowed}. A bare filename is stored in "
                        f"artifacts/; pass that absolute path if you meant to "
                        f"edit the project's own file.")
+        result += moved_note
         return result
 
     if mode == "python_eval":
