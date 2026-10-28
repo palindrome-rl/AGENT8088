@@ -19812,7 +19812,7 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(f"Test-integrity note: existing test file(s) were changed this run ({listed}). "
                      "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
-        notes.append(CHECKS_FAILED_NOTE)
+        notes.append(f"{CHECKS_FAILED_NOTE} {which}" if (which := trajectory.failing_check_note()) else CHECKS_FAILED_NOTE)
     if not read_only and (mirror_note := _mirror_redirected_writes(trajectory)):
         notes.append(mirror_note)
     location_note = (_workspace_note(trajectory, probe_backend=False) if read_only else _workspace_note(trajectory))
