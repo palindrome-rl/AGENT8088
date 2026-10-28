@@ -156,15 +156,23 @@ def _default_chromium() -> str | None:
         return p.chromium.executable_path
 
 
-_PARENT_REF = re.compile(r"""(?:src|href)\s*=\s*["']((?:\.\./)+)""", re.IGNORECASE)
+# A `../` reference that the browser resolves against the page itself: an attribute (src, href), a CSS url(), a module
+# import (`import x from "../a.js"`, `export ... from`, `import "../a.js"`, `import("../a.js")`), or a fetch / new URL /
+# importScripts call written in the page.
+_PARENT_REF = re.compile(
+    r"""(?:(?:src|href)\s*=\s*["']?|url\(\s*["']?|\bfrom\s*["']|\bimport\s*\(?\s*["']"""
+    r"""|\b(?:fetch|URL|importScripts)\s*\(\s*["'])(?:\./)*((?:\.\./)+)""",
+    re.IGNORECASE)
 
 
 def serve_root(page: Path) -> Path:
     """The folder to serve: the page's own, or the ancestor its `../` links reach.
 
     A page in docs/ that loads ../style.css needs the folder above it, or every
-    correct site with a shared stylesheet is reported broken. Bounded to three
-    levels and never above the filesystem root.
+    correct site with a shared stylesheet is reported broken. The same holds for a
+    page in test/ whose module script imports "../js/game.js": served from test/,
+    every import answered 404 and a working page was reported broken. Bounded to
+    three levels and never above the filesystem root.
     """
     page = Path(page)
     try:
