@@ -184,6 +184,44 @@ def test_a_key_after_a_name_and_separator_is_still_reported(line):
     assert secret_scan.find_secrets(line)
 
 
+@pytest.mark.parametrize("line", [
+    "/* ===================== DATA ===================== */",
+    "/* ===================== STAT CALC ===================== */",
+    "# ----------------------------------------",
+    "//////////////////////////////////////////",
+    "# ++++++++++++++++++++ Setup2 ++++++++++++++++++++",
+    "/*=====================Team2Build=====================*/",
+    "## ____________________ helpers ____________________",
+])
+def test_a_banner_or_divider_line_is_not_a_credential(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line) == []
+
+
+@pytest.mark.parametrize("line", [
+    'key = "=====Kx9fQ2mPz7Lr4Tw8YbN3vH6====="',
+    '/* ===== */ token = "Kx9fQ2mPz7Lr4Tw8YbN3/vH6"',
+    'k = "sk-live-AbCdEf0123456789xyz" // ==========',
+])
+def test_a_key_next_to_a_banner_is_still_reported(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line)
+
+
+@pytest.mark.parametrize('separator', ['/', '+', '_', '-'])
+def test_repeated_separators_inside_a_credential_are_not_a_banner(separator):
+    from agent8088 import secret_scan
+    value = 'Kx9fQ27' + separator * 4 + 'mPz7L48'
+    assert secret_scan.looks_like_opaque_credential(value)
+    assert secret_scan.find_secrets('key = "' + value + '"')
+
+
+@pytest.mark.parametrize('value', ['////Kx9fQ27', 'Kx9fQ27////', '====Kx9fQ27===='])
+def test_short_values_keep_their_original_shape_when_separator_edges_are_removed(value):
+    from agent8088 import secret_scan
+    assert not secret_scan.looks_like_opaque_credential(value)
+
+
 def test_only_an_opaque_string_with_no_digit_is_weak():
     from agent8088 import secret_scan
     weak = secret_scan.find_secrets('key = "aBcDeFgHiJ/kLmNoPqRsTu"')
