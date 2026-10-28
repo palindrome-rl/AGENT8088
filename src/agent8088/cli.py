@@ -1772,6 +1772,21 @@ def render_answer(answer):
                             box=box.ROUNDED, border_style="#00C8FF"))
 
 
+def _print_round_prose(text):
+    """Print what the model said before its tool calls, once, into the scrollback.
+
+    Prose that comes with a tool call is a progress update for the user, but it only ever appeared in the live region,
+    and that region is erased the moment the tool row replaces it. Only the final answer was printed for good, so every
+    earlier update vanished as soon as it was written. /verbose controls tool detail, not what the model says."""
+    text = A._mask_system_content(text or "").strip()
+    if not text:
+        return
+    try:
+        console.print(Padding(_AnswerMarkdown(text), (0, 0, 0, 2)))
+    except Exception:
+        console.print(Padding(Text(text), (0, 0, 0, 2)))
+
+
 # ---------------------------------------------------------------------------
 # Sub-agent live view — a nested, animated activity trace inside the parent turn
 # ---------------------------------------------------------------------------
@@ -2462,6 +2477,9 @@ def do_chat(query):
     if getattr(S, "hold", False):
         _answer_on_hold()
         return
+    if _is_pause_request(query):
+        _answer_on_hold(sticky=False)
+        return
     # Filled by the capture thread via the engine hook; read back on this thread.
     memory_stored = []
     A.memory_on_capture = memory_stored.extend
@@ -2555,8 +2573,9 @@ def do_chat(query):
         A.subagent_ui = _make_subagent_ui(live)
 
         def _on_calls(calls):
-            # The round's reasoning belongs above the tool rows it led to.
+            # The round's reasoning and its update to the user belong above the tool rows they led to.
             flush_reasoning()
+            _print_round_prose(stream.prose_text())
             on_calls(calls)
 
         def _on_result(name, result):
@@ -6478,22 +6497,74 @@ def cmd_temp(rest):
     _save_preferences()
 
 
-def _answer_on_hold():
-    """One text-only model call for a message sent while the session is on hold. No tool is offered, so nothing can run."""
+# A plain-language request to stop and report. The pause has to open a sentence ("pause and send an update", "update on step 7.
+# don't execute anything further"), so "stop using requests" or "wait for the server, then report" is still a task, not a pause.
+_PAUSE_OPENER_RE = re.compile(
+    r"(?:^|[.!?;]\s+)(?:please\s+|can you\s+|could you\s+)?(?:"
+    r"(?:pause|halt|freeze)\b(?=\s*(?:$|[.!?,;:]|(?:and|for|now|here)\b|"
+    r"(?:(?:the|your|our|all)\s+)?(?:current\s+)?(?:execution|work|task|run|tool\s+calls)\b))|hold\s+(?:on|up)\b|"
+    r"stop\s+(?:executing|working|everything|doing|what you|for now|now|here|there)\b|"
+    r"(?:do\s*n[o'’]?t|do not)\s+(?:(?:execute|run|do|make|change|touch|act|work)\s+(?:anything|any\s+(?:more|further|other)|further|more)|"
+    r"continue\b|proceed\b|go\s+on\b))", re.IGNORECASE)
+_UPDATE_ASK_RE = re.compile(
+    r"\b(?:update|status|progress|report|summary|summari[sz]e|where\s+(?:are|do)\s+(?:you|we)|where\s+(?:you|we)\s+(?:are|stand)|"
+    r"what\s+(?:have|did|are)\s+you|how\s+far|what(?:'s|\s+is)\s+(?:done|left))\b", re.IGNORECASE)
+_BARE_PAUSE_RE = re.compile(r"(?:please\s+)?(?:pause|stop|wait|halt|hold\s+on|hold\s+up|freeze)(?:\s+(?:now|please|for now))?[\s.!]*", re.IGNORECASE)
+
+
+def _is_pause_request(text) -> bool:
+    """Whether a message asks the agent to stop what it is doing and report, rather than to do something.
+
+    Seen in use: asked to pause and send an update, the agent kept calling tools, because the request was only prose and every
+    tool stayed on offer. /hold fixes that but needs a slash command. This recognises the plain-language form, narrowly: a
+    short message that opens a sentence with a pause ("pause", "hold on", "stop executing", "don't execute anything further")
+    and either is short or also asks for an update. Anything longer or less clear stays a normal task."""
+    text = (text or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    if _BARE_PAUSE_RE.fullmatch(text):
+        return True
+    words = len(text.split())
+    if words > 40 or not _PAUSE_OPENER_RE.search(text):
+        return False
+    return words <= 12 or bool(_UPDATE_ASK_RE.search(text))
+
+
+def _answer_on_hold(sticky=True):
+    """One text-only model call for a message sent while the session is on hold. No tool is offered, so nothing can run.
+
+    `sticky=False` is the plain-language pause: the same text-only answer, but the session is not left on hold, so the next
+    message carries on normally with every tool."""
+    started = time.time()
+    query = S.messages[-1].get("content", "") if S.messages else ""
+    if not sticky:
+        S.turns_this_run = 0
+        S.last_trace = None
+
+    def record_pause(step, interrupted=False):
+        if not sticky and (S.show_trace or S.record_end_reason):
+            _record_trace(query, [step], time.time() - started, interrupted=interrupted)
+
     try:
-        with console.status("thinking (on hold)...", spinner="dots"):
+        with console.status("thinking (on hold)..." if sticky else "thinking (paused)...", spinner="dots"):
             answer = A.reply_without_tools(S.messages, kind="hold", trajectory_state=S.trajectory_state,
                                            system_prompt=_session_system_prompt, temperature=S.temperature)
     except KeyboardInterrupt:
+        record_pause({"turn": 0, "type": "interrupted"}, interrupted=True)
         console.print("[dim]⏹ interrupted[/dim]")
         _save_session_safely()
         return
     except Exception as exc:  # noqa: BLE001
+        record_pause({"turn": 0, "type": "model_error", "detail": "Text-only pause reply failed."})
         console.print(f"[red]could not answer on hold:[/red] {exc}")
         _save_session_safely()
         return
+    record_pause({"turn": 0, "type": "final_answer", "content": answer, "paused": True})
     render_answer(answer)
-    console.print("[dim]on hold: no tools ran. /continue to resume, /finish to wrap up[/dim]")
+    if sticky:
+        console.print("[dim]on hold: no tools ran. /continue to resume, /finish to wrap up[/dim]")
+    else:
+        console.print("[dim]paused: no tools ran. Your next message carries on; /hold keeps it paused, /finish wraps up[/dim]")
     _save_session_safely()
 
 
@@ -10369,7 +10440,7 @@ def _repl_turns():
             else:
                 console.print(_unknown_command_message(cmd))
             continue
-        pasted = None if getattr(S, "hold", False) else _detect_pasted_file(line)
+        pasted = None if getattr(S, "hold", False) or _is_pause_request(line) else _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:
