@@ -19812,7 +19812,8 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(f"Test-integrity note: existing test file(s) were changed this run ({listed}). "
                      "Confirm the tests were not weakened to make them pass.")
     if trajectory is not None and trajectory.check_failing():
-        notes.append(CHECKS_FAILED_NOTE)
+        which = trajectory.failing_check_note(display_filter=_mask_system_content)
+        notes.append(f"{CHECKS_FAILED_NOTE} {which}" if which else CHECKS_FAILED_NOTE)
     if not read_only and (mirror_note := _mirror_redirected_writes(trajectory)):
         notes.append(mirror_note)
     location_note = (_workspace_note(trajectory, probe_backend=False) if read_only else _workspace_note(trajectory))
@@ -21090,6 +21091,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     partial_path=(str(resolve_write_path(str(args.get("filename") or "")).resolve())
                                   if name == "write_file" and mutated and args.get("filename") else ""),
                     command=str(args.get("command") or ""),
+                    display_filter=_mask_system_content,
                     existed=existed_before,
                     written_to=_write_landing(name, args),
                     reference=name == "write_file" and "(fetched from " in str(result),
