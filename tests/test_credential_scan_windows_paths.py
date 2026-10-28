@@ -13,7 +13,7 @@ BATCH = "pokemon_v19_a8088_or_27_20_2"
 @pytest.mark.parametrize("line", [
     rf"E:\agent8088_demo\batches\{BATCH}\runs\run1\work\artifacts",
     rf'BASE = "E:\\agent8088_demo\\batches\\{BATCH}\\runs\\run1"',
-    rf"cd C:\Users\imroze.aslam\projects\{BATCH}",
+    rf"cd C:\Users\ExampleUser\projects\{BATCH}",
     rf"\\fileserver\share\{BATCH}\notes",
     rf"E:\{BATCH}",
     rf"python E:\work\{BATCH}\build.py --out E:\work\{BATCH}\dist",
@@ -27,9 +27,9 @@ def test_the_same_name_outside_a_path_is_still_judged_as_before():
 
 
 @pytest.mark.parametrize("line", [
-    "token = 'q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y'",
-    rf"E:\work\run1 key=q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y",
-    rf"open('E:\\work\\x.txt'); API_KEY='q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y'",
+    "token = 'q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y'",  # gitleaks:allow -- fabricated scanner fixture
+    rf"E:\work\run1 key=q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y",  # gitleaks:allow -- fabricated scanner fixture
+    rf"open('E:\\work\\x.txt'); API_KEY='q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y'",  # gitleaks:allow -- fabricated scanner fixture
     "sk-proj-abcdefghijklmnopqrstuvwx0123456789",
 ])
 def test_a_real_key_beside_a_path_is_still_found(line):
@@ -38,3 +38,18 @@ def test_a_real_key_beside_a_path_is_still_found(line):
 
 def test_a_key_with_one_backslash_is_not_taken_for_a_path():
     assert secret_scan.find_secrets(r"q8Zr1xKp3LmN7v\B2cD5fG9hJ0aS4wE6y")
+
+
+@pytest.mark.parametrize("line", [
+    rf"C:\Users\Example User\{BATCH}",
+    rf"work\{BATCH}",
+    rf'BASE = "C:\\Users\\Example User\\{BATCH}"',
+    rf'BASE = "C:\\work\\Project Files {BATCH}"',
+])
+def test_paths_with_spaces_and_relative_paths_are_not_credentials(line):
+    assert secret_scan.find_secrets(line) == []
+
+
+def test_a_quoted_string_with_a_path_and_a_separate_key_still_reports_the_key():
+    line = r'"C:\work\run1 token=q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y"'  # gitleaks:allow -- fabricated scanner fixture
+    assert secret_scan.find_secrets(line)
