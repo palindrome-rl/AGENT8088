@@ -1695,7 +1695,11 @@ def _shell_fetches_remote_web(command: str) -> bool:
     # `$?` (the last exit status, as in `echo "exit: $?"`) cannot name a host, so it is not a substitution here.
     if re.search(r"\$(?!\?)|`|%[A-Za-z_]\w*%|[\r\n]", command):
         return True
-    parts = _lex_command(_REDIRECTION.sub("", _QUOTED_FLAG_VALUE.sub(lambda m: m.group("flag") + "_", command)))
+    normalised = _QUOTED_FLAG_VALUE.sub(lambda m: m.group("flag") + "_", command)
+    # Bash can open a network connection through a redirection. A URL path or literal payload is not one.
+    if re.search(r""">\s*["']?/dev/(?:tcp|udp)/""", normalised):
+        return True
+    parts = _lex_command(_REDIRECTION.sub("", normalised))
     if not parts:
         return True
     curl_values = {"-o", "--output", "-X", "--request",
@@ -1730,6 +1734,10 @@ def _shell_fetches_remote_web(command: str) -> bool:
             continue
         client = Path(segment[0]).stem.lower()
         if client in _WEB_MENTION_LOOKUPS:
+            # Text can become code when piped to a shell (or evaluated by a wrapper).
+            # Keep such commands unproven instead of letting their later local URL excuse them.
+            if any(Path(word).stem.lower() in _COMMAND_RUNNERS for part in segments for word in part):
+                return True
             continue    # `| findstr /i "HTTP choice"` names a client in a pattern; it does not run one
         if client not in ("curl", "wget"):
             return True
