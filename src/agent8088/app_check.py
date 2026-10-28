@@ -176,8 +176,10 @@ def _resource_tokens(code: str, *, css=False):
         kind, text = match.lastgroup, match.group()
         if css and kind == 'skip' and text.startswith('//'):
             kind, text = 'punct', '//'
-        if kind == 'regex' and (css or (tokens and tokens[-1][1] not in (
-                '=', '(', '[', '{', ',', ':', ';', '!', '?', 'return', 'yield', 'case'))):
+        postfix = len(tokens) >= 2 and [t[1] for t in tokens[-2:]] in (['+', '+'], ['-', '-'])
+        if kind == 'regex' and (css or postfix or (tokens and tokens[-1][1] not in (
+                '=', '(', '[', '{', ',', ':', ';', '!', '?', '>', '|', '&', '+', '-', '*', '~', '^',
+                'return', 'yield', 'case'))):
             kind, text = 'punct', '/'  # Division must not swallow a later import.
         offset = match.start() + len(text)
         if kind != 'skip':
