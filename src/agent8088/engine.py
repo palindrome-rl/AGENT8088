@@ -14101,6 +14101,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += _redirected_note(write_path, target)
             return result
         global _shell_workspace_root
         if (not DISPOSABLE_CONTAINER and PROJECT_ROOT in target.parents
@@ -14220,6 +14221,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += moved_note
             return result
         # Everything above returned; reaching here is a whole-file overwrite.
         # write_file marks both content and source_url optional so either can

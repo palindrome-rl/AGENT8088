@@ -82,3 +82,56 @@ def test_no_note_for_relative_or_unredirected_paths(engine, roots, name):
     assert engine._redirected_note(name, engine.resolve_write_path(name)) == ""
     inside = artifacts / "e.js"
     assert engine._redirected_note(str(inside), inside) == ""
+
+
+@pytest.mark.parametrize('mode', ['overwrite', 'append'])
+def test_real_write_and_read_tools_report_and_follow_the_redirect(engine, roots, monkeypatch, mode):
+    project, artifacts = roots
+    monkeypatch.setattr(engine, 'PERMISSION_MODE', 'full-auto')
+    monkeypatch.setattr(engine, 'NO_PROMPT_PATHS', [project])
+    engine.reset_turn_counters()
+    asked = project / 'outputs' / 'note.txt'
+    result = engine.run_tool('write_file', {'filename': str(asked), 'content': 'redirect fixture', 'mode': mode})
+    assert f'NOT {asked}' in result and str(artifacts / 'outputs' / 'note.txt') in result
+    assert not asked.exists()
+    assert 'redirect fixture' in engine.run_tool('read_text', {'filename': str(asked)})
+
+
+def test_twin_outside_the_allowed_roots_is_refused(engine, roots, monkeypatch):
+    project, artifacts = roots
+    (artifacts / 'note.txt').write_text('fixture', encoding='utf-8')
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [project / 'other'])
+    with pytest.raises(ValueError, match='Path not allowed'):
+        engine.resolve_user_path(str(project / 'note.txt'))
+
+
+def test_a_sensitive_artifact_twin_stays_protected(engine, roots):
+    project, artifacts = roots
+    (artifacts / '.env').write_text('FIXTURE_ONLY=1\n', encoding='utf-8')
+    result = engine.run_tool('read_text', {'filename': str(project / '.env')})
+    assert 'sensitive' in result.lower() and 'FIXTURE_ONLY' not in result
+
+
+def test_a_download_note_names_its_final_derived_extension(engine, roots, monkeypatch):
+    project, artifacts = roots
+    monkeypatch.setattr(engine, 'PERMISSION_MODE', 'full-auto')
+    monkeypatch.setattr(engine, 'NO_PROMPT_PATHS', [project])
+    monkeypatch.setattr(engine, '_fetch_url_bytes', lambda _url: (b'download fixture', '', 'text/plain'))
+    engine.reset_turn_counters()
+    asked = project / 'outputs' / 'download'
+    result = engine.run_tool('write_file', {'filename': str(asked), 'source_url': 'https://example.com/file.txt'})
+    landed = artifacts / 'outputs' / 'download.txt'
+    assert landed.read_bytes() == b'download fixture'
+    assert f'NOT {asked}' in result and f'use {landed} from now on' in result
+
+
+def test_an_artifact_symlink_cannot_escape_allowed_paths(engine, roots, tmp_path):
+    project, artifacts = roots
+    outside = tmp_path / 'outside.txt'
+    outside.write_text('outside fixture', encoding='utf-8')
+    try:
+        (artifacts / 'note.txt').symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip('symlinks unavailable')
+    with pytest.raises(ValueError, match='Path not allowed'):
+        engine.resolve_user_path(str(project / 'note.txt'))
