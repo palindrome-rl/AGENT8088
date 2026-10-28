@@ -67,15 +67,22 @@ def test_a_handled_missing_package_does_not_hide_a_later_crash(tmp_path, termina
     assert report.failed and not report.ask
 
 
-def test_a_real_chained_traceback_keeps_its_terminal_failure(tmp_path):
+@pytest.mark.parametrize("chained", [False, True])
+def test_real_interpreter_failures_distinguish_missing_packages_from_later_crashes(tmp_path, chained):
     import subprocess
     import sys
-    script = _script(tmp_path, "try:\n    import agent8088_nonexistent_fixture_package\n"
-                     "except ModuleNotFoundError:\n    raise NameError('terminal fixture crash')\n")
+    code = "import agent8088_nonexistent_fixture_package\n"
+    if chained:
+        code = ("try:\n    " + code
+                + "except ModuleNotFoundError:\n    raise NameError('terminal fixture crash')\n")
+    script = _script(tmp_path, code)
     def run(_command, timeout):
         result = subprocess.run([sys.executable, str(script), "--help"], cwd=tmp_path,
                                 capture_output=True, text=True, timeout=timeout)
         assert result.returncode == 1
         return result.stderr + f"\nCommand exited with status {result.returncode}."
     report = app_check.check_script(script, run=run)
-    assert report.failed and "NameError" in report.output
+    if chained:
+        assert report.failed and "NameError" in report.output
+    else:
+        assert report.status == app_check.UNAVAILABLE and report.ask
