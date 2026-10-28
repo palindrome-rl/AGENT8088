@@ -96,3 +96,22 @@ def test_the_url_helper_is_judged_by_the_host_as_written(engine):
 ])
 def test_malformed_or_unproven_targets_keep_the_followup_guard(engine, command):
     assert _followup(engine, command)
+
+
+@pytest.mark.parametrize('flag', ['-F', '-m', '-c', '-r', '-d'])
+def test_wget_switches_do_not_hide_a_schemeless_remote_target(engine, flag):
+    assert _followup(engine, f'wget {flag} example.com http://localhost:8000/')
+
+
+@pytest.mark.parametrize('flag', ['-F', '-m', '-c', '-r', '-d'])
+def test_wget_switches_with_only_a_local_target_remain_local(engine, flag):
+    assert not _followup(engine, f'wget {flag} http://localhost:8000/')
+
+
+@pytest.mark.parametrize('command', [
+    'wget -O saved.html http://localhost:8000/',
+    'wget --output-document saved.html http://localhost:8000/',
+    'curl --remote-name http://localhost:8000/data.json',
+])
+def test_output_options_use_the_clients_own_argument_rules(engine, command):
+    assert not _followup(engine, command)
