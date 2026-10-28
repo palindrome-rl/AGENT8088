@@ -21397,7 +21397,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         if on_answer:
             on_answer(answer)
         if trace is not None:
-            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer})
+            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer,
+                          **({"stopped": "no_progress"} if forced_stop else {})})
         return answer
     latest = tool_outputs[-1] if tool_outputs else _last_tool_output
     fallback = f"Error: Agent {reason}."
@@ -21407,5 +21408,6 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     if on_answer:
         on_answer(fallback)
     if trace is not None:
-        trace.append({"turn": -1, "type": "max_turns", "content": fallback})
+        trace.append({"turn": -1, "type": "max_turns", "content": fallback,
+                      **({"stopped": "no_progress"} if forced_stop else {})})
     return fallback
