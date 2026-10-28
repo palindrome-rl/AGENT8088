@@ -17,7 +17,7 @@ def _followup(engine, command):
     "curl -s http://localhost:11434/api/tags -o tags.json && type tags.json",
     "curl -s http://127.0.0.1:8765/index.html",
     "curl http://[::1]:8000/health",
-    "curl -s http://127.0.0.2:18022/v1/models",
+    "curl -s http://192.168.10.20:8000/v1/models",
     "curl http://10.0.0.5/status",
     "curl http://172.16.4.2:9000/",
     "wget -qO- http://app.localhost:3000/",
@@ -49,7 +49,21 @@ def test_commands_that_are_not_fetches_are_unaffected(engine):
 
 def test_the_url_helper_is_judged_by_the_host_as_written(engine):
     assert engine._is_local_url("http://localhost:11434/api/tags")
-    assert engine._is_local_url("http://127.0.0.2:18022/v1")
+    assert engine._is_local_url("http://192.168.10.20:8000/v1")
     assert not engine._is_local_url("https://localhost.example.com/")
     assert not engine._is_local_url("not a url")
     assert not engine._is_local_url("http:///nohost")
+
+
+@pytest.mark.parametrize("command", [
+    "curl http://[broken]/",
+    "curl http://localhost:bad/",
+    "curl http://localhost:9000/ && curl example.com",
+    "curl http://localhost:9000/ --next example.com",
+    "curl http://localhost:9000/ --url example.com",
+    "curl http://localhost:9000/ -K config.txt",
+    'curl http://localhost:9000/ "$REMOTE_URL"',
+    "curl http://localhost:9000/ && wget",
+])
+def test_malformed_or_unproven_targets_keep_the_followup_guard(engine, command):
+    assert _followup(engine, command)

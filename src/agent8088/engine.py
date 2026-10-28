@@ -1646,7 +1646,14 @@ def _is_local_url(url: str) -> bool:
 
     Judged by the host as written: "localhost.example.com" and "127.0.0.1.evil.com" are not local."""
     import ipaddress
-    host = (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        parsed.port  # Reject malformed port/IPv6 syntax as an unknown target.
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
     if not host:
         return False
     if host == "localhost" or host.endswith(".localhost"):
@@ -1665,7 +1672,60 @@ def _shell_fetches_remote_web(command: str) -> bool:
     urls = _shell_web_urls(command)
     if urls is None:
         return False
-    return not urls or not all(_is_local_url(url) for url in urls)
+    if not urls or not all(_is_local_url(url) for url in urls):
+        return True
+    # A URL elsewhere in the command cannot justify another client's target.
+    # Prove the common literal forms; leave wrappers, substitutions, unknown
+    # flags and scheme-less destinations under the existing follow-up guard.
+    if re.search(r"\$|`|%[A-Za-z_]\w*%|[\r\n]", command):
+        return True
+    parts = _lex_command(command)
+    if not parts:
+        return True
+    values = {"-o", "--output", "-O", "--output-document", "-X", "--request",
+              "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+              "-H", "--header", "-u", "--user", "-A", "--user-agent",
+              "--connect-timeout", "--max-time"}
+    flags = {"--silent", "--show-error", "--fail", "--fail-with-body", "--location",
+             "--head", "--insecure", "--verbose", "--quiet", "--no-check-certificate"}
+    segments, segment = [], []
+    for part in parts + [";"]:
+        if part in (";", "&&", "||", "&", "|"):
+            if segment:
+                segments.append(segment)
+            segment = []
+        else:
+            segment.append(part.strip("\"'"))
+    for segment in segments:
+        if not _SHELL_WEB_CLIENT.search(" ".join(segment)):
+            continue
+        client = Path(segment[0]).stem.lower()
+        if client not in ("curl", "wget"):
+            return True
+        targets, index = 0, 1
+        while index < len(segment):
+            token = segment[index]
+            if token in values:
+                index += 2
+                if index > len(segment):
+                    return True
+                continue
+            if token in ("--url", "--next", "--"):
+                index += 1
+                continue
+            if token in flags or re.fullmatch(r"-[sSfLvIkqi]+", token):
+                index += 1
+                continue
+            if client == "wget" and token == "-qO-":
+                index += 1
+                continue
+            if not _is_local_url(token):
+                return True
+            targets += 1
+            index += 1
+        if not targets:
+            return True
+    return False
 
 
 # Commands that name a web client without running it: lookups, text search,
