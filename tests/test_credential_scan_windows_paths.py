@@ -53,3 +53,9 @@ def test_paths_with_spaces_and_relative_paths_are_not_credentials(line):
 def test_a_quoted_string_with_a_path_and_a_separate_key_still_reports_the_key():
     line = r'"C:\work\run1 token=q8Zr1xKp3LmN7vB2cD5fG9hJ0aS4wE6y"'  # gitleaks:allow -- fabricated scanner fixture
     assert secret_scan.find_secrets(line)
+
+
+def test_a_vendor_key_inside_a_path_is_still_found():
+    fabricated = "sk-proj-" + "a1b2" * 8
+    findings = secret_scan.find_secrets(rf"C:\work\{fabricated}\output")
+    assert any(f.kind == "API key (sk-)" for f in findings)
