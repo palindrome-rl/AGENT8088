@@ -368,7 +368,7 @@ def test_script_that_crashes_on_start_fails(tmp_path):
     script = tmp_path / "tool.py"
     script.write_text("import missing_module_xyz\n", encoding="utf-8")
     crash = lambda cmd, timeout: ("Traceback (most recent call last):\n"
-                                  "ModuleNotFoundError: No module named 'missing_module_xyz'\n"
+                                  "ImportError: cannot import name 'missing_name_xyz' from 'tool'\n"
                                   "Command exited with status 1.")
     report = app_check.check_script(script, run=crash)
     assert report.status == app_check.FAIL and "crashed" in report.failures[0]
@@ -430,9 +430,9 @@ def test_a_failed_script_start_keeps_what_the_script_printed(tmp_path):
     script = tmp_path / "tool.py"
     script.write_text("print('x')\n", encoding="utf-8")
     printed = ("Traceback (most recent call last):\n  File \"tool.py\", line 3\n"
-               "ModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.")
+               "ImportError: cannot import name 'nothing_here' from 'tool'\nCommand exited with status 1.")
     report = app_check.check_script(script, run=lambda cmd, timeout: printed)
-    assert report.failed and "ModuleNotFoundError" in report.output
+    assert report.failed and "ImportError" in report.output
     assert app_check.check_script(script, run=lambda c, t: "usage: tool.py [-h]").output == ""
 
 
@@ -464,7 +464,7 @@ def test_a_start_that_fails_for_the_place_it_ran_in_is_not_verified_rather_than_
 
 
 @pytest.mark.parametrize("printed", [
-    "Traceback (most recent call last):\nModuleNotFoundError: No module named 'nothing_here'\nCommand exited with status 1.",
+    "Traceback (most recent call last):\nImportError: cannot import name 'nothing_here' from 'tool'\nCommand exited with status 1.",
     "Traceback (most recent call last):\nNameError: name 'rows' is not defined\nCommand exited with status 1.",
     "Traceback (most recent call last):\nTypeError: 'NoneType' object is not iterable\nCommand exited with status 1.",
 ])
