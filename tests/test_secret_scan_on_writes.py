@@ -184,6 +184,30 @@ def test_a_key_after_a_name_and_separator_is_still_reported(line):
     assert secret_scan.find_secrets(line)
 
 
+@pytest.mark.parametrize("line", [
+    "/* ===================== DATA ===================== */",
+    "/* ===================== STAT CALC ===================== */",
+    "# ----------------------------------------",
+    "//////////////////////////////////////////",
+    "# ++++++++++++++++++++ Setup2 ++++++++++++++++++++",
+    "/*=====================Team2Build=====================*/",
+    "## ____________________ helpers ____________________",
+])
+def test_a_banner_or_divider_line_is_not_a_credential(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line) == []
+
+
+@pytest.mark.parametrize("line", [
+    'key = "=====Kx9fQ2mPz7Lr4Tw8YbN3vH6====="',
+    '/* ===== */ token = "Kx9fQ2mPz7Lr4Tw8YbN3/vH6"',
+    'k = "sk-live-AbCdEf0123456789xyz" // ==========',
+])
+def test_a_key_next_to_a_banner_is_still_reported(line):
+    from agent8088 import secret_scan
+    assert secret_scan.find_secrets(line)
+
+
 def test_only_an_opaque_string_with_no_digit_is_weak():
     from agent8088 import secret_scan
     weak = secret_scan.find_secrets('key = "aBcDeFgHiJ/kLmNoPqRsTu"')

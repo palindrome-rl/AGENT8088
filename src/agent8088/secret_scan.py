@@ -69,6 +69,8 @@ _MIXED = (r"[a-z]", r"[A-Z]", r"[0-9]")
 _MIN_HEX = 16
 _MIN_BLOB = 20
 _MIN_MIXED = 12
+# Four or more of the same separator in a row: a banner or divider such as `=====` or `-----`.
+_RULE_RUN_RE = re.compile(r"([=\-_+/.*#~])\1{3,}")
 
 # A run of digits is never a credential, however long: timestamps, ids and
 # counters all look like that. Same reasoning as detect-secrets' digit
@@ -159,6 +161,10 @@ def looks_like_opaque_credential(value: str) -> bool:
     mixed-case blob with no digit in it is far more often base64 of a
     word than a credential.
     """
+    # A rule line (`=====`, `-----`, `/////`) is decoration around a heading, not part of a key: judge only what
+    # is left once such runs are taken out. A real key has no run of four identical separators.
+    if _RULE_RUN_RE.search(value):
+        return any(looks_like_opaque_credential(piece) for piece in _RULE_RUN_RE.sub(" ", value).split())
     if _DIGITS_ONLY_RE.fullmatch(value):
         return False
     if len(value) >= _MIN_HEX and _HEX_RE.fullmatch(value):
