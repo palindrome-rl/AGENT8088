@@ -1697,12 +1697,24 @@ def _shell_fetches_remote_web(command: str) -> bool:
     parts = _lex_command(command)
     if not parts:
         return True
-    values = {"-o", "--output", "-O", "--output-document", "-X", "--request",
+    curl_values = {"-o", "--output", "-X", "--request",
               "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
               "-H", "--header", "-u", "--user", "-A", "--user-agent",
-              "--connect-timeout", "--max-time"}
-    flags = {"--silent", "--show-error", "--fail", "--fail-with-body", "--location",
-             "--head", "--insecure", "--verbose", "--quiet", "--no-check-certificate"}
+              "--connect-timeout", "--max-time", "-m",
+              # What a model adds to check that its own server answers: curl -w "%{http_code}" prints the status.
+              "-w", "--write-out", "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar",
+              "-F", "--form", "--form-string", "-T", "--upload-file", "-r", "--range",
+              "-D", "--dump-header", "--json", "--retry", "--retry-delay", "--retry-max-time"}
+    curl_flags = {"--silent", "--show-error", "--fail", "--fail-with-body", "--location",
+             "--head", "--insecure", "--verbose", "--quiet", "--no-check-certificate",
+             "--compressed", "--get", "--globoff", "--http1.1", "--http2", "--no-buffer"}
+    # The short options are not interchangeable: wget's -m/-c/-F/-r/-d are
+    # switches, while curl consumes a value. Skipping a wget target as an option
+    # value would wrongly let a remote destination borrow a later localhost URL.
+    wget_values = {"-o", "--output-file", "-O", "--output-document", "--header",
+                   "--user", "-U", "--user-agent", "--connect-timeout", "--timeout"}
+    wget_flags = {"-q", "--quiet", "--no-check-certificate", "-m", "--mirror",
+                  "-c", "--continue", "-F", "--force-html", "-r", "--recursive", "-d", "--debug"}
     segments, segment = [], []
     for part in parts + [";"]:
         if part in (";", "&&", "||", "&", "|"):
@@ -1717,18 +1729,23 @@ def _shell_fetches_remote_web(command: str) -> bool:
         client = Path(segment[0]).stem.lower()
         if client not in ("curl", "wget"):
             return True
+        values = curl_values if client == "curl" else wget_values
+        flags = curl_flags if client == "curl" else wget_flags
         targets, index = 0, 1
         while index < len(segment):
             token = segment[index]
+            if client == "curl" and token in ("-O", "--remote-name"):
+                index += 1      # curl's -O takes no value; only wget's -O names an output file
+                continue
             if token in values:
                 index += 2
                 if index > len(segment):
                     return True
                 continue
-            if token in ("--url", "--next", "--"):
+            if client == "curl" and token in ("--url", "--next", "--"):
                 index += 1
                 continue
-            if token in flags or re.fullmatch(r"-[sSfLvIkqi]+", token):
+            if token in flags or (client == "curl" and re.fullmatch(r"-[sSfLvIkqi]+", token)):
                 index += 1
                 continue
             if client == "wget" and token == "-qO-":
