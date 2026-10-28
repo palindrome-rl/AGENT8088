@@ -48,6 +48,22 @@ def test_a_repeated_call_is_warned_three_times_and_the_fourth_ends_the_run(eng, 
     assert "stopped because repeated tool calls made no progress" in answer
 
 
+def test_the_repeat_breaker_marks_its_trace_step_as_no_progress(eng, monkeypatch):
+    _script(eng, monkeypatch, [SAME] * 8 + ["Gave up."])
+    trace = []
+    eng.run_agent(REQUEST, max_turns=30, tools_def=[], allowed_tools={"execute_shell"}, trace=trace)
+    ends = [t for t in trace if t.get("type") in ("budget_wrap_up", "max_turns")]
+    assert ends and ends[-1].get("stopped") == "no_progress"
+
+
+def test_the_repeat_breaker_fallback_also_marks_no_progress(eng, monkeypatch):
+    _script(eng, monkeypatch, [SAME] * 8)
+    monkeypatch.setattr(eng, '_answer_from_context', lambda *_a, **_kw: None)
+    trace = []
+    eng.run_agent(REQUEST, max_turns=30, tools_def=[], allowed_tools={'execute_shell'}, trace=trace)
+    assert trace[-1]['type'] == 'max_turns' and trace[-1]['stopped'] == 'no_progress'
+
+
 def test_a_different_call_after_a_warning_clears_it(eng, monkeypatch):
     sent = _script(eng, monkeypatch, [SAME, SAME, SAME, OTHER, SAME, SAME, SAME, "All done."])
     answer = _run(eng)

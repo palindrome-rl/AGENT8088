@@ -94,6 +94,8 @@ def test_run_end_reason_names_how_the_turn_ended(cli):
                     "content": "Turn budget exceeded: 866 seconds elapsed (limit 865)."}]) == "time_budget"
     assert reason([{"type": "budget_wrap_up"}]) == "turn_limit"
     assert reason([{"type": "max_turns"}]) == "turn_limit"
+    assert reason([{"type": "budget_wrap_up", "stopped": "no_progress"}]) == "no_progress"
+    assert reason([{"type": "max_turns", "stopped": "no_progress"}]) == "no_progress"
     assert reason([{"type": "model_error", "detail": "Connection refused"}]) == "model_error"
     assert reason([]) == "unknown" and reason(None) == "unknown"
     cli.S.conversation_trace[:] = [{"interrupted": True}]

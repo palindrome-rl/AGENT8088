@@ -35,7 +35,7 @@ if [ -d "$AGENT8088_HOME/logs" ]; then
     cp -r "$AGENT8088_HOME/logs/." /logs/agent/agent8088-internal-logs/ 2>/dev/null || true
 fi
 # agent8088's last line says why the run ended (answered, time_budget,
-# turn_limit, model_error, interrupted, watchdog, unknown).
+# turn_limit, no_progress, model_error, interrupted, watchdog, unknown).
 end_reason=$(grep -a -o '\[agent8088\] run ended: [a-z_]*' "$log" | tail -n 1 | sed 's/.*: //')
 stopped_by=none
 if [ "$budget" -gt 0 ] 2>/dev/null && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; then
