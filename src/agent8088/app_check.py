@@ -510,6 +510,63 @@ def _blocked_request_warning(url: str, methods) -> str:
     return f"blocked request to an external host: {url[:120]}"
 
 
+# What the check's own file server answers for an address it does not have: its error page, as a page that reads the
+# reply and throws or logs it shows it ("Error response", "Error code: 404").
+_STATIC_ERROR_PAGE = re.compile(
+    r"^(?:Error:\s*)?(?:(?:<!doctype\s+html>\s*)?<html\b[\s\S]*?<title>\s*Error response\s*</title>"
+    r"|Error response\s+Error code:\s*(?:404|405|501)\b.*Message:)", re.IGNORECASE)
+# Only this longer form comes from an undecided/noncommittal navigation control.
+# A committal action button doing nothing is still a concrete failure, even
+# when unrelated backend/telemetry requests were blocked during page load.
+_NOTHING_HAPPENED = re.compile(
+    r"^clicking the first control .* changed nothing on the page, and no other control that was tried changed it either$")
+
+
+def _set_aside_missing_backend_effects(failures: list, warnings: list, out: dict, asked: set) -> None:
+    """Failures that follow from the missing backend are not failures of the page.
+
+    The page asked its own server for data and this check, which serves files only, could not answer. An error that
+    consists of that address and its missing-response status, one that quotes the check's own error-page signature,
+    or an undecided navigation control is inconclusive. Concrete action failures and unrelated exceptions stay."""
+    if not asked:
+        return
+    keep, moved = [], []
+    for item in failures:
+        is_error = item.startswith(("page error: ", "console error: "))
+        message = item.partition(": ")[2] if is_error else ""
+        names_route = any(re.fullmatch(
+            r"(?:Error:\s*)?" + re.escape(path) + r"(?:\?[^\s]*)?\s*(?:->|:|returned|HTTP|status)\s*"
+            r"(?:404|405|501)(?:\s+(?:Not Found|Method Not Allowed|Not Implemented))?", message,
+            re.IGNORECASE) for path in asked) if is_error else False
+        quotes_error_page = is_error and bool(_STATIC_ERROR_PAGE.search(message))
+        nothing_happened = bool(_NOTHING_HAPPENED.match(item))
+        if names_route or quotes_error_page or nothing_happened:
+            moved.append(item)
+        else:
+            keep.append(item)
+    if not moved:
+        return
+    failures[:] = keep
+    warnings.extend(f"{item} (follows from the server call this check could not answer; not verified)" for item in moved)
+    out["unavailable"] = "the page depends on its own server, which this check does not run; its behaviour was not verified"
+
+
+def _set_aside_blocked_call_effects(failures: list, warnings: list, out: dict, blocked: list) -> None:
+    """A first control that does nothing after the page's own fetch to an external host was blocked.
+
+    The check blocks every external host, so data the page asks for never arrives and a click has nothing to show."""
+    if not blocked:
+        return
+    keep, moved = [], []
+    for item in failures:
+        (moved if _NOTHING_HAPPENED.match(item) else keep).append(item)
+    if not moved:
+        return
+    failures[:] = keep
+    warnings.extend(f"{item} (the page's call to {blocked[0][:80]} was blocked by this check; not verified)" for item in moved)
+    out["unavailable"] = "the page fetches data from an external host, which this check blocks; its behaviour was not verified"
+
+
 def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 click_steps: int = CLICK_THROUGH_STEPS, backend: bool = False,
                 executable: str | None = None) -> None:
@@ -521,6 +578,7 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
     backend_codes: list[int] = []       # and their status codes (404)
     console_where: dict[int, str] = {}  # failure index -> the url a console error came from
     external: list[str] = []
+    external_fetch: list[str] = []      # blocked external urls the page asked for with fetch/XHR (data it never got)
     external_methods: dict[str, set] = {}   # blocked url -> the HTTP methods the page tried
     external_scripts: list[str] = []
     dialogs: list[str] = []
@@ -563,6 +621,8 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 else:
                     if url not in external:
                         external.append(url)
+                    if request_route.request.resource_type in ("fetch", "xhr") and url not in external_fetch:
+                        external_fetch.append(url)
                     external_methods.setdefault(url, set()).add(request_route.request.method)
                     if request_route.request.resource_type == "script" and url not in external_scripts:
                         external_scripts.append(url)
@@ -706,6 +766,9 @@ def _web_worker(root: Path, page: str, timeout: float, deny, out: dict,
                 failures[:] = [item for i, item in enumerate(failures)
                                if not (i in console_where and console_where[i].split("?")[0] in asked
                                        and item.startswith("console error: Failed to load resource"))]
+                _set_aside_missing_backend_effects(failures, warnings, out, asked)
+            if external_fetch:
+                _set_aside_blocked_call_effects(failures, warnings, out, external_fetch)
             if external_scripts:
                 # A blocked script may explain a missing global, but cannot
                 # prove that the application is correct. Fonts/images alone
