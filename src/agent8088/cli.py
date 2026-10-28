@@ -6424,8 +6424,9 @@ def cmd_temp(rest):
 # A plain-language request to stop and report. The pause has to open a sentence ("pause and send an update", "update on step 7.
 # don't execute anything further"), so "stop using requests" or "wait for the server, then report" is still a task, not a pause.
 _PAUSE_OPENER_RE = re.compile(
-    r"(?:^|[.!?;:,]\s+|\band\s+)(?:please\s+|can you\s+|could you\s+)?(?:"
-    r"(?:pause|halt|freeze)\b(?!\s+(?:the|a|an|my|your|this|that|these|those|all|each|every)\b)|hold\s+(?:on|up)\b|"
+    r"(?:^|[.!?;]\s+)(?:please\s+|can you\s+|could you\s+)?(?:"
+    r"(?:pause|halt|freeze)\b(?=\s*(?:$|[.!?,;:]|(?:and|for|now|here)\b|"
+    r"(?:(?:the|your|our|all)\s+)?(?:current\s+)?(?:execution|work|task|run|tool\s+calls)\b))|hold\s+(?:on|up)\b|"
     r"stop\s+(?:executing|working|everything|doing|what you|for now|now|here|there)\b|"
     r"(?:do\s*n[o'’]?t|do not)\s+(?:(?:execute|run|do|make|change|touch|act|work)\s+(?:anything|any\s+(?:more|further|other)|further|more)|"
     r"continue\b|proceed\b|go\s+on\b))", re.IGNORECASE)
@@ -6458,18 +6459,31 @@ def _answer_on_hold(sticky=True):
 
     `sticky=False` is the plain-language pause: the same text-only answer, but the session is not left on hold, so the next
     message carries on normally with every tool."""
+    started = time.time()
+    query = S.messages[-1].get("content", "") if S.messages else ""
+    if not sticky:
+        S.turns_this_run = 0
+        S.last_trace = None
+
+    def record_pause(step, interrupted=False):
+        if not sticky and (S.show_trace or S.record_end_reason):
+            _record_trace(query, [step], time.time() - started, interrupted=interrupted)
+
     try:
         with console.status("thinking (on hold)..." if sticky else "thinking (paused)...", spinner="dots"):
             answer = A.reply_without_tools(S.messages, kind="hold", trajectory_state=S.trajectory_state,
                                            system_prompt=_session_system_prompt, temperature=S.temperature)
     except KeyboardInterrupt:
+        record_pause({"turn": 0, "type": "interrupted"}, interrupted=True)
         console.print("[dim]⏹ interrupted[/dim]")
         _save_session_safely()
         return
     except Exception as exc:  # noqa: BLE001
+        record_pause({"turn": 0, "type": "model_error", "detail": "Text-only pause reply failed."})
         console.print(f"[red]could not answer on hold:[/red] {exc}")
         _save_session_safely()
         return
+    record_pause({"turn": 0, "type": "final_answer", "content": answer, "paused": True})
     render_answer(answer)
     if sticky:
         console.print("[dim]on hold: no tools ran. /continue to resume, /finish to wrap up[/dim]")
@@ -10346,7 +10360,7 @@ def _repl_turns():
             else:
                 console.print(_unknown_command_message(cmd))
             continue
-        pasted = None if getattr(S, "hold", False) else _detect_pasted_file(line)
+        pasted = None if getattr(S, "hold", False) or _is_pause_request(line) else _detect_pasted_file(line)
         if pasted and _handle_pasted_file(*pasted, original=line):
             continue
         try:

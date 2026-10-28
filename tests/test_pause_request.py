@@ -135,3 +135,42 @@ def test_a_session_already_on_hold_still_answers_in_text_and_stays_on_hold(out, 
     assert calls == {"run_agent": 0, "reply": ["hold"]}
     assert session.hold is True
     assert "on hold: no tools ran" in out.getvalue()
+
+
+@pytest.mark.parametrize('text', [
+    'Implement play and pause buttons.',
+    'Add controls: pause and report progress.',
+    'Pause playback when the user presses space.',
+    'Freeze animation when the mouse leaves the canvas.',
+    'Show the text: pause and send me an update.',
+])
+def test_ui_and_quoted_instruction_tasks_do_not_pause_the_agent(text):
+    assert not cli._is_pause_request(text)
+
+
+@pytest.mark.parametrize('text', [
+    'Pause your current work and give me an update.',
+    'Pause the execution and report progress.',
+])
+def test_explicit_agent_work_can_be_named_in_a_pause(text):
+    assert cli._is_pause_request(text)
+
+
+def test_pause_bypasses_pasted_attachment_detection(monkeypatch, out, session, calls):
+    lines = iter(['pause and send an update about notes.txt', '/exit'])
+    monkeypatch.setattr(cli, '_read_line', lambda: next(lines))
+    monkeypatch.setattr(cli, '_detect_pasted_file', lambda *_a: pytest.fail('pause inspected a file'))
+    cli._repl_turns()
+    assert calls == {'run_agent': 0, 'reply': ['hold']}
+
+
+def test_headless_pause_records_its_own_answer_instead_of_previous_failure(out, session, calls):
+    session.record_end_reason = True
+    session.turns_this_run = 12
+    session.last_trace = [{'type': 'model_error', 'detail': 'previous turn'}]
+    session.conversation_trace = [{'interrupted': True, 'stop_reason': 'SIGTERM'}]
+    cli.do_chat('pause and send me an update')
+    assert cli._run_end_reason(session.last_trace) == 'answered'
+    assert session.last_trace[-1]['paused'] is True
+    assert session.conversation_trace[-1]['input'] == 'pause and send me an update'
+    assert session.turns_this_run == 0
