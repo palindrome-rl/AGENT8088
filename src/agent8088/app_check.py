@@ -512,21 +512,33 @@ def _blocked_request_warning(url: str, methods) -> str:
 
 # What the check's own file server answers for an address it does not have: its error page, as a page that reads the
 # reply and throws or logs it shows it ("Error response", "Error code: 404").
-_STATIC_ERROR_PAGE = re.compile(r"<!doctype html|<html|Error response|Error code:\s*\d{3}|Nothing matches the given URI",
-                                re.IGNORECASE)
-_NOTHING_HAPPENED = re.compile(r"^clicking the first control .* changed nothing on the page")
+_STATIC_ERROR_PAGE = re.compile(
+    r"^(?:Error:\s*)?(?:(?:<!doctype\s+html>\s*)?<html\b[\s\S]*?<title>\s*Error response\s*</title>"
+    r"|Error response\s+Error code:\s*(?:404|405|501)\b.*Message:)", re.IGNORECASE)
+# Only this longer form comes from an undecided/noncommittal navigation control.
+# A committal action button doing nothing is still a concrete failure, even
+# when unrelated backend/telemetry requests were blocked during page load.
+_NOTHING_HAPPENED = re.compile(
+    r"^clicking the first control .* changed nothing on the page, and no other control that was tried changed it either$")
 
 
 def _set_aside_missing_backend_effects(failures: list, warnings: list, out: dict, asked: set) -> None:
     """Failures that follow from the missing backend are not failures of the page.
 
     The page asked its own server for data and this check, which serves files only, could not answer. An error that
-    names that address, one that quotes the check's own error page, and a first control that does nothing because the
-    data never arrived say nothing about the page. Each is set aside as not verified. Any other failure stays."""
+    consists of that address and its missing-response status, one that quotes the check's own error-page signature,
+    or an undecided navigation control is inconclusive. Concrete action failures and unrelated exceptions stay."""
+    if not asked:
+        return
     keep, moved = [], []
     for item in failures:
-        names_route = item.startswith(("page error", "console error")) and any(path in item for path in asked)
-        quotes_error_page = item.startswith(("page error", "console error")) and bool(_STATIC_ERROR_PAGE.search(item))
+        is_error = item.startswith(("page error: ", "console error: "))
+        message = item.partition(": ")[2] if is_error else ""
+        names_route = any(re.fullmatch(
+            r"(?:Error:\s*)?" + re.escape(path) + r"(?:\?[^\s]*)?\s*(?:->|:|returned|HTTP|status)\s*"
+            r"(?:404|405|501)(?:\s+(?:Not Found|Method Not Allowed|Not Implemented))?", message,
+            re.IGNORECASE) for path in asked) if is_error else False
+        quotes_error_page = is_error and bool(_STATIC_ERROR_PAGE.search(message))
         nothing_happened = bool(_NOTHING_HAPPENED.match(item))
         if names_route or quotes_error_page or nothing_happened:
             moved.append(item)
@@ -543,6 +555,8 @@ def _set_aside_blocked_call_effects(failures: list, warnings: list, out: dict, b
     """A first control that does nothing after the page's own fetch to an external host was blocked.
 
     The check blocks every external host, so data the page asks for never arrives and a click has nothing to show."""
+    if not blocked:
+        return
     keep, moved = [], []
     for item in failures:
         (moved if _NOTHING_HAPPENED.match(item) else keep).append(item)

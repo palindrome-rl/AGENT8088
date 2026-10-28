@@ -64,18 +64,18 @@ def _server(tmp_path):
     (tmp_path / "server.py").write_text("# the project's own server\n", encoding="utf-8")
 
 
-NAMED_ROUTE = """<!doctype html><html><body><button id="go">Go</button><p id="out">waiting</p>
+NAMED_ROUTE = """<!doctype html><html><body><button class="tab active">Roster</button><p id="out">waiting</p>
 <script>fetch('/api/roster').then(r => { if (!r.ok) throw new Error('/api/roster -> ' + r.status); return r.json(); });</script>
 </body></html>"""
 
-ERROR_PAGE_THROWN = """<!doctype html><html><body><button id="go">Go</button><p id="out">waiting</p>
+ERROR_PAGE_THROWN = """<!doctype html><html><body><button class="tab active">Roster</button><p id="out">waiting</p>
 <script>fetch('/api/roster').then(r => r.text().then(t => { throw new Error(t); }));</script></body></html>"""
 
 REAL_ERROR_TOO = """<!doctype html><html><body><button id="go">Go</button><p id="out">waiting</p>
 <script>fetch('/api/roster').catch(() => {});
 setTimeout(() => { undefinedFunction(); }, 50);</script></body></html>"""
 
-EXTERNAL_FETCH = """<!doctype html><html><body><button id="go">Go</button><p id="out">waiting</p>
+EXTERNAL_FETCH = """<!doctype html><html><body><button class="tab active">Roster</button><p id="out">waiting</p>
 <script>fetch('https://api.example.com/data').catch(() => {});</script></body></html>"""
 
 IDLE_NO_FETCH = """<!doctype html><html><body><button id="go">Go</button><p id="out">waiting</p></body></html>"""
@@ -108,3 +108,35 @@ def test_an_idle_control_after_a_blocked_external_fetch_is_not_verified(tmp_path
     report = app_check.check_web_page(_page(tmp_path, EXTERNAL_FETCH))
     assert not report.failed, report.failures
     assert report.status == app_check.UNAVAILABLE
+
+
+@pytest.mark.parametrize("item", [
+    "page error: TypeError: /api/roster.map is not a function",
+    "page error: ReferenceError: /api/roster handler is undefined",
+    "page error: TypeError: expected HTML but got <html from a template",
+    "console error: Error response from unrelated validation",
+    "page error: /api/roster-extra -> 404",
+    'clicking the first control (button#save "Save") changed nothing on the page',
+])
+def test_unrelated_errors_and_committal_actions_stay_failed(item):
+    failures, warnings, out = [item], [], {}
+    app_check._set_aside_missing_backend_effects(failures, warnings, out, ASKED)
+    assert failures == [item] and not warnings and not out
+
+
+def test_incidental_external_telemetry_does_not_excuse_a_dead_action():
+    item = 'clicking the first control (button#save "Save") changed nothing on the page'
+    failures, warnings, out = [item], [], {}
+    app_check._set_aside_blocked_call_effects(failures, warnings, out, ["https://telemetry.example.com/ping"])
+    assert failures == [item] and not warnings and not out
+
+
+@needs_chromium
+@pytest.mark.parametrize("external", [False, True])
+def test_a_real_dead_action_still_fails_beside_an_unavailable_request(tmp_path, external):
+    _server(tmp_path)
+    url = "https://telemetry.example.com/ping" if external else "/api/roster"
+    html = ('<html><body><button id="launch">Launch</button><script>'
+            f'fetch("{url}").catch(() => {{}});</script></body></html>')
+    report = app_check.check_web_page(_page(tmp_path, html))
+    assert report.failed and any("changed nothing" in f for f in report.failures), report.text()
