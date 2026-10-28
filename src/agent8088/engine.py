@@ -580,6 +580,10 @@ MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
 # a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
 MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
 REWRITE_NUDGE_AFTER = 4
+# After this many different code or page files change with nothing run or opened in between, the next tool result
+# carries a reminder to run what was written (at most EDIT_CHECK_REMINDERS per run; 0 turns it off).
+EDIT_CHECK_AFTER = 3
+EDIT_CHECK_REMINDERS = max(0, _config_int("edit_check_reminders", 3))
 # Follow-ups the completion checks may send in one request when a reply is empty,
 # admits unfinished work, leaves a named file missing, skips a part of a
 # multi-part request, or leaves changed work unverified. One budget for all of
@@ -5772,9 +5776,32 @@ def _from_container_path(raw_path: str) -> str:
     return str(ARTIFACTS_ROOT / relative)
 
 
+def _artifacts_twin(p: Path) -> Path | None:
+    """Where resolve_write_path put a file whose absolute project path was asked for, when that file is there.
+
+    A write to an absolute path inside the project that does not exist yet is stored under artifacts/ (see
+    resolve_write_path), so reading the same path back must look there too, or the model is told "No such file"
+    for a file it wrote a moment ago. Only used when the stated path is missing: a file that exists where it
+    was named is always the one read, as it is for writes. A task container stores files exactly where they are
+    named, so nothing is redirected there."""
+    if DISPOSABLE_CONTAINER:
+        return None
+    try:
+        resolved = p.resolve()
+        if (resolved.exists() or resolved == ARTIFACTS_ROOT or ARTIFACTS_ROOT in resolved.parents
+                or PROJECT_ROOT not in resolved.parents):
+            return None
+        twin = (ARTIFACTS_ROOT / resolved.relative_to(PROJECT_ROOT)).resolve()
+        return twin if twin.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
 def resolve_user_path(raw_path: str) -> Path:
     p = Path(_from_container_path(raw_path)).expanduser()
-    if not p.is_absolute():
+    if p.is_absolute():
+        p = _artifacts_twin(p) or p
+    else:
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
         p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
@@ -5986,6 +6013,16 @@ def _foreign_attachment(path: Path) -> bool:
             and not resolved.is_relative_to(_document_root))
 
 
+def _smoke_path_denied(path: str) -> bool:
+    """The page server must enforce the file tool's read boundaries on assets too."""
+    try:
+        resolved = Path(path).resolve()
+        return (not _path_is_allowed(resolved) or _is_sensitive_path(str(resolved))
+                or _check_path_zone(resolved) == "blocked" or _foreign_attachment(resolved))
+    except (OSError, ValueError, RuntimeError):
+        return True
+
+
 def _resolve_transfer_paths(args: dict) -> tuple[Path, Path]:
     """Source and destination of copy_file / move_file.
 
@@ -6083,6 +6120,26 @@ def _transfer_file(name: str, source: Path, target: Path, args: dict) -> str:
                    f"name it, so the file is in artifacts/. Ask the user which folder "
                    f"they want, or use a folder that exists.")
     return result
+
+
+def _redirected_note(raw_path: str, target: Path) -> str:
+    """Tell the model when an absolute path inside the project was stored under artifacts/ instead.
+
+    "Wrote N bytes to <path>" names the real path, but a model that asked for another one reads that as
+    confirmation and goes on using the path it asked for. Said once, here, the later read-back and the
+    page's own links use the right path from the start."""
+    try:
+        asked = Path(_from_container_path(raw_path)).expanduser()
+        if not asked.is_absolute():
+            return ""
+        asked_parents = asked.resolve().parents
+        if (ARTIFACTS_ROOT in asked_parents or PROJECT_ROOT not in asked_parents
+                or ARTIFACTS_ROOT not in Path(target).resolve().parents):
+            return ""
+        return (f" — NOT {asked}. New files you create are stored under artifacts/; use {target} "
+                f"from now on.")
+    except (OSError, ValueError):
+        return ""
 
 
 def _shadowed_project_file(raw_path: str, target: Path) -> Path | None:
@@ -13660,6 +13717,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         except ValueError as exc:
             return f"Error: {exc}"
         shadowed = None if source else _shadowed_project_file(write_path, target)
+        moved_note = "" if source else _redirected_note(write_path, target)
         # Layer 1 applies to WRITES as well as reads. Without this a sensitive file
         # (~/.gitconfig, ~/.ssh/authorized_keys, .env, a key file) could be silently
         # overwritten even though reading it is denied.
@@ -13949,7 +14007,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             if not read_target.exists():
                 return f"Error: {read_target} does not exist, so there is nothing to check."
             report = app_check.check_target(
-                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+                read_target, COMPLETION_SMOKE_TIMEOUT, deny=_smoke_path_denied,
                 run=_smoke_script_runner(read_target), click_steps=SMOKE_CLICK_STEPS)
             text = report.text()
             if app_check.browser_unavailable(report):
@@ -14075,6 +14133,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += _redirected_note(write_path, target)
             return result
         global _shell_workspace_root
         if (not DISPOSABLE_CONTAINER and PROJECT_ROOT in target.parents
@@ -14168,6 +14227,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += moved_note
             hunk = "".join(_last_write_diff[2:])[:2000]
             if hunk:
                 result += f"\n{hunk}"
@@ -14193,6 +14253,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                 result += (f" — NOT {shadowed}. A bare filename is stored in "
                            f"artifacts/; pass that absolute path if you meant to "
                            f"edit the project's own file.")
+            result += moved_note
             return result
         # Everything above returned; reaching here is a whole-file overwrite.
         # write_file marks both content and source_url optional so either can
@@ -14234,6 +14295,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             result += (f" — NOT {shadowed}. A bare filename is stored in "
                        f"artifacts/; pass that absolute path if you meant to "
                        f"edit the project's own file.")
+        result += moved_note
         return result
 
     if mode == "python_eval":
@@ -17998,6 +18060,10 @@ def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
             "finish the most important remaining step first." + _wrap_up_ask(final))
 
 
+def _new_edit_check_reminder():
+    return trajectory.EditCheckReminder(EDIT_CHECK_AFTER, EDIT_CHECK_REMINDERS, workspace=str(PROJECT_ROOT))
+
+
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
@@ -19332,7 +19398,7 @@ def _backend_check_step(trajectory, targets) -> None:
             if trajectory.backend_check_current(str(root)):
                 return
             report = backend_check.run_backend_check(root, page, _backend_server_launcher(), startup=BACKEND_CHECK_STARTUP,
-                                                    boundary=boundary, deny=_is_sensitive_path,
+                                                    boundary=boundary, deny=_smoke_path_denied,
                                                     cancelled=lambda: _active_budget is not None and _active_budget.exceeded())
         except Exception as error:  # noqa: BLE001 -- a problem in this optional check must never end the run
             root = Path(target).parent
@@ -19357,7 +19423,7 @@ def _smoke_test_step(trajectory, written: list, report_only: bool = False):
     for target in targets:
         if str(target) not in pending:
             continue
-        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_is_sensitive_path,
+        report = app_check.check_target(target, COMPLETION_SMOKE_TIMEOUT, deny=_smoke_path_denied,
                                         run=_smoke_script_runner(target), click_steps=SMOKE_CLICK_STEPS)
         if report.status == app_check.SKIPPED:
             continue
@@ -19957,6 +20023,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
+    edit_check = _new_edit_check_reminder()
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
@@ -21246,6 +21313,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     trace.append({"turn": turn, "type": "diagnostic_run",
                                   "trigger": "repeated_failure", "tool": name,
                                   "code": code, "outcome": status})
+            if not blocked:
+                reminder_path = str(args.get("filename") or args.get("destination") or "")
+                if reminder_path and _MUTATION_SEQ != mutation_seq_before:
+                    try:
+                        reminder_path = str(_resolve_transfer_paths(args)[1] if name in _TRANSFER_TOOLS
+                                            else resolve_write_path(reminder_path))
+                    except (OSError, ValueError, RuntimeError):
+                        reminder_path = ''
+                check_reminder = edit_check.after_tool(
+                    name, args, result, mutated=_MUTATION_SEQ != mutation_seq_before,
+                    path=reminder_path,
+                    partial=bool(trajectory is not None and trajectory.data.get("partial_files")),
+                    can_check_app="check_app" in round_allowed_tools,
+                    failed=bool(code) or _plan_step_failed(result),
+                    run_workspace=str(_shell_workspace_root or ARTIFACTS_ROOT))
+                if check_reminder:
+                    rewrite_note += f"\n{_HARNESS_PREFIX}{check_reminder}"
+                    if trace is not None:
+                        trace.append({"turn": turn, "type": "edit_check_reminder", "tool": name})
             messages.append({"role": "user", "content":
                              f"{_TOOL_RESULT_PREFIX}{name}):\n{model_result}{note}{rewrite_note}"})
 
@@ -21415,7 +21501,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
         if on_answer:
             on_answer(answer)
         if trace is not None:
-            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer})
+            trace.append({"turn": -1, "type": "budget_wrap_up", "content": answer,
+                          **({"stopped": "no_progress"} if forced_stop else {})})
         return answer
     latest = tool_outputs[-1] if tool_outputs else _last_tool_output
     fallback = f"Error: Agent {reason}."
@@ -21425,5 +21512,6 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     if on_answer:
         on_answer(fallback)
     if trace is not None:
-        trace.append({"turn": -1, "type": "max_turns", "content": fallback})
+        trace.append({"turn": -1, "type": "max_turns", "content": fallback,
+                      **({"stopped": "no_progress"} if forced_stop else {})})
     return fallback

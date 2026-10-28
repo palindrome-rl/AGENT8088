@@ -39,6 +39,7 @@ import uuid
 from urllib.parse import unquote, urlsplit
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 
 WEB_SUFFIXES = frozenset({".html", ".htm"})
@@ -156,22 +157,195 @@ def _default_chromium() -> str | None:
         return p.chromium.executable_path
 
 
-_PARENT_REF = re.compile(r"""(?:src|href)\s*=\s*["']((?:\.\./)+)""", re.IGNORECASE)
+# Tokenize strings/comments as whole units: an example containing `from "../"`
+# in prose, a comment, a regex or a string is not a browser resource reference.
+_RESOURCE_TOKEN = re.compile(
+    r"(?P<skip>\s+|//[^\r\n]*|/\*[\s\S]*?\*/)"
+    r'''|(?P<string>"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|`(?:\\[\s\S]|[^`\\])*`)'''
+    r"|(?P<regex>/(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\r\n\\\[])+/[a-z]*)"
+    r"|(?P<word>[$\w]+)|(?P<punct>[^\s])")
+
+
+def _resource_tokens(code: str, *, css=False):
+    tokens, offset = [], 0
+    while offset < len(code):
+        match = _RESOURCE_TOKEN.match(code, offset)
+        if not match:
+            offset += 1
+            continue
+        kind, text = match.lastgroup, match.group()
+        if css and kind == 'skip' and text.startswith('//'):
+            kind, text = 'punct', '//'
+        postfix = len(tokens) >= 2 and [t[1] for t in tokens[-2:]] in (['+', '+'], ['-', '-'])
+        if kind == 'regex' and (css or postfix or (tokens and tokens[-1][1] not in (
+                '=', '(', '[', '{', ',', ':', ';', '!', '?', '>', '|', '&', '+', '-', '*', '~', '^',
+                'return', 'yield', 'case'))):
+            kind, text = 'punct', '/'  # Division must not swallow a later import.
+        offset = match.start() + len(text)
+        if kind != 'skip':
+            tokens.append((kind, text))
+    return tokens
+
+
+def _resource_string(token) -> str | None:
+    kind, text = token
+    if kind != "string" or (text.startswith('`') and '${' in text):
+        return None
+    def escape(match):
+        value = match.group()[1:]
+        if value.startswith(('u', 'x')):
+            try:
+                return chr(int(value[1:].strip('{}'), 16))
+            except (ValueError, OverflowError):
+                return ''
+        return {'n': '\n', 'r': '\r', 't': '\t', '\n': '', '\r\n': ''}.get(value, value)
+    return re.sub(r"\\(?:u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|\r\n|[\s\S])",
+                  escape, text[1:-1])
+
+
+def _code_resources(code: str, *, css=False):
+    tokens = _resource_tokens(code, css=css)
+    values = [text for _, text in tokens]
+    closing, stack = {}, []
+    if css:
+        for k, value in enumerate(values):
+            if value == '(':
+                stack.append(k)
+            elif value == ')' and stack:
+                closing[stack.pop()] = k
+    for i, (kind, text) in enumerate(tokens):
+        if kind != 'word':
+            continue
+        if css:
+            if text.lower() != 'url' or values[i + 1:i + 2] != ['(']:
+                continue
+            j = i + 2
+            end = closing.get(i + 1)
+            if end is None:
+                continue
+            if j < len(tokens) and tokens[j][0] == 'string':
+                yield _resource_string(tokens[j]) or ''
+            else:
+                yield ''.join(values[j:end])
+            continue
+        if i and values[i - 1] == '.':
+            continue  # Arbitrary object methods are not known browser APIs.
+        if text == 'from' and i + 1 < len(tokens):
+            yield _resource_string(tokens[i + 1]) or ''
+        elif text == 'import' and i + 1 < len(tokens) and tokens[i + 1][0] == 'string':
+            yield _resource_string(tokens[i + 1]) or ''
+        elif text in ('import', 'fetch', 'importScripts', 'URL') and values[i + 1:i + 2] == ['(']:
+            j = i + 2
+            if text == 'URL' and (not i or values[i - 1] != 'new'
+                    or values[j + 1:j + 8] != [',', 'import', '.', 'meta', '.', 'url', ')']):
+                continue  # An explicit unrelated base does not resolve against this page.
+            while j < len(tokens):
+                value = _resource_string(tokens[j])
+                if value is None:
+                    break
+                if text != 'URL' and values[j + 1:j + 2] not in ([','], [')']):
+                    break  # Computed arguments are not statically known paths.
+                yield value
+                if text != 'importScripts' or values[j + 1:j + 2] != [',']:
+                    break
+                j += 2
+
+
+class _PageResources(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.references = []
+        self.base_href = None
+        self.inert = []
+        self.inline = None
+        self.chunks = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('template', 'noscript'):
+            self.inert.append(tag)
+            return
+        if self.inert:
+            return
+        attrs = dict(attrs)
+        if tag == 'base':
+            if self.base_href is None and 'href' in attrs:
+                self.base_href = attrs['href'] or ''
+            return
+        for name in ('src', 'href'):
+            if attrs.get(name):
+                self.references.append(attrs[name])
+        if attrs.get('style'):
+            self.references.extend(_code_resources(attrs['style'], css=True))
+        script_type = str(attrs.get('type') or '').lower()
+        if tag == 'style' or (tag == 'script' and not attrs.get('src') and script_type in
+                ('', 'module', 'text/javascript', 'application/javascript')):
+            self.inline, self.chunks = tag, []
+
+    def handle_data(self, data):
+        if self.inline:
+            self.chunks.append(data)
+
+    def handle_endtag(self, tag):
+        if self.inert:
+            if tag == self.inert[-1]:
+                self.inert.pop()
+            return
+        if tag == self.inline:
+            self.references.extend(_code_resources(''.join(self.chunks), css=tag == 'style'))
+            self.inline, self.chunks = None, []
+
+
+def _reference_parent_depth(reference: str) -> int:
+    try:
+        url = urlsplit(reference.replace('\\', '/'))
+    except ValueError:
+        return 0
+    if url.scheme or url.netloc or url.path.startswith('/'):
+        return 0
+    position, lowest = 0, 0
+    for part in unquote(url.path).split('/'):
+        if part == '..':
+            position -= 1
+        elif part not in ('', '.'):
+            position += 1
+        lowest = min(lowest, position)
+    return -lowest
 
 
 def serve_root(page: Path) -> Path:
     """The folder to serve: the page's own, or the ancestor its `../` links reach.
 
     A page in docs/ that loads ../style.css needs the folder above it, or every
-    correct site with a shared stylesheet is reported broken. Bounded to three
-    levels and never above the filesystem root.
+    correct site with a shared stylesheet is reported broken. The same holds for a
+    page in test/ whose module script imports "../js/game.js": served from test/,
+    every import answered 404 and a working page was reported broken. Bounded to
+    three levels and never above the filesystem root.
     """
     page = Path(page)
     try:
         text = page.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return page.parent
-    depth = max((len(m.group(1)) // 3 for m in _PARENT_REF.finditer(text)), default=0)
+    resources = _PageResources()
+    try:
+        resources.feed(text)
+        resources.close()
+    except (ValueError, AssertionError):
+        return page.parent
+    references = resources.references
+    if resources.base_href:
+        try:
+            base = urlsplit(resources.base_href)
+        except ValueError:
+            return page.parent
+        if base.scheme or base.netloc or base.path.startswith('/'):
+            references = []  # These references cannot ascend relative to the page.
+        else:
+            directory = base.path.rsplit('/', 1)[0] + '/' if '/' in base.path else ''
+            references = [directory + ref if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*:', ref)
+                          and not ref.startswith(('/', '#'))
+                          else ref for ref in references]
+    depth = max((_reference_parent_depth(ref) for ref in references), default=0)
     root = page.parent
     for _ in range(min(depth, 3)):
         if root.parent == root:
