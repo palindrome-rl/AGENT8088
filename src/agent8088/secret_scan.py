@@ -96,6 +96,24 @@ _UA_PRODUCT_RE = re.compile(r"(?P<name>[A-Za-z][\w-]*)/v?[0-9]+(?:\.[0-9]+){0,3}
 _JOINER_RE = re.compile(r"[/+_.\-]")
 # A URL up to the next space or closing quote or bracket; judged by the URL rules, not as a pile of tokens.
 _URL_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>)\]]+")
+# A Windows path (`E:\work\batches\pokemon_v19_a8088_or_27_20_2\run1`, or the same with doubled backslashes inside source
+# code): a drive or two or more folders joined by backslashes. The folder names are the user's own, often a project or
+# batch name with digits, and no credential has two backslashes in it.
+_WINDOWS_PATH_RE = re.compile(
+    r"(?<![\w\\])(?:[A-Za-z]:\\+|\\{2,}|[\w.~-]+\\+)"
+    r"(?:[\w.~-]+(?: +[\w.~-]+)*\\+)*[\w.~-]+\\*")
+_WINDOWS_QUOTED_PATH_RE = re.compile(
+    r'''(["'])(?P<path>(?:[A-Za-z]:\\+|\\{2,}|[\w.~-]+\\+)[\w. ~\\-]+)\1''')
+
+
+def _mask_windows_path(match):
+    value = match.groupdict().get("path") or match.group(0)
+    # A pair of opaque tokens separated by an escaped backslash is not enough
+    # evidence of a relative path. Keep those tokens eligible for scanning.
+    first = value.split("\\", 1)[0]
+    if not re.match(r"^[A-Za-z]:", value) and not value.startswith("\\") and looks_like_opaque_credential(first):
+        return match.group(0)
+    return " "
 OPAQUE_KIND = "Possible credential (opaque string)"
 _HASHISH_WORDS = frozenset({
     "sha256", "sha-256", "sha1", "md5", "sha512", "checksum", "digest",
@@ -289,6 +307,8 @@ def find_secrets(text: str) -> list:
     # of deleting them: a font separator becomes '|', while an encoded key is
     # reassembled rather than broken into short, undetectable pieces.
     opaque_text = _URL_TEXT_RE.sub(" ", text)
+    opaque_text = _WINDOWS_QUOTED_PATH_RE.sub(_mask_windows_path, opaque_text)
+    opaque_text = _WINDOWS_PATH_RE.sub(_mask_windows_path, opaque_text)
     opaque_text = _RELATIVE_URL_RE.sub(lambda m: unquote(m.group(0)), opaque_text)
     # Only URL query context excuses version hashes; a standalone v=<hex>
     # assignment remains eligible for the credential detector.
