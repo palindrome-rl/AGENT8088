@@ -1772,6 +1772,21 @@ def render_answer(answer):
                             box=box.ROUNDED, border_style="#00C8FF"))
 
 
+def _print_round_prose(text):
+    """Print what the model said before its tool calls, once, into the scrollback.
+
+    Prose that comes with a tool call is a progress update for the user, but it only ever appeared in the live region,
+    and that region is erased the moment the tool row replaces it. Only the final answer was printed for good, so every
+    earlier update vanished as soon as it was written. /verbose controls tool detail, not what the model says."""
+    text = A._mask_system_content(text or "").strip()
+    if not text:
+        return
+    try:
+        console.print(Padding(_AnswerMarkdown(text), (0, 0, 0, 2)))
+    except Exception:
+        console.print(Padding(Text(text), (0, 0, 0, 2)))
+
+
 # ---------------------------------------------------------------------------
 # Sub-agent live view — a nested, animated activity trace inside the parent turn
 # ---------------------------------------------------------------------------
@@ -2552,8 +2567,9 @@ def do_chat(query):
         A.subagent_ui = _make_subagent_ui(live)
 
         def _on_calls(calls):
-            # The round's reasoning belongs above the tool rows it led to.
+            # The round's reasoning and its update to the user belong above the tool rows they led to.
             flush_reasoning()
+            _print_round_prose(stream.prose_text())
             on_calls(calls)
 
         def _on_result(name, result):
