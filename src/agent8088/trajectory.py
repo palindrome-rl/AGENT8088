@@ -458,6 +458,24 @@ _TRACEBACK = re.compile(r"Traceback \(most recent call last\)|^\s*(?:\w+\.)*\w*(
 _CD_PREFIX = re.compile(r"""^\s*(?:cd|chdir|pushd)\s+(?:/d\s+)?(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;|&)\s*""", re.IGNORECASE)
 
 
+# The wrapper a tool result is delivered in, and the exit line the shell appends: neither says what went wrong.
+_RESULT_WRAPPER = re.compile(r"<<<(?:EXTERNAL_UNTRUSTED_CONTENT[^\r\n]*?|END_UNTRUSTED_CONTENT)>>>")
+_EXIT_LINE = re.compile(r"^(?:command exited with status \d+\.?|exit(?:ed)? (?:code|status)[: ]+\d+\.?)$", re.IGNORECASE)
+_ERRORISH = re.compile(r"error|exception|fail|not recognized|not found|cannot|can't|no such|denied|refused|timed out|assert|ENOENT", re.IGNORECASE)
+
+
+def _error_line(result) -> str:
+    """The one line of a failed check's output that says what went wrong, on a single line and shortened.
+
+    The last line that reads like an error, else the last line at all. The result's own wrapper and the shell's exit line are
+    left out, since they only say that something failed."""
+    lines = [" ".join(line.split()) for line in _RESULT_WRAPPER.sub("", str(result or "")).splitlines()]
+    lines = [line for line in lines if line and not _EXIT_LINE.match(line)]
+    if not lines:
+        return ""
+    return next((line for line in reversed(lines) if _ERRORISH.search(line)), lines[-1])[:140]
+
+
 def _command_core(command: str) -> str:
     """The command without the `cd <folder> &&` in front of it (up to two of them)."""
     text = (command or "").strip()
@@ -873,7 +891,8 @@ class TrajectoryState:
     def after_tool(self, operation: dict, result: str, *, failed: bool,
                    blocked: bool, mutated: bool, verdict: str = "unknown",
                    path: str = "", command: str = "", existed: bool = False,
-                   partial_path: str = "", written_to: str = "", reference: bool = False) -> None:
+                   partial_path: str = "", written_to: str = "", reference: bool = False,
+                   display_filter=None) -> None:
         operation["status"] = "blocked" if blocked else "failed" if failed else "done"
         if (operation["tool"] == "check_app" and path and not blocked
                 and any(phrase in str(result) for phrase in ("asked the server for", "calls a local service",
@@ -960,6 +979,11 @@ class TrajectoryState:
             self.data["check_failing"] = True
             what = (_command_core(command) or operation["tool"]).strip().replace("\n", " ")[:100]
             self.data["failing_check"] = _text(f"{what} -> {operation['result']}")[:200]
+            # The shortened line above often runs out before the error does; keep what failed and why for the final note.
+            # Filter before clipping: a shortened credential can no longer be matched by the redactor.
+            display = display_filter or str
+            self.data["failing_what"] = _text(display(_command_core(command) or operation["tool"]))[:100]
+            self.data["failing_error"] = _error_line(display(result))
             self.data["failing_command"] = " ".join(command.split())
             # The written files this run started: a clean run of any of them later settles the failure.
             self.data["failing_files"] = ([] if _is_check_run(command) else
@@ -1539,6 +1563,28 @@ class TrajectoryState:
     def failing_check_detail(self) -> str:
         """The command (or tool) of the latest failing check and how it failed, shortened."""
         return str(self.data.get("failing_check") or "")
+
+    def failing_check_note(self, display_filter=None) -> str:
+        """Which check is failing and why, in a sentence for the final answer; empty when none is failing.
+
+        The headline says "the latest check failed" and the notes only said it was not fixed, so the reader could not tell a real
+        failure from a check that was itself broken (a Unix `tail` on Windows, a probe, a path typo)."""
+        if not self.check_failing():
+            return ""
+        display = display_filter or str
+        what = str(self.data.get("failing_what") or "").strip()
+        error = str(self.data.get("failing_error") or "").strip()
+        if not what:
+            # State saved before these fields existed, or set by hand: "<what> -> <result>".
+            raw, _, rest = display(str(self.data.get("failing_check") or "")).partition(" -> ")
+            what, error = raw.strip(), error or _error_line(rest)
+        if not what:
+            return ""
+        what = " ".join(display(what).split())
+        error = " ".join(display(error).split())[:140]
+        what = what if len(what) <= 80 else what[:77] + "..."
+        shown = what if what == "check_app" else f"`{what}`"
+        return f"Failing check: {shown}" + (f" ({error})" if error else "") + "."
 
     def settle_check_app(self, result: str, path: str = "") -> None:
         """A check_app run that passed settles the earlier failure of that same page or script.
