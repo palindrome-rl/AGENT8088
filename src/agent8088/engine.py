@@ -1669,6 +1669,17 @@ def _is_local_url(url: str) -> bool:
     return address.is_loopback or address.is_private
 
 
+# Output redirections (`2>&1`, `2>nul`, `>/dev/null`, `> out.txt`) say where output goes, not where a request goes. The lexer splits
+# `2>&1` into `2>`, `&` and `1`, which then read as extra targets.
+_REDIRECTION = re.compile(r"""(?<=\s)(?:\d|&)?>{1,2}(?:&\d+|\s*[^\s"'`;&|<>()]+)""")
+# The quoted value of a flag that takes one. Written as a Windows command line it carries escaped quotes (`-d "{\"a\":1}"`),
+# which the non-POSIX lexer cuts at the first escaped quote into pieces that read as extra targets. The guard skips the value
+# of such a flag anyway, so it is replaced by a placeholder before lexing; every URL in the original text is still judged.
+_QUOTED_FLAG_VALUE = re.compile(
+    r"""(?P<flag>(?<![\w-])(?:-d|--data(?:-raw|-binary|-urlencode)?|--json|-H|--header|-u|--user|-A|--user-agent|-w|--write-out|"""
+    r"""-F|--form|--form-string|-e|--referer|-b|--cookie|-X|--request)\s+)(?P<value>"(?:\\.|[^"\\])*"|'[^']*')""")
+
+
 def _shell_fetches_remote_web(command: str) -> bool:
     """A shell command that fetches from the web: fetch-shaped with no explicit URL, or with any non-local URL.
 
@@ -1681,9 +1692,14 @@ def _shell_fetches_remote_web(command: str) -> bool:
     # A URL elsewhere in the command cannot justify another client's target.
     # Prove the common literal forms; leave wrappers, substitutions, unknown
     # flags and scheme-less destinations under the existing follow-up guard.
-    if re.search(r"\$|`|%[A-Za-z_]\w*%|[\r\n]", command):
+    # `$?` (the last exit status, as in `echo "exit: $?"`) cannot name a host, so it is not a substitution here.
+    if re.search(r"\$(?!\?)|`|%[A-Za-z_]\w*%|[\r\n]", command):
         return True
-    parts = _lex_command(command)
+    normalised = _QUOTED_FLAG_VALUE.sub(lambda m: m.group("flag") + "_", command)
+    # Bash can open a network connection through a redirection. A URL path or literal payload is not one.
+    if re.search(r""">\s*["']?/dev/(?:tcp|udp)/""", normalised):
+        return True
+    parts = _lex_command(_REDIRECTION.sub("", normalised))
     if not parts:
         return True
     curl_values = {"-o", "--output", "-X", "--request",
@@ -1710,12 +1726,19 @@ def _shell_fetches_remote_web(command: str) -> bool:
             if segment:
                 segments.append(segment)
             segment = []
-        else:
-            segment.append(part.strip("\"'"))
+        elif token := part.strip("\"'").strip("()"):
+            # `(curl ...)` and `(a || b)` group commands; the bracket is not part of the program or its arguments.
+            segment.append(token)
     for segment in segments:
         if not _SHELL_WEB_CLIENT.search(" ".join(segment)):
             continue
         client = Path(segment[0]).stem.lower()
+        if client in _WEB_MENTION_LOOKUPS:
+            # Text can become code when piped to a shell (or evaluated by a wrapper).
+            # Keep such commands unproven instead of letting their later local URL excuse them.
+            if any(Path(word).stem.lower() in _COMMAND_RUNNERS for part in segments for word in part):
+                return True
+            continue    # `| findstr /i "HTTP choice"` names a client in a pattern; it does not run one
         if client not in ("curl", "wget"):
             return True
         values = curl_values if client == "curl" else wget_values
