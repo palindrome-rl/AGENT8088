@@ -897,7 +897,11 @@ def _missing_installed_module(output: str, path: Path) -> str:
     The check starts the script with its own python or node, which may not be the one the script was written for
     (a virtualenv, another install). A missing package then says nothing about the script. A module that is a
     sibling file or folder of the script is the script's own import, and stays a crash."""
-    match = _MISSING_MODULE.search(_SANDBOX_NOTE.sub("", output))
+    # In a chained traceback the terminal exception is the failure. Earlier
+    # handled import failures (or printed diagnostic text) must not hide it.
+    errors = [line.strip() for line in _SANDBOX_NOTE.sub("", output).splitlines()
+              if _ERROR_LINE.match(line)]
+    match = _MISSING_MODULE.fullmatch(errors[-1]) if errors else None
     name = (match.group(1) or match.group(2)) if match else ""
     if not name:
         return ""

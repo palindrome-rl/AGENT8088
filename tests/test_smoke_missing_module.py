@@ -56,3 +56,26 @@ def test_a_misspelt_local_module_is_still_a_crash_only_when_it_exists_beside_the
 def test_other_crashes_still_fail(tmp_path, out):
     script = _script(tmp_path, "print(x)\n")
     assert app_check.check_script(script, run=lambda c, t: out).failed
+
+
+@pytest.mark.parametrize("terminal", ["NameError: name 'x' is not defined", "TypeError: x is not callable"])
+def test_a_handled_missing_package_does_not_hide_a_later_crash(tmp_path, terminal):
+    script = _script(tmp_path, "print(x)\n")
+    out = (OUT.format("optional_package") + "\nDuring handling of the above exception, another exception occurred:\n"
+           "Traceback (most recent call last):\n" + terminal + "\nCommand exited with status 1.")
+    report = app_check.check_script(script, run=lambda c, t: out)
+    assert report.failed and not report.ask
+
+
+def test_a_real_chained_traceback_keeps_its_terminal_failure(tmp_path):
+    import subprocess
+    import sys
+    script = _script(tmp_path, "try:\n    import agent8088_nonexistent_fixture_package\n"
+                     "except ModuleNotFoundError:\n    raise NameError('terminal fixture crash')\n")
+    def run(_command, timeout):
+        result = subprocess.run([sys.executable, str(script), "--help"], cwd=tmp_path,
+                                capture_output=True, text=True, timeout=timeout)
+        assert result.returncode == 1
+        return result.stderr + f"\nCommand exited with status {result.returncode}."
+    report = app_check.check_script(script, run=run)
+    assert report.failed and "NameError" in report.output
