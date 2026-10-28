@@ -110,6 +110,15 @@ def test_parent_climb_is_still_bounded_to_three_levels(tmp_path):
     assert app_check.serve_root(page) == tmp_path / 'a'
 
 
+def test_asset_policy_keeps_sensitive_and_blocked_files_protected(engine, monkeypatch, tmp_path):
+    monkeypatch.setattr(engine, 'ALLOWED_PATHS', [tmp_path])
+    monkeypatch.setattr(engine, 'BLOCKED_PATHS', [tmp_path / 'blocked'])
+    assert not engine._smoke_path_denied(str(tmp_path / 'ordinary.txt'))
+    assert engine._smoke_path_denied(str(tmp_path / '.env'))
+    assert engine._smoke_path_denied(str(tmp_path / 'blocked' / 'ordinary.txt'))
+    assert engine._smoke_path_denied(str(tmp_path.parent / 'outside.txt'))
+
+
 @needs_chromium
 def test_prose_does_not_break_a_working_root_relative_script(tmp_path):
     page = _page(tmp_path, '<html><body><p>Read from "../notes" for details.</p>'
