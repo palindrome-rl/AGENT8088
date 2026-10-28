@@ -42,6 +42,35 @@ def test_a_real_web_fetch_after_a_search_is_still_refused(engine, command):
     assert _followup(engine, command)
 
 
+@pytest.mark.parametrize("command", [
+    # Both calls from a demo run's last turns: a model checking that the page it just wrote is served.
+    'cd /d "C:\\work\\app" && start /b python -m http.server 8000 && timeout /t 2 >nul && curl -s -o nul -w "%%{http_code}" http://localhost:8000/index.html',
+    'curl -s -o nul -w "index:%%{http_code}\\n" http://localhost:8000/index.html && curl -s -o nul -w "engine:%%{http_code}\\n" http://localhost:8000/engine.js',
+    'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8765/',
+    "curl --write-out '%{http_code}' --max-time 5 http://localhost:3000/",
+    "curl -m 5 -s http://localhost:11434/api/tags",
+    "curl -s -e http://localhost:8000/ -b session=1 http://localhost:8000/api",
+    "curl -s -F file=@a.txt http://localhost:8000/upload",
+    "curl -s --retry 3 --retry-delay 1 --compressed http://localhost:8000/",
+    "curl -s --json '{}' http://localhost:8000/api",
+    "curl -O http://localhost:8000/data.json",
+])
+def test_status_and_other_common_flags_on_a_local_call_are_not_a_search_follow_up(engine, command):
+    assert not _followup(engine, command)
+
+
+@pytest.mark.parametrize("command", [
+    'curl -s -o nul -w "%{http_code}" https://pokeapi.co/api/v2/pokemon/garchomp',
+    'curl -s -w "%{http_code}" http://localhost:8000/ https://example.com/',
+    "curl -m 5 https://example.com/",
+    "curl -O https://example.com/data.json",
+    "curl -s -F file=@a.txt https://example.com/upload",
+    'curl -w "%{http_code}"',                   # no URL at all: unchanged
+])
+def test_the_same_flags_on_a_remote_call_are_still_refused(engine, command):
+    assert _followup(engine, command)
+
+
 def test_commands_that_are_not_fetches_are_unaffected(engine):
     for command in ("python app.py", "node --check app.js", "dir", "which curl"):
         assert not _followup(engine, command)

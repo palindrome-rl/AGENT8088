@@ -1689,9 +1689,14 @@ def _shell_fetches_remote_web(command: str) -> bool:
     values = {"-o", "--output", "-O", "--output-document", "-X", "--request",
               "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
               "-H", "--header", "-u", "--user", "-A", "--user-agent",
-              "--connect-timeout", "--max-time"}
+              "--connect-timeout", "--max-time", "-m",
+              # What a model adds to check that its own server answers: curl -w "%{http_code}" prints the status.
+              "-w", "--write-out", "-e", "--referer", "-b", "--cookie", "-c", "--cookie-jar",
+              "-F", "--form", "--form-string", "-T", "--upload-file", "-r", "--range",
+              "-D", "--dump-header", "--json", "--retry", "--retry-delay", "--retry-max-time"}
     flags = {"--silent", "--show-error", "--fail", "--fail-with-body", "--location",
-             "--head", "--insecure", "--verbose", "--quiet", "--no-check-certificate"}
+             "--head", "--insecure", "--verbose", "--quiet", "--no-check-certificate",
+             "--compressed", "--get", "--globoff", "--http1.1", "--http2", "--no-buffer"}
     segments, segment = [], []
     for part in parts + [";"]:
         if part in (";", "&&", "||", "&", "|"):
@@ -1709,6 +1714,9 @@ def _shell_fetches_remote_web(command: str) -> bool:
         targets, index = 0, 1
         while index < len(segment):
             token = segment[index]
+            if client == "curl" and token in ("-O", "--remote-name"):
+                index += 1      # curl's -O takes no value; only wget's -O names an output file
+                continue
             if token in values:
                 index += 2
                 if index > len(segment):
