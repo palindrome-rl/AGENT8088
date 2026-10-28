@@ -17985,7 +17985,7 @@ def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
 
 
 def _new_edit_check_reminder():
-    return trajectory.EditCheckReminder(EDIT_CHECK_AFTER, EDIT_CHECK_REMINDERS, workspace=str(ARTIFACTS_ROOT))
+    return trajectory.EditCheckReminder(EDIT_CHECK_AFTER, EDIT_CHECK_REMINDERS, workspace=str(PROJECT_ROOT))
 
 
 def _harness_turn(text: str) -> dict:
@@ -21238,11 +21238,20 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                                   "trigger": "repeated_failure", "tool": name,
                                   "code": code, "outcome": status})
             if not blocked:
+                reminder_path = str(args.get("filename") or args.get("destination") or "")
+                if reminder_path and _MUTATION_SEQ != mutation_seq_before:
+                    try:
+                        reminder_path = str(_resolve_transfer_paths(args)[1] if name in _TRANSFER_TOOLS
+                                            else resolve_write_path(reminder_path))
+                    except (OSError, ValueError, RuntimeError):
+                        reminder_path = ''
                 check_reminder = edit_check.after_tool(
                     name, args, result, mutated=_MUTATION_SEQ != mutation_seq_before,
-                    path=str(args.get("filename") or args.get("destination") or ""),
+                    path=reminder_path,
                     partial=bool(trajectory is not None and trajectory.data.get("partial_files")),
-                    can_check_app="check_app" in TOOL_SPECS)
+                    can_check_app="check_app" in round_allowed_tools,
+                    failed=bool(code) or _plan_step_failed(result),
+                    run_workspace=str(_shell_workspace_root or ARTIFACTS_ROOT))
                 if check_reminder:
                     rewrite_note += f"\n{_HARNESS_PREFIX}{check_reminder}"
                     if trace is not None:

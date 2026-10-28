@@ -88,7 +88,8 @@ def _response(name, args):
     return type("R", (), {"choices": [type("C", (), {"message": message, "finish_reason": "tool_calls"})()]})()
 
 
-def test_the_loop_adds_the_reminder_to_the_third_write_result(engine, monkeypatch):
+@pytest.mark.parametrize('can_check_app', [False, True])
+def test_the_loop_adds_the_reminder_to_the_third_write_result(engine, monkeypatch, can_check_app):
     seen = []
     files = iter(["a.js", "b.js", "index.html"])
 
@@ -109,9 +110,61 @@ def test_the_loop_adds_the_reminder_to_the_third_write_result(engine, monkeypatc
     monkeypatch.setattr(engine, "EDIT_CHECK_REMINDERS", 3)
     trace = []
     try:
-        engine.run_agent([{"role": "user", "content": "build the page"}], max_turns=10, trace=trace, dynamic_turns=False)
+        engine.run_agent([{"role": "user", "content": "build the page"}], max_turns=10, trace=trace,
+                         dynamic_turns=False, allowed_tools={'write_file'} | ({'check_app'} if can_check_app else set()))
     except RuntimeError:
         pass
     assert any(t["type"] == "edit_check_reminder" for t in trace)
     assert "since you last ran or opened anything" in seen[-1]
     assert all("since you last ran or opened anything" not in s for s in seen[:-1])
+    assert ('use check_app' in seen[-1]) == can_check_app
+
+
+@pytest.mark.parametrize('name,args,result', [
+    ('execute_shell', {'command': 'pytest'}, '1 failed, 2 passed\nCommand exited with status 1.'),
+    ('execute_shell', {'command': 'node a.js'}, 'Traceback (most recent call last):\nNameError: x is not defined'),
+    ('check_app', {'path': 'index.html'}, 'index.html: smoke test FAILED - dead button'),
+    ('check_app', {'path': 'index.html'}, 'index.html: smoke test unavailable'),
+    ('browse_page', {'url': 'http://localhost.example.com/'}, 'opened page'),
+    ('browse_page', {'url': 'http://127.0.0.1.example.com/'}, 'opened page'),
+    ('browse_page', {'url': 'http://[broken]/'}, 'opened page'),
+    ('get_page_title', {'url': 'http://localhost:8000/'}, 'Title only'),
+    ('execute_shell', {'command': 'pytest --help'}, 'usage: pytest ...'),
+    ('execute_shell', {'command': 'echo node a.js'}, 'node a.js'),
+])
+def test_failed_checks_unavailable_pages_and_non_executing_queries_preserve_count(name, args, result):
+    rem = EditCheckReminder(after=2)
+    _write(rem, 'a.js')
+    rem.after_tool(name, args, result, mutated=False)
+    assert _write(rem, 'b.js')
+
+
+def test_explicit_failure_metadata_prevents_clearing():
+    rem = EditCheckReminder(after=2)
+    _write(rem, 'a.js')
+    rem.after_tool('execute_shell', {'command': 'pytest'}, 'custom tool failure', mutated=False, failed=True)
+    assert _write(rem, 'b.js')
+
+
+def test_workspace_parent_names_do_not_turn_deliverables_into_tests_or_scratch(tmp_path):
+    workspace = tmp_path / 'tests' / 'temp' / 'project'
+    rem = EditCheckReminder(after=2, workspace=str(workspace))
+    assert not _write(rem, str(workspace / 'a.js'))
+    assert _write(rem, str(workspace / 'b.js'))
+
+
+def test_relative_absolute_and_normalized_names_count_once(tmp_path):
+    rem = EditCheckReminder(after=2, workspace=str(tmp_path))
+    assert not _write(rem, 'app/a.js')
+    assert not _write(rem, str(tmp_path / 'app' / 'a.js'))
+    assert not _write(rem, 'app/./a.js')
+    assert _write(rem, 'app/b.js')
+
+
+def test_running_a_redirected_file_uses_the_actual_shell_workspace(tmp_path):
+    rem = EditCheckReminder(after=2, workspace=str(tmp_path))
+    artifacts = tmp_path / 'artifacts'
+    _write(rem, str(artifacts / 'a.js'))
+    rem.after_tool('execute_shell', {'command': 'node a.js'}, 'ok', mutated=False,
+                   run_workspace=str(artifacts))
+    assert not _write(rem, str(artifacts / 'b.js'))

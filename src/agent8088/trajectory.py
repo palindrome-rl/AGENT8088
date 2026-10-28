@@ -8,6 +8,7 @@ import re
 import shlex
 from copy import deepcopy
 from pathlib import PurePath
+from urllib.parse import urlsplit
 
 from agent8088.completion import SUBGOAL_PREFIX
 
@@ -363,7 +364,17 @@ def _runs_a_written_file(command: str, written) -> bool:
 
 # Files whose change is worth a look at the running result: code, pages and styles. Notes, data files and tests are not.
 _RUNNABLE_SUFFIXES = CODE_SUFFIXES | {".html", ".htm", ".css", ".mjs", ".cjs", ".sh"}
-_LOCAL_PAGE = re.compile(r"^(?:https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?|file://)", re.IGNORECASE)
+
+
+def _local_page(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+    except ValueError:
+        return False
+    return ((parsed.scheme == 'file' and parsed.hostname in (None, '', 'localhost'))
+            or (parsed.scheme in ('http', 'https')
+                and parsed.hostname in ('localhost', '127.0.0.1', '::1')))
 
 
 class EditCheckReminder:
@@ -381,37 +392,52 @@ class EditCheckReminder:
         self.sent = 0
 
     def _counts(self, path: str) -> bool:
-        return (PurePath(path).suffix.lower() in _RUNNABLE_SUFFIXES and not _is_test_path(path)
-                and not _is_scratch_path(path, self.workspace))
+        local = PurePath(path)
+        if self.workspace:
+            try:
+                local = local.relative_to(self.workspace)
+            except ValueError:
+                pass
+        return (local.suffix.lower() in _RUNNABLE_SUFFIXES and not _is_test_path(str(local))
+                and not _is_scratch_path(str(local)))
 
-    def _ran(self, name: str, args: dict, result: str) -> bool:
+    def _ran(self, name: str, args: dict, result: str, run_workspace: str = '') -> bool:
         text = str(result or "")
-        if text.startswith("Error:"):
+        if (text.lstrip().lower().startswith(('error:', 'blocked:', 'escalation_request'))
+                or _RUN_FAILED_RE.search(text) or _REAL_TEST_FAILURE.search(text)):
             return False
         if name == "check_app":
-            return True
+            return ': smoke test passed' in text.splitlines()[0].lower() if text.splitlines() else False
         if name == "execute_shell":
             command = str(args.get("command") or "")
-            return _is_check_run(command) or _runs_a_written_file(command, list(self.changed))
-        return any(_LOCAL_PAGE.match(str(args.get(k) or "")) for k in ("url", "path"))
+            return bool(command.strip() and not _is_probe(command)
+                        and (_is_check_run(command) or any(
+                            _runs_script(command, path, run_workspace or self.workspace)
+                            for path in self.changed.values())))
+        return name == 'browse_page' and any(_local_page(str(args.get(k) or '')) for k in ('url', 'path'))
 
     def after_tool(self, name: str, args: dict, result: str, *, mutated: bool, path: str = "",
-                   partial: bool = False, can_check_app: bool = False) -> str:
+                   partial: bool = False, can_check_app: bool = False, failed: bool = False,
+                   run_workspace: str = '') -> str:
         """The reminder to append to this tool's result, or ""."""
         if not self.after or not self.limit:
             return ""
-        if self._ran(name, args, result):
+        if not failed and self._ran(name, args, result, run_workspace):
             self.changed.clear()
             return ""
         if mutated and path and self._counts(path):
-            self.changed[path] = True
+            canonical = PurePath(path)
+            if self.workspace and not canonical.is_absolute():
+                canonical = PurePath(self.workspace) / canonical
+            self.changed[_file_key(str(canonical))] = str(canonical)
         if len(self.changed) < self.after or self.sent >= self.limit or partial:
             return ""
-        names = [PurePath(p).name for p in self.changed][-4:]
+        count = len(self.changed)
+        names = [PurePath(p).name for p in self.changed.values()][-4:]
         self.sent += 1
         self.changed.clear()
         how = ("use check_app on a page or script, or run it" if can_check_app else "run it or open the page")
-        return (f"You have changed {len(names)} files ({', '.join(names)}) since you last ran or opened anything. "
+        return (f"You have changed {count} files (latest: {', '.join(names)}) since you last ran or opened anything. "
                 f"Before writing more, {how} through its real entry point, look at what it actually does "
                 "(for a page, use its main controls), and fix what is wrong.")
 
