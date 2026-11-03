@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="#demo">Demo</a> ·
   <a href="#about">About</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#inside-agent8088">Features</a> ·
@@ -37,11 +36,9 @@
   <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
 </p>
 
-## Demo
-
 <p align="center">
   <a href="assets/demo.mp4">
-    <img src="assets/demo.gif" alt="Agent8088 tour: the live CLI, context budgeting, verification-gated completion, execution-grounded tests, usage transparency, permissions and OS sandboxing, and every front end from one engine" width="820">
+    <img src="assets/demo.gif" alt="Agent8088: reliable AI agents, even on small local models. Context budgeting, tool-call repair, permissions and sandboxing, and every front end from one engine." width="820">
   </a>
 </p>
 
