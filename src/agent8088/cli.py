@@ -288,9 +288,9 @@ class Session:
         self.trajectory_state = {}
         self.hold = False  # /hold: tools are off and replies are text only until /continue
         try:
-            self.temperature = float(config.get("temperature", "0.1"))
+            self.temperature = float(config.get("temperature", "0.8"))
         except ValueError:
-            self.temperature = 0.1
+            self.temperature = 0.8
         try:
             self.max_turns = int(config.get("max_turns", str(DEFAULT_MAX_TURNS)))
         except ValueError:
@@ -6258,7 +6258,7 @@ def cmd_resume(rest):
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.hold = bool(data.get("hold", False))
     S.name = name
-    S.temperature = float(data.get("temperature", 0.1))
+    S.temperature = float(data.get("temperature", 0.8))
     # Fall back to what this session already has, not to a literal: a session
     # file written before this setting existed used to pull max_turns back down
     # to 10, silently discarding both config.txt and a /maxturns set this run.

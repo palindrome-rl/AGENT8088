@@ -3066,7 +3066,7 @@ def _finish_interrupt_watcher(stop, watcher):
 
 
 def create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
-                      temperature=0.1, on_token=None, interrupt_check=None,
+                      temperature=0.8, on_token=None, interrupt_check=None,
                       model_name: str = "", provider_name: str = "",
                       telemetry_attempt: str = "direct", thinking=None):
     """Create one model response and record metadata-only local telemetry."""
@@ -3458,7 +3458,7 @@ def _resolve_temperature(provider_name: str, temperature: float) -> float:
 
 
 def _create_completion(client, messages, tools, max_tokens=2000, system_prompt=None,
-                       temperature=0.1, on_token=None, interrupt_check=None,
+                       temperature=0.8, on_token=None, interrupt_check=None,
                        model_name: str = "", provider_name: str = "", _skip_optional=False,
                        thinking=None, timeout=None, _drop_extra=frozenset()):
     selected_model = model_name or MODEL_NAME
@@ -19122,7 +19122,7 @@ FINISH_ASK = ("The user asked you to finish now: no more tools will run. Give yo
               "a tool.")
 
 
-def reply_without_tools(messages, *, kind, trajectory_state=None, system_prompt=None, temperature=0.1,
+def reply_without_tools(messages, *, kind, trajectory_state=None, system_prompt=None, temperature=0.8,
                         on_token=None, interrupt_check=None, trace=None, record_ask=None):
     """The one model call behind a held message (kind="hold") or /finish (kind="finish"): no tools are offered.
 
@@ -19991,7 +19991,7 @@ def _consult_llmrouter(config, messages, eligible):
                       "applied": False, "latency_ms": 0}
 
 
-def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, spin=None,
+def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, spin=None,
                     on_calls=None, on_tool=None, on_result=None, on_answer=None,
                     on_escalation=None,
                     on_token=None, interrupt_check=None, trace=None,

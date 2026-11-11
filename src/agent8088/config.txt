@@ -104,7 +104,7 @@ max_turns=400
 # provider.<name>.context_window=1048576
 # provider.<name>.max_completion_tokens=32768
 
-# Per-provider temperature override. `temperature` (unset here; 0.1 default,
+# Per-provider temperature override. `temperature` (unset here; 0.8 default,
 # see cli.py) is sent on every request regardless of provider, which can
 # override a server's own tuned default (a value present in the request
 # always wins), or get rejected outright by a provider/model that does not

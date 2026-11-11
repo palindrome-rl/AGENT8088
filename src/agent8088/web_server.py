@@ -1250,7 +1250,7 @@ def _load_session(C, name: str, data: dict):
     state = data.get("trajectory_state", {})
     S.trajectory_state = state if isinstance(state, dict) else {}
     S.hold = bool(data.get("hold", False))
-    S.temperature = float(data.get("temperature", 0.1))
+    S.temperature = float(data.get("temperature", 0.8))
     # Same as the CLI's loader: keep the live value when the file predates
     # the setting, rather than resetting it to a literal.
     S.max_turns = int(data.get("max_turns", S.max_turns))
