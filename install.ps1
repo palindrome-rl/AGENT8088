@@ -2,9 +2,9 @@
 # Agent8088 Installer - Windows (native PowerShell)
 # ============================================================================
 # Usage:
-#   iex (irm https://agent8088-installer.pages.dev/install.ps1)
+#   iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
 #   or, from cmd.exe / when scripts are blocked by execution policy:
-#   powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 | iex"
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, PortableGit install, repo clone,
@@ -263,7 +263,7 @@ function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -Fore
 # comfortably.
 #
 # Scale them all for a slow connection:
-#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://agent8088-installer.pages.dev/install.ps1)
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
 $TimeoutScale = 1
 if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
     $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
@@ -1212,7 +1212,7 @@ function Get-InstallerInvocation {
 
     $sourceUrl = $InstallerSourceUrl
     if (-not $sourceUrl) {
-        $sourceUrl = "https://agent8088-installer.pages.dev/install.ps1"
+        $sourceUrl = "https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1"
     }
     $urlLiteral = ConvertTo-PowerShellLiteral $sourceUrl
     $tlsCommand = "try { [Net.ServicePointManager]::SecurityProtocol = " +
@@ -1554,7 +1554,7 @@ function Test-SlowConnection {
     $tmp = $null
     try {
         $tmp = [System.IO.Path]::GetTempFileName()
-        $probeUrl = "https://agent8088-installer.pages.dev/install.ps1"
+        $probeUrl = "https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $dl = Invoke-BoundedDownload -Uri $probeUrl -OutFile $tmp -TimeoutSec 8 -Proxy $script:ResolvedProxy
         $sw.Stop()
@@ -3497,7 +3497,7 @@ function Verify-Install {
             Write-Err "The executable is missing: $agentExe"
         }
         Write-Info "See the error directly:  & `"$InstallDir\venv\Scripts\python.exe`" -m agent8088.cli --version"
-        Write-Info "Fix: re-run the installer:  iex (irm https://agent8088-installer.pages.dev/install.ps1)"
+        Write-Info "Fix: re-run the installer:  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)"
         Write-Info "If that fails too, delete $InstallDir\venv and re-run."
         if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
     }
@@ -3565,7 +3565,7 @@ function Verify-Install {
         Write-Host "            Native setup did not finish; retry (no admin needed):"
         Write-Host "            agent8088 --sandbox-setup"
     }
-    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://agent8088-installer.pages.dev/install.ps1)"
+    Write-Host "  Update: `$env:AGENT8088_BRANCH = '$Branch'; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$Branch/install.ps1)"
     if ($script:InstallLog) { Write-Host "  Log:    $($script:InstallLog)" }
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated),"

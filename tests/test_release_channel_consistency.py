@@ -74,10 +74,9 @@ def test_installer_bootstrap_and_update_urls_stay_on_the_channel():
     channel = _channel()
     for relative in ("install.sh", "install.ps1"):
         text = (ROOT / relative).read_text(encoding="utf-8")
-        # The development channel also serves its installer via Cloudflare
-        # Pages; staging uses branch-specific raw GitHub URLs instead.
-        if channel != "development":
-            assert "agent8088-installer.pages.dev" not in text
+        # Every channel must fetch the installer from this repository, including
+        # bootstrap/relaunch and retry paths; a branch variable alone is not enough.
+        assert "agent8088-installer.pages.dev" not in text
         concrete = re.findall(
             r"raw\.githubusercontent\.com/palindrome-rl/"
             r"AGENT8088/([^/\s$]+)/install\.(?:sh|ps1)", text
@@ -92,3 +91,21 @@ def test_development_docs_advertise_the_development_channel():
     assert "AGENT8088_BRANCH=development" in readme
     wiki_home = (ROOT / "docs" / "wiki" / "README.md").read_text(encoding="utf-8")
     assert "Staging 1.2 documentation" not in wiki_home
+
+
+def test_readme_and_agent_install_guide_fetch_the_selected_channel():
+    channel = _channel()
+    base = f"https://raw.githubusercontent.com/palindrome-rl/AGENT8088/{channel}/"
+    for relative in ("README.md", "docs/install-for-agents.md"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert base + "install.sh" in text, relative
+        assert base + "install.ps1" in text, relative
+        assert "agent8088-installer.pages.dev" not in text, relative
+        assert "repository is private" not in text, relative
+
+
+def test_agent_install_guide_does_not_require_github_authentication():
+    text = (ROOT / "docs/install-for-agents.md").read_text(encoding="utf-8")
+    assert "public repository" in text
+    assert "gh api" not in text
+    assert "Invoke-RestMethod -Uri" in text

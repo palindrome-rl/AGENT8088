@@ -191,12 +191,13 @@ Write-Output "files-after:" @(Get-ChildItem -LiteralPath (Join-Path $env:TEMP 'a
     assert out.read_text().strip() == "it works; with quotes"
 
 
-def test_terminal_relaunch_preserves_installer_parameters(tmp_path):
+@pytest.mark.parametrize("branch", ["development", "staging-1.3"])
+def test_terminal_relaunch_preserves_installer_parameters(tmp_path, branch):
     output = _run_powershell(
         f"""
 $env:TEMP = '{str(tmp_path).replace("'", "''")}'
 $env:TMP = $env:TEMP
-$Branch = 'development'
+$Branch = '{branch}'
 $RepoSlug = 'palindrome-rl/AGENT8088'
 $Agent8088Home = "C:\\Users\\O'Brien\\Agent Home"
 $InstallDir = 'C:\\Agent Install'
@@ -230,7 +231,8 @@ Write-Output ([IO.File]::ReadAllText($file))
     assert ";" not in head.split("|")[-1]                      # wt.exe would split on it
     assert "ReadAllText" in head
     assert launcher.index("Tls12") < launcher.index("Invoke-RestMethod")
-    assert "agent8088-installer.pages.dev/install.ps1" in launcher
+    assert f"raw.githubusercontent.com/palindrome-rl/AGENT8088/{branch}/install.ps1" in launcher
+    assert f"-Branch '{branch}'" in launcher
     assert "-Agent8088Home 'C:\\Users\\O''Brien\\Agent Home'" in launcher
     assert "-InstallDir 'C:\\Agent Install'" in launcher
     assert "-SkipSetup:$true" in launcher

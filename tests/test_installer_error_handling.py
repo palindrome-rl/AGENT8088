@@ -26,7 +26,7 @@ STUB_LOGS = (
     'log_warn() { echo "WARN:$1"; }\n'
     'log_error() { echo "ERR:$1"; }\n'
     'log_success() { echo "OK:$1"; }\n'
-    'INSTALL_CMD="curl -fsSL https://agent8088-installer.pages.dev/install.sh | bash"\n'
+    'INSTALL_CMD="curl -fsSL https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash"\n'
 )
 
 
@@ -87,7 +87,7 @@ def test_sudo_invocation_is_refused_with_the_rerun_command(tmp_path):
     )
     assert result.returncode == 1
     assert "Don't run the installer with sudo" in result.stdout
-    assert "agent8088-installer.pages.dev/install.sh | bash" in result.stdout
+    assert "raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" in result.stdout
     assert "REACHED" not in result.stdout
 
 
@@ -583,7 +583,7 @@ def test_piped_to_dash_prints_the_bash_hint_without_bad_substitution(tmp_path):
     assert result.returncode == 1
     assert "Bad substitution" not in result.stderr
     assert "This installer needs bash" in result.stderr
-    assert "agent8088-installer.pages.dev/install.sh | bash" in result.stderr
+    assert "raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" in result.stderr
     assert "CRLF" not in result.stderr
 
 

@@ -36,7 +36,7 @@ Ask these before installing, and use the answers below:
 |---|---|---|
 | OS | `uname -s` (macOS/Linux/WSL) or `$PSVersionTable.OS` (Windows) | picks the installer |
 | git | `git --version` | yes |
-| GitHub access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: the repository is private. If this fails, ask the person to sign in (`gh auth login`) and stop. |
+| GitHub access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: public repository; no GitHub login is required. If this fails, check network/proxy access before continuing. |
 | Disk | about 4 GB free | yes |
 
 Python, Node.js, Playwright Chromium and uv are installed by the installer; do
@@ -44,13 +44,14 @@ not install them yourself.
 
 ## 3. Run the installer
 
-Replace `development` with the chosen branch, and set the two yes/no answers
+Replace `development` with the chosen branch in both the installer URL and
+`AGENT8088_BRANCH`, and set the two yes/no answers
 (`1` = yes, `0` = no).
 
 **macOS, Linux or WSL2** (bash):
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh \
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh \
   | AGENT8088_BRANCH=development AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
     bash -s -- --skip-setup
 ```
@@ -58,8 +59,8 @@ curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/inst
 **Windows** (PowerShell, not `cmd.exe`):
 
 ```powershell
-$installer = Join-Path $env:TEMP "agent8088-install.ps1"
-Invoke-RestMethod https://agent8088-installer.pages.dev/install.ps1 -OutFile $installer
+$installer = Join-Path $env:TEMP ("agent8088-install-" + [guid]::NewGuid().ToString("N") + ".ps1")
+Invoke-RestMethod -Uri https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 -OutFile $installer -ErrorAction Stop
 $env:AGENT8088_BRANCH = "development"
 $env:AGENT8088_INSTALL_MEM0 = "0"
 $env:AGENT8088_INSTALL_LIBREOFFICE = "0"

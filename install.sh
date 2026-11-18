@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -35,7 +35,7 @@
 # a file to check (bash install.sh, sh install.sh). Piped, it is "bash"/"sh" or
 # the shell binary's own path (`curl | /bin/sh`), so only a first line that is a
 # "#!" line counts -- a binary never starts with one, and a piped download is LF.
-head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash   (always LF)" >&2 && exit 1
+head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash   (always LF)" >&2 && exit 1
 
 # ----------------------------------------------------------------------------
 # Shell preflight -- must be the first executable code in this file
@@ -57,12 +57,12 @@ if [ -z "${BASH_VERSION:-}" ]; then
         # re-exec something whose first line is a bash shebang (this script).
         if [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!.*bash'; then exec bash "$0" "$@"; fi
         echo "This installer needs bash. Re-run it as:" >&2
-        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash" >&2
+        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" >&2
         exit 1
     fi
     echo "ERROR: bash is required and was not found." >&2
     echo "  Alpine / busybox:  apk add bash" >&2
-    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | bash" >&2
+    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" >&2
     exit 1
 fi
 
@@ -185,7 +185,7 @@ INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
 PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
 NODE_VERSION="22.11.0"
-INSTALLER_URL="https://agent8088-installer.pages.dev/install.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh"
 # Everything the heavy stages print goes here instead of /dev/null, so a failure
 # can show its last lines and the user has a file to attach to a bug report.
 INSTALL_LOG="$AGENT8088_HOME/install.log"
@@ -282,6 +282,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # The exact command to re-run, for every "re-run the installer" message.
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh"
 if [ "$BRANCH" = "development" ]; then
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash"
 else
@@ -1335,7 +1336,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*)
             OS="windows"; DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://agent8088-installer.pages.dev/install.ps1 | iex\""
+            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 | iex\""
             exit 1
             ;;
         *)

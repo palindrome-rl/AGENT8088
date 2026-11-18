@@ -49,13 +49,13 @@ Agent8088 is a local-first agent for real work: it reads files, runs tools, rese
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | AGENT8088_BRANCH=development bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "development"; iex (irm https://agent8088-installer.pages.dev/install.ps1)
+$env:AGENT8088_BRANCH = "development"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
 ```
 
 ### Install with an AI agent
@@ -63,9 +63,9 @@ $env:AGENT8088_BRANCH = "development"; iex (irm https://agent8088-installer.page
 Let an AI agent do the install: Claude Code, OpenCode, Codex, Hermes Agent, Cursor, or any agent that can run shell commands. Paste this into it:
 
 ```text
-Install Agent8088 for me. Fetch the guide with
-  gh api "repos/palindrome-rl/AGENT8088/contents/docs/install-for-agents.md?ref=development" -H "Accept: application/vnd.github.raw"
-(use the command above, not a web-fetch tool, so no step is summarized away) and follow it exactly.
+Install Agent8088 for me. Read the complete guide at
+  https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/docs/install-for-agents.md
+Follow the full guide exactly; do not summarize away installation or verification steps.
 Ask me before anything that needs my choice; never ask me to paste an API key into this chat.
 ```
 
@@ -73,7 +73,7 @@ The agent asks a few questions (branch, optional Mem0 and LibreOffice, which mod
 
 ### Manual install notes
 
-Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
+Run it in PowerShell, not `cmd.exe`. From `cmd.exe` or a locked-down execution policy: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 | iex"`. On macOS/Linux, don't prefix the installer with `sudo` — it asks for sudo itself when a system package needs it.
 
 The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
 
@@ -85,7 +85,7 @@ The installer provisions an isolated Python environment, installs the global `ag
 | Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
-| Native sandbox runtime | yes (auto-setup) | hint only — needs an elevated terminal |
+| Native sandbox runtime | yes (auto-setup) | yes (auto-setup; no admin needed) |
 
 ### Supported platforms
 
@@ -118,7 +118,7 @@ agent8088                    # start the interactive agent
 
 The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
 
-> **Windows only:** the native sandbox runtime needs an elevated terminal to provision its restricted account. After install, open an elevated PowerShell and run `agent8088 --sandbox-setup`. On Linux and macOS the installer runs this automatically.
+> The installer sets up the native sandbox automatically. If setup did not finish, run `agent8088 --sandbox-setup` to retry. On Windows, use your normal, non-admin terminal: the backend restricts file writes using the current account. For network isolation on Windows, use `sandbox_backend=docker`.
 
 ### Use the web UI
 
