@@ -77,7 +77,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 
 ### Install the staging-1.3 branch
 
-This is the v2 staging channel. The commands below install it and keep it
+This is the v1.3 staging channel. The commands below install it and keep it
 on it: `agent8088 --update` stays on `staging-1.3` rather than moving you
 to `development`.
 
@@ -93,17 +93,17 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindro
 $env:AGENT8088_BRANCH = "staging-1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1)
 ```
 
-These staging commands intentionally fetch the branch-specific installers;
-the Pages installer URL serves the development channel.
+Both commands fetch this branch's installer and explicitly select `staging-1.3`,
+so installation and subsequent updates stay on this channel.
 
 ### Install with an AI agent
 
 Let an AI agent do the install: Claude Code, OpenCode, Codex, Hermes Agent, Cursor, or any agent that can run shell commands. Paste this into it:
 
 ```text
-Install Agent8088 for me. Fetch the guide with
-  gh api "repos/palindrome-rl/AGENT8088/contents/docs/install-for-agents.md?ref=staging-1.3" -H "Accept: application/vnd.github.raw"
-(use the command above, not a web-fetch tool, so no step is summarized away) and follow it exactly.
+Install Agent8088 for me. Read the complete guide at
+  https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/docs/install-for-agents.md
+Follow the full guide exactly; do not summarize away installation or verification steps.
 Ask me before anything that needs my choice; never ask me to paste an API key into this chat.
 ```
 

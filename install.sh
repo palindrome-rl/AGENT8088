@@ -282,6 +282,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # The exact command to re-run, for every "re-run the installer" message.
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh"
 if [ "$BRANCH" = "development" ]; then
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash"
 else

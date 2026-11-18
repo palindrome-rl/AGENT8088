@@ -36,8 +36,7 @@ Ask these before installing, and use the answers below:
 |---|---|---|
 | OS | `uname -s` (macOS/Linux/WSL) or `$PSVersionTable.OS` (Windows) | picks the installer |
 | git | `git --version` | yes |
-| GitHub CLI | `gh --version` | yes: used below to fetch this branch's installer with the person's existing GitHub authentication. Never print or copy their token. |
-| GitHub access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: the repository is private. If this fails, ask the person to sign in (`gh auth login`) and stop. |
+| GitHub access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: public repository; no GitHub login is required. If this fails, check network/proxy access before continuing. |
 | Disk | about 4 GB free | yes |
 
 Python, Node.js, Playwright Chromium and uv are installed by the installer; do
@@ -45,7 +44,7 @@ not install them yourself.
 
 ## 3. Run the installer
 
-Replace `staging-1.3` with the chosen branch in both the installer fetch and
+Replace `staging-1.3` with the chosen branch in both the installer URL and
 `AGENT8088_BRANCH`, and set the two yes/no answers
 (`1` = yes, `0` = no).
 
@@ -53,8 +52,7 @@ Replace `staging-1.3` with the chosen branch in both the installer fetch and
 
 ```sh
 set -o pipefail
-gh api "repos/palindrome-rl/AGENT8088/contents/install.sh?ref=staging-1.3" \
-  -H "Accept: application/vnd.github.raw" \
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.sh \
   | AGENT8088_BRANCH=staging-1.3 AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
     bash -s -- --skip-setup
 ```
@@ -63,8 +61,7 @@ gh api "repos/palindrome-rl/AGENT8088/contents/install.sh?ref=staging-1.3" \
 
 ```powershell
 $installer = Join-Path $env:TEMP ("agent8088-install-" + [guid]::NewGuid().ToString("N") + ".ps1")
-gh api "repos/palindrome-rl/AGENT8088/contents/install.ps1?ref=staging-1.3" -H "Accept: application/vnd.github.raw" | Set-Content -LiteralPath $installer -Encoding UTF8
-if ($LASTEXITCODE -ne 0) { throw "Could not fetch the staging-1.3 installer; stop here." }
+Invoke-RestMethod -Uri https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1 -OutFile $installer -ErrorAction Stop
 $env:AGENT8088_BRANCH = "staging-1.3"
 $env:AGENT8088_INSTALL_MEM0 = "0"
 $env:AGENT8088_INSTALL_LIBREOFFICE = "0"
@@ -76,9 +73,8 @@ person at the keyboard (step 5). `-SkipTerminalCheck` stops the Windows
 installer from relaunching itself in a new Windows Terminal window, which an
 agent cannot see.
 
-These fetch the installer from the selected branch, not the hosted Pages
-installer, which serves development. GitHub CLI must already be authenticated
-with access to the private repository; ask the person to sign in if needed.
+These commands fetch the selected branch directly from the public repository.
+GitHub CLI and GitHub authentication are not prerequisites for installation.
 
 **Progress and errors** are written to the install log:
 `~/.agent8088/install.log` (macOS/Linux) or
