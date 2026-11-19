@@ -2325,6 +2325,20 @@ def _make_plan_approval(live=None, esc=None):
     return approve
 
 
+def _answer_left_to_show(answer):
+    """The part of a turn's answer the user has not already seen.
+
+    A reply offered as the plan and declined is also the turn's answer, and the
+    plan panel has just shown it: printing it again right below reads as a second
+    reply. Anything the engine added after it (task notes) is still shown, and
+    any other answer is shown whole."""
+    declined = (A.declined_plan_reply() or "").strip()
+    text = answer or ""
+    if declined and text.strip().startswith(declined):
+        return text.strip()[len(declined):].strip()
+    return text
+
+
 def _after_turn_plan_state():
     """Close out the turn's plan state.
 
@@ -2698,7 +2712,9 @@ def do_chat(query):
         _save_session_safely()
         return
 
-    render_answer(answer)
+    left = _answer_left_to_show(answer)
+    if left:
+        render_answer(left)
     S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "turns": S.turns_this_run,
                     "context": _estimate_context_pct()}
     if S.usage_mode == "tokens":

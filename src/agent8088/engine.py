@@ -1122,6 +1122,10 @@ _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this tur
 # the user set and to their answers to the model's questions, not only to the
 # model's last reply.
 _plan_requests: list[str] = []
+# Turn-scoped: the reply the user saw as an offered plan and declined. That reply
+# is also the turn's answer; the CLI already showed it in the plan panel, so it
+# reads this to avoid printing the same text twice.
+_declined_plan_reply = ""
 # Set while a sub-agent whose profile declares `permission: readonly` is running.
 # Such an agent is refused mutations outright rather than being allowed to escalate:
 # an escalation is a question the user can say yes to, and "this agent only
@@ -1208,6 +1212,11 @@ def finish_plan_session() -> str:
     return target
 
 
+def declined_plan_reply() -> str:
+    """The reply offered as the plan and declined this turn, or "" if none."""
+    return _declined_plan_reply
+
+
 def plan_tool_ran() -> bool:
     """True if a plan tool ran during the current turn. The CLI uses this to tell
     an executed plan apart from a model that only described one."""
@@ -1218,13 +1227,14 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
-    global _failure_streak, _diagnostic_shown, _shell_workspace_root
+    global _failure_streak, _diagnostic_shown, _shell_workspace_root, _declined_plan_reply
     _turn_writes = 0
     _shell_workspace_root = None
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
     _plan_tool_ran = False
+    _declined_plan_reply = ""
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
     _failure_streak = 0
@@ -8252,6 +8262,12 @@ def _mark_plan_presented() -> None:
     _plan_tool_ran = True
 
 
+def _remember_declined_reply(text: str) -> None:
+    """Record the reply the user saw as a plan and declined (see declined_plan_reply)."""
+    global _declined_plan_reply
+    _declined_plan_reply = text
+
+
 def _approval_takes_source(callback) -> bool:
     """Whether a plan-approval callback accepts the `source` keyword.
 
@@ -8287,6 +8303,12 @@ def _approve_plan(chosen: str, plan_text: str) -> None:
 
 
 _PLAN_REQUEST_CHARS = 4000  # per request quoted back with an approved reply
+
+_APPROVED_REPLY_NOT_STARTED = (
+    "The user already approved your plan and asked you to carry it out; they are not answering "
+    "questions now. Do not ask again. Make the most reasonable choice for anything still open, say "
+    "which choice you made, and carry out the plan now with tool calls. If it truly cannot be done, "
+    "say plainly what is missing.")
 
 
 def _note_plan_request(request: str) -> None:
@@ -20138,6 +20160,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
     plan_text_nudged = False  # a plan written as text has been sent back to present_plan once
+    # A reply approved as the plan, and the model has not acted on it yet. Its
+    # next answer without any tool call is sent back once (see below).
+    approved_reply_awaiting_work = False
+    approved_reply_pushed = False
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
@@ -20708,12 +20734,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
         else:
             _log.debug("turn %d: no tool calls — model replied with text", turn)
+        if calls:
+            approved_reply_awaiting_work = False  # the approved plan has started
         if not calls:
             # The model may have *tried* to call a tool that doesn't exist (a common
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
             # markup as the "answer", tell the model what went wrong and loop so it can
             # recover (call a real tool or just answer). Bounded to avoid infinite loops.
             attempted = _attempted_tool_names(content)
+            if attempted:
+                approved_reply_awaiting_work = False  # it tried to act on the plan
             invalid_plan = [n for n in attempted
                             if PERMISSION_MODE == "plan-only"
                             and _resolve_tool_name(n) in TOOL_SPECS
@@ -20882,6 +20912,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     post_check_rounds = 0
                     continue
             reply_declined = False  # the user saw this reply as a plan and kept planning
+            if (approved_reply_awaiting_work and not approved_reply_pushed and depth == 0
+                    and model_replied):
+                # Seen live: the approved reply was a question, and the model asked
+                # it again instead of choosing and working, so the plan session
+                # closed with nothing done. The user approved running it; say so once.
+                approved_reply_pushed = True
+                messages.append(_harness_turn(_APPROVED_REPLY_NOT_STARTED))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "approved_plan_not_started"})
+                continue
             if (gates_open and depth == 0 and model_replied and PERMISSION_MODE == "plan-only"
                     and not _plan_tool_ran and callable(_plan_on_approval)):
                 # The model finished planning without present_plan: a summary, a
@@ -20901,6 +20941,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                     plan_path, _save_error = _save_plan_proposal(plan_text)
                     messages.append(_harness_turn(_reply_plan_approved_message(chosen, plan_path)))
                     _approve_plan(chosen, plan_text)
+                    approved_reply_awaiting_work = True
                     if on_trajectory_state:
                         on_trajectory_state()
                     continue
@@ -20908,6 +20949,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.1, s
                 # user's "not yet" is the next turn's input, not a cue for the
                 # completion checks to send the model back to work.
                 reply_declined = True
+                _remember_declined_reply(plan_text)
             elif (gates_open and depth == 0 and not plan_text_nudged and PERMISSION_MODE == "plan-only"
                     and not _plan_tool_ran and _looks_like_a_plan(answer)):
                 # A plan written as chat text is never approved, and the session stays in plan mode with

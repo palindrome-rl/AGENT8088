@@ -55,6 +55,7 @@ def _run(engine, monkeypatch, replies, request="Plan a small web app, then wait 
 
 
 SUMMARY = "I looked at the project. It is a Flask app with two routes and no tests yet."
+TOOL_CALL = '✿FUNCTION✿: calculate ✿ARGS✿: {"expression": "1+1"}'
 QUESTION = "Should the new page use Flask templates or a separate React front end?"
 
 
@@ -81,10 +82,10 @@ def test_an_approved_reply_runs_as_the_plan_with_the_original_request(planning, 
     shown, seen = [], []
     monkeypatch.setattr(planning, "_plan_on_approval", _approver("full-auto", shown), raising=False)
     answer, calls, messages, trace = _run(
-        planning, monkeypatch, [SUMMARY, "All steps are done."],
+        planning, monkeypatch, [SUMMARY, TOOL_CALL, "All steps are done."],
         request="Add an about page to the Flask app.", seen=seen)
     assert len(shown) == 1
-    assert len(calls) == 2, "approval continues the same request so the work runs"
+    assert len(calls) >= 2, "approval continues the same request so the work runs"
     assert planning.PERMISSION_MODE == "full-auto"
     assert planning._plan_approved is True
     assert planning._plan_approved_text == SUMMARY
@@ -97,7 +98,7 @@ def test_an_approved_reply_runs_as_the_plan_with_the_original_request(planning, 
 
 def test_readonly_approval_is_passed_through(planning, monkeypatch):
     monkeypatch.setattr(planning, "_plan_on_approval", _approver("readonly", []), raising=False)
-    _run(planning, monkeypatch, [SUMMARY, "Done."])
+    _run(planning, monkeypatch, [SUMMARY, TOOL_CALL, "Done."])
     assert planning.PERMISSION_MODE == "readonly"
     assert planning._plan_approved is True
 
@@ -224,3 +225,66 @@ def test_cli_after_turn_notice_is_not_repeated_once_a_reply_was_offered(monkeypa
     monkeypatch.setattr(cli.A, "_plan_approved", False)
     cli._after_turn_plan_state()
     assert not any("no plan was approved" in line for line in shown)
+
+
+# --- the declined reply is not printed twice ------------------------------------------------------------------
+
+def test_the_engine_remembers_a_declined_reply_for_this_turn_only(planning, monkeypatch):
+    monkeypatch.setattr(planning, "_plan_on_approval", _approver("", []), raising=False)
+    _run(planning, monkeypatch, [QUESTION])
+    assert planning.declined_plan_reply() == QUESTION
+    planning.reset_turn_counters()
+    assert planning.declined_plan_reply() == ""
+
+
+def test_an_approved_reply_is_not_remembered_as_declined(planning, monkeypatch):
+    monkeypatch.setattr(planning, "_plan_on_approval", _approver("full-auto", []), raising=False)
+    _run(planning, monkeypatch, [SUMMARY, "Done."])
+    assert planning.declined_plan_reply() == ""
+
+
+@pytest.mark.parametrize("answer, expected", [
+    (QUESTION, ""),                                              # the panel already showed it
+    (QUESTION + "\n\nNot completed: x", "Not completed: x"),     # notes the panel did not show still appear
+    ("A different answer.", "A different answer."),               # anything else is shown as usual
+])
+def test_cli_does_not_print_a_declined_reply_again(monkeypatch, answer, expected):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "declined_plan_reply", lambda: QUESTION)
+    assert cli._answer_left_to_show(answer) == expected
+
+
+def test_cli_shows_the_whole_answer_when_nothing_was_declined(monkeypatch):
+    from agent8088 import cli
+    monkeypatch.setattr(cli.A, "declined_plan_reply", lambda: "")
+    assert cli._answer_left_to_show(QUESTION) == QUESTION
+
+
+# --- an approved reply must lead to work, not another question ----------------------------------------------
+
+def test_an_answer_with_no_work_after_approval_is_sent_back_once(planning, monkeypatch):
+    """Seen live: the approved reply was a question, and the model asked it again instead of choosing and working.
+    The plan session then closed with nothing built. It is told once to carry out what the user approved."""
+    seen = []
+    monkeypatch.setattr(planning, "_plan_on_approval", _approver("full-auto", []), raising=False)
+    answer, calls, _messages, trace = _run(
+        planning, monkeypatch, [QUESTION, "I still need to know which one you prefer.", "Done."], seen=seen)
+    assert len(calls) >= 3
+    push = seen[2][-1]["content"]
+    assert "approved" in push.lower() and "carry out" in push.lower()
+    assert [s["type"] for s in trace].count("approved_plan_not_started") == 1
+
+
+def test_the_push_after_approval_happens_only_once(planning, monkeypatch):
+    monkeypatch.setattr(planning, "_plan_on_approval", _approver("full-auto", []), raising=False)
+    answer, calls, _messages, trace = _run(
+        planning, monkeypatch, [QUESTION, "Which one?", "Which one, really?"])
+    assert [s["type"] for s in trace].count("approved_plan_not_started") == 1, "one push, never a loop"
+    assert "Which one, really?" in answer
+
+
+def test_no_push_when_the_approved_plan_did_run_tools(planning, monkeypatch):
+    monkeypatch.setattr(planning, "_plan_on_approval", _approver("full-auto", []), raising=False)
+    _answer, _calls, _messages, trace = _run(
+        planning, monkeypatch, [SUMMARY, TOOL_CALL, "Done, 1+1 is 2."])
+    assert not any(s["type"] == "approved_plan_not_started" for s in trace)
