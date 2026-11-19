@@ -195,3 +195,54 @@ def test_the_fallback_budget_is_not_swamped_by_image_data(engine, monkeypatch):
     messages = [{"role": "user", "content": [{"type": "text", "text": "look"},
                                              {"type": "image_url", "image_url": {"url": huge}}]}]
     assert engine._fallback_max_tokens(messages, "", [], "p", "m") > 4_000
+
+
+# --- a server that takes fewer images per request ----------------------------------------------------------
+
+class _ImageLimitError(Exception):
+    """What vLLM answers when a request carries more images than --limit-mm-per-prompt allows."""
+
+
+def _limited_completion(limit, replies, seen):
+    def completion(messages, *_args, **_kwargs):
+        count = _images_in(messages)
+        seen.append(count)
+        if count > limit:
+            raise _ImageLimitError(f"Error code: 400 - {{'error': {{'message': 'At most {limit} image(s) may be "
+                                   "provided in one prompt. (parameter=image)', 'code': 400}}")
+        text = replies[min(sum(1 for c in seen if c <= limit) - 1, len(replies) - 1)]
+        message = type("Message", (), {"content": text})()
+        choice = type("Choice", (), {"message": message, "finish_reason": "stop"})()
+        return type("Response", (), {"choices": [choice]})()
+    return completion
+
+
+def test_a_server_image_limit_is_learned_and_the_call_retried(engine, workspace, monkeypatch):
+    monkeypatch.setattr(engine, "MODEL_IMAGE_KEEP", 3)
+    engine._model_image_limits.clear()
+    for i in range(3):
+        _png(workspace / f"shot{i}.png", (64, 64), (i * 60, 90, 120))
+    seen = []
+    replies = [CALL.format(name=f"shot{i}.png") for i in range(3)] + ["All three looked fine."]
+    monkeypatch.setattr(engine, "_create_completion_with_fallback", _limited_completion(1, replies, seen))
+    monkeypatch.setattr(engine, "_model_accepts_images", lambda: True)
+    trace = []
+    answer = engine.run_agent([{"role": "user", "content": "Look at the pictures."}], max_turns=12,
+                              tools_def=[], allowed_tools={"view_image"}, system_prompt="",
+                              memory_capture=False, trace=trace)
+    assert answer.startswith("All three looked fine."), answer
+    assert seen.count(2) == 1, "the server refuses once, then the limit is known"
+    assert max(seen[seen.index(2) + 1:]) <= 1
+    assert any(step["type"] == "image_limit_learned" and step["limit"] == 1 for step in trace)
+    assert engine._image_keep() == 1
+
+
+def test_a_failed_turn_never_prints_raw_image_data(engine):
+    message = {"role": "user", "content": [
+        {"type": "text", "text": "Tool result (screenshot_page): page.html rendered. Page errors: none"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "QUJD" * 500}}]}
+    marker = engine._IMAGE_MARKER_PREFIX + json.dumps({"message": message})
+    answer = engine._fallback_answer(marker, RuntimeError("backend down"))
+    assert "base64" not in answer and "QUJD" not in answer and "IMAGE" not in answer.split("\n\n", 1)[-1][:10]
+    assert "Page errors: none" in answer
+    assert "image is not shown" in answer

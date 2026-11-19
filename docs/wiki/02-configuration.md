@@ -241,7 +241,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_image_bytes` | `20 MB` | Cap on an image attachment. |
 | `model_image_max_side` | `768` | Longest side, in pixels, of the copy of a tool-attached image the model sees. The file on disk keeps its size. `0` = no limit. |
 | `model_image_max_bytes` | `1500000` | Byte cap on that model copy; larger images are re-encoded (PNG, then JPEG) and shrunk until they fit. `0` = no limit. |
-| `model_image_keep` | `3` | How many images stay in the conversation. Older ones are replaced by a short note and keep their text. `0` = keep all. |
+| `model_image_keep` | `3` | How many images stay in the conversation. Older ones are replaced by a short note and keep their text. `0` = keep all. When a server refuses a request for carrying too many images (vLLM's `--limit-mm-per-prompt`, for example "At most 1 image(s)"), Agent8088 lowers this to the server's limit for that model and retries once. |
 | `document_process_concurrency` | `4` | Document chunks `document_read action=process` keeps in flight (clamped 1-16). Chunk requests are independent, so this multiplies throughput almost linearly until the provider rate-limits. |
 | `browser_max_steps` | `25` | Max steps `browse_page`'s browsing agent takes on one task. Override once with `AGENT8088_BROWSER_MAX_STEPS`. |
 | `browser_task_timeout_seconds` | `600` | Overall wall-clock limit for one `browse_page` call. Clamped to `max_tool_timeout_seconds`; override once with `AGENT8088_BROWSER_TASK_TIMEOUT_SECONDS`. |
