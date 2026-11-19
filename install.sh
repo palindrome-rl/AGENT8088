@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -35,7 +35,7 @@
 # a file to check (bash install.sh, sh install.sh). Piped, it is "bash"/"sh" or
 # the shell binary's own path (`curl | /bin/sh`), so only a first line that is a
 # "#!" line counts -- a binary never starts with one, and a piped download is LF.
-head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash   (always LF)" >&2 && exit 1
+head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash   (use LF line endings)" >&2 && exit 1
 
 # ----------------------------------------------------------------------------
 # Shell preflight -- must be the first executable code in this file
@@ -57,12 +57,12 @@ if [ -z "${BASH_VERSION:-}" ]; then
         # re-exec something whose first line is a bash shebang (this script).
         if [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!.*bash'; then exec bash "$0" "$@"; fi
         echo "This installer needs bash. Re-run it as:" >&2
-        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" >&2
+        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" >&2
         exit 1
     fi
     echo "ERROR: bash is required and was not found." >&2
     echo "  Alpine / busybox:  apk add bash" >&2
-    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" >&2
+    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" >&2
     exit 1
 fi
 
@@ -179,13 +179,13 @@ fi
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/palindrome-rl/AGENT8088.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-development}"
+REPO_BRANCH="${AGENT8088_BRANCH:-AGENT8088-v1.3}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
 PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
 NODE_VERSION="22.11.0"
-INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh"
 # Everything the heavy stages print goes here instead of /dev/null, so a failure
 # can show its last lines and the user has a file to attach to a bug report.
 INSTALL_LOG="$AGENT8088_HOME/install.log"
@@ -251,7 +251,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-setup) SKIP_SETUP=true; shift ;;
         --branch)
-            _require_option_value "$1" "${2:-}" "development"
+            _require_option_value "$1" "${2:-}" "AGENT8088-v1.3"
             BRANCH="$2"; shift 2 ;;
         --memory)
             _require_option_value "$1" "${2:-}" "native"
@@ -272,8 +272,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-setup          Skip interactive setup wizard"
             echo "  --branch NAME         Git branch to install (default: $REPO_BRANCH)"
             echo "  --memory BACKEND      Memory engine: native (default) or mem0"
-            echo "  --with-libreoffice    Install LibreOffice (docx/pptx/xlsx conversion)"
-            echo "  --skip-libreoffice    Don't install LibreOffice"
+            echo "  --with-libreoffice    Also install LibreOffice (off by default; docx/pptx/xlsx conversion)"
+            echo "  --skip-libreoffice    Don't install LibreOffice (the default)"
             echo "  -h, --help            Show this help"
             exit 0
             ;;
@@ -282,8 +282,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # The exact command to re-run, for every "re-run the installer" message.
-INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh"
-if [ "$BRANCH" = "development" ]; then
+if [ "$BRANCH" = "AGENT8088-v1.3" ]; then
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash"
 else
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | AGENT8088_BRANCH=$BRANCH bash"
@@ -366,8 +365,9 @@ resolve_memory_choice() {
 #
 # Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading, and
 # Excel formula recalculation (see documents.py's _soffice_executable). It is
-# the slowest optional stage here by a wide margin, so it asks first, same as
-# mem0 above and Install-LibreOffice in install.ps1.
+# the slowest optional stage here by a wide margin, so it is opt-in only:
+# --with-libreoffice or AGENT8088_INSTALL_LIBREOFFICE=1, or later
+# `agent8088 --libreoffice-setup`. Same contract as install.ps1.
 resolve_libreoffice_choice() {
     if [ -n "$LIBREOFFICE_CHOICE" ]; then
         echo "$LIBREOFFICE_CHOICE"
@@ -375,30 +375,8 @@ resolve_libreoffice_choice() {
     fi
     case "${AGENT8088_INSTALL_LIBREOFFICE:-}" in
         1|y|yes|true)  echo "true"; return ;;
-        0|n|no|false)  echo "false"; return ;;
     esac
-    if [ "$DISTRO" = "termux" ]; then
-        echo "false"  # no LibreOffice build for Android
-        return
-    fi
-    if ! _can_prompt || [ -n "${CI:-}" ]; then
-        echo "false"
-        return
-    fi
-    {
-        echo ""
-        echo "    LibreOffice is optional (~350 MB+) and can take several minutes to"
-        echo "    download and install."
-        echo "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls"
-        echo "    reading, and Excel formula recalculation. Skipping is safe."
-    } >&2
-    local answer=""
-    while [ "$answer" != "yes" ] && [ "$answer" != "no" ]; do
-        answer="$(_read_from_terminal "Install LibreOffice now? [yes/no]: ")"
-        [ -z "$answer" ] && continue
-        answer="$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-    done
-    [ "$answer" = "yes" ] && echo "true" || echo "false"
+    echo "false"
 }
 
 # Best-effort install: macOS via Homebrew cask, Linux via the distro's package
@@ -746,9 +724,8 @@ _json_escape() {
     printf '%s' "$_out"
 }
 
-# Persist the skipped-stage ledger to $AGENT8088_HOME/install-state.json, which
-# agent8088 reads to report what is missing in /doctor and the startup banner
-# (agent8088/install_state.py). Rewritten on every run, so a stage fixed by a
+# Persist the skipped-stage ledger to $AGENT8088_HOME/install-state.json for
+# the startup banner, /doctor and agent8088 --doctor. A stage fixed by a
 # re-run drops out; written to a temp file and renamed, so a reader never sees
 # half a file. Never fails the install.
 write_install_state() {
@@ -773,7 +750,7 @@ write_install_state() {
         printf '\n]}\n'
     } > "$_tmp" 2>/dev/null && mv -f "$_tmp" "$_file" 2>/dev/null || {
         rm -f "$_tmp" 2>/dev/null
-        log_warn "Could not write $_file (agent8088 --doctor will not list skipped stages)"
+        log_warn "Could not save the skipped-stage diagnostics to $_file"
     }
     return 0
 }
@@ -973,7 +950,7 @@ _report_install_stop() {
     if [ "$INSTALL_LOG" != "/dev/null" ]; then
         log_info "Log: $INSTALL_LOG"
     fi
-    log_info "If agent8088 was already installed, run 'agent8088 --doctor' to check your setup."
+    log_info "If agent8088 was already installed, start it and enter /doctor to check your setup."
 }
 
 _on_install_exit() {
@@ -1014,7 +991,7 @@ install_traps() {
 }
 
 # ----------------------------------------------------------------------------
-# Repository access (private repo)
+# Public repository access
 # ----------------------------------------------------------------------------
 # Echoes one of: tls access auth network unknown. Order matters: a TLS failure
 # also says "unable to access", and GitHub answers "Repository not found" (404)
@@ -1035,22 +1012,19 @@ classify_git_error() {
 }
 
 _print_repo_auth_help() {
-    log_info "Give git your GitHub credentials, then re-run. Any one of:"
-    log_info "  gh auth login && gh auth setup-git    (GitHub CLI, easiest)"
-    log_info "  a personal access token with repo scope, used as the password: https://github.com/settings/tokens"
-    log_info "  an SSH key on your GitHub account, then: git config --global url.\"git@github.com:\".insteadOf \"https://github.com/\""
+    log_info "This repository is public and needs no GitHub token."
+    log_info "Check stale github.com credentials, Git URL rewrites (git config --get-regexp url),"
+    log_info "and your proxy configuration, then re-run."
     log_info "Re-run: $INSTALL_CMD"
 }
 
-# Check the repository and branch BEFORE clone/fetch. The repo is private, so the
-# usual failure is credentials -- which used to surface as "git clone timed out
-# or failed ... check your connection", sending people after their network.
+# Check the public repository and branch BEFORE clone/fetch so missing branches,
+# TLS failures, and credential/proxy misconfiguration have distinct guidance.
 #
 # The first probe is non-interactive: a credential prompt from a command under
 # `timeout` lands in a background process group and is stopped (SIGTTIN), which
 # looks like a hang. Stored credentials (gh, osxkeychain, libsecret, an SSH
-# agent) still work. Only when that is refused and a terminal is available does
-# it ask, in the foreground, and the clone/fetch then runs the same way.
+# agent) still work. Public access needs no interactive sign-in.
 probe_repo_access() {
     log_info "Checking access to $REPO_URL (branch $BRANCH)..."
     local _rc=0 _kind
@@ -1067,29 +1041,16 @@ probe_repo_access() {
         exit 1
     fi
     _kind="$(classify_git_error "$(cat "$LAST_STEP_LOG" 2>/dev/null)")"
-    if [ "$_kind" = "auth" ] && _can_prompt; then
-        log_warn "GitHub needs your credentials for this private repository."
-        log_info "Username: your GitHub login. Password: a personal access token (not your account password)."
-        _rc=0
-        RUN_LOGGED_FOREGROUND=true
-        run_logged 300 env GIT_TERMINAL_PROMPT=1 git ls-remote --heads "$REPO_URL" "$BRANCH" || _rc=$?
-        if [ "$_rc" -eq 0 ]; then
-            _check_branch_listed
-            return 0
-        fi
-        RUN_LOGGED_FOREGROUND=false
-        _kind="$(classify_git_error "$(cat "$LAST_STEP_LOG" 2>/dev/null)")"
-    fi
     case "$_kind" in
         access)
-            log_error "GitHub says the repository does not exist for this account (it is private)."
+            log_error "GitHub could not find the public repository at $REPO_URL."
             show_step_failure
-            log_info "Your login works but has no access: ask an palindrome-rl admin to add you,"
-            log_info "or switch to the right account (gh auth status / gh auth login)."
+            log_info "This is a public repository. Check the URL in your browser and your Git/proxy configuration."
+            log_info "No private-repository membership or GitHub token is required."
             log_info "Re-run: $INSTALL_CMD"
             ;;
         auth)
-            log_error "GitHub refused the credentials for $REPO_URL (private repository)."
+            log_error "Git reported an authentication error accessing $REPO_URL."
             show_step_failure
             _print_repo_auth_help
             ;;
@@ -1117,7 +1078,7 @@ _check_branch_listed() {
         return 0
     fi
     log_error "Branch '$BRANCH' does not exist in $REPO_URL."
-    log_info "Use an existing branch: --branch development (or AGENT8088_BRANCH=development)"
+    log_info "Use an existing branch: --branch AGENT8088-v1.3 (or AGENT8088_BRANCH=AGENT8088-v1.3)"
     log_info "List them: git ls-remote --heads $REPO_URL"
     exit 1
 }
@@ -1336,7 +1297,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*)
             OS="windows"; DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 | iex\""
+            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1 | iex\""
             exit 1
             ;;
         *)
@@ -1577,8 +1538,7 @@ check_git() {
 clone_repo() {
     log_info "Installing to $INSTALL_DIR..."
 
-    # The repository is private, so allow Git to use the member's existing
-    # GitHub credentials or request them when needed.
+    # This public repository does not need interactive GitHub credentials.
 
     # An interrupted previous clone leaves .git with no initial commit.
     if [ -d "$INSTALL_DIR/.git" ] && ! git -C "$INSTALL_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -1599,9 +1559,15 @@ clone_repo() {
                 git reset -q
             fi
             log_info "Local changes detected, stashing before update..."
-            git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)" >/dev/null 2>&1 || true
+            if ! git stash push --include-untracked -m "agent8088-install-autostash-$(date -u +%Y%m%d-%H%M%S)"; then
+                log_error "Could not stash local installation changes; refusing to update."
+                exit 1
+            fi
         fi
-        git remote set-url origin "$REPO_URL" 2>/dev/null || true
+        if ! git remote set-url origin "$REPO_URL"; then
+            log_error "Could not configure the Agent8088 remote; refusing to update."
+            exit 1
+        fi
         probe_repo_access
         # GIT_HTTP_LOW_SPEED_* bounds the byte-moving part; this bounds the rest
         # (ref negotiation, local object write), which those variables do not cover.
@@ -1617,12 +1583,23 @@ clone_repo() {
             show_step_failure
             exit 1
         fi
-        git checkout -B "$BRANCH" FETCH_HEAD >/dev/null 2>&1
-        git reset --hard FETCH_HEAD >/dev/null 2>&1
+        if ! git checkout -B "$BRANCH" FETCH_HEAD; then
+            log_error "Could not check out '$BRANCH'; update did not complete."
+            exit 1
+        fi
+        if ! git reset --hard FETCH_HEAD; then
+            log_error "Could not reset the installation to '$BRANCH'; update did not complete."
+            exit 1
+        fi
     else
         probe_repo_access
         log_info "Cloning Agent8088 repository (this can take a minute)..."
-        rm -rf "$INSTALL_DIR"
+        if [ -e "$INSTALL_DIR" ]; then
+            local saved_dir
+            saved_dir="$(mktemp -d "${INSTALL_DIR}.saved.XXXXXX")" || exit 1
+            log_warn "Preserving the incomplete installation at $saved_dir/checkout."
+            mv "$INSTALL_DIR" "$saved_dir/checkout" || exit 1
+        fi
         mkdir -p "$AGENT8088_HOME"
         local _git_rc=0
         run_logged "$T_GIT" git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || _git_rc=$?
@@ -1640,7 +1617,7 @@ clone_repo() {
         git config core.autocrlf false
         FRESH_INSTALL=true
     fi
-    # Only git may need the terminal for a credential prompt; nothing after it.
+    # Nothing after repository setup should request Git credentials.
     RUN_LOGGED_FOREGROUND=false
     local installed_commit
     installed_commit="$(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -2266,16 +2243,26 @@ install_webui() {
     fi
 }
 
+find_verified_review_executable() {
+    local candidate version
+    for candidate in "$1"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
+        [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
+        version="$(run_with_timeout 15 "$candidate" --version 2>/dev/null)" || continue
+        case "$version" in
+            "open-code-review v$OPEN_CODE_REVIEW_VERSION "*|"open-code-review $OPEN_CODE_REVIEW_VERSION "*)
+                printf '%s\n' "$candidate"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
 install_code_review() {
     # Run after install_node_bridge so a fresh machine can use managed Node.
-    local prefix="$INSTALL_DIR/code-review" candidate rc=0
+    local prefix="$INSTALL_DIR/code-review" attempt rc=0
+    REVIEW_INSTALLED=false
+    REVIEW_EXECUTABLE="$(find_verified_review_executable "$prefix")"
     local _review_stamp="$prefix/.agent8088-install-stamp"
-    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
-        [ -f "$candidate" ] || continue
-        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
-        REVIEW_EXECUTABLE="$candidate"
-        break
-    done
     # The pinned version is the delegation contract, so an install of another
     # version -- or one interrupted before its stamp -- is reinstalled.
     if [ -n "$REVIEW_EXECUTABLE" ] && _stamp_matches "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"; then
@@ -2289,21 +2276,32 @@ install_code_review() {
         return
     fi
     log_info "Installing code review engine (optional, for /review)..."
-    run_with_timeout "$T_PIP" npm install --silent --no-fund --no-audit \
-        --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" \
-        >>"$INSTALL_LOG" 2>&1 </dev/null || rc=$?
-    REVIEW_EXECUTABLE=""
-    for candidate in "$prefix"/node_modules/@alibaba-group/ocr-*/bin/opencodereview*; do
-        [ -f "$candidate" ] || continue
-        case "$candidate" in *.cmd|*.ps1|*.bat) continue ;; esac
-        REVIEW_EXECUTABLE="$candidate"
-        break
+    for attempt in 1 2 3; do
+        rc=0
+        run_logged "$T_PIP" npm install --no-fund --no-audit \
+            --prefix "$prefix" "@alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION" || rc=$?
+        [ "$rc" -eq 0 ] && break
+        [ "$rc" -eq 124 ] && break
+        if [ "$attempt" -eq 3 ] || ! grep -qiE 'ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|could not resolve host' "$LAST_STEP_LOG"; then
+            break
+        fi
+        log_warn "Code review download could not reach its server; retrying ($attempt/3)."
+        sleep "$((2 * attempt))"
     done
+    REVIEW_EXECUTABLE="$(find_verified_review_executable "$prefix")"
     if [ "$rc" -eq 0 ] && [ -n "$REVIEW_EXECUTABLE" ]; then
         REVIEW_INSTALLED=true
         _write_stamp "$_review_stamp" "$OPEN_CODE_REVIEW_VERSION"
         log_success "Code review engine installed"
     else
+        if [ "$rc" -eq 0 ]; then
+            rc=1
+            echo "The pinned OpenCodeReview executable is missing, cannot run, or reports the wrong version." >> "$LAST_STEP_LOG"
+        fi
+        show_step_failure
+        if grep -qiE 'ENOTFOUND|EAI_AGAIN|could not resolve host' "$LAST_STEP_LOG"; then
+            log_warn "DNS lookup failed while downloading code review. Check the named host, DNS, VPN and proxy settings. Docker is not required."
+        fi
         warn_stage "$rc" "$T_PIP" "code review engine" \
             "/review and review_code will report the install command instead of running" \
             "npm install --prefix \"$prefix\" @alibaba-group/open-code-review@$OPEN_CODE_REVIEW_VERSION"
@@ -2713,7 +2711,7 @@ verify_install() {
     if [ "$LIBREOFFICE_INSTALLED" = true ]; then
         echo "  Office:   LibreOffice ready (docx/pptx/xlsx conversion)"
     else
-        echo "  Office:   LibreOffice not installed (rerun with --with-libreoffice)"
+        echo "  Office:   LibreOffice not installed (add it with: agent8088 --libreoffice-setup)"
     fi
     if [ "$REPOSITORY_INSTALLED" = true ]; then
         echo "  Repos:    repository_read ready (bounded repository overviews)"
@@ -2733,7 +2731,7 @@ verify_install() {
         echo "  Sandbox:  Docker fallback is automatic when available"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
-    echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | AGENT8088_BRANCH=$BRANCH bash"
+    echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"
     [ "$INSTALL_LOG" != "/dev/null" ] && echo "  Log:    $INSTALL_LOG"
     echo ""
     case ":$PATH:" in
@@ -2747,7 +2745,7 @@ verify_install() {
             fi
             ;;
     esac
-    [ "$_ready" = true ] && echo "Run 'agent8088 --doctor' to check your setup."
+    [ "$_ready" = true ] && echo "Start agent8088, then enter /doctor to check your setup."
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
     # view minutes ago on a multi-minute install, which is how a failed WhatsApp
     # bridge got reported and still went unnoticed.

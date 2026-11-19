@@ -234,7 +234,7 @@ function PreferencesPanel({ initial, onSet, setting }: {
   onSet: (prefs: Record<string, unknown>) => void
   setting: boolean
 }) {
-  const [temperature, setTemperature] = useState(initial.temperature ?? 0.1)
+  const [temperature, setTemperature] = useState(initial.temperature ?? 0.8)
   const [maxTurns, setMaxTurns] = useState(initial.max_turns ?? 10)
   const [verbose, setVerbose] = useState<string>(initial.verbose ?? 'on')
   const [usageMode, setUsageMode] = useState<string>(initial.usage_mode ?? 'tokens')

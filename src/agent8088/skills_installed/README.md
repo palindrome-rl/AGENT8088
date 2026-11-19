@@ -43,7 +43,7 @@ load `SKILL.md` and permitted text resources through `view_skill` when needed.
 ## Verifying an install
 
 ```bash
-python agent8088_cli.py
+agent8088
 ```
 
 Then run `/skills` to list packages, and `/tools` to confirm the new tools loaded.

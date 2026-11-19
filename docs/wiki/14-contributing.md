@@ -4,17 +4,19 @@
 
 ## Setup
 
+Start from the v1.3 branch:
+
 ```sh
-git clone https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
-AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent .venv/bin/python scripts/verify_features.py
 ```
 
-Install **both** extras. Without `gateway`, `test_gateway_core.py` and
-`test_gateway_startup.py` fail at import (they import the Slack/Discord
-adapters directly) and look like real breakage.
+Install **both** extras. Without `gateway`, anything importing the
+Slack/Discord adapters fails at import rather than skipping, which looks like
+real breakage but is a missing optional dependency.
 
 ## Non-negotiable safety rules
 
@@ -53,8 +55,8 @@ my_tool|What it does|mode=http_get|args=query|url=https://api.example.com?q={que
 Pick an existing `mode` and it inherits that mode's permission gating
 automatically. Then:
 
-1. Add a test in `tests/` asserting the spec and, if it has logic, its behaviour.
-2. If it's a new `mode`, add gating in `check_permission()` **and** a test for
+1. Add a check asserting the spec and, if it has logic, its behaviour.
+2. If it's a new `mode`, add gating in `check_permission()` **and** a check for
    each permission mode.
 3. Update `expected_tools` in `scripts/verify_everything.py` — it's the single
    source of truth for the inventory, and the count assertions derive from it.
@@ -81,8 +83,8 @@ Write the failing test first, then the fix — every fix in this repo's recent
 history has a repro that failed before and passed after.
 
 - **Establish the target branch's baseline before comparing.** Otherwise you
-  cannot tell "I broke this" from "this was already broken." The `pr-check`
-  skill does it in a worktree.
+  cannot tell "I broke this" from "this was already broken." Run the
+  baseline in a separate worktree.
 - **Don't silently flip a test whose expectation changed.** If code and test
   disagree about intent, that's a decision to surface, not to resolve by editing
   whichever is convenient. If you must park it, `xfail` with a reason explaining
@@ -93,24 +95,25 @@ history has a repro that failed before and passed after.
 ## Before opening a PR
 
 ```sh
-AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest tests/ -q
+AGENT8088_CONFIG=/nonexistent .venv/bin/python -m pytest scripts/installer_checks/ -q
 .venv/bin/python scripts/check_duplicate_defs.py
 VERIFY_HOME="$(mktemp -d)"; AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
   .venv/bin/python scripts/verify_features.py; rm -rf -- "$VERIFY_HOME"
 ```
 
-There is **no CI** — GitHub Actions is blocked by a billing issue on this
-account, and no `.github/workflows/` are checked in. Local runs are the gate.
+CI runs the lint, static and install checks on every push and pull request
+(see [CI](12-testing-and-verification.md#ci)). The checks above go further, so
+run them locally too.
 
 ## Branch and PR conventions
 
-- Branch from `development`, not `main`.
-- **Never push to `main` or `development` directly.** Open a PR. (There is no
+- Branch from `AGENT8088-v1.3`, not `main`.
+- **Never push to `main` or `AGENT8088-v1.3` directly.** Open a PR. (There is no
   repo-level hook enforcing this — it's discipline, backed by whatever branch
   protection is configured on GitHub.)
-- Commit messages here are plain imperative sentences, not conventional-commit
-  prefixes — `git log` shows none of `feat:`/`fix:`/`docs:` in recent history.
-  Match that style rather than prefixing.
+- Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:` or `chore:`, then a
+  short imperative summary. See [CONTRIBUTING.md](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/CONTRIBUTING.md).
 - In the PR body, state: what changed, the repro that proves it, verification
   output, and anything you deliberately left out.
 - Flag behaviour changes that could break an existing setup. A security

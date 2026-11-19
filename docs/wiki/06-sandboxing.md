@@ -12,7 +12,7 @@ command can't reach your whole filesystem or network.
 | Value | Behaviour |
 |---|---|
 | `auto` *(default)* | Native runtime first, Docker if it is missing or fails its one-time probe, otherwise refuse execution |
-| `native` | Force the free OS-level sandbox |
+| `native` | Force the free OS-level sandbox (if it is installed but fails its probe, Docker is used when available, otherwise execution is refused) |
 | `docker` | Force the Docker fallback |
 
 Check what's active:
@@ -32,8 +32,9 @@ on `PATH` is not treated as proof that it works.
 agent8088 --sandbox-setup
 ```
 
-Installs the open-source Anthropic sandbox runtime — no Docker daemon, no
-container images, low overhead.
+Installs the native sandbox runtime: Anthropic's sandbox runtime on macOS/Linux
+or the DSH Windows ACL runtime on Windows. No Docker daemon or container images
+are needed.
 
 **Prerequisites:**
 
@@ -41,7 +42,13 @@ container images, low overhead.
 |---|---|
 | macOS | Node.js 20.11+, `ripgrep` |
 | Linux | Node.js 20.11+, `bubblewrap`, `socat`, `ripgrep` |
-| Windows | Node.js 20.11+ — no admin prompt |
+| Windows | Supported Node.js (managed automatically if needed); setup runs as the current user, with no admin elevation or separate sandbox account |
+
+On Windows, setup and runtime both prefer Agent8088's managed Node when it
+meets the Node.js 20.11+ requirement. An older managed installation is skipped
+in favor of a supported PATH version. If neither is suitable, sandbox setup
+downloads the pinned Node.js 22.11.0 build and verifies its SHA-256 checksum.
+Setup requires npm; running an already-installed sandbox only requires Node.
 
 On Windows the sandbox restricts file writes (a restricted token plus NTFS
 ACLs on the current account); it does not filter the network, and `/sandbox`
@@ -180,20 +187,13 @@ Worth being precise, because it's easy to over-trust:
 
 ## Interaction with git tools
 
-Under the native sandbox, `git status` / `git diff` / `git log` run without a
-prompt. If no sandbox is available they are refused; `git show HEAD:.env` is
-separately blocked outright in every backend.
+`git status` / `git diff` / `git log` typed through `execute_shell` are
+sandboxed like any other command, and are refused when no sandbox is available.
+The dedicated `git_*` tools are host tools (`host=1` in `tools.txt`): they run
+on the host regardless of backend and are gated by the permission layer
+instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
+`git show HEAD:.env` is separately blocked outright in every backend.
 
 ## Verifying it works
 
-```sh
-VERIFY_HOME="$(mktemp -d)"
-AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$VERIFY_HOME" \
-  python scripts/verify_features.py
-rm -rf -- "$VERIFY_HOME"
-```
-
-Section 3 covers sandboxing and reports the resolved backend. If the native
-runtime isn't installed or cannot pass its probe you get an explicit `⊘ SKIP`
-naming the missing dependency or failed backend rather than a silent pass — see
-[Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).

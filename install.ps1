@@ -2,9 +2,7 @@
 # Agent8088 Installer - Windows (native PowerShell)
 # ============================================================================
 # Usage:
-#   iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
-#   or, from cmd.exe / when scripts are blocked by execution policy:
-#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1 | iex"
+#   $env:AGENT8088_BRANCH = "AGENT8088-v1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, PortableGit install, repo clone,
@@ -23,7 +21,7 @@ param(
     [switch]$SkipLibreOffice,
     [switch]$WithMem0,
     [switch]$SkipMem0,
-    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "development" }),
+    [string]$Branch = $(if ($env:AGENT8088_BRANCH) { $env:AGENT8088_BRANCH } else { "AGENT8088-v1.3" }),
     [string]$Agent8088Home = $(if ($env:AGENT8088_HOME) { $env:AGENT8088_HOME } else { "$env:LOCALAPPDATA\agent8088" }),
     [string]$InstallDir = "",
     [string]$InstallerSourceUrl = ""
@@ -221,7 +219,7 @@ $OcrInstalled = $false
 $ReviewInstalled = $false
 $ReviewExecutable = ""
 # Pinned: the delegation JSON contract is version-specific.
-$OpenCodeReviewVersion = "1.12.1"
+$script:OpenCodeReviewVersion = "1.12.1"
 $Mem0Installed = $false
 $MemoryEngine = ""
 $RepositoryInstalled = $false
@@ -263,7 +261,7 @@ function Write-Err     { param([string]$Message) Write-Host "[X] $Message" -Fore
 # comfortably.
 #
 # Scale them all for a slow connection:
-#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)
+#   $env:AGENT8088_TIMEOUT_SCALE = 3; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 $TimeoutScale = 1
 if ($env:AGENT8088_TIMEOUT_SCALE -match '^\d+$' -and [int]$env:AGENT8088_TIMEOUT_SCALE -ge 1) {
     $TimeoutScale = [int]$env:AGENT8088_TIMEOUT_SCALE
@@ -664,9 +662,8 @@ function Write-StageWarning {
     Register-SkippedStage -Label $What -Reason $reason -Fix $Fix
 }
 
-# Persist the skipped-stage ledger to $Agent8088Home\install-state.json, which
-# agent8088 reads to report what is missing in /doctor and the startup banner
-# (agent8088/install_state.py). Rewritten on every run, so a stage fixed by a
+# Persist the skipped-stage ledger to $Agent8088Home\install-state.json for
+# the startup banner, /doctor and agent8088 --doctor. A stage fixed by a
 # re-run drops out; written to a temp file and renamed, so a reader never sees
 # half a file. UTF-8 without a BOM. Never fails the install.
 function Save-InstallState {
@@ -689,7 +686,7 @@ function Save-InstallState {
         [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
         Move-Item -LiteralPath $tmp -Destination $file -Force
     } catch {
-        Write-Warn "Could not write install-state.json (agent8088 --doctor will not list skipped stages): $_"
+        Write-Warn "Could not save the skipped-stage diagnostics to install-state.json: $_"
     }
 }
 
@@ -727,16 +724,23 @@ function Write-AntivirusGuidance {
 
 function Protect-ConfigFile {
     param([string]$Path)
+    # A user's PATH can omit System32 even on a supported Windows install.
+    # Resolve this security-critical utility by its OS path so an otherwise
+    # successful install does not fail after writing the config.
+    $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
+    if (-not (Test-Path -LiteralPath $icacls -PathType Leaf)) {
+        throw "Cannot secure config.txt: Windows ACL utility is missing at $icacls"
+    }
     $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-    icacls $Path /grant:r "*$sid`:(F)" | Out-Null
+    & $icacls $Path /grant:r "*$sid`:(F)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         $owner = try { (Get-Acl -LiteralPath $Path).Owner } catch { "unknown" }
         throw ("Could not secure config.txt for the current user. " +
                "Current owner: $owner. Open PowerShell as Administrator and run: " +
                "takeown.exe /F `"$Path`"; " +
-               "icacls.exe `"$Path`" /grant:r `"*$sid`:(F)`"")
+               "`"$icacls`" `"$Path`" /grant:r `"*$sid`:(F)`"")
     }
-    icacls $Path /inheritance:r | Out-Null
+    & $icacls $Path /inheritance:r | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not remove inherited config permissions: $Path" }
 }
 
@@ -914,40 +918,19 @@ function Install-WindowsTerminal {
 # invocation, same "warn and register a skipped stage, never abort the whole
 # installer" contract as every other optional component here.
 #
-# Unlike the others it asks first. ~350 MB installed per-machine by WinGet is
-# the slowest stage in this installer by a wide margin, and the three
-# capabilities it unlocks are ones plenty of users never touch.
+# Opt-in only: ~350 MB installed per-machine by WinGet is the slowest stage in
+# this installer by a wide margin, and the capabilities it unlocks are ones
+# plenty of users never touch. Pass -WithLibreOffice (or set
+# AGENT8088_INSTALL_LIBREOFFICE=1), or add it later with
+# `agent8088 --libreoffice-setup`.
 # ----------------------------------------------------------------------------
-# Consent for the one stage nobody should be made to wait on unasked. Kept out
-# of Install-LibreOffice so the tests can stub the console read.
-#
-# The $NonInteractive guard is not a policy choice: on a headless host Read-Host
-# returns empty immediately, so the explicit-answer loop below would spin
-# forever.
 function Read-LibreOfficeConsent {
     if ($WithLibreOffice -and $SkipLibreOffice) {
         throw "-WithLibreOffice and -SkipLibreOffice cannot be used together."
     }
     if ($WithLibreOffice) { return $true }
     if ($SkipLibreOffice) { return $false }
-    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$') { return $true }
-    if ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(0|n|no|false)$') { return $false }
-    $runningInCI = $env:CI -match '^(1|y|yes|true)$'
-    if ($NonInteractive -or $runningInCI) {
-        Write-Info "Non-interactive - skipping the optional LibreOffice install."
-        return $false
-    }
-
-    Write-Host ""
-    Write-Warn "LibreOffice is optional (~350 MB) and can take several minutes to download and install."
-    Write-Host "    Gives .docx/.pptx/.xlsx to PDF conversion, legacy .doc/.ppt/.xls reading,"
-    Write-Host "    and Excel formula recalculation. Skipping is safe."
-    Write-Host "    Add it later with: winget install TheDocumentFoundation.LibreOffice"
-    do {
-        $rawAnswer = Read-Host "Install LibreOffice now? [yes/no]"
-        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim().ToLowerInvariant() }
-    } while ($answer -notin @("yes", "no"))
-    return ($answer -eq "yes")
+    return ($env:AGENT8088_INSTALL_LIBREOFFICE -match '^(1|y|yes|true)$')
 }
 
 function Install-LibreOffice {
@@ -966,6 +949,14 @@ function Install-LibreOffice {
         Write-Warn "LibreOffice exists at $existing but does not run - attempting repair with WinGet"
     }
 
+    if (-not (Read-LibreOfficeConsent)) {
+        Write-Info "Skipping LibreOffice (opt-in; add it later with: agent8088 --libreoffice-setup)."
+        Register-SkippedStage -Label "LibreOffice" `
+            -Reason "opt-in (optional, slow to install)" `
+            -Fix "agent8088 --libreoffice-setup, or rerun with -WithLibreOffice"
+        return $false
+    }
+
     $winget = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $winget) {
@@ -973,16 +964,6 @@ function Install-LibreOffice {
         Register-SkippedStage -Label "LibreOffice" `
             -Reason "no WinGet available" `
             -Fix "install App Installer from the Microsoft Store, then rerun, or install LibreOffice manually from https://www.libreoffice.org/download/"
-        return $false
-    }
-
-    # Asked only once both cheap preconditions hold: nothing installed already,
-    # and a WinGet that could actually carry the answer out.
-    if (-not (Read-LibreOfficeConsent)) {
-        Write-Info "Skipping LibreOffice."
-        Register-SkippedStage -Label "LibreOffice" `
-            -Reason "not selected (optional, slow to install)" `
-            -Fix "winget install TheDocumentFoundation.LibreOffice"
         return $false
     }
 
@@ -2136,7 +2117,7 @@ function Write-InstallFailureHint {
 }
 
 # ----------------------------------------------------------------------------
-# Repository access (private repo)
+# Public repository access
 # ----------------------------------------------------------------------------
 # Same classification as classify_git_error in install.sh. Order matters: a
 # TLS failure also says "unable to access", and GitHub answers "Repository not
@@ -2155,20 +2136,18 @@ function Write-RepoAccessHelp {
     switch ($Kind) {
         "branch" {
             Write-Err "Branch '$Branch' does not exist in $RepoUrl."
-            Write-Info "Use an existing branch:  `$env:AGENT8088_BRANCH = 'development'; then re-run."
+            Write-Info "Use an existing branch:  `$env:AGENT8088_BRANCH = 'AGENT8088-v1.3'; then re-run."
         }
         "access" {
-            Write-Err "GitHub says the repository does not exist for this account (it is private)."
-            Write-Info "Your login works but has no access: ask an palindrome-rl admin to add you,"
-            Write-Info "or switch accounts (gh auth status / gh auth login, or remove the github.com"
-            Write-Info "entry in Windows Credential Manager), then re-run."
+            Write-Err "GitHub could not find the public repository at $RepoUrl."
+            Write-Info "This is a public repository. Check the URL in your browser and your Git/proxy configuration."
+            Write-Info "No private-repository membership or GitHub token is required."
         }
         "auth" {
-            Write-Err "GitHub refused the credentials for $RepoUrl (private repository)."
-            Write-Info "Give git your GitHub credentials, then re-run. Any one of:"
-            Write-Info "  gh auth login; gh auth setup-git     (GitHub CLI, easiest)"
-            Write-Info "  sign in when Git Credential Manager opens its window"
-            Write-Info "  a personal access token with repo scope as the password: https://github.com/settings/tokens"
+            Write-Err "Git reported an authentication error accessing $RepoUrl."
+            Write-Info "This repository is public and needs no GitHub token."
+            Write-Info "Check stale github.com credentials in Windows Credential Manager,"
+            Write-Info "Git URL rewrites (git config --get-regexp url), and your proxy; then re-run."
         }
         "tls" {
             Write-Err "git could not verify github.com's TLS certificate (a proxy or antivirus re-signing HTTPS?)."
@@ -2185,10 +2164,9 @@ function Write-RepoAccessHelp {
 
 # Probe the repository and branch before clone/fetch. Returns "ok", "branch",
 # or a Get-GitFailureKind result. Non-interactive on purpose: a stored
-# credential still works, but nothing prompts here. "auth" is therefore not
-# final (the real clone can still sign in through Git Credential Manager), but
-# it does mean the ZIP fallback is pointless: a private repo's archive is a 404
-# that would hide the real error.
+# credential still works, but nothing prompts here. Public access should not
+# require sign-in. Report authentication/configuration failures explicitly
+# instead of masking them behind an archive fallback.
 function Test-RepoAccess {
     $gitExe = (Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $gitExe) { $gitExe = "git" }
@@ -2216,8 +2194,7 @@ function Test-RepoAccess {
 function Clone-Repo {
     Write-Info "Installing to $InstallDir..."
 
-    # The repository is private, so allow Git Credential Manager to use the
-    # member's existing GitHub credentials or request them when needed.
+    # This public repository does not require interactive GitHub credentials.
 
     # An interrupted previous clone leaves .git with no initial commit.
     if ((Test-Path (Join-Path $InstallDir ".git")) -and -not (& git -C $InstallDir rev-parse --verify HEAD 2>$null)) {
@@ -2237,7 +2214,11 @@ function Clone-Repo {
         Push-Location $InstallDir
         try {
             & git -c windows.appendAtomically=false config core.autocrlf false
-            $diff = & git -c windows.appendAtomically=false diff --name-only 2>$null
+            $diff = & git -c windows.appendAtomically=false status --porcelain 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Err "Could not inspect local installation changes; refusing to update."
+                return $false
+            }
             if ($diff) {
                 # Clear unmerged index entries
                 $unmerged = & git -c windows.appendAtomically=false ls-files --unmerged 2>$null
@@ -2255,13 +2236,9 @@ function Clone-Repo {
             & git -c windows.appendAtomically=false remote set-url origin $RepoUrl 2>$null
             if ($LASTEXITCODE -ne 0) { Write-Err "Could not configure the Agent8088 remote."; return $false }
             $access = Test-RepoAccess
-            if ($access -in @("branch", "access")) {
+            if ($access -in @("branch", "access", "auth")) {
                 Write-RepoAccessHelp -Kind $access
                 return $false
-            }
-            if ($access -eq "auth") {
-                Write-Warn "No stored GitHub credentials work for this private repository."
-                Write-Info "Git will ask you to sign in. Use an account with access to palindrome-rl."
             }
             # 2>&1 + Write-Host rather than 2>$null: git's stderr is the only
             # place that says why a fetch failed.
@@ -2285,15 +2262,12 @@ function Clone-Repo {
         }
     } else {
         $access = Test-RepoAccess
-        if ($access -in @("branch", "access")) {
+        if ($access -in @("branch", "access", "auth")) {
             Write-RepoAccessHelp -Kind $access
             return $false
         }
         $authProblem = ($access -eq "auth")
-        if ($authProblem) {
-            Write-Warn "No stored GitHub credentials work for this private repository."
-            Write-Info "Git will ask you to sign in. Use an account with access to palindrome-rl."
-        } elseif ($access -ne "ok") {
+        if ($access -ne "ok") {
             Write-Warn "Repository check failed ($access) - trying the clone anyway:"
             Write-OutputTail -Text $script:RepoProbeOutput -Lines 5
         }
@@ -2316,10 +2290,10 @@ function Clone-Repo {
         } catch {
             $cloneKind = Get-GitFailureKind -Text ($cloneLines -join "`n")
             if ($authProblem -or $cloneKind -in @("auth", "access")) {
-                # The ZIP archive of a private repo is a 404, which would replace
-                # this real cause with a misleading "download failed".
+                # Preserve the real Git failure instead of masking it with
+                # an unrelated archive-download error.
                 Write-RepoAccessHelp -Kind $(if ($cloneKind -in @("auth", "access")) { $cloneKind } else { "auth" })
-                Write-Info "Not trying the ZIP download: the repository is private, so it cannot work."
+                Write-Info "Fix the Git access/configuration error above before retrying."
                 [void](Remove-IncompleteInstallDirectory)
                 return $false
             }
@@ -3087,34 +3061,46 @@ function Install-WebUI {
 # the model is there. The message names the exact command to fix it.
 $EmbedModel = "nomic-embed-text"
 
+function Find-VerifiedReviewExecutable {
+    param([string]$Prefix)
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $Prefix -Recurse -Filter "opencodereview*.exe" -ErrorAction SilentlyContinue)) {
+        if ($candidate.PSIsContainer) { continue }
+        $check = Invoke-WithTimeout -FilePath $candidate.FullName -Arguments @("--version") -TimeoutSec 15 -CaptureOutput
+        $text = ("$($check.Output)`n$($check.ErrorOutput)").Trim()
+        Add-InstallLog -Title "Code review executable verification" -Text $text
+        if ($check.ExitCode -eq 0 -and $text -match ("(?m)\bopen-code-review\s+v?" + [regex]::Escape($script:OpenCodeReviewVersion) + "(?:\s|$)")) {
+            return $candidate.FullName
+        }
+    }
+    return ""
+}
+
 function Install-CodeReview {
     # Run after Install-Node-Bridge: a fresh machine gets portable Node there.
     $reviewPrefix = Join-Path $InstallDir "code-review"
-    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
-        -ErrorAction SilentlyContinue | Where-Object {
-            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
-        } | Select-Object -First 1
-    $reviewHealthy = $false
-    if ($reviewBin) {
-        $reviewHealthy = Invoke-DependencyProbe -FilePath $reviewBin.FullName `
-            -Arguments @("version") -TimeoutSec 30
-        if ($reviewHealthy) {
-            $reviewVersion = ("$($script:LastDependencyProbe.Output)`n$($script:LastDependencyProbe.ErrorOutput)").Trim()
-            $reviewHealthy = $reviewVersion -match "\bv$([regex]::Escape($script:OpenCodeReviewVersion))\b"
-        }
-    }
-    if ((Test-StageComplete "codereview") -and $reviewHealthy) {
-        $script:ReviewInstalled = $true
-        $script:ReviewExecutable = $reviewBin.FullName
-        Write-Success "Code review engine already installed and verified (skipping)"
+    $script:ReviewInstalled = $false
+    $script:ReviewExecutable = ""
+    if ($script:OpenCodeReviewVersion -notmatch '^\d+\.\d+\.\d+$') {
+        Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip -What "code review engine" `
+            -Consequence "the pinned version is missing; refusing an unpinned download" -Fix "rerun the latest public installer"
         return
     }
-    if ((Test-StageComplete "codereview") -and -not $reviewHealthy) {
+    $reviewBin = Find-VerifiedReviewExecutable -Prefix $reviewPrefix
+    if ((Test-StageComplete "codereview") -and $reviewBin) {
+        $script:ReviewInstalled = $true
+        $script:ReviewExecutable = $reviewBin
+        Write-Success "Code review engine already installed (skipping)"
+        return
+    }
+    if (Test-StageComplete "codereview") {
         Write-Warn "Code review resume marker is stale - repairing the engine"
     }
-    $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $npm) {
+    $npmPath = $script:NpmExe
+    if (-not $npmPath -or -not (Test-Path -LiteralPath $npmPath)) {
+        $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        $npmPath = if ($npm) { $npm.Source } else { "" }
+    }
+    if (-not $npmPath) {
         Write-StageWarning -Result @{ ExitCode = 1 } -TimeoutSec $TPip `
             -What "code review engine" `
             -Consequence "/review will report the install command instead of running" `
@@ -3122,32 +3108,35 @@ function Install-CodeReview {
         return
     }
     Write-Info "Installing code review engine (optional, for /review)..."
-    $reviewResult = Invoke-WithTimeout -FilePath $npm.Source `
-        -Arguments @("install", "--silent", "--no-fund", "--no-audit", "--prefix",
-                     $reviewPrefix,
-                     "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
-        -TimeoutSec $TPip -Activity "Installing code review engine"
-    $reviewBin = Get-ChildItem -Path $reviewPrefix -Recurse -Filter "opencodereview*" `
-        -ErrorAction SilentlyContinue | Where-Object {
-            -not $_.PSIsContainer -and $_.Extension -notin @(".cmd", ".ps1", ".bat")
-        } | Select-Object -First 1
-    $reviewHealthy = $false
-    if ($reviewResult.ExitCode -eq 0 -and $reviewBin) {
-        $reviewHealthy = Invoke-DependencyProbe -FilePath $reviewBin.FullName `
-            -Arguments @("version") -TimeoutSec 30
-        if ($reviewHealthy) {
-            $reviewVersion = ("$($script:LastDependencyProbe.Output)`n$($script:LastDependencyProbe.ErrorOutput)").Trim()
-            $reviewHealthy = $reviewVersion -match "\bv$([regex]::Escape($script:OpenCodeReviewVersion))\b"
-        }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $reviewResult = Invoke-WithTimeout -FilePath $npmPath `
+            -Arguments @("install", "--no-fund", "--no-audit", "--prefix", $reviewPrefix,
+                         "@alibaba-group/open-code-review@$script:OpenCodeReviewVersion") `
+            -TimeoutSec $TPip -CaptureOutput -Activity "Installing code review engine"
+        $reviewText = ("$($reviewResult.Output)`n$($reviewResult.ErrorOutput)`n$($reviewResult.Error)").Trim()
+        Add-InstallLog -Title "Code review installation attempt $attempt (exit $($reviewResult.ExitCode))" -Text $reviewText
+        if ($reviewResult.ExitCode -eq 0 -or $reviewResult.TimedOut) { break }
+        $transient = $reviewText -match '(?i)ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EHOSTUNREACH|could not resolve host'
+        if (-not $transient -or $attempt -eq 3) { break }
+        Write-Warn "Code review download could not reach its server; retrying ($attempt/3)."
+        Start-Sleep -Seconds (2 * $attempt)
     }
-    if ($reviewResult.ExitCode -eq 0 -and $reviewBin -and $reviewHealthy) {
+    $reviewBin = Find-VerifiedReviewExecutable -Prefix $reviewPrefix
+    if ($reviewResult.ExitCode -eq 0 -and $reviewBin) {
         $script:ReviewInstalled = $true
-        $script:ReviewExecutable = $reviewBin.FullName
+        $script:ReviewExecutable = $reviewBin
         Set-StageComplete "codereview"
         Write-Success "Code review engine installed"
     } else {
-        $reviewFailure = if ($reviewResult.ExitCode -eq 0 -and $script:LastDependencyProbe) { $script:LastDependencyProbe } else { $reviewResult }
-        Write-StageWarning -Result $reviewFailure -TimeoutSec $TPip `
+        if ($reviewResult.ExitCode -eq 0) {
+            $reviewResult.ExitCode = 1
+            $reviewText += "`nThe pinned OpenCodeReview executable is missing, cannot run, or reports the wrong version."
+        }
+        Write-OutputTail -Text $reviewText -Lines 15
+        if ($reviewText -match '(?i)ENOTFOUND|EAI_AGAIN|could not resolve host') {
+            Write-Warn "DNS lookup failed while downloading code review. Check the named host, DNS, VPN and proxy settings. Docker is not required."
+        }
+        Write-StageWarning -Result $reviewResult -TimeoutSec $TPip `
             -What "code review engine" `
             -Consequence "/review will report the install command instead of running" `
             -Fix "npm install --prefix `"$reviewPrefix`" @alibaba-group/open-code-review@$script:OpenCodeReviewVersion"
@@ -3497,7 +3486,7 @@ function Verify-Install {
             Write-Err "The executable is missing: $agentExe"
         }
         Write-Info "See the error directly:  & `"$InstallDir\venv\Scripts\python.exe`" -m agent8088.cli --version"
-        Write-Info "Fix: re-run the installer:  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.ps1)"
+        Write-Info "Fix: re-run the installer:  iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)"
         Write-Info "If that fails too, delete $InstallDir\venv and re-run."
         if ($script:InstallLog) { Write-Info "Full log: $($script:InstallLog)" }
     }
@@ -3570,7 +3559,7 @@ function Verify-Install {
     Write-Host ""
     Write-Host "If 'agent8088' is not recognized, open a NEW terminal (PATH was updated),"
     Write-Host "or run this in the current one:  `$env:Path = `"$LauncherDir;`$env:Path`""
-    if ($ready) { Write-Host "Run 'agent8088 --doctor' to check your setup." }
+    if ($ready) { Write-Host "Start agent8088, then enter /doctor to check your setup." }
     # Last, so it is the final thing on screen: per-stage warnings scrolled out of
     # view minutes ago on a multi-minute install, which is how a failed WhatsApp
     # bridge got reported and still went unnoticed.
