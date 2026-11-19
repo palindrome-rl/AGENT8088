@@ -72,7 +72,7 @@ At a glance, verified against the current tree:
 | Built-in model providers | **12** (plus custom OpenAI-compatible and litellm) |
 | Permission modes | **3** — `readonly`, `full-auto`, `plan-only` |
 | Sub-agent profiles | **6** — `auditor`, `coder`, `explore`, `general-purpose`, `researcher`, `test-writer` |
-| Bundled skills | **39** packages in `src/agent8088/skills_installed/`, each an installable `SKILL.md` + `tools.txt` bundle |
+| Bundled skills | **40** packages in `src/agent8088/skills_installed/`, each an installable `SKILL.md` + `tools.txt` bundle |
 | Slash commands | **45** |
 | Gateway platforms | **5** — Slack, WhatsApp, Discord, Telegram, Email |
 | Python | **3.10+** |
@@ -109,7 +109,7 @@ uv run python -c "import agent8088.cli as c; print(len(c.COMMANDS))" # 45 comman
 ls src/agent8088/gateway/platforms/*.py | grep -vc 'base\|__init__'  # 5 platforms
 ls src/agent8088/agents/ | wc -l                                     # 6 sub-agents
 uv run python -c "import agent8088.providers as p; print(len(p.BUILTIN_PROVIDERS))"  # 12
-ls src/agent8088/skills_installed/ | grep -vc '_references\|LICENSE' # 39 bundled skills
+ls src/agent8088/skills_installed/ | grep -vc '_references\|LICENSE' # 40 bundled skills
 ```
 
 The snippet is POSIX (`export`, `grep -c`, `ls`, `wc -l`); on Windows run it under
