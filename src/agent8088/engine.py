@@ -23,7 +23,7 @@ from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
 from agent8088 import (app_check, backend_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
-                       memory, patching, providers, routing, secret_scan, testing_support,
+                       memory, patching, providers, render_check, routing, secret_scan, testing_support,
                        tool_output,
                        trajectory, web_search)
 
@@ -573,6 +573,15 @@ MODEL_IMAGE_KEEP = max(0, _config_int("model_image_keep", 3))
 # Image tools (view_image) read local files only unless this is on; a URL then
 # still passes the egress and SSRF checks in build_image_message.
 IMAGE_TOOL_ALLOW_URLS = APP_CONFIG.get("image_tool_allow_urls", "0").strip().lower() in ("1", "true", "yes", "on")
+# screenshot_page defaults. The viewport is the size of the browser window the
+# file is shown in; the tool's width/height arguments override it per call.
+SCREENSHOT_WIDTH = max(200, _config_int("screenshot_width", 1280))
+SCREENSHOT_HEIGHT = max(200, _config_int("screenshot_height", 800))
+SCREENSHOT_WAIT_MS = max(0, _config_int("screenshot_wait_ms", 300))
+SCREENSHOT_MAX_WAIT_MS = 3000
+SCREENSHOT_TIMEOUT = max(5, _config_int("screenshot_timeout_seconds", 30))
+# Below this share of non-background pixels a render is reported as looking blank.
+SCREENSHOT_BLANK_SHARE = max(0.0, _config_float("screenshot_blank_share", 0.005))
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
@@ -4680,7 +4689,23 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     # picture the request asks to look at or check.
     if "view_image" in allowed and _visual_intent(low):
         selected.add("view_image")
+    # Checking how something built looks: appearance, layout, readability, a
+    # phone-sized screen. check_app answers "does it load"; screenshot_page
+    # answers "does it look right", and plain wording ranks it too low.
+    if "screenshot_page" in allowed and _appearance_intent(low):
+        selected.add("screenshot_page")
     return selected
+
+
+_APPEARANCE = re.compile(
+    r"\blooks?\s+(?:right|good|correct|ok(?:ay)?|fine|wrong|off|broken|like)\b|\bhow\s+(?:it|this|that|they)\s+looks?\b|"
+    r"\bvisual(?:ly)?\b|\blayout\b|\bappearance\b|\breadable\b|\blegible\b|\bscreenshot\b|\brender(?:s|ed|ing)?\b|"
+    r"\b(?:on|for)\s+(?:a\s+)?(?:phone|mobile|narrow\s+screen|small\s+screen)\b|\baligns?\b|\bline\s+up\b|\boverlap")
+
+
+def _appearance_intent(low: str) -> bool:
+    """A request to check how something looks once rendered."""
+    return bool(_APPEARANCE.search(low))
 
 
 _IMAGE_FILE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)\b")
@@ -13733,6 +13758,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         ref = str(args.get("path") or "").strip()
         if not ref:
             return _tool_arg_missing_error(name, "path")
+        if name == "screenshot_page":
+            return _exec_screenshot(name, ref, args)
         if re.match(r"^[a-z][a-z0-9+.-]*://", ref, re.IGNORECASE) and not IMAGE_TOOL_ALLOW_URLS:
             return efficiency.tool_error(
                 "invalid_input",
@@ -18318,6 +18345,115 @@ def _harness_turn(text: str) -> dict:
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
+_screenshot_counts: dict = {}   # resolved file -> renders so far (file names only, never shown as a count)
+_screenshot_last: dict = {}     # resolved file -> its previous render, for the difference
+
+
+def _screenshot_wait(args: dict) -> int:
+    try:
+        wait = int(float(args.get("wait_ms", SCREENSHOT_WAIT_MS)))
+    except (TypeError, ValueError):
+        wait = SCREENSHOT_WAIT_MS
+    return max(0, min(SCREENSHOT_MAX_WAIT_MS, wait))
+
+
+def _screenshot_size(args: dict, key: str, default: int) -> int:
+    try:
+        return max(200, min(4000, int(float(args.get(key, default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _exec_screenshot(name: str, ref: str, args: dict) -> str:
+    """Render a local page or image-type file and attach the picture, with deterministic evidence."""
+    import json as _json
+    if re.match(r"^[a-z][a-z0-9+.-]*://", ref, re.IGNORECASE):
+        return efficiency.tool_error("invalid_input", f"{name} renders a local file inside the workspace, not a URL.",
+                                     "Use browse_page for a web page on another site.", recoverable=True)
+    try:
+        target = resolve_user_path(ref)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if _is_sensitive_path(str(target)):
+        _audit("tool_call", tool=name, mode="image", decision="denied", detail=str(target), reason="sensitive_path")
+        return f"Error: Access to sensitive file denied: {target}"
+    if not target.is_file():
+        return f"Error: {target} does not exist, so there is nothing to render."
+    suffix = target.suffix.lower()
+    if suffix not in render_check.RENDERABLE:
+        kinds = ", ".join(sorted(render_check.RENDERABLE))
+        return efficiency.tool_error("invalid_input", f"{name} cannot render {suffix or 'files without an extension'}.",
+                                     f"It renders {kinds}. For a script, use check_app.", recoverable=True)
+    if suffix in render_check.XML_SUFFIXES:
+        problem = render_check.xml_problem(target)
+        if problem:
+            return (f"Error: {target.name} is not well formed: {problem}. Fix it (a small edit is usually enough), "
+                    "then render it again.")
+    key = str(target)
+    number = _screenshot_counts.get(key, 0) + 1
+    _screenshot_counts[key] = number
+    png = ARTIFACTS_ROOT / "screenshots" / f"{target.stem}_{number:03d}.png"
+    width = _screenshot_size(args, "width", SCREENSHOT_WIDTH)
+    height = _screenshot_size(args, "height", SCREENSHOT_HEIGHT)
+    full_page = str(args.get("full_page", "0")).strip().lower() in ("1", "true", "yes", "on")
+    render = render_check.render_file(target, png, width=width, height=height, wait_ms=_screenshot_wait(args),
+                                      full_page=full_page, timeout=SCREENSHOT_TIMEOUT, deny=_smoke_path_denied)
+    try:
+        shown = target.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        shown = str(target)
+    if render.status != "ok":
+        if str(render.note).startswith("Chromium is not installed"):
+            _report_browser("chromium")
+        return (f"Rendering {shown} was unavailable: {render.note}. How it looks was not verified; "
+                "say so in your answer rather than describing it.")
+    from PIL import Image
+    with Image.open(png) as shot:
+        shot_w, shot_h = shot.size
+    ink = render_check.ink_share(png)
+    previous = _screenshot_last.get(key)
+    diff = None if previous is None or render.animating or not Path(previous).is_file() else \
+        render_check.diff_share(previous, png)
+    _screenshot_last[key] = str(png)
+
+    def listed(items):
+        return "none" if not items else "; ".join(items[:5]) + (f" (+{len(items) - 5} more)" if len(items) > 5 else "")
+
+    lines = [f"Tool result ({name}): {shown} rendered in a {width} x {height} browser window; "
+             f"the image is {shot_w} x {shot_h} and is attached to this message.",
+             f"Saved: {png}"]
+    if suffix in render_check.XML_SUFFIXES:
+        lines.append("Well formed: yes")
+    lines.append(f"Page errors: {listed(render.page_errors)}")
+    lines.append(f"Console errors: {listed(render.console_errors)}")
+    if render.blocked:
+        lines.append(f"Requests to other hosts were blocked: {listed(render.blocked)}")
+    if ink < SCREENSHOT_BLANK_SHARE:
+        lines.append(f"Drawn content: the render looks blank ({ink:.1%} of the image differs from the background).")
+    else:
+        lines.append(f"Drawn content: {ink:.0%} of the image differs from the background.")
+    if render.animating:
+        lines.append("Compared with the previous render: skipped, the page is still changing on screen "
+                     "(animation or a timer), so a pixel difference would not mean anything.")
+    elif diff is None:
+        lines.append("Compared with the previous render: this is the first render of this file.")
+    elif diff == 0:
+        lines.append("Compared with the previous render: identical to the previous render.")
+    else:
+        lines.append(f"Compared with the previous render: {diff:.1%} of the pixels changed from the previous render.")
+    lines.append("Look at the image and compare it with what was asked for; name any specific problem you see.")
+    text = "\n".join(lines)
+    try:
+        message = build_image_message(text, [str(png)], resolver=lambda p: Path(p), for_model=True)
+    except ValueError as exc:
+        return f"{text}\n(The image could not be attached: {exc}.)"
+    evidence = {"file": str(target), "png": str(png), "width": shot_w, "height": shot_h,
+                "viewport": [width, height], "ink": round(ink, 4), "diff": None if diff is None else round(diff, 4),
+                "animating": render.animating, "page_errors": render.page_errors[:5],
+                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5]}
+    return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message, "evidence": evidence})
+
+
 _IMAGE_REMOVED_NOTE = ("[The image that came with this message was removed from the conversation "
                        "to save space; only the most recent images are kept.]")
 _IMAGE_WITHHELD_NOTE = ("[The image was not attached: this model has no image input. "
@@ -21528,10 +21664,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # marker never reaches the message list as text.
                 import json as _json
                 try:
-                    result_message = _json.loads(
-                        result[len(_IMAGE_MARKER_PREFIX):])["message"]
-                except (ValueError, KeyError):
-                    result_message = None
+                    payload = _json.loads(result[len(_IMAGE_MARKER_PREFIX):])
+                    result_message = payload["message"]
+                except (ValueError, KeyError, TypeError):
+                    payload, result_message = {}, None
+                if trace is not None and isinstance(payload.get("evidence"), dict):
+                    trace.append({"turn": turn, "type": "render_evidence", "tool": name, **payload["evidence"]})
                 withheld = False
                 if result_message is None:
                     messages.append(_harness_turn(
