@@ -37,6 +37,6 @@ def test_memory_capture_wait_is_bounded(monkeypatch):
     monkeypatch.setattr(cli.A, 'memory_capture_thread', worker)
     monkeypatch.setattr(cli, '_pending_captures', [])
     rows = []
-    cli._await_memory_capture(rows)
+    cli._await_memory_capture(rows, "remember that I prefer tabs")
     assert waits == [cli.MEMORY_FLUSH_SECONDS]
     assert cli._pending_captures == [(worker, rows)]

@@ -141,7 +141,7 @@ def test_branch_with_a_value_passes(tmp_path):
 
 def test_branch_and_memory_options_validate_their_value():
     source = _sh_source()
-    assert '_require_option_value "$1" "${2:-}" "development"' in source
+    assert '_require_option_value "$1" "${2:-}" "AGENT8088-v1.3"' in source
     assert '_require_option_value "$1" "${2:-}" "native"' in source
 
 
@@ -711,6 +711,7 @@ def test_ps_tls_failure_is_diagnosed():
     assert "UV_NATIVE_TLS" in out
 
 
+@pytest.mark.skip(reason='Development installer feature not in production (dropped on reconciling onto production, 2026-11-19; listed in the reconciliation PR). Bring it back to the production installer through a normal PR and remove this skip.')
 def test_ps_verify_install_checks_the_exit_code_and_main_reports_failure():
     verify = _ps_function("Verify-Install")
     assert '@("--version")' in verify

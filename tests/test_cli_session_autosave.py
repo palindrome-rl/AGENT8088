@@ -58,7 +58,7 @@ def _chat(monkeypatch, query, run_agent=None):
 
     monkeypatch.setattr(cli, "EscListener", _Esc)
     monkeypatch.setattr(cli.A, "run_agent", run_agent or answer)
-    monkeypatch.setattr(cli, "_await_memory_capture", lambda stored: None)
+    monkeypatch.setattr(cli, "_await_memory_capture", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "_after_turn_plan_state", lambda: None)
     cli.do_chat(query)
 

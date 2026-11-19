@@ -436,6 +436,7 @@ def test_sh_libreoffice_cannot_prompt_defaults_to_false():
     assert out.strip() == "false"
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 def test_sh_libreoffice_prompt_fires_even_when_piped():
     """Same bug class as memory: must go through _can_prompt, not IS_INTERACTIVE."""
     out = _run_sh(
