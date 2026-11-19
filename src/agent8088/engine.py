@@ -570,6 +570,9 @@ MODEL_IMAGE_MAX_BYTES = max(0, _config_int("model_image_max_bytes", 1_500_000))
 # How many images stay in the conversation; older ones become a short text note
 # carrying the text that came with them. 0 keeps every image.
 MODEL_IMAGE_KEEP = max(0, _config_int("model_image_keep", 3))
+# Image tools (view_image) read local files only unless this is on; a URL then
+# still passes the egress and SSRF checks in build_image_message.
+IMAGE_TOOL_ALLOW_URLS = APP_CONFIG.get("image_tool_allow_urls", "0").strip().lower() in ("1", "true", "yes", "on")
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
@@ -4671,7 +4674,25 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     if review_intent and "review_code" in allowed:
         selected.add("review_code")
         selected.discard("git_diff")
+    # Looking at a picture. Retrieval ranks view_image low for plain wording such
+    # as "look at diagram.png", and a small model without it reads the file as
+    # text or guesses. Generic on purpose: any image file, screenshot, photo or
+    # picture the request asks to look at or check.
+    if "view_image" in allowed and _visual_intent(low):
+        selected.add("view_image")
     return selected
+
+
+_IMAGE_FILE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)\b")
+_VISUAL_NOUN = re.compile(r"\b(?:screenshots?|screen\s*shots?|images?|pictures?|photos?|"
+                          r"diagrams?|mock-?ups?|renders?|rendering)\b")
+_VISUAL_VERB = re.compile(r"\b(?:look(?:s|ing)?|see|show|view|check|inspect|describe|compare|"
+                          r"match(?:es)?|review|read|what)\b")
+
+
+def _visual_intent(low: str) -> bool:
+    """A request to look at an image: an image file named, or a visual noun with a looking verb."""
+    return bool(_IMAGE_FILE.search(low) or (_VISUAL_NOUN.search(low) and _VISUAL_VERB.search(low)))
 
 
 def _mcp_tool_names(allowed) -> set[str]:
@@ -13712,6 +13733,12 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         ref = str(args.get("path") or "").strip()
         if not ref:
             return _tool_arg_missing_error(name, "path")
+        if re.match(r"^[a-z][a-z0-9+.-]*://", ref, re.IGNORECASE) and not IMAGE_TOOL_ALLOW_URLS:
+            return efficiency.tool_error(
+                "invalid_input",
+                f"{name} opens a local image file inside the workspace, not a URL.",
+                "Save the image into the workspace first, or use browse_page for a web page.",
+                recoverable=True)
         if not re.match(r"^https?://", ref, re.IGNORECASE):
             try:
                 resolved_ref = resolve_user_path(ref)
