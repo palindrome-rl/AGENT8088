@@ -224,6 +224,7 @@ an already-running external process or cancel independent background tasks.
 | `/reasoning` | Toggle reasoning display |
 | `/tool-selection [hybrid\|full\|auto]` | Show or set how native tool schemas are narrowed per request — see [Tool-calling compatibility](05-model-providers.md#tool-calling-compatibility) |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
+| `/vision [probe]` | Whether the active model reads images and what decided it (setting, catalog, endpoint or live probe); `probe` asks the model again with a test picture |
 | `/fusion setup` | Interactively pick a default panel and judge (checkbox pickers), saved to `config.txt` |
 | `/fusion <query>` | Ask the panel in parallel; a blind judge picks the best answer. `--panel p:m,...`/`--judge p:m` flags override the saved config for one call |
 
