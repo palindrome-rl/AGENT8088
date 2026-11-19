@@ -36,6 +36,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | Tool | Mode | Args | readonly? | What it does |
 |---|---|---|---|---|
 | `read_text` | `read_text` | `filename`, `offset`*, `limit`* | ✅ | Read a file. Extracts `.docx`/`.xlsx`/`.pptx`/`.pdf` to text. Paginated. Refuses credential files. |
+| `view_image` | `image` | `path` | ✅ | Attach a local image (png, jpg, gif, webp, bmp) to the next model message so the model can see it. Local files inside the allowed paths only (`image_tool_allow_urls=1` also takes URLs, through the egress and SSRF checks). The model gets a downscaled copy (`model_image_max_side`, `model_image_max_bytes`); a model without image input gets a text note instead. Allowed in readonly and plan mode. |
 | `write_file` | `write_text` | `filename`, `content`*, `source_url`*, `mode`* | prompt | Write a file, or fetch and save binary/remote content from a URL. `mode` is `overwrite` (default) or `append`; a long file is written as a first part plus appended parts. Path-zone + sensitive + shell-rc checked. |
 | `edit_file` | `write_text` | `filename`, `old_string`, `new_string`* | prompt | Exact-replacement edit of one matching place; refuses an ambiguous match and writes nothing. Empty `new_string` deletes it. |
 | `read_content` | `last_output` | `ref`, `offset`*, `length`* | ✅ | Read a window from a session-scoped content ref, without re-reading the source. |

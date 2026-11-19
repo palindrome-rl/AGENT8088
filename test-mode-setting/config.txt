@@ -80,6 +80,8 @@ tools_file=/opt/agent8088/test-mode-setting/tools.txt
 system_file=/opt/agent8088/test-mode-setting/system.md
 skills_dir=/opt/agent8088/test-mode-setting/skills
 tool_host.execute_shell=1
+# view_image here also takes image URLs, as task inputs sometimes are (#21).
+image_tool_allow_urls=1
 # Defaults only: the Harbor adapter rewrites these per task from its time
 # budget (agent8088_harbor/config_edit.py:budget_edits), together with
 # max_turn_seconds.

@@ -607,7 +607,7 @@ def _active_tool_specs(session=None):
         allowed &= {
             "present_plan", "read_text", "repository_read", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
-            "view_skill",
+            "view_skill", "view_image",
         }
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
 
