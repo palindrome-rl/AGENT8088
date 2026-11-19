@@ -5524,6 +5524,11 @@ def read_skill_resource(name: str, resource: str) -> str:
 _TASK_SKILL_RULES = (
     ("repository-reading", r"\b(?:repository_read|read|inspect|explore|search|understand)\s+(?:a\s+)?(?:github\s+)?repo(?:sitory)?\b|\bgithub\.com/"),
     ("planning-and-task-breakdown", r"\b(?:plan|break\s+down|roadmap|milestone)\b"),
+    # Checking how something built looks or behaves on screen. Before the review,
+    # debugging and build rules, which would otherwise take "check the layout".
+    ("browser-qa", r"\blooks?\s+(?:right|good|correct|ok(?:ay)?|fine|wrong|off|broken)\b|\bhow\s+(?:it|this|that)\s+looks?\b|"
+                   r"\bvisual(?:ly)?\b|\blayout\b|\bscreenshot\b|\breadable\b|\blegible\b|"
+                   r"\b(?:on|for)\s+(?:a\s+)?(?:phone|mobile|narrow\s+screen|small\s+screen)\b|\bline\s+up\b"),
     ("code-review-and-quality", r"\b(?:review|pull request|\bpr\b|diff)\b"),
     ("debugging-and-error-recovery", r"\b(?:debug|bug|broken|error|failure|regression)\b"),
     ("test-driven-development", r"\b(?:test|coverage|assertion|spec)\b"),

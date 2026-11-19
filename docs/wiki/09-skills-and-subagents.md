@@ -172,7 +172,7 @@ readonly mode it escalates for approval like any other.
 A skill package bundles instructions, and optionally extra tool definitions,
 that get merged into the agent's context.
 
-### The 39 bundled skills
+### The 40 bundled skills
 
 Verified by counting `src/agent8088/skills_installed/*/` (excluding
 `_references/`). A representative slice — see the directory for the rest,
@@ -188,6 +188,7 @@ covering everything from `api-and-interface-design` to `workspace-engineering`:
 | `humanizer` | creative |
 | `spike` | workflow |
 | `browsing` | workflow |
+| `browser-qa` | workflow: verify visual and interactive work with `check_app`, a headless test script and `screenshot_page` |
 | `cli-anything` | application-automation |
 | `delegation-and-audit` | harness |
 | `tool-orchestration` | harness |
