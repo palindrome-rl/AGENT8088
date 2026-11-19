@@ -29,7 +29,7 @@ def test_missing_libreoffice_gives_an_actionable_message(monkeypatch, tmp_path):
     src.write_bytes(b"x")
     result = documents.convert_document(src, "pdf")
     assert "not installed" in result
-    assert "winget install TheDocumentFoundation.LibreOffice" in result
+    assert "agent8088 --libreoffice-setup" in result
 
 
 def test_missing_source_file_is_refused(monkeypatch, tmp_path):

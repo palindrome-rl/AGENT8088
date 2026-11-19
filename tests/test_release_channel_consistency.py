@@ -85,10 +85,13 @@ def test_installer_bootstrap_and_update_urls_stay_on_the_channel():
         assert not wrong, f"{relative} advertises installer branches {wrong}, not {channel!r}"
 
 
-def test_development_docs_advertise_the_development_channel():
+def test_every_branch_carries_the_production_channel():
+    """development, staging-1.3 and AGENT8088-v1.3 share one tree. The installers
+    default to production, other channels are chosen with AGENT8088_BRANCH, and
+    `--update` follows the branch an install is on (tests/test_update_follows_installed_branch.py)."""
+    assert _channel() == "AGENT8088-v1.3"
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "/tree/development" in readme
-    assert "AGENT8088_BRANCH=development" in readme
+    assert "/tree/AGENT8088-v1.3" in readme
     wiki_home = (ROOT / "docs" / "wiki" / "README.md").read_text(encoding="utf-8")
     assert "Staging 1.2 documentation" not in wiki_home
 
@@ -106,6 +109,6 @@ def test_readme_and_agent_install_guide_fetch_the_selected_channel():
 
 def test_agent_install_guide_does_not_require_github_authentication():
     text = (ROOT / "docs/install-for-agents.md").read_text(encoding="utf-8")
-    assert "public repository" in text
-    assert "gh api" not in text
-    assert "Invoke-RestMethod -Uri" in text
+    assert re.search(r"public repository|repository is public", text)
+    assert "gh api" not in text and "gh auth login" not in text
+    assert "Invoke-RestMethod" in text

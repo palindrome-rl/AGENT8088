@@ -173,6 +173,7 @@ def test_winget_timeout_remains_optional_and_reports_the_reason():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_declining_never_invokes_winget_and_records_the_fix_line():
     """The whole point of the gate: 'no' must cost nothing but a response, and
@@ -191,6 +192,7 @@ def test_declining_never_invokes_winget_and_records_the_fix_line():
     assert "winget install TheDocumentFoundation.LibreOffice" in out
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_accepting_at_the_prompt_proceeds_to_winget():
     out = _run(
@@ -206,6 +208,7 @@ def test_accepting_at_the_prompt_proceeds_to_winget():
     assert "CALL:winget.exe" in out
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_prompt_requires_an_explicit_yes_or_no():
     """Empty input, abbreviations, and arbitrary text must all re-prompt."""
@@ -236,6 +239,7 @@ def test_an_existing_install_is_never_prompted_about():
     assert "Result=True" in out
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_missing_winget_is_never_prompted_about():
     """No point asking a question that cannot be acted on either way."""
@@ -271,6 +275,7 @@ def test_env_var_decides_without_reading_the_console(value, expected):
     assert "Result=" + expected in out
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_an_unrecognised_env_value_falls_through_to_the_prompt():
     out = _run(
@@ -316,6 +321,7 @@ def test_a_host_that_cannot_answer_skips_instead_of_hanging(setup):
     assert "Result=False" in out
 
 
+@pytest.mark.skip(reason='Superseded on reconciling onto production (2026-11-19): the production installer installs LibreOffice only on request (-WithLibreOffice / AGENT8088_INSTALL_LIBREOFFICE=1 / `agent8088 --libreoffice-setup`) and never prompts; scripts/installer_checks covers that.')
 @needs_windows
 def test_ci_false_does_not_silently_skip_the_prompt():
     out = _run(

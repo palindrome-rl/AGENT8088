@@ -8,82 +8,83 @@
 - A model endpoint — either local [Ollama](https://ollama.com) or any
   OpenAI-compatible API key
 - Optional: Node.js 20.11+ for the native sandbox and the WhatsApp bridge
-- Optional (Windows): LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
+- Optional: LibreOffice, for `.docx`/`.pptx`/`.xlsx`→PDF conversion,
   legacy `.doc`/`.ppt`/`.xls` reading, and Excel formula recalculation. It is
-  ~350 MB and by far the slowest stage in the installer, so the installer
-  **asks before installing it** rather than assuming. Answer `no` and setup
-  carries on — those three capabilities are simply unavailable until you run
-  `winget install TheDocumentFoundation.LibreOffice`, which the end-of-install
-  summary reminds you of.
+  ~350 MB and by far the slowest optional stage, so it is **opt-in**: the
+  installers skip it unless you pass `--with-libreoffice` (bash) or
+  `-WithLibreOffice` (PowerShell), or set `AGENT8088_INSTALL_LIBREOFFICE=1`.
+  Everything else works without it. Add it at any time with:
 
-  To answer in advance, or on a machine that cannot be prompted:
-
-  ```powershell
-  $env:AGENT8088_INSTALL_LIBREOFFICE = 'yes'   # or 'no' to skip
-  $env:AGENT8088_BRANCH = 'development'
-  iex (irm https://agent8088-installer.pages.dev/install.ps1)
+  ```sh
+  agent8088 --libreoffice-setup
   ```
 
-No admin rights are needed for the base install. WinGet may prompt for
-elevation if you accept LibreOffice, since it's a per-machine install — that's
-WinGet's own prompt, not something this installer requests.
+  This uses WinGet on Windows, Homebrew on macOS, and apt/dnf/pacman on Linux.
+  If the agent needs LibreOffice and it is missing, it tells you to run this
+  command.
+
+WinGet may prompt for elevation when installing LibreOffice, since it's a
+per-machine install — that's WinGet's own prompt, not something Agent8088
+requests. No admin rights are needed for the base install.
 
 ## Install
+
+These commands install the public **AGENT8088-v1.3** branch.
+`agent8088 --update` continues to follow that branch.
+
+For an AI agent helping you install, use the [AI-assisted installation guide](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/docs/install-for-agents.md). It keeps secrets out of chat and leaves API-key entry to your own setup wizard.
 
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://agent8088-installer.pages.dev/install.sh | AGENT8088_BRANCH=development bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | AGENT8088_BRANCH=AGENT8088-v1.3 bash
 ```
 
-Run it as your normal user, **not** with `sudo` — the installer asks for sudo
-itself for the few system packages it needs, and refuses to run under `sudo`
-(that would install into root's home). Plain root in a container is fine.
+Run as your normal user, without `sudo`. The installer requests elevation only
+for system packages that need it; installing under another user's profile can
+make the command unavailable in your own terminal.
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = 'development'
-iex (irm https://agent8088-installer.pages.dev/install.ps1)
+$env:AGENT8088_BRANCH = 'AGENT8088-v1.3'
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
 ```
 
-Run this in **PowerShell**, not `cmd.exe`. From `cmd.exe`, or where the
-execution policy blocks scripts, use:
+Use PowerShell, not `cmd.exe`, and start from a normal, non-administrator window.
+The base installation is per-user. Windows Terminal setup confirms that the
+new installer window started instead of assuming that opening a process means
+installation succeeded.
 
-```bat
-powershell -ExecutionPolicy Bypass -c "irm https://agent8088-installer.pages.dev/install.ps1 | iex"
-```
-
-Run it from a normal (non-admin) window: an elevated one installs for the
-administrator account's profile.
+If Terminal setup is blocked or its window never starts, open Windows Terminal
+yourself and rerun the command. Alternatively, set
+`$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"` before rerunning it in the current
+PowerShell window. This only skips the terminal-host check; it does not disable
+security software. The legacy console may display colours and box drawing poorly.
 
 The installer installs [uv](https://docs.astral.sh/uv/) if missing, clones the
 repo into an isolated venv, exposes a global `agent8088` command, and writes a
 default `config.txt` pointing at localhost Ollama.
 
-If the install fails, it prints the last lines of the failing step, the likely
-cause (TLS interception by a proxy, a full disk, GitHub credentials for the
-private repository, no wheel for your Python) and the command to re-run. Every
-step's full output is kept in `~/.agent8088/install.log`
-(`%LOCALAPPDATA%\agent8088\install.log` on Windows). Re-running the same
-command resumes; anything already complete is skipped.
+Failures include the failed stage, relevant command output, and recovery guidance.
+Full logs are at `~/.agent8088/install.log` on macOS/Linux and
+`%LOCALAPPDATA%\agent8088\install.log` on Windows, or under your custom
+`AGENT8088_HOME`. Rerunning the same installer resumes validated stages.
+Skipped optional components are listed at the end with their repair commands.
+An existing configuration is preserved. The public repository needs no GitHub
+account or token to install.
 On Windows, resume markers are hints rather than proof: the installer launches
 or imports each dependency again before skipping it. Missing packages, native
 DLLs, browser files, or executables are repaired automatically. Optional stages
 that still fail are listed at the end with the exact repair command.
 
-**From a clone, for development:**
-
-Needs Python **3.10 or newer** (3.11/3.12 recommended) — check with
-`python3 --version` first; an older `python` gives a confusing resolver error
-rather than a version message.
+**From a clone, to work on the code.** Clone the public release branch:
 
 ```sh
-git clone https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
-python3 -m venv .venv
+python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"
-.venv/bin/playwright install chromium   # browser for browse_page
 ```
 
 Install the extras you actually need:
@@ -120,13 +121,7 @@ playwright install chromium
 
 ```sh
 agent8088 --version
-agent8088 --doctor     # checks your setup
 ```
-
-If `agent8088` is not found, open a new terminal (the installer updated your
-shell's PATH) or run the `export PATH=...` line the installer printed. If the
-installer warned that *another agent8088* will run instead, remove that copy or
-put `~/.local/bin` first in `PATH`.
 
 ## Configure a model
 
@@ -180,10 +175,12 @@ approval. Now try something that mutates:
 > create a file called hello.txt with the text hi
 ```
 
-The agent is in **readonly** mode, so instead of writing it asks:
+The default mode is `full-auto`, so it simply writes the file. To see the
+permission layer, restart with `agent8088 --mode readonly` (or run
+`/mode readonly`) and ask again. This time it stops and asks:
 
 ```
-Allow write to /path/hello.txt? [y/N]
+Allow? (o=once / s=session / d=deny):
 ```
 
 That prompt is the permission layer, not the model being polite. See
@@ -197,8 +194,21 @@ agent8088 --sandbox-setup
 
 This installs the open-source Anthropic sandbox runtime so shell commands run
 isolated from your filesystem and network. Without it Agent8088 falls back to
-Docker, and if neither exists it asks before every local command. See
-[Sandboxing](06-sandboxing.md).
+Docker, and if neither exists shell and code execution are refused outright
+rather than prompted for. See [Sandboxing](06-sandboxing.md).
+
+## Turn limits and generated output
+
+Requests start with 150 rounds by default; `/maxturns <int>` changes the starting
+allowance. Productive runs can earn more rounds within a hard ceiling. Time,
+token and cost limits are separate, so raising the turn allowance does not
+override those limits. See [Configuration](02-configuration.md#dynamic-turn-budget).
+
+When work lands in the sandbox workspace rather than the project folder, the
+final answer includes a location note. In the Web UI, the `+` menu's Web search
+and Memory recall options start normal requests, not configuration commands.
+Slash commands do not accept attachments: remove the files or send a normal
+message instead. Refused commands leave the staged files intact.
 
 ## Where things live
 
@@ -212,6 +222,14 @@ Docker, and if neither exists it asks before every local command. See
 | `USER.md` | Optional persona / "about me" injected into the prompt (`user_file` config key, default: the installed app directory) |
 
 On Windows, `config.txt` and `.env` live at `%LOCALAPPDATA%\agent8088\`.
+
+## Check your setup
+
+Run `agent8088 --doctor` from your terminal, or `/doctor` inside the agent.
+Optional components that are missing or using a fallback are reported with
+repair guidance. In the Web UI, the limited-capabilities badge explains the
+same reduced modes. An optional component warning does not mean the core
+installation failed.
 
 ## Next
 

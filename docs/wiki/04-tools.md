@@ -45,7 +45,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `repo_map` | `repomap` | `focus`*, `budget`*, `detail_level`* | ✅ | Outline the repository's most depended-on classes and functions, ranked by dependents. Definition lines only. |
 | `generate_tests` | `autotest` | `filename`, `focus`* | prompt | Write and run tests for a source file via a sub-agent that may not change the code under test; the file is hashed and restored if it was. |
 | `run_tests` | `shell` | `path`* | depends | Detect the project's test framework and run it. Prefer over `execute_shell`. |
-| `execute_shell` | `shell` | `command` | safe list only | Run a shell command. |
+| `execute_shell` | `shell` | `command` | safe list only | Run a shell command; shipped timeout 60 seconds. Override with `tool_timeout.execute_shell` or a per-call `timeout`, bounded by `max_tool_timeout_seconds`. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
@@ -55,10 +55,10 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `get_page_title` | `http_get` | `url` | prompt | Fetch just a page's `<title>`. |
 | `browse_page` | `browser` | `url`, `task` | prompt | Headless browser — click, fill forms, navigate, and extract via natural-language instructions, not just read static text. |
 | `create_document` | `write_text` | `filename`, `content` | prompt | Build a `.docx`/`.xlsx`/`.pptx` from plain lines. Same write gate as `write_file`. |
-| `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. |
+| `convert_document` | `write_text` | `filename`, `format` | prompt | Convert an existing Office document through LibreOffice. Same write gate as `write_file`. LibreOffice is opt-in; when it is missing the tool says to run `agent8088 --libreoffice-setup`. |
 | `copy_file` | `write_text` | `source`, `destination` | prompt | Copy an existing local file byte-for-byte (PDFs, images); a folder destination keeps the file's name. Same write gate as `write_file`. |
 | `move_file` | `write_text` | `source`, `destination` | prompt | Copy, then remove the original; project files only. Same write gate as `write_file`. |
-| `run_sandboxed` | `docker` | `code` | prompt | Run code in the sandbox. |
+| `run_sandboxed` | `docker` | `code` | prompt | Run a Python snippet with native OS isolation and no network, falling back to Docker. |
 | `schedule_task` | `cron` | `action`, `schedule`*, `task`* | prompt | Add/list/remove a scheduled run. |
 | `spawn_subagent` | `subagent` | `agent_type`, `task` | prompt | Delegate to an isolated sub-agent. |
 | `create_subagent` | `write_text` | `name`, `description`, `tools`, `max_turns`, `model`*, `prompt` | escalates | Create a custom sub-agent profile in `user_agents_dir`. |
@@ -126,9 +126,10 @@ key on that mode — the sensitive-file floor, write path zones, plan-only
 blocking, plan-audit revert. Sharing the mode means the tool inherits every one
 of them instead of needing a parallel set that could drift.
 
-> `git_status`/`git_diff`/`git_log` depend on the sandbox backend: allowed
-> without a prompt under the native sandbox, escalated under `local`, because
-> reading a repo unsandboxed can surface credential content.
+> `git_status`/`git_diff`/`git_log` are host tools (`host=1`), so they run on
+> the host whatever the sandbox backend. In `readonly` they still ask, because a
+> host-side git read can surface credential content; they are not treated as
+> fixed commands since each takes an optional `repo` argument.
 
 ## `review_code`
 
@@ -172,6 +173,20 @@ The model can call tools by natural names; they resolve to the canonical tool:
 | `calc`, `eval`, `math` | `calculate` |
 | `last`, `prev_output` | `last_output` |
 
+## Keeping a generated project together
+
+For relative paths with a project folder, the first file placed in that folder
+chooses its location: the project root for a user-named file, or `artifacts/`
+for an invented file. Later files in the same folder follow that location,
+including files the user named, so an application's page, styles and server
+are not split across two roots. Another project folder is decided separately.
+Deleting the chosen folder releases the decision for subsequent writes.
+
+Bare filenames retain their existing placement rules. Absolute paths outside
+the project are not redirected by this rule, and allowed-path, sensitive-file
+and permission checks still apply. Disposable task containers retain their
+explicit-path behavior.
+
 ## Backups of overwritten files
 
 Before the first change to a file that already exists (`write_file`, `edit_file`,
@@ -192,6 +207,17 @@ disposable container, and `file_backups=0` turns it off.
 ## `check_app`
 
 A deterministic smoke test of something the agent built; no model call.
+
+Calls to a page's backend or a blocked local service are **not verified** by
+the static page check. Its summary counts those calls, and the final answer
+retains the caveat for both manual and completion checks. It does not start
+the service or relax network blocking. A missing browser or timed-out check
+never counts as a pass; a timeout alone does not establish whether the page
+or the environment caused it. Browser-emulation scripts are not a substitute.
+
+Completion checks can skip known downloaded reference HTML in reference
+folders when another page was built. A folder name alone does not exclude an
+authored documentation or data page.
 
 With `backend_check=1` (off by default), completion checks can also start the
 project's server through the **Windows native read-only sandbox** and probe up
@@ -250,6 +276,22 @@ Windows native confinement restricts writes, not all reads or network access.
   check the containing HTML page to verify it in a browser context.
 - Without Chromium (`playwright install chromium`) it reports "unavailable"
   instead of failing the task.
+
+A dropdown is exercised by selecting another option and dispatching its change
+events. Changing only the dropdown's own value is not enough to pass: the page
+must respond. A request to a project's missing backend can count as a control's
+effect, with a warning; this does not verify that the backend works. An ambiguous
+page error matching a missing backend's status remains `unavailable`, not a pass.
+
+A script is treated as page-loaded only when its resolved local path matches a
+page's script reference, not merely its filename or a similarly named CDN asset.
+That script, and a Python package member requiring relative imports, are not
+started as standalone programs. Their startup is reported as unverified until
+checked in the appropriate page or package context.
+
+A failed `check_app` invoked by the model is recorded as a failing check. A later
+pass for the same actual target settles it; another page with the same filename
+does not. Passing this smoke test is not equivalent to passing a test suite.
 
 It also runs automatically on the pages and scripts a run wrote, just before the
 reply is accepted (see [completion checks](11-architecture.md#completion-checks)),

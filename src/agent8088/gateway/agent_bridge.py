@@ -75,7 +75,7 @@ def run_turn(session_key: str, user_text: str, session_store: SessionStore,
     answer = A.run_agent(
         messages,
         max_turns=_turn_max_turns(A.PERMISSION_MODE),
-        temperature=float(A.APP_CONFIG.get("temperature", "0.1")),
+        temperature=float(A.APP_CONFIG.get("temperature", "0.8")),
         memory_source_channel=f"gateway:{platform}" if platform else "gateway",
         memory_identity=memory_identity,
         system_prompt=build_system_prompt(platform=platform, chat_type=chat_type),

@@ -110,7 +110,7 @@ def _chat(monkeypatch, run_agent):
     monkeypatch.setattr(cli, "S", cli.Session())
     monkeypatch.setattr(cli, "_StatusLine", _Status)
     monkeypatch.setattr(cli.A, "run_agent", run_agent)
-    monkeypatch.setattr(cli, "_await_memory_capture", lambda stored: None)
+    monkeypatch.setattr(cli, "_await_memory_capture", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "_after_turn_plan_state", lambda: None)
     cli.do_chat("hello")
     return out.getvalue(), hints

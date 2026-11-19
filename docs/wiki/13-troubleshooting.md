@@ -70,6 +70,81 @@ live state is shown.
 
 ## Install & startup
 
+### Installation fails or stops
+
+Read the named stage and the last command output before retrying. The full
+installation log is `%LOCALAPPDATA%\agent8088\install.log` on Windows or
+`~/.agent8088/install.log` on macOS/Linux, under `AGENT8088_HOME` if configured.
+Re-run the [same public v1.3 installation command](01-getting-started.md#install)
+to resume. Do not delete your configuration, memory, or entire installation home.
+
+The installer checks that the installed command can run `--version` before
+declaring success. If it says the core command does not start, follow the
+printed direct Python command to see the import error. Optional-component
+warnings do not mean the core agent failed; their summary gives repair commands.
+`install-state.json` beside the log records the skipped stages from the most
+recent installer run. The startup banner, `/doctor`, and `agent8088 --doctor`
+report outstanding stages, labelled as install-time information.
+
+### Windows Terminal setup is blocked or no installer window appears
+
+Open Windows Terminal yourself and repeat the installation command. If Terminal
+cannot be installed or launched, use the current PowerShell window:
+
+```powershell
+$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
+$env:AGENT8088_BRANCH = "AGENT8088-v1.3"
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
+```
+
+The override only bypasses the terminal-host check, not antivirus or Windows
+permissions. Windows Terminal remains the supported display host. To restore
+the usual terminal check in this session, run
+`Remove-Item Env:AGENT8088_SKIP_TERMINAL_CHECK`.
+If security software blocks the installer itself, retain the error and consult
+your administrator or security vendor; do not disable protection.
+
+### Git asks for credentials or reports repository access errors
+
+`palindrome-rl/AGENT8088` is public: installing it needs no GitHub token,
+private-repository membership, or administrator invitation. Check the URL in
+your browser, stale Git credentials, proxy settings, and Git URL rewrites.
+Do not create a broad-access token just to install Agent8088. A TLS error needs
+certificate/proxy diagnosis, not repeated sign-in; do not disable TLS verification.
+
+### An older Agent8088 opens after reinstalling
+
+The installer warns when another command earlier in PATH shadows its launcher.
+Open a new terminal after installation and inspect `Get-Command agent8088 -All`
+on Windows, or `type -a agent8088` on macOS/Linux. Use the printed launcher path
+and PATH guidance. Run `agent8088 --doctor` or enter `/doctor` in the agent
+to check your setup.
+
+### OpenCodeReview download fails with `ENOTFOUND github.com`
+
+The npm package was fetched, but its executable download could not resolve
+GitHub. Docker is not involved. The installer retries transient network errors
+up to three attempts, keeps the underlying output in `install.log`, and only
+marks the engine ready when its executable reports the pinned version.
+Check DNS, VPN and proxy settings without disabling TLS or antivirus protection.
+On Windows, retry the pinned package with:
+
+```powershell
+npm.cmd install --no-fund --no-audit --prefix "$env:LOCALAPPDATA\agent8088\agent8088\code-review" "@alibaba-group/open-code-review@1.12.1"
+```
+
+For a custom installation home, use the prefix printed by the installer.
+Then run `/doctor` to check availability. Rerunning the installer also resumes
+optional stages without deleting your configuration or memory.
+
+### Installation was interrupted
+
+Rerun the same public installation command. macOS/Linux detects an active
+installer and cleans up its lock on normal termination. If it reports an
+existing lock, follow the printed process/lock guidance instead of starting
+multiple installers together. Windows reports a locked partial checkout
+with recovery guidance; close the reported process before retrying.
+
 ### `No module named pytest` / `No module named slack_bolt`
 
 The optional extras aren't installed. They're separate on purpose so a plain CLI
@@ -104,44 +179,6 @@ without an isolated `HOME` during testing. See
 ```sh
 agent8088 --setup
 ```
-
-### Windows: "This script contains malicious content and has been blocked by your antivirus software"
-
-The Windows installer works inside Windows Terminal. If it is not installed (or
-is too old), the installer sets it up and reopens itself there. Security
-software on some machines blocked the helper window that did this, because it
-was launched with an encoded PowerShell command. The handoff now uses plain,
-readable text instead, and when Windows Terminal is not installed at all it is
-installed from the window you are already in, with no helper window.
-
-If a security product still blocks the new window, install in the window you
-are in:
-
-```powershell
-$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"
-$env:AGENT8088_BRANCH = "AGENT8088-v1.2"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.2/install.ps1)
-```
-
-Or answer `c` ("continue in this window") at the Windows Terminal prompt. Agent8088
-still runs in a plain PowerShell window, but colours and box drawing may display
-poorly; Windows Terminal remains the supported host.
-
-An installer driven by another program (an agent, a script) cannot answer that
-prompt and stops with a message naming `AGENT8088_SKIP_TERMINAL_CHECK=1`. Set it
-in that environment to install without Windows Terminal. The installer also
-accepts `-SkipTerminalCheck` when run as a script file.
-
-### Windows: "continuing in the new window", but no window opens
-
-The installer used to report success as soon as it had asked Windows to open
-Windows Terminal, and the helper window ("Agent8088 Terminal Setup") could quit
-right after its banner without installing anything at all. Now the new window
-reports back when it starts, and the installer waits for that (60 seconds by
-default) before saying it continues there. If no window starts in time you get
-an error naming the fix instead of a silent stop: open Windows Terminal yourself
-and run the install command in it, or install in the current window with
-`AGENT8088_SKIP_TERMINAL_CHECK=1` as above. On a slow machine, allow longer with
-`$env:AGENT8088_HANDOFF_TIMEOUT = "120"`.
 
 ## Model & providers
 
@@ -413,9 +450,9 @@ and an allowlist for the package registry; see
 
 ### A test passes alone but fails in the suite (or vice versa)
 
-`tests/test_cli_setup.py` has known cross-test fixture dependence — 3 cases fail
-in isolation but pass in the full suite. Pre-existing; run the full suite to
-judge.
+Use a temporary `AGENT8088_HOME` and a configuration path you know does not
+exist. Tests must not load personal settings or rely on leftovers from another
+test. The regression checks live under `scripts/installer_checks/`.
 
 ### Duplicate function silently ignored
 
@@ -429,8 +466,9 @@ Don't rely on ruff `F811`; it has verifiably missed this in this codebase.
 
 ### CI checks failing instantly
 
-GitHub Actions is blocked by a billing issue on this account, so jobs fail in
-~3s without starting. Not a code problem — run the suites locally.
+Open the failed job in [GitHub Actions](https://github.com/palindrome-rl/AGENT8088/actions)
+and inspect its actual error. Distinguish a runner or account issue from a test,
+dependency or build failure; do not assume either cause without the job log.
 
 ## Still stuck
 

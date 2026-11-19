@@ -288,9 +288,9 @@ class Session:
         self.trajectory_state = {}
         self.hold = False  # /hold: tools are off and replies are text only until /continue
         try:
-            self.temperature = float(config.get("temperature", "0.1"))
+            self.temperature = float(config.get("temperature", "0.8"))
         except ValueError:
-            self.temperature = 0.1
+            self.temperature = 0.8
         try:
             self.max_turns = int(config.get("max_turns", str(DEFAULT_MAX_TURNS)))
         except ValueError:
@@ -2446,7 +2446,7 @@ def _flush_memory_capture(timeout=MEMORY_FLUSH_SECONDS):
     _report_pending_capture()
 
 
-def _await_memory_capture(stored_ref):
+def _await_memory_capture(stored_ref, query=""):
     """Finish the turn's memory save before the prompt returns.
 
     The store is part of answering "remember this": the prompt must not come
@@ -2461,7 +2461,10 @@ def _await_memory_capture(stored_ref):
     # Drain anything owed from earlier turns first, so reports stay in order.
     _report_pending_capture()
     thread = A.memory_capture_thread
-    if thread is not None and thread.is_alive():
+    # Only an explicit "remember ..." ask is worth blocking the prompt for; anything
+    # else saves in the background and is reported next turn (or flushed on /exit).
+    if thread is not None and thread.is_alive() and re.search(
+            r"\b(remember|memori[sz]e|don'?t forget|save (this|that)|note that)\b", query or "", re.I):
         with status_cm("memory · saving…"):
             thread.join(MEMORY_FLUSH_SECONDS)
     if thread is not None and thread.is_alive():
@@ -2725,7 +2728,7 @@ def do_chat(query):
         console.print(f"[dim]{elapsed:.1f}s · {S.turns_this_run} turn{'s' if S.turns_this_run != 1 else ''} · "
                       f"↑{tokens_ref[0]} tokens · "
                       f"{_estimate_context_pct()}% ctx · {active}:{A.MODEL_NAME}[/dim]")
-    _await_memory_capture(memory_stored)
+    _await_memory_capture(memory_stored, query)
     if trace is not None:
         _record_trace(query, trace, elapsed)
         console.print(Panel(Text(json.dumps(_trace_for_display(trace), indent=2)), title="[#237dd7]trace[/#237dd7]",
@@ -4427,6 +4430,61 @@ def run_memory_setup():
     return 0
 
 
+def _libreoffice_install_command():
+    """The system package-manager command that installs LibreOffice here, or
+    None. Same package sources as install.sh / install.ps1's opt-in stage."""
+    if sys.platform == "win32":
+        if shutil.which("winget"):
+            return ["winget", "install", "--id", "TheDocumentFoundation.LibreOffice",
+                    "--exact", "--silent", "--accept-package-agreements",
+                    "--accept-source-agreements"]
+        return None
+    if sys.platform == "darwin":
+        return ["brew", "install", "--cask", "libreoffice"] if shutil.which("brew") else None
+    sudo = [] if os.geteuid() == 0 or not shutil.which("sudo") else ["sudo"]
+    for tool, args in (("apt-get", ["install", "-y", "libreoffice"]),
+                       ("dnf", ["install", "-y", "libreoffice"]),
+                       ("pacman", ["-S", "--noconfirm", "libreoffice-fresh"])):
+        if shutil.which(tool):
+            return sudo + [tool] + args
+    return None
+
+
+def run_libreoffice_setup():
+    """`agent8088 --libreoffice-setup`: add LibreOffice to an existing install.
+
+    LibreOffice is opt-in in both installers (~350 MB, the slowest optional
+    stage), so this is the one-command way to add it later -- the same shape
+    as --memory-setup. Runs attached to the terminal so sudo/UAC prompts and
+    package-manager progress are visible; success is judged by soffice being
+    findable afterwards, not by the exit code alone.
+    """
+    from agent8088.documents import _soffice_executable
+    if _soffice_executable():
+        print(f"LibreOffice is already installed: {_soffice_executable()}")
+        return 0
+    cmd = _libreoffice_install_command()
+    if cmd is None:
+        print("No supported package manager found (winget, brew, apt-get, dnf, pacman).")
+        print("Install LibreOffice manually from https://www.libreoffice.org/download/")
+        return 1
+    print(f"Installing LibreOffice (~350 MB, can take several minutes): {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Installation failed: {exc}")
+    found = _soffice_executable()
+    if not found:
+        print("LibreOffice was not found after the install. Install it manually from "
+              "https://www.libreoffice.org/download/ or rerun the installer with "
+              "--with-libreoffice / -WithLibreOffice.")
+        return 1
+    print(f"LibreOffice installed: {found}")
+    print("Document conversion (convert_document), legacy .doc/.ppt/.xls and "
+          "formula recalculation are now available.")
+    return 0
+
+
 def _reinstall_package(package: str) -> tuple[bool, str]:
     """Force-reinstall `package` into the interpreter currently running this
     process. Tries pip first -- it works whether the venv is stdlib-created or a
@@ -4970,10 +5028,12 @@ _DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": 
 def _tilde(text):
     """`text` with the home folder written as ~, only where it is a whole path
     segment: /Users/al becomes ~, /Users/alice does not."""
-    home = str(Path.home())
-    if not home or home in ("/", "\\"):
-        return text
-    return re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+    # Windows diagnostics can contain both native and forward-slash paths.
+    homes = {str(Path.home()), Path.home().as_posix()}
+    for home in sorted(homes, key=len, reverse=True):
+        if home and home not in ("/", "\\"):
+            text = re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+    return text
 
 
 def _render_doctor(checks):
@@ -6233,7 +6293,7 @@ def cmd_resume(rest):
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.hold = bool(data.get("hold", False))
     S.name = name
-    S.temperature = float(data.get("temperature", 0.1))
+    S.temperature = float(data.get("temperature", 0.8))
     # Fall back to what this session already has, not to a literal: a session
     # file written before this setting existed used to pull max_turns back down
     # to 10, silently discarding both config.txt and a /maxturns set this run.
@@ -8810,7 +8870,7 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "development"
+UPDATE_BRANCH = "AGENT8088-v1.3"
 
 
 def _git(install_dir, *args):
@@ -8819,17 +8879,34 @@ def _git(install_dir, *args):
                           capture_output=True, text=True)
 
 
+def _remote_has_branch(install_dir, branch):
+    probe = _git(install_dir, "ls-remote", "--heads", "origin", branch)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
 def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
-    UPDATE_BRANCH names today's release branch, but branches get renamed and
-    retired. An install pointed at one that no longer exists should still
-    update, and say why it went somewhere else, rather than fail on git's raw
-    'couldn't find remote ref'. So the remote is asked whether the branch is
-    still there, and if it is not, its own default branch is used instead.
+    The branch the install has checked out is the channel the user chose
+    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
+    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    development or staging install to production on its first update. That
+    branch is followed while the remote still has it.
+
+    Otherwise UPDATE_BRANCH, today's release branch, is used. Branches get
+    renamed and retired: an install pointed at one that no longer exists should
+    still update, and say why it went somewhere else, rather than fail on git's
+    raw 'couldn't find remote ref'. If the release branch is gone as well, the
+    remote's own default branch is used.
     """
-    probe = _git(install_dir, "ls-remote", "--heads", "origin", UPDATE_BRANCH)
-    if probe.returncode == 0 and probe.stdout.strip():
+    current = _git(install_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    installed = current.stdout.strip() if current.returncode == 0 else ""
+    if installed and installed != UPDATE_BRANCH and _remote_has_branch(install_dir, installed):
+        return installed, ""
+    if _remote_has_branch(install_dir, UPDATE_BRANCH):
+        if installed and installed != UPDATE_BRANCH:
+            return UPDATE_BRANCH, (f"Branch '{installed}' is no longer on the remote; "
+                                   f"updating to the release branch '{UPDATE_BRANCH}' instead.")
         return UPDATE_BRANCH, ""
     head = _git(install_dir, "ls-remote", "--symref", "origin", "HEAD")
     if head.returncode == 0:
@@ -10133,6 +10210,8 @@ def main():
     parser.add_argument("--sandbox-setup", action="store_true", help="install the free native sandbox runtime")
     parser.add_argument("--memory-setup", action="store_true",
                         help="install the mem0 memory backend and make it the default engine")
+    parser.add_argument("--libreoffice-setup", action="store_true",
+                        help="install LibreOffice for document conversion, legacy Office formats and formula recalculation")
     parser.add_argument("--gateway", action="store_true", help="run the messaging gateway (Slack/WhatsApp/Discord/Email/Telegram) instead of the REPL")
     parser.add_argument("--gateway-setup", action="store_true", help="configure Slack/WhatsApp/Discord/Email/Telegram messaging gateways, then exit")
     parser.add_argument("--web", action="store_true",
@@ -10211,6 +10290,8 @@ def main():
         return 0 if A.native_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
+    if args.libreoffice_setup:
+        return run_libreoffice_setup()
     if args.resume and not args.prompt_file:
         print("agent8088: --resume is only meaningful with --prompt-file", file=sys.stderr)
         return 2

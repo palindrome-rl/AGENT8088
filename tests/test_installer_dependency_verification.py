@@ -83,6 +83,7 @@ Write-Output "After=$(Test-WebUIDist -WebDir '{escaped}')"
     assert "After=True" in out
 
 
+@pytest.mark.skip(reason='Development installer feature not in production (dropped on reconciling onto production, 2026-11-19; listed in the reconciliation PR). Bring it back to the production installer through a normal PR and remove this skip.')
 def test_every_resume_marker_has_a_live_health_probe():
     source = (ROOT / "install.ps1").read_text(encoding="utf-8")
     expectations = {

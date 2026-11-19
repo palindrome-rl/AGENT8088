@@ -1,0 +1,40 @@
+# Tests that already failed before the 2026-11-19 reconciliation onto production,
+# measured on development 722aef0 (Windows 10 locally; Linux in a python:3.12
+# container and on the GitHub runner). tests/conftest.py marks each one as a
+# non-strict expected failure: it still runs, a pass shows as XPASS, and the
+# rest of the suite is unaffected. A new failure is NOT on this list and fails CI.
+#
+# Fix a test, then delete its line. Format: <node id> <TAB> <platforms seen>
+tests/test_app_check.py::test_browser_context_is_unavailable_not_verified_startup	linux
+tests/test_audit_loop_guards.py::test_time_spent_verifying_does_not_count_against_the_turn	linux-ci
+tests/test_completion_checks.py::test_the_inventory_is_bounded_and_skips_dependency_folders	linux-ci (order-dependent: completion.inventory reads only as many entries as files it still needs, so a skipped folder such as node_modules in that slice leaves it short; fix in its own PR)
+tests/test_document_access.py::test_extraction_survives_an_os_that_refuses_memory_limits	windows
+tests/test_genuine_user_turns.py::test_every_loop_injected_turn_carries_a_marker	linux,windows
+tests/test_git_branch_and_subdir.py::test_commit_stages_inside_the_named_repo	linux
+tests/test_git_branch_and_subdir.py::test_git_branch_really_creates_a_branch	linux
+tests/test_installer_timeouts.py::test_activity_animates_while_a_bounded_process_is_running	linux-ci
+tests/test_installer_timeouts.py::test_bounded_download_animates_without_changing_timeout_result	linux-ci
+tests/test_installer_web_ui.py::TestInstallNodeBridgeDependencies::test_partial_bridge_is_reinstalled_before_marked_ready[powershell-0]	windows
+tests/test_installer_web_ui.py::TestInstallNodeBridgeDependencies::test_partial_bridge_is_reinstalled_before_marked_ready[powershell-1]	windows
+tests/test_issue_sheet_39b.py::test_a_run_timeout_kills_the_whole_probe_tree	linux
+tests/test_native_sandbox_windows.py::test_exec_native_sandbox_builds_dsh_argv_on_windows	linux
+tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[//example.com/main.js]	linux
+tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[client/main.js]	linux
+tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[https://example.com/main.js]	linux
+tests/test_page_check_controls.py::test_a_page_script_is_not_started_alone	linux
+tests/test_page_check_controls.py::test_a_script_no_page_loads_is_still_started_and_names_its_error	linux
+tests/test_prompt_token_budget.py::test_fixed_overhead_within_budget	linux,windows
+tests/test_prompt_token_budget.py::test_hybrid_request_is_the_path_that_actually_ships	linux,windows
+tests/test_repository_access.py::test_the_resolved_commit_is_recorded_in_a_git_worktree	windows
+tests/test_stale_failing_check.py::test_a_clean_run_that_still_prints_a_traceback_does_not_settle_it	linux
+tests/test_stale_failing_check.py::test_a_real_error_in_a_written_script_still_fails	linux
+tests/test_stale_failing_check.py::test_a_written_script_that_crashed_and_later_ran_clean_is_settled	linux
+tests/test_stale_failing_check.py::test_identical_command_with_an_error_in_its_output_does_not_settle	linux
+tests/test_stale_failing_check.py::test_running_some_other_file_does_not_settle_it	linux
+tests/test_stale_failing_check.py::test_the_failing_check_names_the_command_not_the_folder	linux
+tests/test_stale_failing_check.py::test_the_wrong_place_rule_needs_a_written_file	linux
+tests/test_sync_development.py::test_check_is_unknown_when_base_branch_is_missing	windows
+tests/test_sync_development.py::test_hook_allows_the_edit_when_status_cannot_be_determined	windows
+tests/test_trajectory.py::test_running_a_program_the_run_wrote_and_failing_is_a_failed_check_whatever_the_command_is_called	linux
+tests/test_turn_budget_human_wait.py::test_plan_approval_wait_is_not_charged_to_the_budget	linux,windows
+tests/test_web_plan_command.py::test_inline_plan_uses_web_chat_runner	linux,windows

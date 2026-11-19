@@ -105,7 +105,7 @@ def calls(monkeypatch):
     monkeypatch.setattr(cli, "EscListener", _Esc)
     monkeypatch.setattr(cli.A, "run_agent", run_agent)
     monkeypatch.setattr(cli.A, "reply_without_tools", reply_without_tools)
-    monkeypatch.setattr(cli, "_await_memory_capture", lambda stored: None)
+    monkeypatch.setattr(cli, "_await_memory_capture", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "_after_turn_plan_state", lambda: None)
     return seen
 

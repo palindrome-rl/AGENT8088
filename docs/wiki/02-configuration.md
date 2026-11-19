@@ -51,9 +51,16 @@ The three write zones are checked in order: blocked → no-prompt → prompt. Se
 | `provider.<name>.reasoning_budget_tokens` | Thinking-token budget for that provider, overriding `reasoning_budget_tokens`; `0` turns it off for the provider. |
 | `provider.<name>.reasoning_budget_extra_body` | JSON object that tells that provider the budget, with `{budget}` standing for the number, e.g. `{"thinking": {"budget_tokens": {budget}}}`. Without it only OpenRouter is configured (`{"reasoning": {"max_tokens": N}}`); other providers are left alone. |
 | `provider.<name>.extra_body` | JSON object sent as additional request fields for that provider, such as vLLM `chat_template_kwargs`. Invalid JSON is ignored with a warning. Only configure fields your server accepts. |
+| `provider.<name>.length_retry_extra_body` | JSON fields sent only on the retry after a length cut-off, to turn thinking off for that one call. Defaults by provider: Ollama `{"think": false}`, vLLM `{"chat_template_kwargs": {"enable_thinking": false}}`, others `{"reasoning_effort": "none"}`. A provider that rejects them gets the call again without them. |
 | `fallback_models` | Comma-separated `provider:model` chain for transient errors, missing models, capacity failures, and independent-provider authentication failures. |
+| `tool_selection` | Which tool schemas go on the wire for native function-calling. `hybrid` (default) sends the ~10 most relevant via keyword + embedding retrieval, falling back to `full` when the two signals disagree or embeddings are unavailable; `full` always sends every schema; `auto` enables hybrid only for the measured `provider:model` entries in `tool_selection_models`. `/tool-selection <mode>` changes it live. |
+| `tool_selection_models` | Comma-separated `provider:model` entries `tool_selection=auto` treats as measured-safe for hybrid mode. |
 | `context_window` | Token budget for history trimming. |
 | `max_completion_tokens` | Global output-token ceiling when the active model has no reviewed limit or provider override. |
+| `chars_per_token` | Characters per token for the context-size estimate (default `4`). Code, JSON and Qwen tokenizers run nearer `3`; set it lower if requests are rejected for exceeding the context length. |
+| `model_base_url` | Endpoint used when no `provider.<name>` profile is active (legacy flat setting; the `OLLAMA_URL` environment variable also sets it). Default `http://localhost:11434/v1`. |
+| `model_name` | Model id for `model_base_url` (the `MODEL_NAME` environment variable also sets it). |
+| `gemma_base_url`, `gemma_model_name` | Endpoint and model for the legacy `USE_GEMMA4=1` switch. Defaults `http://localhost:8003/v1` and `gemma-4-12B-it-Q4_K_M.gguf`. |
 | `timeout_seconds` | Per-request timeout (default `120`). |
 
 Transient provider failures are retried before the turn fails or `fallback_models`
@@ -149,6 +156,8 @@ not per call.
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
+| `sandbox_network` | (empty) | Explicitly setting `open` removes network filtering for Docker commands. In `auto` mode this prefers Docker on Linux/macOS; an explicit `native` backend remains native. Linux uses host networking; macOS uses bridge networking, where host services need `host.docker.internal`, not `localhost`. This can expose reachable services and allow project data to leave the sandbox; enable only for trusted work. Filesystem protections still apply. |
+| `docker_autostart` | `1` | Start an already-installed Docker Desktop on Windows/macOS when needed for sandbox fallback or managed SearXNG recovery. Set `0` to disable; `AGENT8088_DOCKER_AUTOSTART=0` also disables it. Does not install Docker or start a Linux system daemon. |
 | `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |
 | `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
@@ -171,6 +180,7 @@ See [Messaging Gateway](08-messaging-gateway.md).
 
 | Key | Default | Purpose |
 |---|---|---|
+| `mcp_startup_wait_seconds` | `20` | How long a turn waits for MCP servers to connect at startup before going ahead without their tools. Late servers are picked up on a later turn. |
 | `mcp_server_allow_writes` | `0` | `1` exposes `write_file` over `--mcp-serve`. Writes are **unattended** — MCP has no approval channel. |
 
 MCP *servers you connect to* are configured in `mcp.json`, not here. See
@@ -183,13 +193,15 @@ On by default. Full explanation in [Memory](16-memory.md).
 | Key | Default | Purpose |
 |---|---|---|
 | `memory` | `1` | Master switch. `0` stops both recall and learning; stored memories are kept. |
-| `memory_engine` | `native` | Backend: `native` (built-in SQLite with BM25 + vector RRF) or `mem0` (the Mem0 library with graph/vector management). Set by `/memory engine <name>`. |
+| `memory_engine` | `native` | Backend: `native` (built-in SQLite with BM25 + vector RRF) or `mem0` (the Mem0 library with graph/vector management). Set by `/memory engine <name>`. Default `native`; the installers and `--memory-setup` switch it to `mem0`. |
 | `memory_db_path` | `~/.agent8088/memory.db` | The store for the native engine. One SQLite file, mode `0600`. |
 | `memory_user_id` | `owner` | Whose memories these are. One identity by default, so memory carries across the CLI and every gateway platform. |
 | `memory_scope_by_identity` | `0` | `1` gives each gateway identity its own namespace. Needed only if a `*_allowed_users` line holds more than one person. |
 | `memory_embed_model` | `nomic-embed-text` | Embedding model for semantic recall (274 MB; the installers pull it). Missing or unreachable degrades recall to keyword-only rather than failing. |
 | `memory_embed_provider` | `ollama` | Provider asked for embeddings. Deliberately **not** your chat provider — chat and embeddings are separate services, and the default embed model is an Ollama model. Whatever serves chat is irrelevant here. |
+| `memory_embed_timeout_seconds` | `30` | Timeout for an embedding request, in seconds (minimum `1`). Increase for a slow local embedding service; unavailable embeddings still degrade to keyword-only selection. |
 | `memory_extract_model` | *(chat model)* | Model for the fact-extraction call. Point at something small to spend less. |
+| `memory_extract_max_tokens` | `4000` | Output budget for the fact-extraction call (minimum `256`). Reasoning models need room to think before they answer. |
 | `memory_capture` | `1` | `0` keeps recall and stops learning new facts. |
 | `memory_recall_limit` | `5` | Facts injected into a turn's prompt. |
 | `memory_rrf_k` | `60` | RRF damping constant. Lower makes rank 1 dominate; higher flattens. |
@@ -215,6 +227,9 @@ never does — and a recalled memory can never authorise a tool call.
 | Key | Default | Purpose |
 |---|---|---|
 | `max_read_bytes` | `2 MB` | Cap on a single file read. |
+| `tool_result_max_chars` | `3000` | Characters of one tool result shown to the model. The rest stays reachable with `read_content`. |
+| `read_content_window_chars` | `2400` | Characters `read_content` returns per call. |
+| `reuse_known_verdicts` | `1` | Reuse a recorded check or test result while nothing has changed since it ran. `0` always reruns. |
 | `max_http_bytes` | `5 MB` | Cap on an HTTP response. |
 | `max_tool_output_bytes` | `1 MB` | Cap on tool output fed back to the model. |
 | `max_tool_timeout_seconds` | `1200` | Hard ceiling for one tool call. |
@@ -230,6 +245,8 @@ never does — and a recalled memory can never authorise a tool call.
 | `browser_screenshots` | `0` | Enable browser screenshots for a vision-capable model; override once with `AGENT8088_BROWSER_SCREENSHOTS=1`. |
 | `browser_max_actions_per_step` | `1` | Actions the browsing model may batch into one step. Raise for form-heavy sites; keep at 1 where clicks reshuffle the DOM. |
 | `browser_headless` | `1` | `0` opens a visible window (demos, debugging a stuck selector). Visibility only — every guard is unaffected. |
+| `browser_window_size` | (unset) | Visible browser window size as `W,H`. Only used with `browser_headless=0`. |
+| `browser_window_position` | (unset) | Visible browser window position as `X,Y`, so it does not land on top of the terminal. Only used with `browser_headless=0`. |
 | `browser_reuse_session` | `1` | Keep the browser alive across consecutive tasks in the session, preserving cookies and in-memory tabs. |
 | `browser_hitl` | `1` | Human-in-the-loop interrupts (`ask_human`) for captchas, passwords and user input. |
 | `browser_flash_mode` | `0` | Much smaller system prompt (~2.4 KB vs ~22 KB) and leaner action schema — each step 2-4x faster on a small model. Off by default: A/B it on your model first. |
@@ -241,12 +258,15 @@ never does — and a recalled memory can never authorise a tool call.
 
 ### Dynamic turn budget
 
-`max_turns` is what a request *starts* with, not what it is allowed. A run that
-is still producing new, successful tool results has not failed, so ending it on
-a number chosen before the task began throws away real work. When the loop is
-one round from its soft limit and that round ran a new, non-repeated tool whose
-result did not fail, it is granted another block of rounds — up to a hard
-ceiling of `max_turns x dynamic_turns_ceiling_multiplier`.
+`max_turns` is the starting allowance, not a fixed hard cap. The default is
+**150 rounds**, shared by the CLI, Web UI and messaging gateways. Set
+`max_turns` in `config.txt` or use `/maxturns <int>` to override it.
+Older saved sessions without this setting retain the current value on resume.
+
+At a block boundary, growth requires more than half the block's rounds to
+produce fresh, successful work. Extensions add another block of rounds up to
+`max_turns x dynamic_turns_ceiling_multiplier` (450 at the defaults).
+Repetition and failed calls do not earn extensions.
 
 The signals come from state the loop already tracks, so extension costs no
 extra tokens and the model cannot request rounds it has not earned: a run that
@@ -255,9 +275,11 @@ them and ends where it is.
 
 | Key | Default | Purpose |
 |---|---|---|
+| `max_turns` | `400` | Starting rounds per request. Time, token and cost budgets are separate limits; raising this does not raise those limits. |
 | `dynamic_turns_ceiling_multiplier` | `3` | Hard turn ceiling as a multiple of `max_turns` (default 400 x 3 = 1200 rounds). `1` disables growth and restores a fixed limit. |
 | `dynamic_turns_extension` | `5` | Rounds granted per extension. |
 | `stall_rounds` | `6` | Rounds in a row that bring nothing new (no new call that worked, no file changed, no check newly passing, no part finished) before the main agent is asked once to finish with what it has or change approach. A second stretch of the same length with nothing ends the run with the usual summary. Reading or fetching something new always counts as progress. `0` turns the watch off. |
+| `repeat_refresh_seconds` | `20` | Refresh a consecutive identical, successful shell observation after this many seconds, at most 12 refreshes per command per request. Only supported read-only probes qualify; writes, unknown commands and failures stay cached. Explicit supported waits can refresh sooner but share the same cap. `0` disables timed refresh, not explicit waits. |
 | `verification_loop_rounds` | `8` | Once the work is built, its checks pass and no part is open, this many rounds in a row that change no file are answered once with a message that finishing is the next step (at most twice per request). It never ends the run. `0` turns it off. |
 
 Growth applies to the top-level request and to delegated sub-agents. It does
@@ -297,6 +319,8 @@ number of rounds. All default to `0`, meaning disabled.
 | `thinking_off_max_tokens` | Effective floor | Ceiling for a reduced-thinking retry, defaulting to the effective `main_llm_min_tokens` floor (4096 at 32K; 8192 at 64K and above when unset). An explicit positive value overrides this ceiling. The ordinary/provider limits still apply. A growing tool-call retry is exempt; following sticky thinking-off calls retain their normal cap. |
 | `salvage_cutoff_writes` | `1` | When a `write_file` call is cut off mid-content, save the content up to its last whole line if that is safe (a new file, or an append part; never an overwrite of an existing file, never `.json`), once per resolved file, through the normal write path. The file is marked unfinished: completion checks request continuation or report it as incomplete if the run reaches its limits. Only a successful write to that same file clears the marker. The retry asks for the rest with `mode="append"`. `0` discards the partial call as before. |
 | `adaptive_completion_cap` | `1` | With a nonzero ceiling above, cap an ordinary call at twice the median size of the last five normal replies (reasoning included), bounded by the effective `main_llm_min_tokens` floor and the ceiling. `0` keeps the configured or context-scaled ceiling. |
+| `length_retry_max_tokens` | `0` | Additional ceiling for a cut-off retry's completion cap. `0` leaves the other configured and provider limits in effect. |
+| `length_cutoff_max_retries` | `4` | Consecutive length cut-offs before one final no-tools round reports the incomplete output. `0` disables this retry-count stop; other budgets still apply. |
 | `edit_check_reminders` | `3` | Maximum short after-edit reminders per request. After three distinct code/page files change without a successful check/run or local page open, the next tool result asks for verification. Tests, scratch files and unfinished file chunks do not trigger it. `0` disables these reminders; no verification verdict or completion budget changes. |
 | `failing_check_follow_up` | `1` | When a reply would end the work while the latest automated check (a test run or an audit) is still failing, send up to two follow-ups per request, each naming the failing command and how it failed: fix it and run it again, or say plainly that it still fails. The answer's "Incomplete" note is unchanged. Each follow-up spends one `max_completion_continuations`. `0` keeps the note only. |
 | `not_verified_headline` | `1` | When the run itself saw a clear sign that the work is unfinished or not working (a failed page or script check, an unresolved failing check, parts of the request not addressed, a requested file missing, a file cut off, a credential written in clear text), the answer starts with one line "NOT VERIFIED: ..." naming it; the notes at the end are unchanged. The common notes on correct work (no fresh verification evidence, no tests written, smoke test unavailable) never trigger it. `0` turns it off. |
@@ -375,6 +399,16 @@ where a silently half-done plan does damage.
 | `open_code_review_max_tools` | `50` | Tool rounds the reviewer may take (50-200). |
 | `open_code_review_concurrency` | `8` | Parallel file reviews (1-16). |
 | `open_code_review_file_timeout_minutes` | `15` | Per-file ceiling (1-60). The lever to raise on a slow endpoint — lowering the token budget or reviewing a smaller range are the alternatives. |
+
+## Display, logs and local data
+
+| Key | Default | Purpose |
+|---|---|---|
+| `syntax_theme` | `monokai` | Pygments style for code and diffs in the terminal. |
+| `log_enabled` | `1` | `0` turns off the JSONL log under `<data dir>/logs`. |
+| `log_level` | `INFO` | Level for that log: `DEBUG`, `INFO`, `WARNING` or `ERROR`. |
+| `searxng_port` | `8080` | Host port for the local SearXNG container that `/search setup` provisions. |
+| `task_db_path` | `tasks.db` beside `config.txt` | SQLite store for long-running tasks. |
 
 ## Extension points
 

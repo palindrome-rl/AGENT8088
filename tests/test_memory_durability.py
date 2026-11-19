@@ -176,7 +176,7 @@ def test_the_turn_end_saving_line_is_erased_once_the_save_finishes(monkeypatch):
     monkeypatch.setattr(cli.A, "memory_capture_thread", thread, raising=False)
     monkeypatch.setattr(cli, "_pending_captures", [])
 
-    cli._await_memory_capture(stored)
+    cli._await_memory_capture(stored, "remember that I prefer tabs")
 
     text = out.getvalue()
     assert "saving" in text

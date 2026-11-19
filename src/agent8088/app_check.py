@@ -469,6 +469,26 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
             return None
 
         def do_POST(self):  # GET and HEAD only
+            # Closing with an unread request body can discard the 405 response
+            # as a TCP reset on Windows. Drain only a small, time-bounded body;
+            # never execute the request or wait indefinitely for its sender.
+            try:
+                remaining = min(65536, max(0, int(self.headers.get("Content-Length", "0"))))
+            except (ValueError, OverflowError):
+                remaining = 0
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + 0.2
+            try:
+                while remaining and time.monotonic() < deadline:
+                    self.connection.settimeout(min(0.2, max(0.001, deadline - time.monotonic())))
+                    chunk = self.rfile.read1(min(8192, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.connection.settimeout(previous_timeout)
             self.send_error(405)
 
         do_PUT = do_DELETE = do_PATCH = do_POST

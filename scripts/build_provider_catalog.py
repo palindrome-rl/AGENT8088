@@ -65,6 +65,7 @@ def fetch_api_models(provider: str, url: str):
 
 def main() -> None:
     ref = json.loads(REF_PATH.read_text(encoding="utf-8"))
+    ref_by_key = {f"{m['platform']}:{m['modelId']}": m for m in ref["models"]}
     ref_for_us = {}
     for platform, provider in FREELLM_PLATFORMS.items():
         for m in ref["models"]:

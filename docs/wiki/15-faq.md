@@ -23,8 +23,10 @@ tool, so you and it never get different answers. See [Tools](04-tools.md#describ
 
 ### Why did it refuse to write a file / run a command / search the web?
 
-`readonly` is the default mode. Reads are allowed; writes, shell, network,
-scheduling and browser actions each need a one-time approval.
+You are in `readonly` mode. The default is `full-auto`, so `--mode readonly`,
+`/mode readonly`, `AGENT8088_PERMISSION` or `default_permission_mode` switched
+it. In `readonly`, reads are allowed; writes, shell, network, scheduling and
+browser actions each need your approval.
 
 Approving grants **exactly one** blocked call. It is not a mode change — the
 next write asks again. See [Permissions & Security](03-permissions-and-security.md).

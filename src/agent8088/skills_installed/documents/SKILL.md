@@ -45,10 +45,9 @@ read_text /absolute/path/to/output.docx
 Never touch these with python-docx/openpyxl/python-pptx — they don't
 understand the old binary format and you will produce a corrupt file.
 
-LibreOffice, installed by the Windows installer alongside this agent, handles
-them. See the LibreOffice section below to check it's actually present before
-relying on it — the install can fail (no WinGet, offline machine) and degrades
-to a warning rather than blocking setup, so don't assume it's there.
+LibreOffice handles them. It is opt-in at install time, so many machines won't
+have it — see the LibreOffice section below to check it's actually present
+before relying on it.
 
 ## Word (.docx) — python-docx
 
@@ -159,9 +158,11 @@ Editing follows the same open → modify → save pattern:
 
 ## LibreOffice (soffice) — conversion, legacy formats, formula recalc
 
-The Windows installer asks whether to install LibreOffice — it is optional and
-slow — so plenty of machines will not have it, whether the user declined or the
-install failed (offline machine, no WinGet). The `convert_document` tool checks
+LibreOffice is opt-in in the installers — it is optional and slow — so plenty
+of machines will not have it. If a task needs it and it is missing, and no
+pure-Python route (python-docx/openpyxl/python-pptx) can do the job, tell the
+user to run `agent8088 --libreoffice-setup` and stop; do not try to install it
+yourself. The `convert_document` tool checks
 for soffice itself and tells you plainly if it's missing — you do not need to
 pre-check before calling it.
 

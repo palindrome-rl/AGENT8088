@@ -1,5 +1,8 @@
 # Agent8088 Wiki
 
+> **Agent8088 v1.3 documentation.** These pages describe the public
+> `AGENT8088-v1.3` branch and are published to its repository wiki.
+
 Complete reference for Agent8088 — a local-first AI agent with fine-tuned tool
 calling, an enforced permission layer, OS-level sandboxing, MCP in both
 directions, and messaging gateways.
@@ -8,7 +11,7 @@ Everything here was verified against the code in this repository rather than
 copied from the README. Where the two disagree, the wiki notes it explicitly.
 
 > **This directory is the source of truth.** It is versioned with the code and
-> reviewed in PRs. The [GitHub Wiki tab](https://github.com/tayyabimam1/AGENT8088/wiki)
+> reviewed in PRs. The [GitHub Wiki tab](https://github.com/palindrome-rl/AGENT8088/wiki)
 > is a generated mirror — run `python scripts/sync_wiki.py` after changing a
 > page here to republish it. Edits made in the wiki UI are overwritten by the
 > next sync.
@@ -58,8 +61,8 @@ Look things up here.
 
 A single-process agent that runs on your machine. It talks to any
 OpenAI-compatible endpoint (local Ollama or a hosted API), calls tools to get
-real work done, and gates every side effect behind a permission layer that
-defaults to read-only.
+real work done, and puts a permission layer around every side effect. It starts
+in `full-auto`; switch to `readonly` to approve each action yourself.
 
 At a glance, verified against the current tree:
 
@@ -80,11 +83,12 @@ Agent8088 assumes the model will sometimes be wrong, and sometimes be
 manipulated by content it reads. So the safety properties do not live in the
 prompt — they live in code that runs regardless of what the model decides:
 
-- **Read-only by default.** Writes, shell, network, cron and browser actions
-  are refused unless you approve them for that one action.
+- **Full-auto by default, readonly on request.** Out of the box the agent acts
+  without asking, inside the workspace and the always-on floor. In `readonly`,
+  writes, shell, network, cron and browser actions each need your approval.
 - **An always-on floor.** Some things are refused in *every* mode, even
   full-auto, even after you approve an escalation: reading or writing
-  credential files, writing shell startup files, `git push`/`reset --hard`,
+  credential files, writing shell startup files, a shell `git push`/`reset --hard`,
   and requests for the agent's own system prompt.
 - **External content is fenced.** Anything fetched from the web or an MCP
   server is wrapped in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers with

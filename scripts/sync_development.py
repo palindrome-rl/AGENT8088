@@ -29,7 +29,7 @@ DEFAULT_REMOTE = os.environ.get("AGENT8088_SYNC_REMOTE", "origin")
 SKIP_ENV = "AGENT8088_SKIP_SYNC"
 
 # Branches that are themselves integration targets: never block work on them.
-PROTECTED = {"main", "master", "development", "staging"}
+PROTECTED = {"main", "master", "development", "staging", "staging-1.3", "AGENT8088-v1.3"}
 
 
 # --- process helpers ------------------------------------------------------

@@ -1019,15 +1019,15 @@ provs = E.load_providers({
     "provider.openai.base_url": "https://api.openai.com/v1",
     "provider.openai.model": "gpt-4o",
     "provider.openai.api_key": "sk-verysecretkey123456",
-    "provider.ornith.base_url": "http://127.0.0.1:8080/v1/chat/completions",
-    "provider.ornith.model": "ornith-1.0-35b",
+    "provider.example.base_url": "http://192.0.2.10:8080/v1/chat/completions",
+    "provider.example.model": "example-model",
     "provider.broken.model": "no-url",
     "unrelated": "x",
 })
-ok("parses providers", set(provs) == {"openai", "ornith"}, ", ".join(sorted(provs)))
+ok("parses providers", set(provs) == {"openai", "example"}, ", ".join(sorted(provs)))
 ok("drops provider without base_url", "broken" not in provs)
 ok("normalizes /chat/completions suffix",
-   provs["ornith"]["base_url"] == "http://127.0.0.1:8080/v1", provs["ornith"]["base_url"])
+   provs["example"]["base_url"] == "http://192.0.2.10:8080/v1", provs["example"]["base_url"])
 ok("litellm provider allowed without base_url",
    "claude" in E.load_providers({"provider.claude.api_mode": "litellm",
                                  "provider.claude.model": "anthropic/claude"}))
@@ -1042,9 +1042,9 @@ _pp = E.PROVIDERS
 E.PROVIDERS = provs
 c, m = E.get_client("openai")
 ok("get_client for named provider", m == "gpt-4o" and "api.openai.com" in str(c.base_url))
-os.environ["AGENT8088_PROVIDER"] = "ornith"
+os.environ["AGENT8088_PROVIDER"] = "example"
 _, m = E.get_client()
-ok("env var selects provider", m == "ornith-1.0-35b")
+ok("env var selects provider", m == "example-model")
 del os.environ["AGENT8088_PROVIDER"]
 _, m = E.get_client("ghost")
 ok("unknown provider falls back", bool(m), m)
@@ -1078,11 +1078,11 @@ for url, label in blocked_urls:
     ok(f"blocks {label}", E._ssrf_check(url) is not None, url[:34])
 for url in ("https://example.com", "http://93.184.216.34/", "https://api.github.com/x"):
     ok(f"allows public {url[:34]}", E._ssrf_check(url) is None)
-E.SSRF_ALLOW_HOSTS = {"192.168.1.10", "10.0.0.5:9200"}
-ok("allowlisted host permitted", E._ssrf_check("http://192.168.1.10:8888/s") is None)
+E.SSRF_ALLOW_HOSTS = {"192.168.2.3", "10.0.0.5:9200"}
+ok("allowlisted host permitted", E._ssrf_check("http://192.168.2.3:8888/s") is None)
 ok("allowlisted host:port permitted", E._ssrf_check("http://10.0.0.5:9200/s") is None)
 ok("same host other port still blocked", E._ssrf_check("http://10.0.0.5:22/") is not None)
-ok("other LAN host still blocked", E._ssrf_check("http://192.168.1.11/") is not None)
+ok("other LAN host still blocked", E._ssrf_check("http://192.168.2.99/") is not None)
 ok("metadata blocked despite allowlist", E._ssrf_check("http://169.254.169.254/") is not None)
 E.SSRF_ALLOW_HOSTS = set()
 E.SSRF_ALLOW_PRIVATE = True

@@ -11,7 +11,8 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}]
                  [--uninstall] [--workspace] [--all] [--yes]
                  [--non-interactive] [--dry-run]
-                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup] [--memory-setup]
+                 [--update] [--force] [--setup] [--doctor] [--model-setup] [--sandbox-setup] [--memory-setup]
+                 [--libreoffice-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
                  [--web] [--web-port PORT] [--web-host HOST] [--web-dev]
@@ -26,9 +27,11 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mode {readonly,full-auto}` | Permission mode at startup. Plan mode is not settable here — start it with `/plan` |
 | `--full-auto` | Start in full-auto (no per-action prompts) |
 | `--setup` | Interactive config wizard, then exit |
+| `--doctor` | Check provider, model, configuration and optional capabilities without entering the REPL; prints fixes and exits non-zero on a failing check |
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
 | `--memory-setup` | Install the mem0 memory backend deps and set `memory_engine=mem0`; switch back with `/memory engine native` |
+| `--libreoffice-setup` | Install LibreOffice (via winget/brew/apt-get/dnf/pacman, whichever is available) for document conversion, legacy Office formats, and formula recalculation |
 | `--gateway` | Run the messaging gateway instead of the REPL |
 | `--gateway-setup` | Configure gateway channels, then exit |
 | `--mcp-serve` | Run as an MCP server |
@@ -39,13 +42,13 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--web-port PORT` | Web UI server port (default `8180`) |
 | `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
-| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment; the benchmark adapter supplies a disposable task container. |
+| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment that supplies a disposable task container. |
 | `--logs [MODE]` | Print the operational log; pass `follow` to tail it in real time. Bare `--logs` prints the last `--limit` lines and exits |
 | `-n`, `--limit LIMIT` | With `--logs`: number of lines to print (default 50) |
 | `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |
 | `--subsystem SUBSYSTEM` | With `--logs`: substring filter on subsystem name |
 | `--json` | With `--logs`: emit raw JSONL instead of the human-formatted view |
-| `--update` | Pull latest code + reinstall, then exit |
+| `--update` | Update from the public `AGENT8088-v1.3` branch and reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
 | `--workspace` | With `--uninstall`: also remove trace logs and the WhatsApp session directory |
@@ -70,6 +73,39 @@ agent8088 --web
 ```
 
 Open `http://127.0.0.1:8180`.
+
+### Switching chats while a task runs
+
+**New chat** and saved chats remain available during a task. The running task
+keeps its own transcript, answers and approval requests; switching chats does
+not move them into the chat you are viewing. Return to the running chat to
+approve its action. Session-scoped grants are cleared when switching chats,
+so an action may ask for approval again.
+
+Messages entered while a task runs wait in a queue for the chat where you
+entered them. Only one task runs at a time. Stop or failure pauses the queue
+for your review. The sidebar identifies the running chat. You cannot rename,
+delete, reset or compact that chat while its task is running.
+
+### Images and attachments in Agent8088 v1.3
+
+Use **+ → Image analysis** to choose images, paste a screenshot into the
+message box, or drop a file onto the composer. The clipboard button also
+attaches an image when browser permissions allow it; otherwise use Ctrl+V
+(Cmd+V on macOS). Wait for **Ready**, add your question, then send a normal
+message. Slash commands do not accept attachments.
+
+Vision-capable chat models receive the images themselves. Models without
+vision use the installed local OCR engine; OCR extracts text, not a complete
+visual interpretation. An unknown model's image support is initially shown
+as unconfirmed and checked when sending. If neither vision nor OCR is
+available, the attachment warns that the image cannot be read. Dedicated
+provider OCR, embedding and speech APIs are not vision chat models.
+
+History shows your question and attachment chips without displaying base64
+image data. Saved session files can still contain the image data. Completed
+answers retain their thinking and tool activity in the active browser page;
+reloading may not restore those live-only traces.
 
 Use the web flags to change the server settings:
 
@@ -149,7 +185,7 @@ sensitive-file floor still applies unconditionally.
 |---|---|
 | `/help` | List all commands |
 | `/new [name]` | Start a fresh session, optionally named |
-| `/sessions` | List saved named sessions |
+| `/sessions` | List saved chats, including their CLI/web source and model |
 | `/resume [name]` | Reload a named session, including its hold and skill state. With no name, release a hold; otherwise show usage. |
 | `/hold` | Hold the session: subsequent chat replies use no tools, execution-capable commands are blocked and new attachments are not processed until released. The hold is saved with the session. |
 | `/continue` | Release a hold; the next message can run normally. |
@@ -157,10 +193,17 @@ sensitive-file floor still applies unconditionally.
 | `/reset` | Clear the current conversation |
 | `/history` | Show conversation history |
 | `/compact [n]` | Summarise older turns, keep the last `n` verbatim |
-| `/save <file>` | Export conversation + trace to JSON (mode `0600`) |
+| `/save [file]` | Export conversation + trace to JSON (mode `0600`). Without a name it writes `agent8088_session-<date>-<time>.json`, so earlier saves are never overwritten |
 | `/status` | Model, mode, tools, skills, token usage; current task goal, steps, changed files, verification level and recorded check results. Task rows read a copy of the saved snapshot without a model call or starting a new request. `Limited` rows describe fallbacks ([reduced modes](13-troubleshooting.md#reduced-modes-and-fallbacks)). |
 | `/usage` | Token usage for this session |
 | `/exit` | Quit |
+
+The first ordinary message in the interactive CLI automatically names and
+saves the chat. You do not need to run `/new` first. After restarting, use
+`/sessions` to find its name, then `/resume <name>` to continue. Saved progress
+also survives a failed or interrupted turn when the session write succeeds;
+a save failure is reported. One-shot and `--prompt-file` runs do not enable
+this interactive autosave behavior. `/save` remains a separate JSON export.
 
 While held, reporting and session controls such as `/status`, `/history`,
 `/help`, `/resume`, `/new` and `/reset` remain available. Use `/continue` before
@@ -177,7 +220,7 @@ an already-running external process or cancel independent background tasks.
 | `/model setup` | Add or update a provider profile |
 | `/models [provider]` | Fuzzy model picker, fetched live |
 | `/temp <float>` | Sampling temperature |
-| `/maxturns <int>` | Max agent turns per prompt (same as `/limits max_turns`) |
+| `/maxturns <int>` | Starting rounds per prompt, default 150; productive runs can grow within the dynamic ceiling (450 rounds with the default multiplier of 3, same starting setting as `/limits max_turns`). Separate time/token/cost limits still apply. |
 | `/reasoning` | Toggle reasoning display |
 | `/tool-selection [hybrid\|full\|auto]` | Show or set how native tool schemas are narrowed per request — see [Tool-calling compatibility](05-model-providers.md#tool-calling-compatibility) |
 | `/raw <text>` | One raw model call — content, reasoning, tool_calls |
@@ -242,8 +285,8 @@ an already-running external process or cancel independent background tasks.
 | `/cost [on\|off\|<task_id>]` | Local telemetry summary of model cost/usage; `on`/`off` toggles recording, persisted to `config.txt` |
 | `/review` | Bare: list stored reviews. With arguments: launch `review_code` from the CLI — same tool the model calls, see [`review_code`](04-tools.md#review_code) |
 | `/doctor [--fix]` | Environment health check, incl. a row per [reduced mode](13-troubleshooting.md#reduced-modes-and-fallbacks); `--fix` repairs a broken web-search install |
-| `/dump` | Write a redacted diagnostic bundle to disk, for sharing in a bug report |
-| `/trace [on\|off]` | Toggle JSON trace capture |
+| `/dump` | Write a redacted diagnostic bundle, `dump-<date>-<time>.txt` in the data folder, for sharing in a bug report |
+| `/trace [on\|off\|save [file]]` | Toggle JSON trace capture; `save` exports it (default name `<session>_trace-<date>-<time>.json`) |
 | `/verbose` | Toggle verbose output |
 
 ### Memory

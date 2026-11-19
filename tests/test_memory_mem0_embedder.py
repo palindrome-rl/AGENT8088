@@ -38,6 +38,6 @@ def test_mem0_embed_model_stays_empty_so_the_store_picks_per_provider():
 
 
 def test_shipped_config_makes_the_default_explicit():
-    for name in ("config.txt", "src/agent8088/config.txt"):
+    for name in ("src/agent8088/config.txt",):
         text = (ROOT / name).read_text(encoding="utf-8")
         assert re.search(r"(?m)^memory_embed_provider=ollama\s*$", text), name
