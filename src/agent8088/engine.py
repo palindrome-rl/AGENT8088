@@ -562,6 +562,14 @@ READ_PAGE_LINES = _config_int("read_page_lines", 200)
 # unbounded read reachable in readonly mode.
 MAX_DOCUMENT_BYTES = _config_int("max_document_bytes", 25 * 1024 * 1024)
 MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
+# The copy of a tool-attached image that the model sees (the file on disk keeps its
+# full size): longest side in pixels and a byte cap, so one picture costs a few
+# hundred tokens rather than thousands. 0 disables either limit.
+MODEL_IMAGE_MAX_SIDE = max(0, _config_int("model_image_max_side", 768))
+MODEL_IMAGE_MAX_BYTES = max(0, _config_int("model_image_max_bytes", 1_500_000))
+# How many images stay in the conversation; older ones become a short text note
+# carrying the text that came with them. 0 keeps every image.
+MODEL_IMAGE_KEEP = max(0, _config_int("model_image_keep", 3))
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
@@ -3944,7 +3952,10 @@ def _fallback_max_tokens(messages, system_prompt, tools, provider_name, model_na
     the estimated prompt leaves in the fallback's window."""
     window, ceiling = _active_model_token_limits(provider_name, model_name)
     try:
-        chars = (len(json.dumps(messages, default=str)) + len(system_prompt or "")
+        # _estimate_context_chars counts an image as a flat allowance; measuring
+        # json.dumps(messages) counted its base64 and left a fallback model a few
+        # hundred output tokens after one screenshot.
+        chars = (_estimate_context_chars(messages, system_prompt or "")
                  + len(json.dumps(tools or [], default=str)))
     except Exception:  # noqa: BLE001
         chars = 0
@@ -4258,7 +4269,49 @@ _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".gif": "image/gif", ".webp": "image/webp"}
 
 
-def build_image_message(text: str, images: list, resolver=None) -> dict:
+def _model_image_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """The copy of an image the model receives: within MODEL_IMAGE_MAX_SIDE and MODEL_IMAGE_MAX_BYTES.
+
+    An image already inside both limits is returned unchanged. Otherwise it is
+    resized (aspect ratio kept) and re-encoded as PNG, falling back to JPEG at
+    falling quality when PNG cannot meet the byte cap. Anything Pillow cannot
+    open is returned as it was, so the existing size check still applies."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(raw)) as img:
+            img.load()
+            width, height = img.size
+            too_wide = bool(MODEL_IMAGE_MAX_SIDE) and max(width, height) > MODEL_IMAGE_MAX_SIDE
+            too_big = bool(MODEL_IMAGE_MAX_BYTES) and len(raw) > MODEL_IMAGE_MAX_BYTES
+            if not too_wide and not too_big:
+                return raw, mime
+            if too_wide:
+                scale = MODEL_IMAGE_MAX_SIDE / max(width, height)
+                img = img.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                                 Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "PNG", optimize=True)
+            if not MODEL_IMAGE_MAX_BYTES or buf.tell() <= MODEL_IMAGE_MAX_BYTES:
+                return buf.getvalue(), "image/png"
+            rgb = img.convert("RGB")
+            # JPEG at falling quality first, then smaller dimensions, until the cap holds.
+            for _shrink in range(8):
+                for quality in (85, 70, 55, 40):
+                    buf = io.BytesIO()
+                    rgb.save(buf, "JPEG", quality=quality)
+                    if buf.tell() <= MODEL_IMAGE_MAX_BYTES:
+                        return buf.getvalue(), "image/jpeg"
+                w, h = rgb.size
+                if max(w, h) <= 64:
+                    break
+                rgb = rgb.resize((max(1, int(w * 0.75)), max(1, int(h * 0.75))), Image.LANCZOS)
+            return buf.getvalue(), "image/jpeg"
+    except Exception:  # noqa: BLE001 -- a resize must never fail the attachment
+        return raw, mime
+
+
+def build_image_message(text: str, images: list, resolver=None, for_model: bool = False) -> dict:
     """Build a multimodal user message: text plus one or more images.
     Local paths are inlined as base64 data URLs; http(s) URLs pass through
     (SSRF-checked). Requires a vision-capable model/provider.
@@ -4266,6 +4319,9 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
     resolver defaults to resolve_user_path (ALLOWED_PATHS-gated), unchanged
     from before this parameter existed. The paste-detection path in cli.py
     passes resolve_pasted_path instead — see that function's docstring for why.
+
+    for_model=True sends the downscaled copy (_model_image_bytes); a tool's
+    image uses it, a picture the user attached keeps its own size.
     """
     import base64 as _b64
     resolver = resolver or resolve_user_path
@@ -4293,6 +4349,8 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
         except OSError as exc:
             raise ValueError(documents.cloud_placeholder_message(path)
                              or f"Could not read {path}: {exc.strerror or exc}")
+        if for_model:
+            raw, mime = _model_image_bytes(raw, mime)
         b64 = _b64.b64encode(raw).decode()
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return {"role": "user", "content": parts}
@@ -13666,7 +13724,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         try:
             message = build_image_message(
                 f"Tool result ({name}): {ref} is attached to this message.",
-                [ref])
+                [ref], for_model=True)
         except ValueError as exc:
             return efficiency.tool_error("image_unavailable", str(exc),
                 "Check the path, the file type (png/jpg/gif/webp/bmp) and the "
@@ -16312,6 +16370,13 @@ def _fallback_answer(last_tool_output: str, error, provider_name: str = "",
     body = (last_tool_output or "").strip()
     if not body:
         return reason
+    if body.startswith(_IMAGE_MARKER_PREFIX):
+        # An image tool's result: show its text, never the base64 payload.
+        try:
+            message = json.loads(body[len(_IMAGE_MARKER_PREFIX):])["message"]
+            body = f"{_message_text(message).strip()}\n(The image is not shown here.)"
+        except (ValueError, KeyError, TypeError):
+            body = "(An image tool ran; its result could not be shown.)"
     try:
         parsed = json.loads(body)
         if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
@@ -18224,6 +18289,102 @@ def _new_edit_check_reminder():
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
+
+
+_IMAGE_REMOVED_NOTE = ("[The image that came with this message was removed from the conversation "
+                       "to save space; only the most recent images are kept.]")
+_IMAGE_WITHHELD_NOTE = ("[The image was not attached: this model has no image input. "
+                        "Rely on the text above, or check the file another way.]")
+_model_vision_cache: dict = {}
+# Images per request a server accepts, learned from its refusal (vLLM's
+# --limit-mm-per-prompt answers "At most 1 image(s) may be provided in one
+# prompt"). Per provider:model, for the life of the process.
+_model_image_limits: dict = {}
+_IMAGE_LIMIT_ERROR = re.compile(
+    r"at most (\d+) images?(?:\(s\))?\b|(?:maximum|max|limit)(?: of)? (\d+) images?\b|too many images", re.IGNORECASE)
+
+
+def _model_key() -> str:
+    return f"{ACTIVE_PROVIDER or DEFAULT_PROVIDER or ''}:{MODEL_NAME}"
+
+
+def _image_keep() -> int:
+    """Images to keep in the conversation: model_image_keep, lowered to a limit the server stated."""
+    learned = _model_image_limits.get(_model_key())
+    if learned is None:
+        return MODEL_IMAGE_KEEP
+    return learned if MODEL_IMAGE_KEEP == 0 else min(MODEL_IMAGE_KEEP, learned)
+
+
+def _image_limit_from_error(error) -> int | None:
+    """The per-request image limit a refusal states, or None when the error is about something else."""
+    match = _IMAGE_LIMIT_ERROR.search(str(error))
+    if not match:
+        return None
+    number = match.group(1) or match.group(2)
+    return max(0, int(number)) if number else 1
+
+
+def _model_accepts_images() -> bool:
+    """Whether the active model reads images (model_catalog's decision, cached per model)."""
+    provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    key = f"{provider}:{MODEL_NAME}"
+    if key not in _model_vision_cache:
+        try:
+            from agent8088 import model_catalog
+            _model_vision_cache[key] = bool(
+                model_catalog.vision_decision(provider, MODEL_NAME, client).vision)
+        except Exception:  # noqa: BLE001 -- unknown means "send no image parts"
+            _model_vision_cache[key] = False
+    return _model_vision_cache[key]
+
+
+def _text_only_turn(message: dict) -> dict:
+    """The tool's image message for a model without image input: its text, and a plain note."""
+    text = _message_text(message).strip()
+    return {"role": "user", "content": f"{text}\n{_IMAGE_WITHHELD_NOTE}".strip()}
+
+
+def _prune_old_images(messages: list, keep: int, *, strip_all: bool = False) -> int:
+    """Keep the `keep` most recent image parts; turn older ones into a short note. 0 keeps all.
+
+    strip_all removes every image (a server that takes none). The text that came
+    with each image stays. Returns how many images were removed."""
+    if strip_all:
+        keep = 0
+    elif keep <= 0:
+        return 0
+    seen = removed = 0
+    for message in reversed(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        images = [part for part in content if isinstance(part, dict) and part.get("type") == "image_url"]
+        if not images:
+            continue
+        if seen + len(images) <= keep:
+            seen += len(images)
+            continue
+        allowed = max(0, keep - seen)
+        seen += allowed
+        kept_images = 0
+        rebuilt = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                if kept_images < allowed:
+                    rebuilt.append(part)
+                    kept_images += 1
+                else:
+                    removed += 1
+            else:
+                rebuilt.append(part)
+        if kept_images == 0:
+            text = " ".join(str(p.get("text", "")) for p in rebuilt if isinstance(p, dict)).strip()
+            message["content"] = f"{text}\n{_IMAGE_REMOVED_NOTE}".strip()
+        else:
+            rebuilt.append({"type": "text", "text": _IMAGE_REMOVED_NOTE})
+            message["content"] = rebuilt
+    return removed
 
 
 def _image_turn(message: dict) -> dict:
@@ -20146,6 +20307,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             on_result("error", message)
 
     overflow_recovery_used = False  # one shrink-and-retry per run, never a loop
+    image_limit_recovery_used = False  # one "fewer images" retry per run, never a loop
     if system_prompt is None:
         system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
@@ -20505,6 +20667,30 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                         max_tokens=tokens, client_override=loop_client,
                         provider_override=loop_provider, model_override=loop_model,
                         on_retry=_retry_notice, on_stream_reset=on_stream_reset))
+            image_limit = None if response is not None or image_limit_recovery_used else _image_limit_from_error(e)
+            if image_limit is not None:
+                # The server takes fewer images per request than the conversation
+                # holds. Remember its limit for this model, drop the oldest images
+                # down to it, and retry once.
+                image_limit_recovery_used = True
+                _model_image_limits[_model_key()] = image_limit
+                removed = _prune_old_images(messages, image_limit, strip_all=image_limit == 0)
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "image_limit_learned", "limit": image_limit,
+                                  "removed": removed})
+                try:
+                    with spin("thinking..."):
+                        response = _create_completion_with_fallback(
+                            messages, round_tools_def, temperature=temperature,
+                            system_prompt=round_system_prompt, on_token=on_token,
+                            interrupt_check=interrupt_check, trace=trace, turn=turn,
+                            max_tokens=turn_max_tokens, client_override=loop_client,
+                            provider_override=loop_provider, model_override=loop_model,
+                            on_retry=_retry_notice, on_stream_reset=on_stream_reset)
+                except (AgentInterrupted, TurnBudgetExceeded):
+                    raise
+                except Exception as retry_error:  # noqa: BLE001 -- reported below like any model error
+                    response, e = None, retry_error
             if response is None:
                 # A hard, non-retryable error (a renamed/deprecated model id, an
                 # invalid key) raises straight through _create_completion_with_fallback
@@ -21319,15 +21505,28 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                         result[len(_IMAGE_MARKER_PREFIX):])["message"]
                 except (ValueError, KeyError):
                     result_message = None
+                withheld = False
                 if result_message is None:
                     messages.append(_harness_turn(
                         "Error: the attached image could not be delivered."))
+                elif not _model_accepts_images():
+                    # A text-only model would get nothing usable from image
+                    # parts, and most providers reject them outright.
+                    withheld = True
+                    messages.append(_text_only_turn(result_message))
                 else:
                     messages.append(_image_turn(result_message))
+                    keep = _image_keep()
+                    pruned = _prune_old_images(messages, keep)
+                    if pruned and trace is not None:
+                        trace.append({"turn": turn, "type": "images_pruned", "removed": pruned,
+                                      "kept": keep})
                 if on_result:
-                    on_result(name, "[image attached]")
+                    on_result(name, "[image not attached: text-only model]" if withheld
+                              else "[image attached]")
                 if trace is not None:
-                    trace.append({"turn": turn, "type": "image_attached", "tool": name})
+                    trace.append({"turn": turn, "type": "image_withheld" if withheld else "image_attached",
+                                  "tool": name})
                 executed = executed or not no_progress
                 continue
             if (PERMISSION_MODE == "plan-only"
