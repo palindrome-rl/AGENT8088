@@ -196,3 +196,28 @@ def test_plan_decline_stays_in_plan_mode(monkeypatch, tmp_path):
     engine, _ = _run_plan_approval(monkeypatch, tmp_path, "")
 
     assert engine.chosen == ""
+
+
+class _ReplyPlanEngine(_PlanEngine):
+    """The engine offers the model's reply as the plan (no present_plan call)."""
+
+    def run_agent(self, messages, **kwargs):
+        self.chosen = self._plan_on_approval("Should this use Flask or FastAPI?", source="reply")
+        return "done"
+
+
+def test_a_reply_offered_as_the_plan_is_labelled_for_the_card(monkeypatch, tmp_path):
+    engine = _ReplyPlanEngine(tmp_path)
+    socket = _ApprovingSocket("")
+    monkeypatch.setattr(web_server, "_validated_attachments", lambda *a, **k: [])
+    asyncio.run(web_server._handle_chat(socket, {"text": "plan it"}, engine, _PlanCli()))
+
+    frames = [e for e in socket.events if e.get("type") == "plan_approval"]
+    assert frames and frames[0]["source"] == "reply"
+    assert engine.chosen == ""
+
+
+def test_a_present_plan_frame_is_labelled_as_a_tool_plan(monkeypatch, tmp_path):
+    _engine, socket = _run_plan_approval(monkeypatch, tmp_path, "full-auto")
+    frames = [e for e in socket.events if e.get("type") == "plan_approval"]
+    assert frames and frames[0]["source"] == "tool"

@@ -2277,19 +2277,34 @@ def _make_plan_approval(live=None, esc=None):
     `_handle_escalation` pauses it: a running listener swallows the keystroke meant
     for this prompt. This is a second interactive prompt, added after that fix, so
     it needed the same treatment rather than inheriting it."""
-    def approve(plan_text):
+    def approve(plan_text, source="tool"):
+        # source="reply": the model ended plan mode without present_plan, so its
+        # reply is offered as the plan. Say so, and say nothing has run, because
+        # a reply like "I've added the route" reads as if work already happened.
+        offered_reply = source == "reply"
         if live is not None:
             live.stop()
         console.print()
-        console.print(Panel(_AnswerMarkdown(plan_text),
-                            title="[bold #00edff]Plan[/bold #00edff]",
-                            box=box.ROUNDED, border_style="#00C8FF"))
+        if offered_reply:
+            console.print(Panel(_AnswerMarkdown(plan_text),
+                                title="[bold #00edff]Agent's reply — no plan was presented[/bold #00edff]",
+                                subtitle="[dim]Nothing has been run yet[/dim]",
+                                box=box.ROUNDED, border_style="#00C8FF"))
+            if not A._PLAN_STEP_LINE.search(plan_text or ""):
+                console.print("[dim]This reply has no numbered steps; e (approve, ask before "
+                              "each edit) is the safer choice.[/dim]")
+            prompt = ("[bold yellow]Approve this reply as the plan? (a=approve and run / "
+                      "e=approve, ask before each edit / d=don't approve — reply to answer "
+                      "or ask for a revision): [/bold yellow]")
+        else:
+            console.print(Panel(_AnswerMarkdown(plan_text),
+                                title="[bold #00edff]Plan[/bold #00edff]",
+                                box=box.ROUNDED, border_style="#00C8FF"))
+            prompt = ("[bold yellow]Approve plan? (a=approve and run / "
+                      "e=approve, ask before each edit / d=keep planning): [/bold yellow]")
         try:
             with (esc.paused() if esc is not None else nullcontext()):
-                answer = console.input(
-                    "[bold yellow]Approve plan? (a=approve and run / "
-                    "e=approve, ask before each edit / d=keep planning): [/bold yellow]"
-                ).strip().lower()
+                answer = console.input(prompt).strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "d"
         if live is not None:
@@ -2300,8 +2315,12 @@ def _make_plan_approval(live=None, esc=None):
         if answer in ("e", "edit", "edits", "r", "readonly"):
             console.print("[green]Plan approved — each write will ask first.[/green]")
             return "readonly"
-        console.print("[yellow]Still in plan mode. No plan steps were run — "
-                      "say what to change and Agent8088 will revise the plan.[/yellow]")
+        if offered_reply:
+            console.print("[yellow]Still in plan mode. Nothing was run — reply with your "
+                          "answer or what to change, and Agent8088 will revise the plan.[/yellow]")
+        else:
+            console.print("[yellow]Still in plan mode. No plan steps were run — "
+                          "say what to change and Agent8088 will revise the plan.[/yellow]")
         return ""
     return approve
 
