@@ -446,6 +446,30 @@ these tools, switch to the Docker backend with an image that has Python and Node
 and an allowlist for the package registry; see
 [Sandboxing](06-sandboxing.md).
 
+## Images and visual checks
+
+### `screenshot_page` or `view_image` says "image not attached: this model has no image input"
+
+Agent8088 decides whether a model reads images from its bundled catalog, then from
+what the endpoint reports. A self-hosted OpenAI-compatible server (vLLM, LM Studio,
+a custom provider) usually reports nothing, so an uncatalogued model is treated as
+text-only and gets the evidence text without the picture. If the served build does
+read images, say so in `model_catalog.json` next to your `config.txt` (in
+`AGENT8088_HOME`):
+
+```json
+{"myprovider:my-vision-model": {"rank": 50, "vision": true, "tools": true}}
+```
+
+Use the provider name and model id shown in `/status`.
+
+### The server answers "At most 1 image(s) may be provided in one prompt"
+
+The server limits images per request (vLLM's `--limit-mm-per-prompt`). Agent8088
+lowers how many images it keeps in the conversation to that limit for the model and
+retries once; older renders stay as their text evidence. To start that way, set
+`model_image_keep=1` in `config.txt`.
+
 ## Development
 
 ### A test passes alone but fails in the suite (or vice versa)

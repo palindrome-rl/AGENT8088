@@ -16397,6 +16397,13 @@ def _fallback_answer(last_tool_output: str, error, provider_name: str = "",
     body = (last_tool_output or "").strip()
     if not body:
         return reason
+    if body.startswith(_IMAGE_MARKER_PREFIX):
+        # An image tool's result: show its text, never the base64 payload.
+        try:
+            message = json.loads(body[len(_IMAGE_MARKER_PREFIX):])["message"]
+            body = f"{_message_text(message).strip()}\n(The image is not shown here.)"
+        except (ValueError, KeyError, TypeError):
+            body = "(An image tool ran; its result could not be shown.)"
     try:
         parsed = json.loads(body)
         if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
@@ -18316,6 +18323,33 @@ _IMAGE_REMOVED_NOTE = ("[The image that came with this message was removed from 
 _IMAGE_WITHHELD_NOTE = ("[The image was not attached: this model has no image input. "
                         "Rely on the text above, or check the file another way.]")
 _model_vision_cache: dict = {}
+# Images per request a server accepts, learned from its refusal (vLLM's
+# --limit-mm-per-prompt answers "At most 1 image(s) may be provided in one
+# prompt"). Per provider:model, for the life of the process.
+_model_image_limits: dict = {}
+_IMAGE_LIMIT_ERROR = re.compile(
+    r"at most (\d+) images?(?:\(s\))?\b|(?:maximum|max|limit)(?: of)? (\d+) images?\b|too many images", re.IGNORECASE)
+
+
+def _model_key() -> str:
+    return f"{ACTIVE_PROVIDER or DEFAULT_PROVIDER or ''}:{MODEL_NAME}"
+
+
+def _image_keep() -> int:
+    """Images to keep in the conversation: model_image_keep, lowered to a limit the server stated."""
+    learned = _model_image_limits.get(_model_key())
+    if learned is None:
+        return MODEL_IMAGE_KEEP
+    return learned if MODEL_IMAGE_KEEP == 0 else min(MODEL_IMAGE_KEEP, learned)
+
+
+def _image_limit_from_error(error) -> int | None:
+    """The per-request image limit a refusal states, or None when the error is about something else."""
+    match = _IMAGE_LIMIT_ERROR.search(str(error))
+    if not match:
+        return None
+    number = match.group(1) or match.group(2)
+    return max(0, int(number)) if number else 1
 
 
 def _model_accepts_images() -> bool:
@@ -18338,11 +18372,14 @@ def _text_only_turn(message: dict) -> dict:
     return {"role": "user", "content": f"{text}\n{_IMAGE_WITHHELD_NOTE}".strip()}
 
 
-def _prune_old_images(messages: list, keep: int) -> int:
+def _prune_old_images(messages: list, keep: int, *, strip_all: bool = False) -> int:
     """Keep the `keep` most recent image parts; turn older ones into a short note. 0 keeps all.
 
-    The text that came with each image stays. Returns how many images were removed."""
-    if keep <= 0:
+    strip_all removes every image (a server that takes none). The text that came
+    with each image stays. Returns how many images were removed."""
+    if strip_all:
+        keep = 0
+    elif keep <= 0:
         return 0
     seen = removed = 0
     for message in reversed(messages):
@@ -20297,6 +20334,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             on_result("error", message)
 
     overflow_recovery_used = False  # one shrink-and-retry per run, never a loop
+    image_limit_recovery_used = False  # one "fewer images" retry per run, never a loop
     if system_prompt is None:
         system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
@@ -20656,6 +20694,30 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                         max_tokens=tokens, client_override=loop_client,
                         provider_override=loop_provider, model_override=loop_model,
                         on_retry=_retry_notice, on_stream_reset=on_stream_reset))
+            image_limit = None if response is not None or image_limit_recovery_used else _image_limit_from_error(e)
+            if image_limit is not None:
+                # The server takes fewer images per request than the conversation
+                # holds. Remember its limit for this model, drop the oldest images
+                # down to it, and retry once.
+                image_limit_recovery_used = True
+                _model_image_limits[_model_key()] = image_limit
+                removed = _prune_old_images(messages, image_limit, strip_all=image_limit == 0)
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "image_limit_learned", "limit": image_limit,
+                                  "removed": removed})
+                try:
+                    with spin("thinking..."):
+                        response = _create_completion_with_fallback(
+                            messages, round_tools_def, temperature=temperature,
+                            system_prompt=round_system_prompt, on_token=on_token,
+                            interrupt_check=interrupt_check, trace=trace, turn=turn,
+                            max_tokens=turn_max_tokens, client_override=loop_client,
+                            provider_override=loop_provider, model_override=loop_model,
+                            on_retry=_retry_notice, on_stream_reset=on_stream_reset)
+                except (AgentInterrupted, TurnBudgetExceeded):
+                    raise
+                except Exception as retry_error:  # noqa: BLE001 -- reported below like any model error
+                    response, e = None, retry_error
             if response is None:
                 # A hard, non-retryable error (a renamed/deprecated model id, an
                 # invalid key) raises straight through _create_completion_with_fallback
@@ -21481,10 +21543,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     messages.append(_text_only_turn(result_message))
                 else:
                     messages.append(_image_turn(result_message))
-                    pruned = _prune_old_images(messages, MODEL_IMAGE_KEEP)
+                    keep = _image_keep()
+                    pruned = _prune_old_images(messages, keep)
                     if pruned and trace is not None:
                         trace.append({"turn": turn, "type": "images_pruned", "removed": pruned,
-                                      "kept": MODEL_IMAGE_KEEP})
+                                      "kept": keep})
                 if on_result:
                     on_result(name, "[image not attached: text-only model]" if withheld
                               else "[image attached]")
