@@ -446,6 +446,37 @@ these tools, switch to the Docker backend with an image that has Python and Node
 and an allowlist for the package registry; see
 [Sandboxing](06-sandboxing.md).
 
+## Images and visual checks
+
+### `screenshot_page` or `view_image` says "image not attached: this model has no image input"
+
+Agent8088 decides whether a model reads images from what is declared, published or
+observed, never from its name:
+
+1. `provider.<name>.vision=1` (or `0`) in `config.txt`, or `model_vision` without a
+   named provider;
+2. the model catalog (bundled, plus your `model_catalog.json`) and what the endpoint
+   publishes (Ollama capabilities, `/models` modalities);
+3. one live probe, the first time an image is about to be sent: a small picture with a
+   known answer. A correct answer means the model reads images; a refusal, an error or
+   a wrong answer means it does not. The result is cached per endpoint and model.
+
+So a new or self-hosted vision model normally works without any setting. You see this
+note when the probe said no, or could not reach the endpoint. If the model does read
+images, set `provider.<name>.vision=1` (the name is the part before the colon in
+`/status`), or run `/vision probe` to ask again, for example after restarting the
+server with a vision build. `/vision` shows the current answer and what decided it.
+
+A request the server rejects because the model takes no images also marks it
+text-only, and the turn is resent without the picture.
+
+### The server answers "At most 1 image(s) may be provided in one prompt"
+
+The server limits images per request (vLLM's `--limit-mm-per-prompt`). Agent8088
+lowers how many images it keeps in the conversation to that limit for the model and
+retries once; older renders stay as their text evidence. To start that way, set
+`model_image_keep=1` in `config.txt`.
+
 ## Development
 
 ### A test passes alone but fails in the suite (or vice versa)

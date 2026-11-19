@@ -607,7 +607,7 @@ def _active_tool_specs(session=None):
         allowed &= {
             "present_plan", "read_text", "repository_read", "calculate", "describe_capabilities", "describe_tool",
             "git_status", "git_diff", "git_log", "last_output", "web_search",
-            "view_skill",
+            "view_skill", "view_image",
         }
     return {name: spec for name, spec in A.TOOL_SPECS.items() if name in allowed}
 
@@ -2769,6 +2769,7 @@ COMMAND_SPECS = (
     ("fusion", "/fusion [setup|--panel provider:model,… --judge provider:model] <query>", "Ask a model panel and have a blind judge select the winner", ()),
     ("image", "/image <path-or-url> [question]", "Analyze a screenshot/diagram with a vision model", ()),
     ("raw", "/raw <text>", "One raw model call — shows content, reasoning, tool_calls", ()),
+    ("vision", "/vision [probe]", "Whether the model reads images; probe asks it again with a test picture", ()),
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
@@ -3695,6 +3696,38 @@ def cmd_plan(rest):
         do_chat(task)
 
 
+def _vision_status_value() -> str:
+    """One line: whether the active model reads images, and what decided it."""
+    provider = _active_provider_name()
+    decision = A.model_vision_decision(probe=False, provider=provider)
+    seen = A._model_vision_cache.get(f"{provider}:{A.MODEL_NAME}")
+    if decision.source == "default" and seen is not None:
+        return f"{'yes' if seen else 'no'} (observed this session)"
+    if decision.source == "default":
+        return f"not known yet: checked with one small probe when an image is first sent, or set {A._vision_setting_hint()}"
+    return f"{'yes' if decision.vision else 'no'} ({decision.source})"
+
+
+def cmd_vision(rest):
+    """/vision shows whether the active model reads images; /vision probe asks the model again."""
+    arg = rest.strip().lower()
+    if arg == "probe":
+        provider = _active_provider_name()
+        with status_cm("checking image input..."):
+            answer = A.providers.probe_image_understanding(A.client, A.MODEL_NAME, provider, force=True)
+        if answer is None:
+            console.print("[yellow]The model could not be asked (the endpoint did not answer); nothing changed.[/yellow]")
+        else:
+            A._model_vision_cache[f"{provider}:{A.MODEL_NAME}"] = answer
+            console.print(f"Image input: {'yes' if answer else 'no'} (live probe: the model "
+                          f"{'named' if answer else 'did not name'} the colours of a test picture)")
+        return
+    if arg:
+        console.print("[red]usage:[/red] /vision [probe]")
+        return
+    console.print(f"Image input for {_active_provider_name()}:{A.MODEL_NAME}: {_vision_status_value()}")
+
+
 def cmd_raw(rest):
     if not rest.strip():
         console.print("[red]usage:[/red] /raw <prompt>")
@@ -3734,16 +3767,15 @@ def _vision_capable() -> bool:
     be noise -- because an unannounced fallback is how a stale catalog stays
     stale: a vision model quietly receives OCR text and nobody ever finds out.
     """
-    from agent8088 import model_catalog
-
     provider = _active_provider_name()
-    decision = model_catalog.vision_decision(
-        provider, A.MODEL_NAME, client=getattr(A, "client", None))
+    # Config, catalog, what the endpoint publishes, then one cached live probe.
+    decision = A.model_vision_decision(provider=provider)
     key = f"{provider}:{A.MODEL_NAME}"
+    A._model_vision_cache[key] = bool(decision.vision)
     if decision.source == "default" and key not in _VISION_NOTICE_SHOWN:
         _VISION_NOTICE_SHOWN.add(key)
-        console.print(f"[dim]treating {key} as text-only (uncatalogued) — using OCR. "
-                      f"Declare it in model_catalog.json if it can see.[/dim]")
+        console.print(f"[dim]treating {key} as text-only (its image input could not be checked) — using OCR. "
+                      f"Set {A._vision_setting_hint()} in config.txt if it can see.[/dim]")
     return decision.vision
 
 
@@ -4294,6 +4326,10 @@ def cmd_status(_):
         active = _active_provider_name()
         t.add_row("Model", _model_status_value(f"{active}:{A.MODEL_NAME}"))
     ctx_window, _ = A._active_model_token_limits()
+    try:
+        t.add_row("Images", _vision_status_value())
+    except Exception:  # noqa: BLE001 -- status must always render
+        pass
     t.add_row("Context", f"{_estimate_context_pct()}% used of {ctx_window:,} "
                          f"({A.context_window_source()}) · {len(S.messages)} messages")
     t.add_row("Tools", str(len(_active_tool_specs())))
@@ -7544,7 +7580,7 @@ COMMANDS = {
     "agents": cmd_agents, "agent": cmd_agent, "plan": cmd_plan, "image": cmd_image,
     "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
-    "raw": cmd_raw, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
+    "raw": cmd_raw, "vision": cmd_vision, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
     "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
     "local": cmd_local,
     "search": cmd_search,

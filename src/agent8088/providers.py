@@ -532,3 +532,111 @@ def probe_model_vision(client, model_id, provider_name="", timeout=MODEL_LIST_TI
         disk[cache_key] = {"ts": now, "vision": answer}
         _save_disk_cache(disk)
     return answer
+
+
+# --- live image probe ----------------------------------------------------------------------------------
+#
+# When neither the catalog nor the endpoint says whether a model reads images, ask it: send one small
+# picture with a known answer and check the answer. Accepting the request proves nothing -- some servers
+# drop image parts silently and the model then answers anyway -- so only a correct answer counts.
+
+_PROBE_COLOURS = {"red": (220, 30, 30), "green": (30, 160, 60), "blue": (40, 80, 220),
+                  "yellow": (240, 200, 20), "black": (20, 20, 20), "white": (245, 245, 245)}
+_PROBE_QUESTION = ("This picture has two halves of different solid colours. Name the colour of the left "
+                   "half, then the right half, in two words and nothing else.")
+_IMAGE_REJECTED = re.compile(
+    r"(?:does not|doesn't|do not|cannot|can't|not)\s+(?:support|accept|take|handle)\w*\s+(?:image|vision|multimodal)|"
+    r"image(?:s|_url)?\s+(?:input\s+)?(?:is|are)\s+not\s+supported|not\s+a\s+(?:multimodal|vision)\s+model|"
+    r"unsupported\s+(?:content|message)\s+(?:part\s+)?type[^.]*image|"
+    r"(?:unknown|invalid|unexpected)\s+(?:content\s+)?(?:part\s+)?type[^.]*image", re.IGNORECASE)
+
+
+# A model that cannot see often says so and then guesses; a guess that happens to name the right two
+# colours must not count as seeing.
+_CANNOT_SEE = re.compile(
+    r"\b(?:can(?:no|')?t|cannot|unable to|not able to|don't|do not)\s+(?:see|view|read|process|access|open)\b[^.]*"
+    r"\b(?:image|picture|attachment|photo)s?\b|\bno (?:image|picture) (?:was |is )?(?:provided|attached|shown)\b",
+    re.IGNORECASE)
+
+
+def image_input_rejected(error) -> bool:
+    """Whether an error says the model takes no image input at all (not a per-request limit)."""
+    return bool(_IMAGE_REJECTED.search(str(error)))
+
+
+def _probe_picture(left: str, right: str) -> str:
+    import base64
+    import io
+    from PIL import Image
+    img = Image.new("RGB", (96, 48), _PROBE_COLOURS[left])
+    img.paste(Image.new("RGB", (48, 48), _PROBE_COLOURS[right]), (48, 0))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _probe_cache_key(client, model_id, provider_name) -> str:
+    base_url = str(getattr(client, "base_url", "")).rstrip("/")
+    api_key = str(getattr(client, "api_key", ""))
+    identity = hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "anonymous"
+    return f"vision-live|{provider_name}|{base_url}|{identity}|{model_id}"
+
+
+def remember_image_input(client, model_id, provider_name, accepts: bool) -> None:
+    """Record what was observed about a model's image input (a probe, or a rejected request)."""
+    disk = _load_disk_cache()
+    disk[_probe_cache_key(client, model_id, provider_name)] = {"ts": time.time(), "vision": bool(accepts)}
+    _save_disk_cache(disk)
+
+
+def cached_image_understanding(client, model_id, provider_name=""):
+    """A probe answer already on disk for this endpoint, key and model, or None. Never calls anything."""
+    if client is None or not model_id:
+        return None
+    cached = _load_disk_cache().get(_probe_cache_key(client, model_id, provider_name))
+    if (isinstance(cached, dict) and isinstance(cached.get("vision"), bool)
+            and time.time() - cached.get("ts", 0) < VISION_CACHE_SECONDS):
+        return cached["vision"]
+    return None
+
+
+def probe_image_understanding(client, model_id, provider_name="", *, force=False, timeout=30):
+    """Whether the model answers a question only a model that sees the picture can answer.
+
+    True or False is cached on disk per endpoint, key and model for VISION_CACHE_SECONDS; force asks
+    again. None (the endpoint could not be reached, or answered nothing) is not cached. Never raises.
+    """
+    import random
+    if client is None or not model_id:
+        return None
+    key = _probe_cache_key(client, model_id, provider_name)
+    if not force:
+        cached = _load_disk_cache().get(key)
+        if (isinstance(cached, dict) and isinstance(cached.get("vision"), bool)
+                and time.time() - cached.get("ts", 0) < VISION_CACHE_SECONDS):
+            return cached["vision"]
+    left, right = random.sample(list(_PROBE_COLOURS), 2)
+    messages = [{"role": "user", "content": [{"type": "text", "text": _PROBE_QUESTION},
+                                             {"type": "image_url", "image_url": {"url": _probe_picture(left, right)}}]}]
+    try:
+        response = client.chat.completions.create(model=model_id, messages=messages, max_tokens=64,
+                                                  temperature=0, timeout=timeout)
+        message = response.choices[0].message
+        text = " ".join(str(part or "") for part in (getattr(message, "content", ""),
+                                                     getattr(message, "reasoning_content", ""))).lower()
+    except Exception as exc:  # noqa: BLE001 -- a probe never breaks a turn
+        if not image_input_rejected(exc):
+            return None
+        answer = False
+    else:
+        if not text.strip():
+            return None
+        if _CANNOT_SEE.search(text):
+            answer = False
+            remember_image_input(client, model_id, provider_name, answer)
+            return answer
+        named = [colour for colour in _PROBE_COLOURS if re.search(rf"\b{colour}\b", text)]
+        answer = (len(named) >= 2 and left in named and right in named
+                  and text.find(left) < text.rfind(right))
+    remember_image_input(client, model_id, provider_name, answer)
+    return answer
