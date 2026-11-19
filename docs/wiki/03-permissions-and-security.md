@@ -98,10 +98,21 @@ Plan mode holds across turns until a plan is approved or you change mode by hand
 `set_permission_mode()` is the only thing that changes the mode, and it clears
 every grant tied to the old one, so an approval cannot outlive its mode.
 
-If a turn ends in plan mode without a plan being approved, Agent8088 says so:
+If the model ends its turn without calling `present_plan`, its reply is offered to
+you as the plan, whatever it is: a plan written as text, a research summary or a
+question. The panel is titled `Agent's reply — no plan was presented` and says
+nothing has been run yet. The same `a` / `e` / `d` choices apply. Approving runs
+that reply as the plan, and the model is reminded of what you asked while
+planning, so the work is held to your request and to your answers. Declining
+(`d`) keeps you in plan mode; reply with your answer or what to change and the
+model revises. A declined reply is not saved as `PLAN.md`. When the reply has no
+numbered steps, the prompt points out that `e` (ask before each edit) is the
+safer choice.
+
+Runs with nobody to ask (the messaging gateway, scheduled runs, the MCP server)
+are not offered anything. If such a turn ends in plan mode without a plan being
+approved, Agent8088 says so:
 `Still in plan mode — no plan was approved, so nothing above was written or run.`
-A model that writes a plan out in prose and then reports it complete is otherwise
-indistinguishable from one that did the work.
 
 `execute_plan` still exists for running an already-decided sequence of tool calls
 with per-step verification (see `plan_audit`). It is not how a plan is proposed.
