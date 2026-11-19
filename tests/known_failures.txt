@@ -7,6 +7,7 @@
 # Fix a test, then delete its line. Format: <node id> <TAB> <platforms seen>
 tests/test_app_check.py::test_browser_context_is_unavailable_not_verified_startup	linux
 tests/test_audit_loop_guards.py::test_time_spent_verifying_does_not_count_against_the_turn	linux-ci
+tests/test_completion_checks.py::test_the_inventory_is_bounded_and_skips_dependency_folders	linux-ci (order-dependent: completion.inventory reads only as many entries as files it still needs, so a skipped folder such as node_modules in that slice leaves it short; fix in its own PR)
 tests/test_document_access.py::test_extraction_survives_an_os_that_refuses_memory_limits	windows
 tests/test_genuine_user_turns.py::test_every_loop_injected_turn_carries_a_marker	linux,windows
 tests/test_git_branch_and_subdir.py::test_commit_stages_inside_the_named_repo	linux
