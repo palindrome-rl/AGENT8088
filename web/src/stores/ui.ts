@@ -49,6 +49,8 @@ interface UIState {
     id: string
     plan: string
     sessionId?: string
+    /** 'reply': the model's reply offered as the plan (no present_plan call). */
+    source?: 'tool' | 'reply'
   } | null
   rawPanelOpen: boolean
 

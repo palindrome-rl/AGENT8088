@@ -2899,17 +2899,20 @@ async def _handle_chat_locked(ws, text, attachments, interrupt, handed_off, A, C
         """Route plan write-step escalations to the ApprovalCard."""
         return on_escalation("plan", escalation_text)
 
-    def _plan_on_approval(escalation_text):
+    def _plan_on_approval(escalation_text, source="tool"):
         """Plan (execute_plan) approval — keyed like tool escalations.
 
         Returns the permission mode the approved plan runs in, or "" to stay in
         plan mode. present_plan feeds this straight to set_permission_mode, so a
         bool would set PERMISSION_MODE to True and silently break every mode
         gate; the mode also has to be one the browser is allowed to ask for.
+
+        `source` is "reply" when the model ended plan mode without present_plan
+        and its reply is offered as the plan; the card says so.
         """
         plan_id = f"plan-{int(time.time()*1000)}-{id(escalation_text)}"
         frame = {"type": "plan_approval", "plan": escalation_text[:2000], "id": plan_id,
-                 "session_id": session_id}
+                 "session_id": session_id, "source": "reply" if source == "reply" else "tool"}
         entry = {"event": threading.Event(), "mode": "", "owner": id(ws),
                  "session_id": session_id, "frame": frame}
         _pending_plan_approvals[plan_id] = entry
