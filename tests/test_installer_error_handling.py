@@ -274,8 +274,9 @@ def test_probe_names_a_missing_branch(tmp_path):
 def test_probe_auth_failure_suggests_credentials_and_shows_git_stderr(tmp_path):
     result = _probe(tmp_path, "auth")
     assert result.returncode == 1
-    assert "gh auth login" in result.stdout
-    assert "personal access token" in result.stdout
+    # Public repository: no gh login or token is suggested, only stale credentials and URL rewrites.
+    assert "needs no GitHub token" in result.stdout
+    assert "gh auth login" not in result.stdout
     assert "terminal prompts disabled" in result.stdout  # git's own stderr is shown
 
 
@@ -283,7 +284,7 @@ def test_probe_auth_failure_suggests_credentials_and_shows_git_stderr(tmp_path):
 def test_probe_access_denied_is_not_reported_as_a_network_problem(tmp_path):
     result = _probe(tmp_path, "access")
     assert result.returncode == 1
-    assert "does not exist for this account" in result.stdout
+    assert "could not find the public repository" in result.stdout
     assert "network" not in result.stdout.lower()
 
 
@@ -511,6 +512,7 @@ def test_broken_shim_is_reported_instead_of_done(tmp_path):
 
 
 @posix_only
+@pytest.mark.skip(reason="Development installer feature not in production (dropped on reconciling onto production, 2026-11-19; listed in the reconciliation PR). Bring it back to the production installer through a normal PR and remove this skip.")
 def test_healthy_shim_prints_done_session_path_and_doctor_hint(tmp_path):
     result = _verify(tmp_path, 'echo "agent8088 1.2.3"\n')
     assert "RC=0" in result.stdout
@@ -583,7 +585,7 @@ def test_piped_to_dash_prints_the_bash_hint_without_bad_substitution(tmp_path):
     assert result.returncode == 1
     assert "Bad substitution" not in result.stderr
     assert "This installer needs bash" in result.stderr
-    assert "raw.githubusercontent.com/palindrome-rl/AGENT8088/development/install.sh | bash" in result.stderr
+    assert "raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" in result.stderr
     assert "CRLF" not in result.stderr
 
 

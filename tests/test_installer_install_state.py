@@ -124,7 +124,7 @@ def test_write_install_state_failure_warns_and_never_fails(tmp_path):
     body = f'AGENT8088_HOME="{tmp_path / "missing" / "dir"}"\nSKIPPED_STAGES=()\nset -e\nwrite_install_state\necho DONE\n'
     result = _run_sh(tmp_path, body, "_json_escape", "write_install_state")
     assert result.returncode == 0
-    assert "WARN:Could not write" in result.stdout
+    assert "WARN:Could not save the skipped-stage diagnostics" in result.stdout  # production wording
     assert "DONE" in result.stdout
 
 

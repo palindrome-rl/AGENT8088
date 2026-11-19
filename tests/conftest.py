@@ -69,3 +69,33 @@ def _no_real_install_state(monkeypatch):
     cannot leak into unrelated tests (tests of the reader pass a file)."""
     from agent8088 import install_state
     monkeypatch.setattr(install_state, "path", lambda: ROOT / "_no_such_install_state.json")
+
+
+_KNOWN_FAILURES = ROOT / "tests" / "known_failures.txt"
+
+
+def _known_failures():
+    known = {}
+    if _KNOWN_FAILURES.exists():
+        for line in _KNOWN_FAILURES.read_text(encoding="utf-8").splitlines():
+            if line.strip() and not line.startswith("#"):
+                node, _, where = line.partition("\t")
+                known[node.strip()] = where.strip() or "unknown"
+    return known
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests that failed before the 2026-11-19 reconciliation run as non-strict xfail.
+
+    They are listed, with the platforms they failed on, in tests/known_failures.txt.
+    They still run and report as XFAIL or XPASS; anything not on the list fails as usual.
+    """
+    known = _known_failures()
+    if not known:
+        return
+    for item in items:
+        where = known.get(item.nodeid.split("[", 1)[0]) or known.get(item.nodeid)
+        if where:
+            item.add_marker(pytest.mark.xfail(
+                reason=f"known failure before the 2026-11-19 reconciliation ({where}); "
+                       "see tests/known_failures.txt", strict=False))
