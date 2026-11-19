@@ -4,6 +4,42 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-20
+
+### Added
+
+- `screenshot_page` renders a local page or image-type file (`.html`, `.htm`,
+  `.svg`, `.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) in headless Chromium through
+  the same guarded loader as `check_app` and attaches the picture to the next
+  model message. Its evidence is deterministic: well-formedness for XML-based
+  files, page and console errors, blocked requests, a blank-render warning, the
+  change from the previous render, and whether the page is still moving.
+- `view_image` is a core tool: the agent can look at any local image in the
+  workspace (URLs only with `image_tool_allow_urls`).
+- The `browser-qa` skill: verify visual and interactive work by loading it,
+  exercising its main action with a headless test script, rendering it, and
+  fixing what is wrong with targeted edits.
+- Image input is decided from a `provider.<name>.vision` setting, the model
+  catalog, what the endpoint publishes, or one cached live probe with a
+  known-answer picture. `/vision [probe]` shows and re-checks the decision;
+  `/status` and `/capabilities` report it.
+- `scripts/check_generic_terms.py` checks that a branch's added lines and commit
+  messages stay generic.
+
+### Improved
+
+- The model gets a downscaled copy of tool-attached images
+  (`model_image_max_side`, `model_image_max_bytes`), only the most recent images
+  stay in the conversation (`model_image_keep`), a server's per-request image
+  limit is learned from its refusal, and a text-only model gets the evidence text
+  instead of image parts.
+- README and wiki counts: 61 built-in tools and 40 skill packages.
+
+### Fixed
+
+- The fallback-model output budget no longer counts an image's base64 data.
+- A failed model call after an image tool no longer prints the image data.
+
 ## v1.3 branch maintenance - 2026-10-18
 
 ### Fixed
