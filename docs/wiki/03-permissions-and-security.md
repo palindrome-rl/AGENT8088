@@ -127,7 +127,7 @@ These are refused in **every** mode — full-auto included — and no escalation
 grant unlocks them.
 
 > **Exception: `AGENT8088_DISPOSABLE_CONTAINER=1`.** This environment variable
-> is meant for throwaway benchmark containers holding no user data. It turns off
+> is meant for throwaway task containers holding no user data. It turns off
 > the credential-file floor, the shell-startup-file floor, the destructive-git
 > check, and the pipe-to-shell (`curl | sh`) patterns (`engine.py`:
 > `_is_sensitive_path`, `_is_shell_startup_file`, `_dangerous_git_args`, the
@@ -632,32 +632,11 @@ so "which guardrails are active?" in chat gets the same facts. See
 
 ## Verifying any of this yourself
 
-The root Python suite is maintained on `development`, not shipped in this
-staging checkout. Run the following test commands from a development clone.
-
-> **Correction.** This page used to point at a dedicated
-> `tests/test_permission.py` / `test_ssrf.py` / `test_egress.py` /
-> `test_exfil_guard.py` / `test_turn_budget.py` / `test_audit_log.py` /
-> `test_command_allowlist.py` / `test_capabilities.py` /
-> `tests/gateway/test_rate_limit.py` suite. None of those files exist in the
-> development tree (verified against that branch's `tests/`) — security behavior
-> is exercised as part of the general test suite instead, under names tied to
-> the feature rather than to "security", e.g. `tests/test_local_search_ssrf_exemption.py`
-> (the loopback SSRF exemption), `tests/test_operational_log.py` (the audit
-> trail), `tests/test_web_search_permission.py`, and `tests/test_describe_tool.py`.
-
-Run the full suite to exercise everything on this page at once:
+Run the regression checks from a source checkout:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -v
+uv run --extra dev python -m pytest scripts/installer_checks/ -q
 ```
 
-Or verify the default-mode claim above directly:
-
-```sh
-AGENT8088_CONFIG=/nonexistent AGENT8088_HOME="$(mktemp -d)" python -c \
-  "from agent8088 import engine as A; print(A.PERMISSION_MODE)"
-# -> full-auto
-```
-
-See [Testing & Verification](12-testing-and-verification.md).
+See [Testing & Verification](12-testing-and-verification.md) for the deeper
+feature and exhaustive verification passes.

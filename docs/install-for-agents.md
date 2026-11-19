@@ -22,7 +22,7 @@ shorter.
 
 Ask these before installing, and use the answers below:
 
-1. **Branch** — `staging-1.3` (this release channel) unless they name another.
+1. **Branch** — `AGENT8088-v1.3` (this public release channel) unless they name another.
 2. **Mem0 memory engine** (optional, larger download) — yes or no. Default no.
 3. **LibreOffice** for Word/Excel/PowerPoint conversion (optional, large) — yes
    or no. Default no.
@@ -36,7 +36,7 @@ Ask these before installing, and use the answers below:
 |---|---|---|
 | OS | `uname -s` (macOS/Linux/WSL) or `$PSVersionTable.OS` (Windows) | picks the installer |
 | git | `git --version` | yes |
-| GitHub access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: public repository; no GitHub login is required. If this fails, check network/proxy access before continuing. |
+| Repository access | `git ls-remote https://github.com/palindrome-rl/AGENT8088.git HEAD` | yes: this repository is public; no GitHub login or token is needed. If access fails, report the network/proxy error and stop. |
 | Disk | about 4 GB free | yes |
 
 Python, Node.js, Playwright Chromium and uv are installed by the installer; do
@@ -44,7 +44,7 @@ not install them yourself.
 
 ## 3. Run the installer
 
-Replace `staging-1.3` with the chosen branch in both the installer URL and
+Replace `AGENT8088-v1.3` with the chosen public branch in both the installer fetch and
 `AGENT8088_BRANCH`, and set the two yes/no answers
 (`1` = yes, `0` = no).
 
@@ -52,8 +52,8 @@ Replace `staging-1.3` with the chosen branch in both the installer URL and
 
 ```sh
 set -o pipefail
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.sh \
-  | AGENT8088_BRANCH=staging-1.3 AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh \
+  | AGENT8088_BRANCH=AGENT8088-v1.3 AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
     bash -s -- --skip-setup
 ```
 
@@ -61,8 +61,8 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindro
 
 ```powershell
 $installer = Join-Path $env:TEMP ("agent8088-install-" + [guid]::NewGuid().ToString("N") + ".ps1")
-Invoke-RestMethod -Uri https://raw.githubusercontent.com/palindrome-rl/AGENT8088/staging-1.3/install.ps1 -OutFile $installer -ErrorAction Stop
-$env:AGENT8088_BRANCH = "staging-1.3"
+Invoke-RestMethod https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1 -OutFile $installer -ErrorAction Stop
+$env:AGENT8088_BRANCH = "AGENT8088-v1.3"
 $env:AGENT8088_INSTALL_MEM0 = "0"
 $env:AGENT8088_INSTALL_LIBREOFFICE = "0"
 powershell -NoProfile -ExecutionPolicy Bypass -File $installer -SkipSetup -SkipTerminalCheck
@@ -73,8 +73,8 @@ person at the keyboard (step 5). `-SkipTerminalCheck` stops the Windows
 installer from relaunching itself in a new Windows Terminal window, which an
 agent cannot see.
 
-These commands fetch the selected branch directly from the public repository.
-GitHub CLI and GitHub authentication are not prerequisites for installation.
+These fetch the installer from the selected public release branch. Neither
+GitHub CLI nor a GitHub account or token is required.
 
 **Progress and errors** are written to the install log:
 `~/.agent8088/install.log` (macOS/Linux) or
@@ -109,7 +109,8 @@ agent8088 --setup
 ```
 
 The wizard picks the provider and model, stores the API key in
-`~/.agent8088/.env`, and chooses the web search backend. With a local Ollama
+`~/.agent8088/.env` on macOS/Linux or `%LOCALAPPDATA%\agent8088\.env` on Windows
+(or your custom `AGENT8088_HOME`), and chooses the web search backend. With a local Ollama
 model no key is needed.
 
 Then they can start the agent with `agent8088` (terminal) or `agent8088 --web`

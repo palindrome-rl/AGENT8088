@@ -196,8 +196,4 @@ instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
 
 ## Verifying it works
 
-Run `/sandbox` in the REPL: it reports the resolved backend and whether native
-isolation is `verified`, `unverified` or `failed`. The feature-verification
-script (`scripts/verify_features.py`) and the test suite live on the
-`development` branch, not in staging releases — see
-[Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).

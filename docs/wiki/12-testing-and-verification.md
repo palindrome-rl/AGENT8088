@@ -4,28 +4,18 @@
 
 Three layers, all runnable offline with no model backend.
 
-> This staging branch deliberately omits the root Python `tests/` directory.
-> The unit-test commands below apply to a separate `development` checkout;
-> they are not installation or runtime requirements. Feature-verification
-> scripts and the Web UI's separate `web/tests/` remain in staging.
-
 | Layer | Command | Covers |
 |---|---|---|
-| Unit tests (development checkout) | `uv run python -m pytest tests/` | Permission layer, tools, gateway, MCP |
+| Regression checks | `pytest scripts/installer_checks/` | Installer and runtime compatibility |
 | Feature verification | `scripts/verify_features.py` | Real behaviour in temp repos and sandboxes |
 | Exhaustive verification | `scripts/verify_everything.py` | Tool specs, shell-classifier matrix, CLI surface |
 
-The optional [Terminal-Bench 2.1 adapter](https://github.com/palindrome-rl/AGENT8088/blob/staging-1.3/test-mode-setting/README.md)
-is a separate evaluation profile. It installs into disposable task containers,
-uses `--prompt-file` for one unattended turn, and deliberately relaxes some
-ordinary workstation safeguards only when `AGENT8088_DISPOSABLE_CONTAINER=1`.
-Do not set that flag on a normal install. The adapter tests do not constitute
-a full Harbor benchmark run; the benchmark README records what has actually
-been exercised.
+`--prompt-file` runs one unattended, full-auto turn. Use it only in a trusted,
+isolated environment.
 
 ## Runtime completion evidence
 
-These runtime checks ship with staging-1.3 and do not require the excluded root
+These runtime checks ship with AGENT8088-v1.3 and do not require a root
 `tests/` directory. End-of-run notes distinguish a passing test run (`tested`)
 from running or loading the result without an error (`exercised`), inspecting
 files, and making changes without fresh verification. `Tested` means the run's
@@ -56,45 +46,18 @@ Agent8088 refuses to run commands with no isolation available — see
 [No unsandboxed fallback](06-sandboxing.md#no-unsandboxed-fallback) — so the
 checks that exercise shell and permission behaviour cannot complete without it.
 
-## 1. Unit tests
+## 1. Regression checks
 
-Clone `development` before running this section. A fresh `staging-1.3`
-checkout has no root `tests/` directory.
-
-```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -q
-```
-
-**`AGENT8088_CONFIG=/nonexistent` is not optional.** It forces packaged-default
-loading so tests never read — or write — your real `config.txt`. Without it a
-test run can pick up and mutate your live configuration.
-
-`tests/` is a **flat directory** — over 150 files, no `tests/gateway/` or
-`tests/memory/` subdirectories, and no single `test_permission.py` /
-`test_providers.py` / `test_mcp.py` per topic. Coverage for a topic is usually
-spread across several specifically-named files; `pytest -k` is the fastest way
-to find them:
+Portable installer and runtime compatibility checks:
 
 ```sh
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "turn_budget" -q   # e.g. token/cost/wall-clock ceilings
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "memory" -q        # store, recall, mem0, forget
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/ -k "gateway" -q       # gateway core + startup
-AGENT8088_CONFIG=/nonexistent uv run python -m pytest tests/test_mcp_server.py -q  # MCP server
+uv run --extra dev python -m pytest scripts/installer_checks/ -q
 ```
 
-(Verified against the development branch's `tests/` listing — file names churn as tests are
-added, so treat any specific filename here as illustrative, not a contract.)
-
-### Gateway extras are required
-
-`test_gateway_core.py` and `test_gateway_startup.py` import the Slack/Discord
-adapters directly, so without the `gateway` extra they fail at **import**
-rather than skipping — which looks like real breakage but is a missing
-optional dependency:
-
-```sh
-uv sync --all-extras --locked
-```
+These use temporary files and simulated failures rather than personal
+configuration or live model credentials. CI runs them on Windows, macOS and
+Linux. Live model and browser acceptance are separate: passing these does not
+establish that every external provider is available.
 
 ## 2. Feature verification
 
@@ -138,6 +101,16 @@ touched the same file, and ruff's `F811` did **not** flag it here (verified
 against both an extracted copy and the committed blob). A 40-line AST check
 catches it with certainty where a linter heuristic didn't.
 
+## 5. Web UI checks
+
+```sh
+npm ci --prefix web
+npm run test:install --prefix web     # one-time Chromium download
+npm test --prefix web
+```
+
+Playwright specs in `web/tests/`, run against a locally started Web UI.
+
 ## Isolation rules for anything you write
 
 Non-negotiable, because violating them has caused a real incident in this repo:
@@ -153,56 +126,21 @@ Non-negotiable, because violating them has caused a real incident in this repo:
 2. **Always set `AGENT8088_CONFIG=/nonexistent`** for tests.
 3. **Use `AGENT8088_HOME`** for verification scripts.
 4. **Mock `subprocess.run`** rather than executing real mutating commands.
-5. **Write generated files under a temp dir, never the repo root.** A handful
-   of tests (e.g. `test_edit_file_tool.py`, `test_generate_tests_tool.py`)
-   write to an `artifacts/`-named path, but there is no shared `artifacts_dir`
-   fixture and no repo-wide guard enforcing this — `tests/conftest.py` is 26
-   lines and only loads the `engine` module fixture. The discipline is on the
-   test author, not automated.
-
-## 5. Live-model tool-choice scoring
-
-The old optional scorer depended on a missing `tests/data/` fixture and could
-not run. It is not included in staging. To assess tool choice, test the agent
-with an isolated configuration and record the prompts, tool calls, and answers.
+5. **Write generated files under a temp dir, never the repo root.** Nothing
+   enforces this automatically — the discipline is on the test author.
 
 ## Pre-PR checklist
 
-There is no automated `pr-check` skill in this repo. Do this by hand:
+Before opening a PR:
 
 1. `git fetch origin` and dry-run the merge for conflicts.
 2. **Run the target branch's baseline first**, in a worktree. Without it you
    cannot distinguish "this PR broke something" from "this was already broken."
-3. Run your branch's full suite; compare against that baseline.
+3. Run the checks above on your branch; compare against that baseline.
 4. Run the duplicate-def check.
-5. Run the functional suite with an isolated `HOME`.
+5. Run the functional checks with an isolated `HOME`.
 6. Report pre-existing vs new vs fixed failures separately — and never silently
-   pick a side on a test whose *expectation* changed.
-
-## Public-release gate
-
-`scripts/release_check.py` requires the Python suite. It fails clearly on a
-fresh staging checkout; run it from `development` before promoting a release.
-
-Before publishing, run the strict local gate from a `development` checkout
-(there is no hosted CI):
-
-```sh
-uv run python scripts/release_check.py
-```
-
-It requires a fresh lockfile, all Python tests, a focused lint baseline,
-duplicate-definition check, Python and WhatsApp-bridge dependency audits, a
-wheel install smoke test, and a real native-sandbox proof. It fails rather than
-skipping when native sandbox prerequisites are absent.
-
-Run it after `agent8088 --sandbox-setup` on macOS, Linux, and Windows. Windows
-needs the one-time restricted-account setup accepted during that command.
-
-Manual release evidence remains required for WhatsApp, Slack, Discord, Telegram
-and email: authenticate a staging account, send and receive one authorized
-message, confirm an unauthorized sender is refused, and verify
-disconnect/reconnect.
+   pick a side on a check whose *expectation* changed.
 
 ## Interpreting expected skips
 
@@ -219,9 +157,10 @@ behaviour report `a sandbox is required to run code` instead of completing.
 That is the isolation rule working as designed — install the runtime rather than
 changing the check.
 
-## No CI
+## CI
 
-There is **no CI**. GitHub Actions is blocked by a billing issue on this
-account, so a workflow was written and then removed rather than left
-permanently red. Everything above runs locally and for free — run it before
-opening a PR.
+GitHub Actions runs `.github/workflows/ci.yml` on every push and pull request:
+Ruff (syntax errors and undefined names), the duplicate-definition check, a
+byte-compile, shell syntax and installer portability checks, the regression
+checks, and an install smoke test on Linux, macOS and Windows. The deeper checks
+above still run locally — run them before opening a PR.

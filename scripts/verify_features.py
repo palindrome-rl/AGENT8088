@@ -429,11 +429,11 @@ check("search chain is never empty (ddgs ships with the agent)",
       bool(A.WEB_SEARCH_REGISTRY.chain(A._search_config(), A._search_context())))
 # SSRF allowlist behaviour (narrower than allow_private)
 _ap, _ah = A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS
-A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = False, {"192.168.1.10"}
+A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = False, {"192.168.2.3"}
 check("allowlisted internal host permitted",
-      A._ssrf_check("http://192.168.1.10:8888/search?q=x") is None)
+      A._ssrf_check("http://192.168.2.3:8888/search?q=x") is None)
 check("other hosts on the same LAN still blocked",
-      A._ssrf_check("http://192.168.1.11/admin") is not None)
+      A._ssrf_check("http://192.168.2.99/admin") is not None)
 check("metadata endpoint still blocked",
       A._ssrf_check("http://169.254.169.254/") is not None)
 A.SSRF_ALLOW_PRIVATE, A.SSRF_ALLOW_HOSTS = _ap, _ah

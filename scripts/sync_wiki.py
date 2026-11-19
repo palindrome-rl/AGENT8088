@@ -6,7 +6,7 @@ in PRs. The GitHub Wiki tab is a *separate* git repository
 (`<repo>.wiki.git`) with different conventions, so publishing is a conversion,
 not a copy:
 
-  - staging pages are namespaced so they can coexist with the shared wiki
+  - this release owns the public wiki's canonical page names
   - pages are addressed by name with no `.md`, so every internal link is
     rewritten (`[Tools](04-tools.md)` -> `[Tools](Tools)`)
   - numeric filename prefixes look wrong in the wiki's page list, so they are
@@ -32,8 +32,8 @@ from pathlib import Path
 REPO = "palindrome-rl/AGENT8088"
 # The branch these pages are generated from. Source links must point at the
 # branch that produced them, or a reader follows them to different text.
-SOURCE_BRANCH = "staging-1.3"
-WIKI_PREFIX = "Staging-1.3-"
+SOURCE_BRANCH = "AGENT8088-v1.3"
+WIKI_PREFIX = ""
 SOURCE_DIR = Path(__file__).resolve().parent.parent / "docs" / "wiki"
 
 # source filename -> wiki page name (no .md). Order defines the sidebar.
@@ -53,7 +53,7 @@ PAGES = [
     ("12-testing-and-verification.md", "Testing-and-Verification"),
     ("13-troubleshooting.md", "Troubleshooting"),
     ("14-contributing.md", "Contributing"),
-    ("15-FAQ.md", "FAQ"),
+    ("15-faq.md", "FAQ"),
     ("16-memory.md", "Memory"),
     ("17-docker.md", "Docker"),
 ]
@@ -89,8 +89,8 @@ BANNER = (
     "     the next sync — change the source file and open a PR instead. -->\n\n"
 )
 
-SIDEBAR_START = "<!-- agent8088-staging-1.3:start -->"
-SIDEBAR_END = "<!-- agent8088-staging-1.3:end -->"
+SIDEBAR_START = "<!-- agent8088-v1.2:start -->"
+SIDEBAR_END = "<!-- agent8088-v1.2:end -->"
 
 SOURCE_NOTE = (
     "\n\n---\n\n*Source of truth: [`docs/wiki/`](https://github.com/"
@@ -123,7 +123,7 @@ def build_sidebar() -> str:
     if unknown:
         raise SystemExit(f"sync_wiki: sidebar references unknown page(s): {sorted(unknown)}")
 
-    lines = [SIDEBAR_START, "", "### Staging 1.3", ""]
+    lines = [SIDEBAR_START, "", "### Agent8088 v1.3", ""]
     for section, pages in SIDEBAR_SECTIONS:
         lines.append(f"**{section}**")
         lines.append("")
@@ -131,17 +131,15 @@ def build_sidebar() -> str:
             label = "Home" if page == "Home" else page.replace("-", " ")
             lines.append(f"- [{label}]({WIKI_PREFIX}{page})")
         lines.append("")
-    lines.append(f"[Staging branch](https://github.com/{REPO}/tree/{SOURCE_BRANCH})")
+    lines.append(f"[Version 1.2 branch](https://github.com/{REPO}/tree/{SOURCE_BRANCH})")
     lines.extend(["", SIDEBAR_END])
     return "\n".join(lines) + "\n"
 
 
 def update_sidebar(existing: str) -> str:
-    """Insert or replace this channel's block without touching other entries."""
+    """Refresh this release's navigation without deleting other wiki entries."""
     block = build_sidebar().rstrip()
-    pattern = re.compile(
-        re.escape(SIDEBAR_START) + r".*?" + re.escape(SIDEBAR_END), re.DOTALL
-    )
+    pattern = re.compile(re.escape(SIDEBAR_START) + r".*?" + re.escape(SIDEBAR_END), re.DOTALL)
     if pattern.search(existing):
         return pattern.sub(block, existing).rstrip() + "\n"
     prefix = existing.rstrip()
@@ -177,11 +175,11 @@ def main() -> int:
             print(f"  {item}", file=sys.stderr)
         return 1
 
-    print(f"Converted {len(PAGES)} namespaced pages + sidebar block, no broken links.")
+    print(f"Converted {len(PAGES)} wiki pages + sidebar block, no broken links.")
     if args.dry_run:
         for name in converted:
             print(f"  would write {name}")
-        print("  would update _Sidebar.md (preserving all other entries)")
+        print("  would replace _Sidebar.md with the v1.3 navigation")
         return 0
 
     workdir = Path(tempfile.mkdtemp(prefix="agent8088-wiki-"))
@@ -197,10 +195,7 @@ def main() -> int:
                   f"first page is saved in the UI.\n{result.stderr}", file=sys.stderr)
             return 1
 
-        # Remove only the pages this script owns. The wiki is shared across
-        # branches -- GitHub gives a repository one wiki, not one per branch --
-        # so deleting every page here would erase anything published beside
-        # these, including another channel's pages, on the next sync.
+        # Only replace pages owned by this release. Other pages are left alone.
         owned = {name for name in converted}
         for existing in clone.glob("*.md"):
             if existing.name in owned:

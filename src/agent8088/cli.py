@@ -288,9 +288,9 @@ class Session:
         self.trajectory_state = {}
         self.hold = False  # /hold: tools are off and replies are text only until /continue
         try:
-            self.temperature = float(config.get("temperature", "0.1"))
+            self.temperature = float(config.get("temperature", "0.8"))
         except ValueError:
-            self.temperature = 0.1
+            self.temperature = 0.8
         try:
             self.max_turns = int(config.get("max_turns", str(DEFAULT_MAX_TURNS)))
         except ValueError:
@@ -5028,10 +5028,12 @@ _DOCTOR_STYLES = {"ok": "#237dd7", "info": "#237dd7", "warn": "yellow", "fail": 
 def _tilde(text):
     """`text` with the home folder written as ~, only where it is a whole path
     segment: /Users/al becomes ~, /Users/alice does not."""
-    home = str(Path.home())
-    if not home or home in ("/", "\\"):
-        return text
-    return re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+    # Windows diagnostics can contain both native and forward-slash paths.
+    homes = {str(Path.home()), Path.home().as_posix()}
+    for home in sorted(homes, key=len, reverse=True):
+        if home and home not in ("/", "\\"):
+            text = re.sub(re.escape(home) + r"(?![^\\/\s;,:)\]'\"])", "~", text)
+    return text
 
 
 def _render_doctor(checks):
@@ -6291,7 +6293,7 @@ def cmd_resume(rest):
                           if isinstance(data.get("trajectory_state", {}), dict) else {})
     S.hold = bool(data.get("hold", False))
     S.name = name
-    S.temperature = float(data.get("temperature", 0.1))
+    S.temperature = float(data.get("temperature", 0.8))
     # Fall back to what this session already has, not to a literal: a session
     # file written before this setting existed used to pull max_turns back down
     # to 10, silently discarding both config.txt and a /maxturns set this run.
@@ -8868,7 +8870,7 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "staging-1.3"
+UPDATE_BRANCH = "AGENT8088-v1.3"
 
 
 def _git(install_dir, *args):
@@ -8877,17 +8879,34 @@ def _git(install_dir, *args):
                           capture_output=True, text=True)
 
 
+def _remote_has_branch(install_dir, branch):
+    probe = _git(install_dir, "ls-remote", "--heads", "origin", branch)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
 def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
-    UPDATE_BRANCH names today's release branch, but branches get renamed and
-    retired. An install pointed at one that no longer exists should still
-    update, and say why it went somewhere else, rather than fail on git's raw
-    'couldn't find remote ref'. So the remote is asked whether the branch is
-    still there, and if it is not, its own default branch is used instead.
+    The branch the install has checked out is the channel the user chose
+    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
+    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    development or staging install to production on its first update. That
+    branch is followed while the remote still has it.
+
+    Otherwise UPDATE_BRANCH, today's release branch, is used. Branches get
+    renamed and retired: an install pointed at one that no longer exists should
+    still update, and say why it went somewhere else, rather than fail on git's
+    raw 'couldn't find remote ref'. If the release branch is gone as well, the
+    remote's own default branch is used.
     """
-    probe = _git(install_dir, "ls-remote", "--heads", "origin", UPDATE_BRANCH)
-    if probe.returncode == 0 and probe.stdout.strip():
+    current = _git(install_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    installed = current.stdout.strip() if current.returncode == 0 else ""
+    if installed and installed != UPDATE_BRANCH and _remote_has_branch(install_dir, installed):
+        return installed, ""
+    if _remote_has_branch(install_dir, UPDATE_BRANCH):
+        if installed and installed != UPDATE_BRANCH:
+            return UPDATE_BRANCH, (f"Branch '{installed}' is no longer on the remote; "
+                                   f"updating to the release branch '{UPDATE_BRANCH}' instead.")
         return UPDATE_BRANCH, ""
     head = _git(install_dir, "ls-remote", "--symref", "origin", "HEAD")
     if head.returncode == 0:

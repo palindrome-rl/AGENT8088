@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest an improvement or a new capability.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Agent loop and tools
+        - Permissions and security
+        - Model providers
+        - Memory
+        - Web UI
+        - Messaging gateway
+        - MCP
+        - Skills and sub-agents
+        - Installer and Docker
+        - Documentation
+        - Other
+    validations:
+      required: true

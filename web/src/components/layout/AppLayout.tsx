@@ -72,10 +72,10 @@ export function AppLayout() {
               type="button"
               aria-label="Back to chat"
               onClick={() => navigate('/')}
-              className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-200"
+              className="flex shrink-0 items-center gap-2 rounded-lg px-2 py-1.5 text-[13px] text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-200"
             >
               <ArrowLeft className="h-4 w-4" />
-              Back to chat
+              <span className="hidden sm:inline">Back to chat</span>
             </button>
           )}
           <ModelSwitcher />

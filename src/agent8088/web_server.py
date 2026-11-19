@@ -1250,7 +1250,7 @@ def _load_session(C, name: str, data: dict):
     state = data.get("trajectory_state", {})
     S.trajectory_state = state if isinstance(state, dict) else {}
     S.hold = bool(data.get("hold", False))
-    S.temperature = float(data.get("temperature", 0.1))
+    S.temperature = float(data.get("temperature", 0.8))
     # Same as the CLI's loader: keep the live value when the file predates
     # the setting, rather than resetting it to a literal.
     S.max_turns = int(data.get("max_turns", S.max_turns))
@@ -1918,7 +1918,7 @@ def _read_attachments(A, C, S=None) -> dict:
 # conversation the model should read, so they never enter S.messages. Without
 # this a reload or chat switch rebuilt the chat from S.messages and every typed
 # /command vanished (issue sheet row 23).
-# ponytail: in memory, so a server restart forgets them; persist with the session if that matters.
+# Display-only command history is in memory and is forgotten on server restart.
 _COMMAND_LOG: dict[str, list] = {}
 _COMMAND_LOG_SKIP = {"new", "resume", "reset", "compact", "raw"}
 
