@@ -53,6 +53,7 @@ than a design choice.
 | `testing_support.py` | Shared test/verification helpers |
 | `completion.py` | Completion checks: unfinished-work wording, required files, multi-part requests, the continuation budget |
 | `app_check.py` | Smoke test behind `check_app`: headless-browser page check, script syntax check |
+| `render_check.py` | Render core behind `screenshot_page`: reuses `app_check`'s guarded loader, shows image-type files through an `<img>` wrapper, and measures the picture (blank share, difference, motion) |
 | `tools.txt` | Tool registry (data, not code) |
 | `system.md` | Base system prompt |
 | `config.txt` | Default settings |

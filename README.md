@@ -114,6 +114,8 @@ Apart from focusing on small models reliability, Agent8088 is a complete agentic
 - **Long-running tasks:** time and round budget warnings, stall decisions, and your rules kept word for word through compaction.
 - **Credential safety:** secret scanning on pasted text and written files; attachments isolated per session.
 - **File handling:** byte-exact `copy_file` and `move_file`; a generated project stays in one folder, and a folder you ask to put in `artifacts/` goes there.
+- **Visual verification:** the new `screenshot_page` tool renders what the agent built (a page, a chart, a UI, an SVG or other image file) in a guarded headless browser and shows the model the picture, with deterministic evidence: page errors, a blank-render warning and the change since the last render. `view_image` lets it look at any image in the workspace, and the `browser-qa` skill turns this into a check-and-fix workflow.
+- **Image input for any model:** whether a model reads images comes from your setting, the catalog, the endpoint or one small cached probe, never from its name, so new and self-hosted vision models work without setup. `/vision` shows what decided it.
 
 Includes the v1.2 reliability fixes; existing configuration and memory are preserved. See the [CHANGELOG](CHANGELOG.md).
 
