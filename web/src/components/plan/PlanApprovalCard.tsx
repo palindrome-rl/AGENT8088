@@ -27,6 +27,11 @@ export function PlanApprovalCard() {
     setPlanApprovalPending(null)
   }
 
+  // The model ended plan mode without present_plan, so its reply is offered as
+  // the plan. Say so, and that nothing has run: a reply such as "I've added the
+  // route" otherwise reads as if the work already happened.
+  const offeredReply = planApprovalPending.source === 'reply'
+
   // Same frame as ApprovalCard: the chat column, and light/dark surfaces. It was
   // dark-only and wider than the chat; `prose` did nothing (no typography
   // plugin), so the plan's headings and numbered steps rendered flat.
@@ -35,8 +40,16 @@ export function PlanApprovalCard() {
       <div className="rounded-xl border border-brand-border/40 bg-white p-4 shadow-card dark:bg-zinc-900/50" style={{ animation: 'fade-up 380ms cubic-bezier(0.23,1,0.32,1) both' }}>
         <div className="mb-3 flex items-center gap-2">
           <FileText className="h-5 w-5 text-brand-cyan" />
-          <h3 className="text-[13px] font-semibold text-zinc-900 dark:text-zinc-100">Plan Proposal</h3>
+          <h3 className="text-[13px] font-semibold text-zinc-900 dark:text-zinc-100">
+            {offeredReply ? "Agent's reply — no plan was presented" : 'Plan Proposal'}
+          </h3>
         </div>
+        {offeredReply && (
+          <p className="mb-3 text-xs text-zinc-600 dark:text-zinc-400">
+            Nothing has been run yet. Approve to run this reply as the plan, or decline and reply
+            with your answer or what to change.
+          </p>
+        )}
         <div className="mb-4 max-h-96 overflow-auto rounded-lg bg-zinc-100 p-3 dark:bg-zinc-950">
           <div className="chat-markdown min-w-0 max-w-full text-[13px] leading-relaxed text-zinc-700 dark:text-zinc-300 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
