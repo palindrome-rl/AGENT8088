@@ -8,6 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
+import inspect
 import queue
 try:
     import readline  # noqa: F401  # Unix-only side effect enables input history/editing
@@ -1116,6 +1117,15 @@ _plan_return_mode = ""      # mode to restore when an approved plan finishes
 _plan_approved = False      # the user approved this session's plan; execution is live
 _plan_approved_text = ""    # the approved plan, so the auditor grades against it
 _plan_tool_ran = False      # turn-scoped: did a plan tool actually run this turn?
+# What the user asked while planning, in order. A reply offered as the plan is
+# approved together with these, so the work that follows is held to the task
+# the user set and to their answers to the model's questions, not only to the
+# model's last reply.
+_plan_requests: list[str] = []
+# Turn-scoped: the reply the user saw as an offered plan and declined. That reply
+# is also the turn's answer; the CLI already showed it in the plan panel, so it
+# reads this to avoid printing the same text twice.
+_declined_plan_reply = ""
 # Set while a sub-agent whose profile declares `permission: readonly` is running.
 # Such an agent is refused mutations outright rather than being allowed to escalate:
 # an escalation is a question the user can say yes to, and "this agent only
@@ -1170,6 +1180,7 @@ def enter_plan_mode() -> None:
     global _plan_return_mode, _plan_approved
     if PERMISSION_MODE != "plan-only":
         _plan_return_mode = PERMISSION_MODE
+        _plan_requests.clear()
     _plan_approved = False
     set_permission_mode("plan-only")
 
@@ -1180,6 +1191,7 @@ def cancel_plan_session() -> None:
     _plan_return_mode = ""
     _plan_approved = False
     _plan_approved_text = ""
+    _plan_requests.clear()
 
 
 def finish_plan_session() -> str:
@@ -1195,8 +1207,14 @@ def finish_plan_session() -> str:
     _plan_approved = False
     _plan_approved_text = ""
     _plan_return_mode = ""
+    _plan_requests.clear()
     set_permission_mode(target)
     return target
+
+
+def declined_plan_reply() -> str:
+    """The reply offered as the plan and declined this turn, or "" if none."""
+    return _declined_plan_reply
 
 
 def plan_tool_ran() -> bool:
@@ -1209,13 +1227,14 @@ def reset_turn_counters() -> None:
     """Clear the per-turn blast-radius counters. Called by run_agent at the start
     of each turn; exposed so an embedder driving run_tool directly can reset too."""
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
-    global _failure_streak, _diagnostic_shown, _shell_workspace_root
+    global _failure_streak, _diagnostic_shown, _shell_workspace_root, _declined_plan_reply
     _turn_writes = 0
     _shell_workspace_root = None
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
     _plan_tool_ran = False
+    _declined_plan_reply = ""
     _turn_blocker_counts = {}
     _pending_blocker_note = ""
     _failure_streak = 0
@@ -8220,6 +8239,128 @@ def _lift_plan_clock() -> None:
         budget.max_seconds = 0
 
 
+def _save_plan_proposal(plan_text: str) -> tuple:
+    """Write a plan proposal next to the project: PLAN.md, or a fresh PLAN.proposal-*.md.
+
+    Returns (path, "") on success or (None, error). Never replaces a user's plan
+    (including through a link), and exclusive creation closes the exists/write
+    race. Plan mode may create this draft, but it obeys the workspace's path
+    protections like any other write."""
+    for attempt in range(4):
+        plan_path = PROJECT_ROOT / ("PLAN.md" if attempt == 0 else
+                                    f"PLAN.proposal-{uuid.uuid4().hex[:12]}.md")
+        if os.path.lexists(plan_path):
+            continue
+        try:
+            target = plan_path.resolve()
+            if (not _path_is_allowed(target) or _is_sensitive_path(str(target))
+                    or _is_shell_startup_file(str(target))
+                    or _check_path_zone(target) == "blocked"):
+                return None, f"Error: cannot save a plan proposal at the protected path {plan_path}."
+            with plan_path.open("x", encoding="utf-8") as draft:
+                draft.write(plan_text.rstrip() + "\n")
+            return plan_path, ""
+        except FileExistsError:
+            continue
+        except (OSError, ValueError) as exc:
+            return None, f"Error: could not save the plan proposal at {plan_path}: {exc}."
+    return None, "Error: could not create a new plan proposal."
+
+
+def _mark_plan_presented() -> None:
+    """Record that a plan was put to the user this turn (present_plan or an offered reply)."""
+    global _plan_tool_ran
+    _plan_tool_ran = True
+
+
+def _remember_declined_reply(text: str) -> None:
+    """Record the reply the user saw as a plan and declined (see declined_plan_reply)."""
+    global _declined_plan_reply
+    _declined_plan_reply = text
+
+
+def _approval_takes_source(callback) -> bool:
+    """Whether a plan-approval callback accepts the `source` keyword.
+
+    The CLI and Web UI label a reply offered as the plan differently from a
+    present_plan plan. Embedders wrote one-argument callbacks before that label
+    existed, and those must keep working."""
+    try:
+        params = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "source" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def _ask_plan_approval(plan_text: str, *, source: str) -> str:
+    """Show a plan to the user and return the mode it runs in, or "" to keep planning.
+
+    `source` is "tool" for a present_plan plan and "reply" for a final reply
+    offered as the plan because the model never called present_plan."""
+    callback = _plan_on_approval
+    with _human_wait():
+        if _approval_takes_source(callback):
+            return callback(plan_text, source=source) or ""
+        return callback(plan_text) or ""
+
+
+def _approve_plan(chosen: str, plan_text: str) -> None:
+    """The user approved a plan: leave plan mode for the mode they picked."""
+    global _plan_approved, _plan_approved_text
+    set_permission_mode(chosen)
+    _lift_plan_clock()
+    _plan_approved = True
+    _plan_approved_text = plan_text
+
+
+_PLAN_REQUEST_CHARS = 4000  # per request quoted back with an approved reply
+
+_APPROVED_REPLY_NOT_STARTED = (
+    "The user already approved your plan and asked you to carry it out; they are not answering "
+    "questions now. Do not ask again. Make the most reasonable choice for anything still open, say "
+    "which choice you made, and carry out the plan now with tool calls. If it truly cannot be done, "
+    "say plainly what is missing.")
+
+
+def _note_plan_request(request: str) -> None:
+    """Remember a request the user made while planning (once per request)."""
+    request = (request or "").strip()
+    if request and (not _plan_requests or _plan_requests[-1] != request):
+        _plan_requests.append(request)
+
+
+def _reply_plan_approved_message(chosen: str, plan_path) -> str:
+    """What the model is told after the user approves its own reply as the plan.
+
+    The reply did not come through present_plan, so it may be a summary or a
+    question rather than numbered steps. The user still chose to run it, so the
+    model is given what was agreed: the user's requests while planning and its
+    reply, which is the message just above."""
+    requests = _plan_requests or []
+    if len(requests) == 1:
+        asked = f"The user's request was:\n<request>\n{requests[0][:_PLAN_REQUEST_CHARS]}\n</request>\n"
+    elif requests:
+        asked = "The user's requests while planning, in order:\n" + "".join(
+            f"<request n=\"{n}\">\n{text[:_PLAN_REQUEST_CHARS]}\n</request>\n"
+            for n, text in enumerate(requests, 1))
+    else:
+        asked = ""
+    message = (
+        "The user approved your previous reply as the plan. You did not call present_plan, "
+        f"so that reply is the plan now. Permission mode is now {chosen}.\n{asked}"
+        "Carry out that plan now, in order, with ordinary tool calls, so that the request is met. "
+        "If the reply asked the user a question that was not answered, make the most reasonable "
+        "choice, say which choice you made, and continue. Report what each step actually did. "
+        "Do not call present_plan.")
+    if PLAN_AUDIT:
+        message += (" Every mutating step will be verified against the real environment "
+                    "by a read-only auditor, and a step that fails verification is put "
+                    "back — so make each one do exactly what the plan said.")
+    if plan_path is not None:
+        message += f" The plan is also saved at {plan_path}."
+    return message
+
+
 def _plan_retry_limit_message(attempts: int) -> str:
     """What the user is told when plan mode gives up on a model that keeps trying to write.
 
@@ -8266,39 +8407,15 @@ def _exec_present_plan(args: dict, depth: int = 0) -> str:
     # transcript scrolled away, so an approved plan had no file behind it and
     # a teammate had nothing to read. Written before the approval prompt, so
     # it is on disk whether the plan is approved, revised or rejected.
-    # Save a proposal without ever replacing a user's plan (including links).
-    # Exclusive creation also closes the exists/write race. The plan-only tool
-    # may create this draft, but must obey the workspace's path protections.
-    for attempt in range(4):
-        plan_path = PROJECT_ROOT / ("PLAN.md" if attempt == 0 else
-                                    f"PLAN.proposal-{uuid.uuid4().hex[:12]}.md")
-        if os.path.lexists(plan_path):
-            continue
-        try:
-            target = plan_path.resolve()
-            if (not _path_is_allowed(target) or _is_sensitive_path(str(target))
-                    or _is_shell_startup_file(str(target))
-                    or _check_path_zone(target) == "blocked"):
-                return f"Error: cannot save a plan proposal at the protected path {plan_path}. Nothing was approved or run."
-            with plan_path.open("x", encoding="utf-8") as draft:
-                draft.write(plan_text.rstrip() + "\n")
-            break
-        except FileExistsError:
-            continue
-        except (OSError, ValueError) as exc:
-            return f"Error: could not save the plan proposal at {plan_path}: {exc}. Nothing was approved or run."
-    else:
-        return "Error: could not create a new plan proposal. Nothing was approved or run."
-    with _human_wait():
-        chosen = _plan_on_approval(plan_text)
+    plan_path, save_error = _save_plan_proposal(plan_text)
+    if save_error:
+        return f"{save_error} Nothing was approved or run."
+    chosen = _ask_plan_approval(plan_text, source="tool")
     if not chosen:
         return ("Plan not approved — still in plan mode. Revise the plan and call "
                 "present_plan again, or answer the user's questions about it. "
                 f"Proposal saved at {plan_path}. No plan steps were run.")
-    set_permission_mode(chosen)
-    _lift_plan_clock()
-    _plan_approved = True
-    _plan_approved_text = plan_text
+    _approve_plan(chosen, plan_text)
     message = (f"Plan approved. Permission mode is now {chosen}. Carry out the plan now, "
                "in order, with ordinary tool calls, and report what each step actually "
                "did. Do not call present_plan again for this plan.")
@@ -20061,6 +20178,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     fail_streak = (None, 0)  # ((tool, error code), consecutive identical failures)
     diagnostic_seen = False  # the model has been shown environment_diagnostic()
     plan_text_nudged = False  # a plan written as text has been sent back to present_plan once
+    # A reply approved as the plan, and the model has not acted on it yet. Its
+    # next answer without any tool call is sent back once (see below).
+    approved_reply_awaiting_work = False
+    approved_reply_pushed = False
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
@@ -20095,6 +20216,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     search_corrections = 0      # calls to the search tool corrected after its allowance was spent
     user_turns = _genuine_user_turns(messages)
     request_text = _message_text(user_turns[-1]) if user_turns else ""
+    if depth == 0 and PERMISSION_MODE == "plan-only":
+        _note_plan_request(request_text)
     durable_browser_goal = next((_message_text(message)
                                  for message in user_turns
                                  if _message_text(message).startswith(
@@ -20629,12 +20752,16 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                       [f"{c['name']}({json.dumps(c.get('arguments', {}))[:60]})" for c in calls])
         else:
             _log.debug("turn %d: no tool calls — model replied with text", turn)
+        if calls:
+            approved_reply_awaiting_work = False  # the approved plan has started
         if not calls:
             # The model may have *tried* to call a tool that doesn't exist (a common
             # failure — e.g. `current_time`). Rather than leaking the raw ✿FUNCTION✿
             # markup as the "answer", tell the model what went wrong and loop so it can
             # recover (call a real tool or just answer). Bounded to avoid infinite loops.
             attempted = _attempted_tool_names(content)
+            if attempted:
+                approved_reply_awaiting_work = False  # it tried to act on the plan
             invalid_plan = [n for n in attempted
                             if PERMISSION_MODE == "plan-only"
                             and _resolve_tool_name(n) in TOOL_SPECS
@@ -20718,6 +20845,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 continue
 
             answer = strip_tool_json(content)
+            # Whether the model itself said something. The fallbacks below stand in
+            # for an empty reply and must never be offered to the user as a plan.
+            model_replied = bool(answer.strip())
 
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
             work_pending = (trajectory is not None and completion_budget.enabled
@@ -20799,7 +20929,46 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     messages.append(_harness_turn(chunk_note))
                     post_check_rounds = 0
                     continue
-            if (gates_open and depth == 0 and not plan_text_nudged and PERMISSION_MODE == "plan-only"
+            reply_declined = False  # the user saw this reply as a plan and kept planning
+            if (approved_reply_awaiting_work and not approved_reply_pushed and depth == 0
+                    and model_replied):
+                # Seen live: the approved reply was a question, and the model asked
+                # it again instead of choosing and working, so the plan session
+                # closed with nothing done. The user approved running it; say so once.
+                approved_reply_pushed = True
+                messages.append(_harness_turn(_APPROVED_REPLY_NOT_STARTED))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "approved_plan_not_started"})
+                continue
+            if (gates_open and depth == 0 and model_replied and PERMISSION_MODE == "plan-only"
+                    and not _plan_tool_ran and callable(_plan_on_approval)):
+                # The model finished planning without present_plan: a summary, a
+                # question, or a plan written as text. The user chose plan mode and
+                # decides what counts as a plan, so the reply goes up for approval as
+                # it is. Approving runs it; declining ends the turn in plan mode,
+                # where the user answers the question or asks for a revision.
+                _mark_plan_presented()
+                plan_text = _guard_answer(answer)
+                chosen = _ask_plan_approval(plan_text, source="reply")
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "reply_offered_as_plan",
+                                  "approved": bool(chosen), "mode": chosen or ""})
+                if chosen:
+                    # Saved only once approved: a declined reply, often a question,
+                    # is not the project's plan.
+                    plan_path, _save_error = _save_plan_proposal(plan_text)
+                    messages.append(_harness_turn(_reply_plan_approved_message(chosen, plan_path)))
+                    _approve_plan(chosen, plan_text)
+                    approved_reply_awaiting_work = True
+                    if on_trajectory_state:
+                        on_trajectory_state()
+                    continue
+                # Declined: the turn ends here with the reply as the answer. The
+                # user's "not yet" is the next turn's input, not a cue for the
+                # completion checks to send the model back to work.
+                reply_declined = True
+                _remember_declined_reply(plan_text)
+            elif (gates_open and depth == 0 and not plan_text_nudged and PERMISSION_MODE == "plan-only"
                     and not _plan_tool_ran and _looks_like_a_plan(answer)):
                 # A plan written as chat text is never approved, and the session stays in plan mode with
                 # nothing built. Send it to present_plan once; the user's approval is still the only way out.
@@ -20808,7 +20977,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 if trace is not None:
                     trace.append({"turn": turn, "type": "plan_text_nudge"})
                 continue
-            if gates_open:
+            if gates_open and not reply_declined:
                 nudge = _next_completion_nudge(
                     completion_budget, trajectory, reply=answer, request=request_text,
                     depth=depth,

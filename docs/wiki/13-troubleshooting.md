@@ -249,10 +249,15 @@ changes so the plan runs. To leave without a plan, `/mode full-auto` or
 
 ### The agent described a plan but nothing happened
 
-Look for `Still in plan mode — no plan was approved, so nothing above was written
-or run.` A plan the model only wrote out in prose is not a plan it ran, and that
-line is how you tell the two apart. Reply to have it revise and actually call
-`present_plan`.
+In the CLI and the Web UI this no longer ends silently: when the model finishes
+planning without calling `present_plan`, its reply is shown as
+`Agent's reply — no plan was presented` with the usual approve choices. Approve it
+to run it as the plan, or decline and reply with what to change.
+
+Where there is nobody to approve (gateway, scheduled runs, MCP), look for
+`Still in plan mode — no plan was approved, so nothing above was written or run.`
+A plan the model only wrote out in prose is not a plan it ran, and that line is
+how you tell the two apart.
 
 ### full-auto still won't `git push`
 

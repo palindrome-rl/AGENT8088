@@ -337,7 +337,7 @@ function offerApproval(frame: PendingApprovalFrame | Extract<WSEvent, { type: 'e
       sessionId: frame.session_id,
     })
   } else {
-    setPlanApprovalPending({ id: frame.id, plan: frame.plan, sessionId: frame.session_id })
+    setPlanApprovalPending({ id: frame.id, plan: frame.plan, sessionId: frame.session_id, source: frame.source })
   }
 }
 

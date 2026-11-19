@@ -2277,19 +2277,34 @@ def _make_plan_approval(live=None, esc=None):
     `_handle_escalation` pauses it: a running listener swallows the keystroke meant
     for this prompt. This is a second interactive prompt, added after that fix, so
     it needed the same treatment rather than inheriting it."""
-    def approve(plan_text):
+    def approve(plan_text, source="tool"):
+        # source="reply": the model ended plan mode without present_plan, so its
+        # reply is offered as the plan. Say so, and say nothing has run, because
+        # a reply like "I've added the route" reads as if work already happened.
+        offered_reply = source == "reply"
         if live is not None:
             live.stop()
         console.print()
-        console.print(Panel(_AnswerMarkdown(plan_text),
-                            title="[bold #00edff]Plan[/bold #00edff]",
-                            box=box.ROUNDED, border_style="#00C8FF"))
+        if offered_reply:
+            console.print(Panel(_AnswerMarkdown(plan_text),
+                                title="[bold #00edff]Agent's reply — no plan was presented[/bold #00edff]",
+                                subtitle="[dim]Nothing has been run yet[/dim]",
+                                box=box.ROUNDED, border_style="#00C8FF"))
+            if not A._PLAN_STEP_LINE.search(plan_text or ""):
+                console.print("[dim]This reply has no numbered steps; e (approve, ask before "
+                              "each edit) is the safer choice.[/dim]")
+            prompt = ("[bold yellow]Approve this reply as the plan? (a=approve and run / "
+                      "e=approve, ask before each edit / d=don't approve — reply to answer "
+                      "or ask for a revision): [/bold yellow]")
+        else:
+            console.print(Panel(_AnswerMarkdown(plan_text),
+                                title="[bold #00edff]Plan[/bold #00edff]",
+                                box=box.ROUNDED, border_style="#00C8FF"))
+            prompt = ("[bold yellow]Approve plan? (a=approve and run / "
+                      "e=approve, ask before each edit / d=keep planning): [/bold yellow]")
         try:
             with (esc.paused() if esc is not None else nullcontext()):
-                answer = console.input(
-                    "[bold yellow]Approve plan? (a=approve and run / "
-                    "e=approve, ask before each edit / d=keep planning): [/bold yellow]"
-                ).strip().lower()
+                answer = console.input(prompt).strip().lower()
         except (EOFError, KeyboardInterrupt):
             answer = "d"
         if live is not None:
@@ -2300,10 +2315,28 @@ def _make_plan_approval(live=None, esc=None):
         if answer in ("e", "edit", "edits", "r", "readonly"):
             console.print("[green]Plan approved — each write will ask first.[/green]")
             return "readonly"
-        console.print("[yellow]Still in plan mode. No plan steps were run — "
-                      "say what to change and Agent8088 will revise the plan.[/yellow]")
+        if offered_reply:
+            console.print("[yellow]Still in plan mode. Nothing was run — reply with your "
+                          "answer or what to change, and Agent8088 will revise the plan.[/yellow]")
+        else:
+            console.print("[yellow]Still in plan mode. No plan steps were run — "
+                          "say what to change and Agent8088 will revise the plan.[/yellow]")
         return ""
     return approve
+
+
+def _answer_left_to_show(answer):
+    """The part of a turn's answer the user has not already seen.
+
+    A reply offered as the plan and declined is also the turn's answer, and the
+    plan panel has just shown it: printing it again right below reads as a second
+    reply. Anything the engine added after it (task notes) is still shown, and
+    any other answer is shown whole."""
+    declined = (A.declined_plan_reply() or "").strip()
+    text = answer or ""
+    if declined and text.strip().startswith(declined):
+        return text.strip()[len(declined):].strip()
+    return text
 
 
 def _after_turn_plan_state():
@@ -2682,7 +2715,9 @@ def do_chat(query):
         _save_session_safely()
         return
 
-    render_answer(answer)
+    left = _answer_left_to_show(answer)
+    if left:
+        render_answer(left)
     S.last_usage = {"seconds": elapsed, "tokens": tokens_ref[0], "turns": S.turns_this_run,
                     "context": _estimate_context_pct()}
     if S.usage_mode == "tokens":
@@ -8844,17 +8879,34 @@ def _git(install_dir, *args):
                           capture_output=True, text=True)
 
 
+def _remote_has_branch(install_dir, branch):
+    probe = _git(install_dir, "ls-remote", "--heads", "origin", branch)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
 def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
-    UPDATE_BRANCH names today's release branch, but branches get renamed and
-    retired. An install pointed at one that no longer exists should still
-    update, and say why it went somewhere else, rather than fail on git's raw
-    'couldn't find remote ref'. So the remote is asked whether the branch is
-    still there, and if it is not, its own default branch is used instead.
+    The branch the install has checked out is the channel the user chose
+    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
+    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    development or staging install to production on its first update. That
+    branch is followed while the remote still has it.
+
+    Otherwise UPDATE_BRANCH, today's release branch, is used. Branches get
+    renamed and retired: an install pointed at one that no longer exists should
+    still update, and say why it went somewhere else, rather than fail on git's
+    raw 'couldn't find remote ref'. If the release branch is gone as well, the
+    remote's own default branch is used.
     """
-    probe = _git(install_dir, "ls-remote", "--heads", "origin", UPDATE_BRANCH)
-    if probe.returncode == 0 and probe.stdout.strip():
+    current = _git(install_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    installed = current.stdout.strip() if current.returncode == 0 else ""
+    if installed and installed != UPDATE_BRANCH and _remote_has_branch(install_dir, installed):
+        return installed, ""
+    if _remote_has_branch(install_dir, UPDATE_BRANCH):
+        if installed and installed != UPDATE_BRANCH:
+            return UPDATE_BRANCH, (f"Branch '{installed}' is no longer on the remote; "
+                                   f"updating to the release branch '{UPDATE_BRANCH}' instead.")
         return UPDATE_BRANCH, ""
     head = _git(install_dir, "ls-remote", "--symref", "origin", "HEAD")
     if head.returncode == 0:

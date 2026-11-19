@@ -344,6 +344,11 @@ export type WSClientMessage =
   | { type: 'approval'; approved: boolean; session_scope: boolean; id: string }
   | { type: 'plan_approval'; mode: string; id: string }
 
+/** Where a plan up for approval came from: the model's present_plan call, or
+ *  its final reply in plan mode, offered as the plan because it never called
+ *  present_plan. */
+export type PlanSource = 'tool' | 'reply'
+
 /** Turn events carry session_id: the chat that owns the turn. The UI applies
  *  them to the visible chat only when it is that chat. */
 export type WSEvent = (
@@ -355,7 +360,7 @@ export type WSEvent = (
   | { type: 'tool_calls'; calls: Array<{ name: string; args: Record<string, unknown> }> }
   | { type: 'spin'; message: string; elapsed: number; tokens: number }
   | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string }
-  | { type: 'plan_approval'; plan: string; id: string }
+  | { type: 'plan_approval'; plan: string; id: string; source?: PlanSource }
   | { type: 'plan_step'; index: number; total: number; step_text: string; tool_name: string; status: 'pending' | 'running' | 'done' | 'failed'; result?: string }
   | { type: 'answer'; text: string; usage: { seconds: number; tokens: number; context?: number }; rate_limit_status: StatusInfo['rate_limit_status'] }
   | { type: 'turn_complete' }
@@ -371,4 +376,4 @@ export type WSEvent = (
 /** A pending approval re-offered by GET /api/history for the viewed chat. */
 export type PendingApprovalFrame =
   | { type: 'escalation'; tool_name: string; change_type: string; description: string; id: string; session_id: string }
-  | { type: 'plan_approval'; plan: string; id: string; session_id: string }
+  | { type: 'plan_approval'; plan: string; id: string; session_id: string; source?: PlanSource }

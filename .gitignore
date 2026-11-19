@@ -2,6 +2,8 @@
 # the loader reads ./config.txt in preference to the user's own, exclusively.
 # The template to copy from is src/agent8088/config.txt.
 /config.txt
+# Written by tests that point AGENT8088_CONFIG at a config that must not exist.
+/_no_such_config.txt
 
 # Python
 __pycache__/
@@ -69,8 +71,11 @@ artifacts/*
 .agent8088/
 
 # Claude Code session runtime state (scheduled-wakeup lock, etc.) — not project
-# content, and specific to whichever machine/session created it.
-.claude/
+# content, and specific to whichever machine/session created it. The team's
+# shared project settings and skills are kept.
+.claude/*
+!.claude/settings.json
+!.claude/skills/
 
 # E2E run output (per-scenario logs, summary, PDF) — never committed
 logs/
@@ -101,9 +106,6 @@ docs/opencode-test-run*/
 # Local planning drafts — not shipped
 docs/superpowers/
 
-# Staging publishes runtime code without the development-only Python suite.
-# The suite remains tracked on the development branch.
-/tests/
 # Tool caches and coverage
 .pytest_cache/
 .ruff_cache/
