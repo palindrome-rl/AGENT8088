@@ -23,7 +23,7 @@ from agent8088.errors import is_context_overflow
 from agent8088 import capabilities
 from agent8088 import (app_check, backend_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
-                       memory, patching, providers, routing, secret_scan, testing_support,
+                       memory, patching, providers, render_check, routing, secret_scan, testing_support,
                        tool_output,
                        trajectory, web_search)
 
@@ -562,6 +562,26 @@ READ_PAGE_LINES = _config_int("read_page_lines", 200)
 # unbounded read reachable in readonly mode.
 MAX_DOCUMENT_BYTES = _config_int("max_document_bytes", 25 * 1024 * 1024)
 MAX_IMAGE_BYTES = _config_int("max_image_bytes", 20 * 1024 * 1024)
+# The copy of a tool-attached image that the model sees (the file on disk keeps its
+# full size): longest side in pixels and a byte cap, so one picture costs a few
+# hundred tokens rather than thousands. 0 disables either limit.
+MODEL_IMAGE_MAX_SIDE = max(0, _config_int("model_image_max_side", 768))
+MODEL_IMAGE_MAX_BYTES = max(0, _config_int("model_image_max_bytes", 1_500_000))
+# How many images stay in the conversation; older ones become a short text note
+# carrying the text that came with them. 0 keeps every image.
+MODEL_IMAGE_KEEP = max(0, _config_int("model_image_keep", 3))
+# Image tools (view_image) read local files only unless this is on; a URL then
+# still passes the egress and SSRF checks in build_image_message.
+IMAGE_TOOL_ALLOW_URLS = APP_CONFIG.get("image_tool_allow_urls", "0").strip().lower() in ("1", "true", "yes", "on")
+# screenshot_page defaults. The viewport is the size of the browser window the
+# file is shown in; the tool's width/height arguments override it per call.
+SCREENSHOT_WIDTH = max(200, _config_int("screenshot_width", 1280))
+SCREENSHOT_HEIGHT = max(200, _config_int("screenshot_height", 800))
+SCREENSHOT_WAIT_MS = max(0, _config_int("screenshot_wait_ms", 300))
+SCREENSHOT_MAX_WAIT_MS = 3000
+SCREENSHOT_TIMEOUT = max(5, _config_int("screenshot_timeout_seconds", 30))
+# Below this share of non-background pixels a render is reported as looking blank.
+SCREENSHOT_BLANK_SHARE = max(0.0, _config_float("screenshot_blank_share", 0.005))
 MAX_HTTP_BYTES = _config_int("max_http_bytes", 5 * 1024 * 1024)
 MAX_TOOL_TIMEOUT_SECONDS = max(1, _config_int("max_tool_timeout_seconds", 1200))
 
@@ -3944,7 +3964,10 @@ def _fallback_max_tokens(messages, system_prompt, tools, provider_name, model_na
     the estimated prompt leaves in the fallback's window."""
     window, ceiling = _active_model_token_limits(provider_name, model_name)
     try:
-        chars = (len(json.dumps(messages, default=str)) + len(system_prompt or "")
+        # _estimate_context_chars counts an image as a flat allowance; measuring
+        # json.dumps(messages) counted its base64 and left a fallback model a few
+        # hundred output tokens after one screenshot.
+        chars = (_estimate_context_chars(messages, system_prompt or "")
                  + len(json.dumps(tools or [], default=str)))
     except Exception:  # noqa: BLE001
         chars = 0
@@ -4258,7 +4281,49 @@ _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".gif": "image/gif", ".webp": "image/webp"}
 
 
-def build_image_message(text: str, images: list, resolver=None) -> dict:
+def _model_image_bytes(raw: bytes, mime: str) -> tuple[bytes, str]:
+    """The copy of an image the model receives: within MODEL_IMAGE_MAX_SIDE and MODEL_IMAGE_MAX_BYTES.
+
+    An image already inside both limits is returned unchanged. Otherwise it is
+    resized (aspect ratio kept) and re-encoded as PNG, falling back to JPEG at
+    falling quality when PNG cannot meet the byte cap. Anything Pillow cannot
+    open is returned as it was, so the existing size check still applies."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(raw)) as img:
+            img.load()
+            width, height = img.size
+            too_wide = bool(MODEL_IMAGE_MAX_SIDE) and max(width, height) > MODEL_IMAGE_MAX_SIDE
+            too_big = bool(MODEL_IMAGE_MAX_BYTES) and len(raw) > MODEL_IMAGE_MAX_BYTES
+            if not too_wide and not too_big:
+                return raw, mime
+            if too_wide:
+                scale = MODEL_IMAGE_MAX_SIDE / max(width, height)
+                img = img.resize((max(1, round(width * scale)), max(1, round(height * scale))),
+                                 Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "PNG", optimize=True)
+            if not MODEL_IMAGE_MAX_BYTES or buf.tell() <= MODEL_IMAGE_MAX_BYTES:
+                return buf.getvalue(), "image/png"
+            rgb = img.convert("RGB")
+            # JPEG at falling quality first, then smaller dimensions, until the cap holds.
+            for _shrink in range(8):
+                for quality in (85, 70, 55, 40):
+                    buf = io.BytesIO()
+                    rgb.save(buf, "JPEG", quality=quality)
+                    if buf.tell() <= MODEL_IMAGE_MAX_BYTES:
+                        return buf.getvalue(), "image/jpeg"
+                w, h = rgb.size
+                if max(w, h) <= 64:
+                    break
+                rgb = rgb.resize((max(1, int(w * 0.75)), max(1, int(h * 0.75))), Image.LANCZOS)
+            return buf.getvalue(), "image/jpeg"
+    except Exception:  # noqa: BLE001 -- a resize must never fail the attachment
+        return raw, mime
+
+
+def build_image_message(text: str, images: list, resolver=None, for_model: bool = False) -> dict:
     """Build a multimodal user message: text plus one or more images.
     Local paths are inlined as base64 data URLs; http(s) URLs pass through
     (SSRF-checked). Requires a vision-capable model/provider.
@@ -4266,6 +4331,9 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
     resolver defaults to resolve_user_path (ALLOWED_PATHS-gated), unchanged
     from before this parameter existed. The paste-detection path in cli.py
     passes resolve_pasted_path instead — see that function's docstring for why.
+
+    for_model=True sends the downscaled copy (_model_image_bytes); a tool's
+    image uses it, a picture the user attached keeps its own size.
     """
     import base64 as _b64
     resolver = resolver or resolve_user_path
@@ -4293,6 +4361,8 @@ def build_image_message(text: str, images: list, resolver=None) -> dict:
         except OSError as exc:
             raise ValueError(documents.cloud_placeholder_message(path)
                              or f"Could not read {path}: {exc.strerror or exc}")
+        if for_model:
+            raw, mime = _model_image_bytes(raw, mime)
         b64 = _b64.b64encode(raw).decode()
         parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
     return {"role": "user", "content": parts}
@@ -4613,7 +4683,41 @@ def _apply_tool_intent_guards(query: str, selected: set[str], allowed: set[str])
     if review_intent and "review_code" in allowed:
         selected.add("review_code")
         selected.discard("git_diff")
+    # Looking at a picture. Retrieval ranks view_image low for plain wording such
+    # as "look at diagram.png", and a small model without it reads the file as
+    # text or guesses. Generic on purpose: any image file, screenshot, photo or
+    # picture the request asks to look at or check.
+    if "view_image" in allowed and _visual_intent(low):
+        selected.add("view_image")
+    # Checking how something built looks: appearance, layout, readability, a
+    # phone-sized screen. check_app answers "does it load"; screenshot_page
+    # answers "does it look right", and plain wording ranks it too low.
+    if "screenshot_page" in allowed and _appearance_intent(low):
+        selected.add("screenshot_page")
     return selected
+
+
+_APPEARANCE = re.compile(
+    r"\blooks?\s+(?:right|good|correct|ok(?:ay)?|fine|wrong|off|broken|like)\b|\bhow\s+(?:it|this|that|they)\s+looks?\b|"
+    r"\bvisual(?:ly)?\b|\blayout\b|\bappearance\b|\breadable\b|\blegible\b|\bscreenshot\b|\brender(?:s|ed|ing)?\b|"
+    r"\b(?:on|for)\s+(?:a\s+)?(?:phone|mobile|narrow\s+screen|small\s+screen)\b|\baligns?\b|\bline\s+up\b|\boverlap")
+
+
+def _appearance_intent(low: str) -> bool:
+    """A request to check how something looks once rendered."""
+    return bool(_APPEARANCE.search(low))
+
+
+_IMAGE_FILE = re.compile(r"\.(?:png|jpe?g|gif|webp|bmp)\b")
+_VISUAL_NOUN = re.compile(r"\b(?:screenshots?|screen\s*shots?|images?|pictures?|photos?|"
+                          r"diagrams?|mock-?ups?|renders?|rendering)\b")
+_VISUAL_VERB = re.compile(r"\b(?:look(?:s|ing)?|see|show|view|check|inspect|describe|compare|"
+                          r"match(?:es)?|review|read|what)\b")
+
+
+def _visual_intent(low: str) -> bool:
+    """A request to look at an image: an image file named, or a visual noun with a looking verb."""
+    return bool(_IMAGE_FILE.search(low) or (_VISUAL_NOUN.search(low) and _VISUAL_VERB.search(low)))
 
 
 def _mcp_tool_names(allowed) -> set[str]:
@@ -5420,6 +5524,11 @@ def read_skill_resource(name: str, resource: str) -> str:
 _TASK_SKILL_RULES = (
     ("repository-reading", r"\b(?:repository_read|read|inspect|explore|search|understand)\s+(?:a\s+)?(?:github\s+)?repo(?:sitory)?\b|\bgithub\.com/"),
     ("planning-and-task-breakdown", r"\b(?:plan|break\s+down|roadmap|milestone)\b"),
+    # Checking how something built looks or behaves on screen. Before the review,
+    # debugging and build rules, which would otherwise take "check the layout".
+    ("browser-qa", r"\blooks?\s+(?:right|good|correct|ok(?:ay)?|fine|wrong|off|broken)\b|\bhow\s+(?:it|this|that)\s+looks?\b|"
+                   r"\bvisual(?:ly)?\b|\blayout\b|\bscreenshot\b|\breadable\b|\blegible\b|"
+                   r"\b(?:on|for)\s+(?:a\s+)?(?:phone|mobile|narrow\s+screen|small\s+screen)\b|\bline\s+up\b"),
     ("code-review-and-quality", r"\b(?:review|pull request|\bpr\b|diff)\b"),
     ("debugging-and-error-recovery", r"\b(?:debug|bug|broken|error|failure|regression)\b"),
     ("test-driven-development", r"\b(?:test|coverage|assertion|spec)\b"),
@@ -13654,6 +13763,14 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         ref = str(args.get("path") or "").strip()
         if not ref:
             return _tool_arg_missing_error(name, "path")
+        if name == "screenshot_page":
+            return _exec_screenshot(name, ref, args)
+        if re.match(r"^[a-z][a-z0-9+.-]*://", ref, re.IGNORECASE) and not IMAGE_TOOL_ALLOW_URLS:
+            return efficiency.tool_error(
+                "invalid_input",
+                f"{name} opens a local image file inside the workspace, not a URL.",
+                "Save the image into the workspace first, or use browse_page for a web page.",
+                recoverable=True)
         if not re.match(r"^https?://", ref, re.IGNORECASE):
             try:
                 resolved_ref = resolve_user_path(ref)
@@ -13666,7 +13783,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         try:
             message = build_image_message(
                 f"Tool result ({name}): {ref} is attached to this message.",
-                [ref])
+                [ref], for_model=True)
         except ValueError as exc:
             return efficiency.tool_error("image_unavailable", str(exc),
                 "Check the path, the file type (png/jpg/gif/webp/bmp) and the "
@@ -16312,6 +16429,13 @@ def _fallback_answer(last_tool_output: str, error, provider_name: str = "",
     body = (last_tool_output or "").strip()
     if not body:
         return reason
+    if body.startswith(_IMAGE_MARKER_PREFIX):
+        # An image tool's result: show its text, never the base64 payload.
+        try:
+            message = json.loads(body[len(_IMAGE_MARKER_PREFIX):])["message"]
+            body = f"{_message_text(message).strip()}\n(The image is not shown here.)"
+        except (ValueError, KeyError, TypeError):
+            body = "(An image tool ran; its result could not be shown.)"
     try:
         parsed = json.loads(body)
         if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
@@ -18224,6 +18348,211 @@ def _new_edit_check_reminder():
 def _harness_turn(text: str) -> dict:
     """A message from the loop to the model. Never mistaken for the person."""
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
+
+
+_screenshot_counts: dict = {}   # resolved file -> renders so far (file names only, never shown as a count)
+_screenshot_last: dict = {}     # resolved file -> its previous render, for the difference
+
+
+def _screenshot_wait(args: dict) -> int:
+    try:
+        wait = int(float(args.get("wait_ms", SCREENSHOT_WAIT_MS)))
+    except (TypeError, ValueError):
+        wait = SCREENSHOT_WAIT_MS
+    return max(0, min(SCREENSHOT_MAX_WAIT_MS, wait))
+
+
+def _screenshot_size(args: dict, key: str, default: int) -> int:
+    try:
+        return max(200, min(4000, int(float(args.get(key, default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _exec_screenshot(name: str, ref: str, args: dict) -> str:
+    """Render a local page or image-type file and attach the picture, with deterministic evidence."""
+    import json as _json
+    if re.match(r"^[a-z][a-z0-9+.-]*://", ref, re.IGNORECASE):
+        return efficiency.tool_error("invalid_input", f"{name} renders a local file inside the workspace, not a URL.",
+                                     "Use browse_page for a web page on another site.", recoverable=True)
+    try:
+        target = resolve_user_path(ref)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if _is_sensitive_path(str(target)):
+        _audit("tool_call", tool=name, mode="image", decision="denied", detail=str(target), reason="sensitive_path")
+        return f"Error: Access to sensitive file denied: {target}"
+    if not target.is_file():
+        return f"Error: {target} does not exist, so there is nothing to render."
+    suffix = target.suffix.lower()
+    if suffix not in render_check.RENDERABLE:
+        kinds = ", ".join(sorted(render_check.RENDERABLE))
+        return efficiency.tool_error("invalid_input", f"{name} cannot render {suffix or 'files without an extension'}.",
+                                     f"It renders {kinds}. For a script, use check_app.", recoverable=True)
+    if suffix in render_check.XML_SUFFIXES:
+        problem = render_check.xml_problem(target)
+        if problem:
+            return (f"Error: {target.name} is not well formed: {problem}. Fix it (a small edit is usually enough), "
+                    "then render it again.")
+    key = str(target)
+    number = _screenshot_counts.get(key, 0) + 1
+    _screenshot_counts[key] = number
+    png = ARTIFACTS_ROOT / "screenshots" / f"{target.stem}_{number:03d}.png"
+    width = _screenshot_size(args, "width", SCREENSHOT_WIDTH)
+    height = _screenshot_size(args, "height", SCREENSHOT_HEIGHT)
+    full_page = str(args.get("full_page", "0")).strip().lower() in ("1", "true", "yes", "on")
+    render = render_check.render_file(target, png, width=width, height=height, wait_ms=_screenshot_wait(args),
+                                      full_page=full_page, timeout=SCREENSHOT_TIMEOUT, deny=_smoke_path_denied)
+    try:
+        shown = target.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        shown = str(target)
+    if render.status != "ok":
+        if str(render.note).startswith("Chromium is not installed"):
+            _report_browser("chromium")
+        return (f"Rendering {shown} was unavailable: {render.note}. How it looks was not verified; "
+                "say so in your answer rather than describing it.")
+    from PIL import Image
+    with Image.open(png) as shot:
+        shot_w, shot_h = shot.size
+    ink = render_check.ink_share(png)
+    previous = _screenshot_last.get(key)
+    diff = None if previous is None or render.animating or not Path(previous).is_file() else \
+        render_check.diff_share(previous, png)
+    _screenshot_last[key] = str(png)
+
+    def listed(items):
+        return "none" if not items else "; ".join(items[:5]) + (f" (+{len(items) - 5} more)" if len(items) > 5 else "")
+
+    lines = [f"Tool result ({name}): {shown} rendered in a {width} x {height} browser window; "
+             f"the image is {shot_w} x {shot_h} and is attached to this message.",
+             f"Saved: {png}"]
+    if suffix in render_check.XML_SUFFIXES:
+        lines.append("Well formed: yes")
+    lines.append(f"Page errors: {listed(render.page_errors)}")
+    lines.append(f"Console errors: {listed(render.console_errors)}")
+    if render.blocked:
+        lines.append(f"Requests to other hosts were blocked: {listed(render.blocked)}")
+    if ink < SCREENSHOT_BLANK_SHARE:
+        lines.append(f"Drawn content: the render looks blank ({ink:.1%} of the image differs from the background).")
+    else:
+        lines.append(f"Drawn content: {ink:.0%} of the image differs from the background.")
+    if render.animating:
+        lines.append("Compared with the previous render: skipped, the page is still changing on screen "
+                     "(animation or a timer), so a pixel difference would not mean anything.")
+    elif diff is None:
+        lines.append("Compared with the previous render: this is the first render of this file.")
+    elif diff == 0:
+        lines.append("Compared with the previous render: identical to the previous render.")
+    else:
+        lines.append(f"Compared with the previous render: {diff:.1%} of the pixels changed from the previous render.")
+    lines.append("Look at the image and compare it with what was asked for; name any specific problem you see.")
+    text = "\n".join(lines)
+    try:
+        message = build_image_message(text, [str(png)], resolver=lambda p: Path(p), for_model=True)
+    except ValueError as exc:
+        return f"{text}\n(The image could not be attached: {exc}.)"
+    evidence = {"file": str(target), "png": str(png), "width": shot_w, "height": shot_h,
+                "viewport": [width, height], "ink": round(ink, 4), "diff": None if diff is None else round(diff, 4),
+                "animating": render.animating, "page_errors": render.page_errors[:5],
+                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5]}
+    return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message, "evidence": evidence})
+
+
+_IMAGE_REMOVED_NOTE = ("[The image that came with this message was removed from the conversation "
+                       "to save space; only the most recent images are kept.]")
+_IMAGE_WITHHELD_NOTE = ("[The image was not attached: this model has no image input. "
+                        "Rely on the text above, or check the file another way.]")
+_model_vision_cache: dict = {}
+# Images per request a server accepts, learned from its refusal (vLLM's
+# --limit-mm-per-prompt answers "At most 1 image(s) may be provided in one
+# prompt"). Per provider:model, for the life of the process.
+_model_image_limits: dict = {}
+_IMAGE_LIMIT_ERROR = re.compile(
+    r"at most (\d+) images?(?:\(s\))?\b|(?:maximum|max|limit)(?: of)? (\d+) images?\b|too many images", re.IGNORECASE)
+
+
+def _model_key() -> str:
+    return f"{ACTIVE_PROVIDER or DEFAULT_PROVIDER or ''}:{MODEL_NAME}"
+
+
+def _image_keep() -> int:
+    """Images to keep in the conversation: model_image_keep, lowered to a limit the server stated."""
+    learned = _model_image_limits.get(_model_key())
+    if learned is None:
+        return MODEL_IMAGE_KEEP
+    return learned if MODEL_IMAGE_KEEP == 0 else min(MODEL_IMAGE_KEEP, learned)
+
+
+def _image_limit_from_error(error) -> int | None:
+    """The per-request image limit a refusal states, or None when the error is about something else."""
+    match = _IMAGE_LIMIT_ERROR.search(str(error))
+    if not match:
+        return None
+    number = match.group(1) or match.group(2)
+    return max(0, int(number)) if number else 1
+
+
+def _model_accepts_images() -> bool:
+    """Whether the active model reads images (model_catalog's decision, cached per model)."""
+    provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    key = f"{provider}:{MODEL_NAME}"
+    if key not in _model_vision_cache:
+        try:
+            from agent8088 import model_catalog
+            _model_vision_cache[key] = bool(
+                model_catalog.vision_decision(provider, MODEL_NAME, client).vision)
+        except Exception:  # noqa: BLE001 -- unknown means "send no image parts"
+            _model_vision_cache[key] = False
+    return _model_vision_cache[key]
+
+
+def _text_only_turn(message: dict) -> dict:
+    """The tool's image message for a model without image input: its text, and a plain note."""
+    text = _message_text(message).strip()
+    return {"role": "user", "content": f"{text}\n{_IMAGE_WITHHELD_NOTE}".strip()}
+
+
+def _prune_old_images(messages: list, keep: int, *, strip_all: bool = False) -> int:
+    """Keep the `keep` most recent image parts; turn older ones into a short note. 0 keeps all.
+
+    strip_all removes every image (a server that takes none). The text that came
+    with each image stays. Returns how many images were removed."""
+    if strip_all:
+        keep = 0
+    elif keep <= 0:
+        return 0
+    seen = removed = 0
+    for message in reversed(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        images = [part for part in content if isinstance(part, dict) and part.get("type") == "image_url"]
+        if not images:
+            continue
+        if seen + len(images) <= keep:
+            seen += len(images)
+            continue
+        allowed = max(0, keep - seen)
+        seen += allowed
+        kept_images = 0
+        rebuilt = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                if kept_images < allowed:
+                    rebuilt.append(part)
+                    kept_images += 1
+                else:
+                    removed += 1
+            else:
+                rebuilt.append(part)
+        if kept_images == 0:
+            text = " ".join(str(p.get("text", "")) for p in rebuilt if isinstance(p, dict)).strip()
+            message["content"] = f"{text}\n{_IMAGE_REMOVED_NOTE}".strip()
+        else:
+            rebuilt.append({"type": "text", "text": _IMAGE_REMOVED_NOTE})
+            message["content"] = rebuilt
+    return removed
 
 
 def _image_turn(message: dict) -> dict:
@@ -20146,6 +20475,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             on_result("error", message)
 
     overflow_recovery_used = False  # one shrink-and-retry per run, never a loop
+    image_limit_recovery_used = False  # one "fewer images" retry per run, never a loop
     if system_prompt is None:
         system_prompt = lambda: current_system_prompt() + render_task_skill_docs(
             messages, allowed_tools() if callable(allowed_tools) else allowed_tools)
@@ -20505,6 +20835,30 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                         max_tokens=tokens, client_override=loop_client,
                         provider_override=loop_provider, model_override=loop_model,
                         on_retry=_retry_notice, on_stream_reset=on_stream_reset))
+            image_limit = None if response is not None or image_limit_recovery_used else _image_limit_from_error(e)
+            if image_limit is not None:
+                # The server takes fewer images per request than the conversation
+                # holds. Remember its limit for this model, drop the oldest images
+                # down to it, and retry once.
+                image_limit_recovery_used = True
+                _model_image_limits[_model_key()] = image_limit
+                removed = _prune_old_images(messages, image_limit, strip_all=image_limit == 0)
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "image_limit_learned", "limit": image_limit,
+                                  "removed": removed})
+                try:
+                    with spin("thinking..."):
+                        response = _create_completion_with_fallback(
+                            messages, round_tools_def, temperature=temperature,
+                            system_prompt=round_system_prompt, on_token=on_token,
+                            interrupt_check=interrupt_check, trace=trace, turn=turn,
+                            max_tokens=turn_max_tokens, client_override=loop_client,
+                            provider_override=loop_provider, model_override=loop_model,
+                            on_retry=_retry_notice, on_stream_reset=on_stream_reset)
+                except (AgentInterrupted, TurnBudgetExceeded):
+                    raise
+                except Exception as retry_error:  # noqa: BLE001 -- reported below like any model error
+                    response, e = None, retry_error
             if response is None:
                 # A hard, non-retryable error (a renamed/deprecated model id, an
                 # invalid key) raises straight through _create_completion_with_fallback
@@ -21315,19 +21669,34 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # marker never reaches the message list as text.
                 import json as _json
                 try:
-                    result_message = _json.loads(
-                        result[len(_IMAGE_MARKER_PREFIX):])["message"]
-                except (ValueError, KeyError):
-                    result_message = None
+                    payload = _json.loads(result[len(_IMAGE_MARKER_PREFIX):])
+                    result_message = payload["message"]
+                except (ValueError, KeyError, TypeError):
+                    payload, result_message = {}, None
+                if trace is not None and isinstance(payload.get("evidence"), dict):
+                    trace.append({"turn": turn, "type": "render_evidence", "tool": name, **payload["evidence"]})
+                withheld = False
                 if result_message is None:
                     messages.append(_harness_turn(
                         "Error: the attached image could not be delivered."))
+                elif not _model_accepts_images():
+                    # A text-only model would get nothing usable from image
+                    # parts, and most providers reject them outright.
+                    withheld = True
+                    messages.append(_text_only_turn(result_message))
                 else:
                     messages.append(_image_turn(result_message))
+                    keep = _image_keep()
+                    pruned = _prune_old_images(messages, keep)
+                    if pruned and trace is not None:
+                        trace.append({"turn": turn, "type": "images_pruned", "removed": pruned,
+                                      "kept": keep})
                 if on_result:
-                    on_result(name, "[image attached]")
+                    on_result(name, "[image not attached: text-only model]" if withheld
+                              else "[image attached]")
                 if trace is not None:
-                    trace.append({"turn": turn, "type": "image_attached", "tool": name})
+                    trace.append({"turn": turn, "type": "image_withheld" if withheld else "image_attached",
+                                  "tool": name})
                 executed = executed or not no_progress
                 continue
             if (PERMISSION_MODE == "plan-only"

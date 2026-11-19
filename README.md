@@ -27,10 +27,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/59%20built--in%20tools-execution%20grounded-10b981" alt="59 built-in tools">
+  <img src="https://img.shields.io/badge/61%20built--in%20tools-execution%20grounded-10b981" alt="61 built-in tools">
   <img src="https://img.shields.io/badge/verification--gated%20completion-optional%20audit%20%2B%20rollback-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
-  <img src="https://img.shields.io/badge/39%20skill%20packages-extensible-6366f1" alt="39 skill packages">
+  <img src="https://img.shields.io/badge/40%20skill%20packages-extensible-6366f1" alt="40 skill packages">
   <img src="https://img.shields.io/badge/12%20provider%20profiles-any%20OpenAI--compatible-8b5cf6" alt="12 provider profiles">
   <img src="https://img.shields.io/badge/messaging-Slack%20%7C%20Discord%20%7C%20WhatsApp%20%7C%20Telegram%20%7C%20email-f43f5e" alt="Slack, Discord, WhatsApp, Telegram, email">
   <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
