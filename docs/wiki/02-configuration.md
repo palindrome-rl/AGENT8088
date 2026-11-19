@@ -241,6 +241,7 @@ never does — and a recalled memory can never authorise a tool call.
 | `max_image_bytes` | `20 MB` | Cap on an image attachment. |
 | `model_image_max_side` | `768` | Longest side, in pixels, of the copy of a tool-attached image the model sees. The file on disk keeps its size. `0` = no limit. |
 | `model_image_max_bytes` | `1500000` | Byte cap on that model copy; larger images are re-encoded (PNG, then JPEG) and shrunk until they fit. `0` = no limit. |
+| `provider.<name>.vision` | unset | `1` or `0`: whether this provider's model reads images. Wins over the catalog and the live probe. `model_vision` does the same without a named provider. |
 | `image_tool_allow_urls` | `0` | Let `view_image` take an image URL as well as a local file (egress and SSRF checks still apply). |
 | `screenshot_width` / `screenshot_height` | `1280` / `800` | Default browser window for `screenshot_page`; the tool's `width`/`height` override it per call. |
 | `screenshot_wait_ms` | `300` | Wait after the page loads before the capture. The tool's `wait_ms` is capped at 3000. |

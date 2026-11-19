@@ -450,18 +450,25 @@ and an allowlist for the package registry; see
 
 ### `screenshot_page` or `view_image` says "image not attached: this model has no image input"
 
-Agent8088 decides whether a model reads images from its bundled catalog, then from
-what the endpoint reports. A self-hosted OpenAI-compatible server (vLLM, LM Studio,
-a custom provider) usually reports nothing, so an uncatalogued model is treated as
-text-only and gets the evidence text without the picture. If the served build does
-read images, say so in `model_catalog.json` next to your `config.txt` (in
-`AGENT8088_HOME`):
+Agent8088 decides whether a model reads images from what is declared, published or
+observed, never from its name:
 
-```json
-{"myprovider:my-vision-model": {"rank": 50, "vision": true, "tools": true}}
-```
+1. `provider.<name>.vision=1` (or `0`) in `config.txt`, or `model_vision` without a
+   named provider;
+2. the model catalog (bundled, plus your `model_catalog.json`) and what the endpoint
+   publishes (Ollama capabilities, `/models` modalities);
+3. one live probe, the first time an image is about to be sent: a small picture with a
+   known answer. A correct answer means the model reads images; a refusal, an error or
+   a wrong answer means it does not. The result is cached per endpoint and model.
 
-Use the provider name and model id shown in `/status`.
+So a new or self-hosted vision model normally works without any setting. You see this
+note when the probe said no, or could not reach the endpoint. If the model does read
+images, set `provider.<name>.vision=1` (the name is the part before the colon in
+`/status`), or run `/vision probe` to ask again, for example after restarting the
+server with a vision build. `/vision` shows the current answer and what decided it.
+
+A request the server rejects because the model takes no images also marks it
+text-only, and the turn is resent without the picture.
 
 ### The server answers "At most 1 image(s) may be provided in one prompt"
 

@@ -17635,8 +17635,21 @@ def describe_capabilities() -> str:
     lines = ["# Agent8088 capabilities", ""]
 
     model_context, model_output = _active_model_token_limits()
+    try:
+        _vision = model_vision_decision(probe=False)
+        _seen = _model_vision_cache.get(_model_key())
+        if _seen is not None and _vision.source == "default":
+            image_line = f"Image input: {'yes' if _seen else 'no'} (observed this session)"
+        elif _vision.source == "default":
+            image_line = (f"Image input: not known yet (checked with one small probe the first time an image "
+                          f"is sent; or set {_vision_setting_hint()})")
+        else:
+            image_line = f"Image input: {'yes' if _vision.vision else 'no'} ({_vision.source})"
+    except Exception:  # noqa: BLE001 -- a status line must never break capabilities
+        image_line = "Image input: unknown"
     lines += [f"Model: {MODEL_NAME}",
               f"Model token limits: {model_context:,} context / {model_output:,} output",
+              image_line,
               f"Permission mode: {PERMISSION_MODE}",
               f"Sandbox backend: {_resolve_sandbox_backend()}",
               f"Max turns per request: {APP_CONFIG.get('max_turns', str(DEFAULT_MAX_TURNS))}",
@@ -18493,24 +18506,71 @@ def _image_limit_from_error(error) -> int | None:
     return max(0, int(number)) if number else 1
 
 
+_TRUE_WORDS = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+def _declared_vision(provider: str) -> bool | None:
+    """`provider.<name>.vision`, or the flat `model_vision`, when the user set one; else None."""
+    for key in ((f"provider.{provider}.vision",) if provider else ()) + ("model_vision",):
+        value = str(APP_CONFIG.get(key, "")).strip().lower()
+        if value in _TRUE_WORDS:
+            return True
+        if value in _FALSE_WORDS:
+            return False
+    return None
+
+
+def model_vision_decision(*, probe: bool = True, provider: str | None = None):
+    """Whether the active model reads images, and what answered (model_catalog.VisionDecision).
+
+    Declared, published or observed, never guessed from a name:
+      1. config: provider.<name>.vision or model_vision;
+      2. the model catalog and what the endpoint publishes (model_catalog.vision_decision);
+      3. one live probe: a picture with a known answer (providers.probe_image_understanding),
+         cached on disk per endpoint and model;
+      4. otherwise text-only.
+    probe=False stays offline: no endpoint call, no model call."""
+    from agent8088 import model_catalog
+    if provider is None:
+        provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    declared = _declared_vision(provider)
+    if declared is not None:
+        return model_catalog.VisionDecision(declared, "config")
+    decision = model_catalog.vision_decision(provider, MODEL_NAME, client if probe else None)
+    if decision.source != "default":
+        return decision
+    live = (providers.probe_image_understanding(client, MODEL_NAME, provider) if probe
+            else providers.cached_image_understanding(client, MODEL_NAME, provider))
+    if live is not None:
+        return model_catalog.VisionDecision(live, "live probe")
+    return decision
+
+
 def _model_accepts_images() -> bool:
-    """Whether the active model reads images (model_catalog's decision, cached per model)."""
-    provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
-    key = f"{provider}:{MODEL_NAME}"
+    """Whether the active model reads images: model_vision_decision, cached per model for the process.
+
+    Called only when an image is about to be sent, so a session that never attaches one never probes."""
+    key = _model_key()
     if key not in _model_vision_cache:
         try:
-            from agent8088 import model_catalog
-            _model_vision_cache[key] = bool(
-                model_catalog.vision_decision(provider, MODEL_NAME, client).vision)
+            _model_vision_cache[key] = bool(model_vision_decision().vision)
         except Exception:  # noqa: BLE001 -- unknown means "send no image parts"
             _model_vision_cache[key] = False
     return _model_vision_cache[key]
 
 
+def _vision_setting_hint() -> str:
+    provider = ACTIVE_PROVIDER or DEFAULT_PROVIDER or ""
+    return f"provider.{provider}.vision=1" if provider else "model_vision=1"
+
+
 def _text_only_turn(message: dict) -> dict:
     """The tool's image message for a model without image input: its text, and a plain note."""
     text = _message_text(message).strip()
-    return {"role": "user", "content": f"{text}\n{_IMAGE_WITHHELD_NOTE}".strip()}
+    note = (f"{_IMAGE_WITHHELD_NOTE} (If this model does read images, set {_vision_setting_hint()} "
+            "in config.txt, or run /vision probe.)")
+    return {"role": "user", "content": f"{text}\n{note}".strip()}
 
 
 def _prune_old_images(messages: list, keep: int, *, strip_all: bool = False) -> int:
@@ -20836,6 +20896,18 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                         provider_override=loop_provider, model_override=loop_model,
                         on_retry=_retry_notice, on_stream_reset=on_stream_reset))
             image_limit = None if response is not None or image_limit_recovery_used else _image_limit_from_error(e)
+            rejected = (response is None and not image_limit_recovery_used and image_limit is None
+                        and providers.image_input_rejected(e))
+            if rejected:
+                # The model takes no images at all, whatever was believed before.
+                # Record it (this process and the probe cache) and resend as text.
+                image_limit = 0
+                _model_vision_cache[_model_key()] = False
+                try:
+                    providers.remember_image_input(client, MODEL_NAME, ACTIVE_PROVIDER or DEFAULT_PROVIDER or "",
+                                                   False)
+                except Exception:  # noqa: BLE001 -- the resend matters more than the record
+                    pass
             if image_limit is not None:
                 # The server takes fewer images per request than the conversation
                 # holds. Remember its limit for this model, drop the oldest images
@@ -20844,8 +20916,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 _model_image_limits[_model_key()] = image_limit
                 removed = _prune_old_images(messages, image_limit, strip_all=image_limit == 0)
                 if trace is not None:
-                    trace.append({"turn": turn, "type": "image_limit_learned", "limit": image_limit,
-                                  "removed": removed})
+                    trace.append({"turn": turn, "type": "image_input_unsupported" if rejected
+                                  else "image_limit_learned", "limit": image_limit, "removed": removed})
                 try:
                     with spin("thinking..."):
                         response = _create_completion_with_fallback(

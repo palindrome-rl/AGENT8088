@@ -2158,7 +2158,9 @@ def _vision_capable() -> bool | None:
     """
     A, C = _eng(), _cl()
     from . import model_catalog
-    decision = model_catalog.vision_decision(C._active_provider_name(), A.MODEL_NAME)
+    decide = getattr(A, "model_vision_decision", None)
+    decision = (decide(probe=False) if callable(decide)
+                else model_catalog.vision_decision(C._active_provider_name(), A.MODEL_NAME))
     return None if decision.source == "default" else decision.vision
 
 
@@ -2170,6 +2172,9 @@ def _vision_capable_probed() -> bool:
     blocking HTTP call cannot stall the server.
     """
     A, C = _eng(), _cl()
+    accepts = getattr(A, "_model_accepts_images", None)
+    if callable(accepts):
+        return accepts()   # config, catalog, endpoint, then one cached live probe
     from . import model_catalog
     return model_catalog.vision_capable(
         C._active_provider_name(), A.MODEL_NAME, client=getattr(A, "client", None))
