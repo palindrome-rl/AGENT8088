@@ -1,0 +1,223 @@
+"""Web-only routing for inline /plan tasks."""
+
+import asyncio
+
+from agent8088 import web_server
+
+
+class _Socket:
+    def __init__(self):
+        self.events = []
+
+    async def send_json(self, event):
+        self.events.append(event)
+
+
+class _Engine:
+    def __init__(self):
+        self.entered_plan_mode = False
+
+    def enter_plan_mode(self):
+        self.entered_plan_mode = True
+        self.PERMISSION_MODE = "plan-only"
+
+
+def test_mode_endpoint_enters_plan_mode(monkeypatch):
+    engine = _Engine()
+    engine.PERMISSION_MODE = "readonly"
+    monkeypatch.setattr(web_server, "_eng", lambda: engine)
+
+    result = asyncio.run(web_server.set_mode(web_server.ModeBody(mode="plan-only")))
+
+    assert engine.entered_plan_mode
+    assert result == {"ok": True, "mode": "plan-only"}
+
+
+def test_inline_plan_uses_web_chat_runner(monkeypatch):
+    seen = []
+
+    async def fake_handle_chat(ws, msg, engine, cli):
+        seen.append((ws, msg, engine, cli))
+
+    monkeypatch.setattr(web_server, "_handle_chat", fake_handle_chat)
+    socket, engine, cli = _Socket(), _Engine(), object()
+
+    asyncio.run(web_server._handle_command(socket, {"command": "plan", "args": "audit the app"}, engine, cli))
+
+    assert engine.entered_plan_mode
+    assert seen == [(socket, {"command": "plan", "args": "audit the app",
+                              "text": "audit the app"}, engine, cli)]
+    assert socket.events == []
+
+
+def test_queued_plan_runs_in_its_originating_chat_and_restores_the_view(monkeypatch):
+    viewed = type("Session", (), {"name": "", "messages": []})()
+    origin = type("Session", (), {"name": "", "messages": []})()
+    cli = type("Cli", (), {"S": viewed})()
+    engine, socket = _Engine(), _Socket()
+    seen = []
+
+    monkeypatch.setattr(web_server, "_turn_session", lambda _cli, sid: origin if sid == "origin" else None)
+
+    async def fake_handle_chat(ws, frame, agent, context):
+        seen.append((ws, frame, agent, context.S))
+
+    monkeypatch.setattr(web_server, "_handle_chat", fake_handle_chat)
+    frame = {"type": "command", "command": "plan", "args": "write a report",
+             "session_id": "origin"}
+    asyncio.run(web_server._handle_command(socket, frame, engine, cli))
+
+    assert seen == [(socket, {"type": "command", "command": "plan", "args": "write a report",
+                              "session_id": "origin", "_session_id": "origin",
+                              "text": "write a report"}, engine, origin)]
+    assert cli.S is viewed
+
+
+def test_queued_context_command_runs_in_origin_and_persists_its_echo(monkeypatch):
+    import io
+    from rich.console import Console
+
+    viewed = type("Session", (), {"name": "", "messages": []})()
+    origin = type("Session", (), {"name": "", "messages": []})()
+    cli = type("Cli", (), {"S": viewed, "console": Console(file=io.StringIO()),
+                            "COMMANDS": {"status": lambda _args: seen.append(cli.S)},
+                            "WEB_CONFIRM": None})()
+    seen = []
+    engine, socket = object(), _Socket()
+    monkeypatch.setattr(web_server, "_turn_session", lambda _cli, sid: origin if sid == "origin" else None)
+
+    asyncio.run(web_server._handle_command(
+        socket, {"type": "command", "command": "status", "args": "", "session_id": "origin"},
+        engine, cli))
+
+    assert seen == [origin]
+    assert cli.S is viewed
+    assert origin.messages == [{"role": "user", "content": "/status"}]
+    assert socket.events[0]["type"] == "command_result"
+
+
+class _PlanEngine(_Engine):
+    """Engine stub whose run_agent exercises the plan-approval callback.
+
+    present_plan feeds this callback's return value straight into
+    set_permission_mode(), so the contract is a permission-mode STRING
+    ("full-auto"/"readonly"), or "" to stay in plan mode - never a bool.
+    """
+
+    class AgentInterrupted(Exception):
+        pass
+
+    def __init__(self, artifacts_root):
+        super().__init__()
+        self.PERMISSION_MODE = "plan-only"
+        self.ARTIFACTS_ROOT = artifacts_root
+        self.chosen = "unset"
+
+    def build_tools_def(self, specs):
+        return []
+
+    def grant_escalation(self):
+        pass
+
+    def run_agent(self, messages, **kwargs):
+        self.chosen = self._plan_on_approval("## Plan\n1. do the thing")
+        return "done"
+
+
+class _PlanSession:
+    def __init__(self):
+        self.messages = []
+        self.show_trace = False
+        self.temperature = 0.0
+        self.name = ""
+        self.last_usage = {}
+        self.trajectory_state = {}
+
+
+class _PlanCli:
+    def __init__(self):
+        self.S = _PlanSession()
+        self._session_system_prompt = "sys"
+
+    def _turn_max_turns(self, mode, session=None):
+        return 25
+
+    def _estimate_context_pct(self, session=None):
+        return 0
+
+    def _save_active_session(self):
+        pass
+
+    def _active_tool_specs(self, session=None):
+        return {}
+
+
+class _ApprovingSocket:
+    """Answers a plan_approval frame the way PlanApprovalCard does."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.events = []
+
+    async def send_json(self, event):
+        self.events.append(event)
+        if event.get("type") == "plan_approval":
+            entry = web_server._pending_plan_approvals.get(event["id"])
+            if entry is not None:
+                entry["mode"] = self.mode
+                entry["event"].set()
+
+
+def _run_plan_approval(monkeypatch, tmp_path, mode):
+    engine = _PlanEngine(tmp_path)
+    cli = _PlanCli()
+    socket = _ApprovingSocket(mode)
+    monkeypatch.setattr(web_server, "_validated_attachments", lambda *a, **k: [])
+    asyncio.run(web_server._handle_chat(socket, {"text": "plan it"}, engine, cli))
+    return engine, socket
+
+
+def test_plan_approval_returns_permission_mode_string(monkeypatch, tmp_path):
+    """Approving in the browser must hand present_plan a real mode to run in."""
+    engine, socket = _run_plan_approval(monkeypatch, tmp_path, "full-auto")
+
+    assert any(e.get("type") == "plan_approval" for e in socket.events)
+    assert engine.chosen == "full-auto"
+
+
+def test_plan_approval_readonly_mode_is_passed_through(monkeypatch, tmp_path):
+    engine, _ = _run_plan_approval(monkeypatch, tmp_path, "readonly")
+
+    assert engine.chosen == "readonly"
+
+
+def test_plan_decline_stays_in_plan_mode(monkeypatch, tmp_path):
+    """Declining must be falsy so present_plan keeps planning."""
+    engine, _ = _run_plan_approval(monkeypatch, tmp_path, "")
+
+    assert engine.chosen == ""
+
+
+class _ReplyPlanEngine(_PlanEngine):
+    """The engine offers the model's reply as the plan (no present_plan call)."""
+
+    def run_agent(self, messages, **kwargs):
+        self.chosen = self._plan_on_approval("Should this use Flask or FastAPI?", source="reply")
+        return "done"
+
+
+def test_a_reply_offered_as_the_plan_is_labelled_for_the_card(monkeypatch, tmp_path):
+    engine = _ReplyPlanEngine(tmp_path)
+    socket = _ApprovingSocket("")
+    monkeypatch.setattr(web_server, "_validated_attachments", lambda *a, **k: [])
+    asyncio.run(web_server._handle_chat(socket, {"text": "plan it"}, engine, _PlanCli()))
+
+    frames = [e for e in socket.events if e.get("type") == "plan_approval"]
+    assert frames and frames[0]["source"] == "reply"
+    assert engine.chosen == ""
+
+
+def test_a_present_plan_frame_is_labelled_as_a_tool_plan(monkeypatch, tmp_path):
+    _engine, socket = _run_plan_approval(monkeypatch, tmp_path, "full-auto")
+    frames = [e for e in socket.events if e.get("type") == "plan_approval"]
+    assert frames and frames[0]["source"] == "tool"

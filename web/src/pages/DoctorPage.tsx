@@ -11,8 +11,8 @@ import { ErrorCard } from '@/components/ErrorCard'
 
 // ---- API helpers ----
 
-async function fetchJSON<T>(url: string): Promise<T> {
-  return apiFetch<T>(url, { action: 'run diagnostics' })
+async function fetchJSON<T>(url: string, timeoutMs?: number): Promise<T> {
+  return apiFetch<T>(url, { action: 'run diagnostics', timeoutMs })
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
@@ -87,22 +87,22 @@ function CheckRow({ label, value, icon: Icon }: {
 }) {
   const state = classifyHealth(value)
   return (
-    <tr className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/20 last:border-0">
-      <td className="px-4 py-3">
+    <tr className="block border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/20 last:border-0 sm:table-row">
+      <td className="block px-4 pb-1 pt-3 sm:table-cell sm:py-3">
         <div className="flex items-center gap-2.5">
           <Icon className="h-4 w-4 text-zinc-500" />
           <span className="text-sm text-zinc-300">{label}</span>
         </div>
       </td>
-      <td className="px-4 py-3">
+      <td className="block px-4 pb-3 pt-1 sm:table-cell sm:py-3">
         <div className="flex items-center gap-2">
           <HealthDot state={state} />
-          <span className={cn('font-mono text-xs', state === 'fail' ? 'text-red-400' : state === 'ok' ? 'text-zinc-200' : 'text-zinc-400')}>
+          <span className={cn('min-w-0 break-all font-mono text-xs', state === 'fail' ? 'text-red-400' : state === 'ok' ? 'text-zinc-200' : 'text-zinc-400')}>
             {value}
           </span>
         </div>
       </td>
-      <td className="px-4 py-3 text-right">
+      <td className="hidden px-4 py-3 text-right sm:table-cell">
         <HealthIcon state={state} />
       </td>
     </tr>
@@ -123,7 +123,7 @@ function SummaryCard({ label, value, icon: Icon, color }: {
         <Icon className={cn('h-4 w-4', color)} />
         <span className="text-xs text-zinc-500">{label}</span>
       </div>
-      <p className="truncate font-mono text-sm text-zinc-200">{value}</p>
+      <p className="break-all font-mono text-sm text-zinc-200">{value}</p>
     </div>
   )
 }
@@ -136,7 +136,9 @@ export default function DoctorPage() {
   // Doctor health check
   const doctorQuery = useQuery({
     queryKey: ['doctor'],
-    queryFn: () => fetchJSON<DoctorReport>('/api/doctor'),
+    // Live probes (sandbox tools, Docker, provider, Chromium) can legitimately
+    // exceed the ordinary 30-second API deadline when optional services are down.
+    queryFn: () => fetchJSON<DoctorReport>('/api/doctor', 120_000),
   })
 
   // Fix mutation
@@ -261,15 +263,15 @@ export default function DoctorPage() {
                 Health Checks
               </h3>
             </div>
-            <table className="w-full">
-              <thead>
+            <table className="block w-full sm:table">
+              <thead className="hidden sm:table-header-group">
                 <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wider text-zinc-600">
                   <th className="px-4 py-3 font-medium">Check</th>
                   <th className="px-4 py-3 font-medium">Result</th>
                   <th className="px-4 py-3 text-right font-medium">Status</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className="block sm:table-row-group">
                 {checkMeta.map(({ key, label, icon }) => (
                   <CheckRow
                     key={key}

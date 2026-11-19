@@ -11,7 +11,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
                  [--mode {readonly,full-auto}]
                  [--uninstall] [--workspace] [--all] [--yes]
                  [--non-interactive] [--dry-run]
-                 [--update] [--force] [--setup] [--model-setup] [--sandbox-setup] [--memory-setup]
+                 [--update] [--force] [--setup] [--doctor] [--model-setup] [--sandbox-setup] [--memory-setup]
                  [--libreoffice-setup]
                  [--gateway] [--gateway-setup] [--mcp-serve] [--mcp-http]
                  [--mcp-port PORT] [--mcp-host HOST]
@@ -27,6 +27,7 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--mode {readonly,full-auto}` | Permission mode at startup. Plan mode is not settable here — start it with `/plan` |
 | `--full-auto` | Start in full-auto (no per-action prompts) |
 | `--setup` | Interactive config wizard, then exit |
+| `--doctor` | Check provider, model, configuration and optional capabilities without entering the REPL; prints fixes and exits non-zero on a failing check |
 | `--model-setup` | Configure a model provider profile |
 | `--sandbox-setup` | Install the native sandbox runtime |
 | `--memory-setup` | Install the mem0 memory backend deps and set `memory_engine=mem0`; switch back with `/memory engine native` |
@@ -41,13 +42,13 @@ usage: agent8088 [-h] [--version] [--full-auto]
 | `--web-port PORT` | Web UI server port (default `8180`) |
 | `--web-host HOST` | Web UI bind host (default `127.0.0.1`); loopback only |
 | `--web-dev` | Run the web backend without serving built frontend files; use with Vite |
-| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment; the benchmark adapter supplies a disposable task container. |
+| `--prompt-file PATH` | Run one headless turn using the entire UTF-8 file as the task, then exit. Implies full-auto: use only in a trusted, isolated environment that supplies a disposable task container. |
 | `--logs [MODE]` | Print the operational log; pass `follow` to tail it in real time. Bare `--logs` prints the last `--limit` lines and exits |
 | `-n`, `--limit LIMIT` | With `--logs`: number of lines to print (default 50) |
 | `--level LEVEL` | With `--logs`: filter by level (`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`) |
 | `--subsystem SUBSYSTEM` | With `--logs`: substring filter on subsystem name |
 | `--json` | With `--logs`: emit raw JSONL instead of the human-formatted view |
-| `--update` | Pull latest code + reinstall, then exit |
+| `--update` | Update from the public `AGENT8088-v1.3` branch and reinstall, then exit |
 | `--force` | With `--update`: discard local changes in the install dir first |
 | `--uninstall` | Remove the install dir, shim, PATH/config lines, and crontab/scheduled-task entries, then exit. Trace logs and the WhatsApp session dir are kept unless `--workspace`/`--all` is also passed |
 | `--workspace` | With `--uninstall`: also remove trace logs and the WhatsApp session directory |
@@ -86,7 +87,7 @@ entered them. Only one task runs at a time. Stop or failure pauses the queue
 for your review. The sidebar identifies the running chat. You cannot rename,
 delete, reset or compact that chat while its task is running.
 
-### Images and attachments on staging 1.3
+### Images and attachments in Agent8088 v1.3
 
 Use **+ → Image analysis** to choose images, paste a screenshot into the
 message box, or drop a file onto the composer. The clipboard button also

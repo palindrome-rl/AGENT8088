@@ -1,8 +1,7 @@
 # Agent8088 Wiki
 
-> **Staging 1.3 documentation.** These pages describe the `staging-1.3`
-> channel. The hosted GitHub Wiki publishes them under `Staging-1.3-*` page
-> names so they can coexist with documentation for other release channels.
+> **Agent8088 v1.3 documentation.** These pages describe the public
+> `AGENT8088-v1.3` branch and are published to its repository wiki.
 
 Complete reference for Agent8088 — a local-first AI agent with fine-tuned tool
 calling, an enforced permission layer, OS-level sandboxing, MCP in both
@@ -20,7 +19,7 @@ copied from the README. Where the two disagree, the wiki notes it explicitly.
 ## Start here
 
 New to Agent8088? [Getting Started](01-getting-started.md) takes you from
-install to your first prompt. In a hurry, [the FAQ](15-FAQ.md) answers most
+install to your first prompt. In a hurry, [the FAQ](15-faq.md) answers most
 first-day questions.
 
 ## Guides
@@ -47,7 +46,7 @@ Look things up here.
 | [Configuration](02-configuration.md) | Every config key, the `.env` store, key resolution order |
 | [Tools](04-tools.md) | All 56 built-in tools, their modes and arguments |
 | [Memory](16-memory.md) | Persistent memory: what it stores, how retrieval works, `/memory` |
-| [FAQ](15-FAQ.md) | Short answers to the common questions |
+| [FAQ](15-faq.md) | Short answers to the common questions |
 | [Troubleshooting](13-troubleshooting.md) | Symptom-first fixes |
 
 ## Development
@@ -62,8 +61,8 @@ Look things up here.
 
 A single-process agent that runs on your machine. It talks to any
 OpenAI-compatible endpoint (local Ollama or a hosted API), calls tools to get
-real work done, and gates every side effect behind a permission layer that
-defaults to read-only.
+real work done, and puts a permission layer around every side effect. It starts
+in `full-auto`; switch to `readonly` to approve each action yourself.
 
 At a glance, verified against the current tree:
 
@@ -84,11 +83,12 @@ Agent8088 assumes the model will sometimes be wrong, and sometimes be
 manipulated by content it reads. So the safety properties do not live in the
 prompt — they live in code that runs regardless of what the model decides:
 
-- **Read-only by default.** Writes, shell, network, cron and browser actions
-  are refused unless you approve them for that one action.
+- **Full-auto by default, readonly on request.** Out of the box the agent acts
+  without asking, inside the workspace and the always-on floor. In `readonly`,
+  writes, shell, network, cron and browser actions each need your approval.
 - **An always-on floor.** Some things are refused in *every* mode, even
   full-auto, even after you approve an escalation: reading or writing
-  credential files, writing shell startup files, `git push`/`reset --hard`,
+  credential files, writing shell startup files, a shell `git push`/`reset --hard`,
   and requests for the agent's own system prompt.
 - **External content is fenced.** Anything fetched from the web or an MCP
   server is wrapped in `<<<EXTERNAL_UNTRUSTED_CONTENT>>>` markers with

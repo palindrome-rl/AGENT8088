@@ -94,7 +94,7 @@ export function CapabilityBadge() {
         onClick={() => setOpen((value) => !value)}
         title={limited.map((row) => `${row.label}: ${row.active || row.state}`).join('\n')}
         className={cn(
-          'flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors',
+          'flex h-7 shrink-0 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-[11px] font-medium transition-colors',
           anyUnavailable
             ? 'border-red-500/30 bg-red-500/10 text-red-600 hover:bg-red-500/15 dark:text-red-400'
             : 'border-amber-500/30 bg-amber-500/10 text-amber-600 hover:bg-amber-500/15 dark:text-amber-400',

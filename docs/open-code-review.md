@@ -68,7 +68,7 @@ commit IDs, computes their merge base, and checks out the PR head. Merge bases
 outside the shallow history fail explicitly; use a local checkout in that case.
 
 Delegation mode does not inherit OpenCodeReview's own agent, reflection and
-positioning pipeline, so its published benchmark results should not be
+positioning pipeline, so OpenCodeReview's own published results should not be
 attributed to it.
 
 ## Using it
