@@ -11,6 +11,9 @@ env:
 
 jobs:
   publish:
+    # Every branch carries this file; only production and release tags publish,
+    # including when the workflow is started by hand.
+    if: github.ref == 'refs/heads/AGENT8088-v1.3' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -18,6 +18,9 @@ concurrency:
 jobs:
   sync:
     name: Publish docs/wiki to the GitHub wiki
+    # Every branch carries this file; only production publishes the public wiki,
+    # including when the workflow is started by hand.
+    if: github.ref == 'refs/heads/AGENT8088-v1.3'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

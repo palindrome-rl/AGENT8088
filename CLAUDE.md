@@ -49,34 +49,31 @@ It matters because a careless live run damages real state:
   (`pkill -f '<venv-path>/bin/agent8088'`), never a broad `chrome`/`chromium`
   match that could close the developer's own windows.
 
-# Promoting to staging
+# Promoting: development → staging-1.3 → AGENT8088-v1.3
 
-Moving merged `development` work onto the `staging-1.2` release branch follows
-the recipe in
+The three branches carry the same tree, with production (`AGENT8088-v1.3`) as
+the shared base since 2026-11-19, so a promotion is an ordinary merge. The
+recipe is in
 [`.claude/skills/promote-to-staging/SKILL.md`](.claude/skills/promote-to-staging/SKILL.md).
-Read it before the merge. Claude Code loads it as a skill; Codex and OpenCode
-read the file directly.
+Claude Code loads it as a skill; Codex and OpenCode read the file directly.
 
-`staging-1.2` is long-lived and carries a trimmed, release-configured tree, so
-a promotion is more than a merge:
+- **How to promote.** Open a PR from `development` into `staging-1.3`, then one
+  from `staging-1.3` into `AGENT8088-v1.3`, and merge each with **Create a merge
+  commit**. Never squash, rebase, cherry-pick or force-push.
+- **No per-branch edits.** Nothing is trimmed and no URL is rewritten:
+  - the installers default to `AGENT8088-v1.3`
+  - other channels install with `AGENT8088_BRANCH=<branch>`
+  - `agent8088 --update` follows the branch an install has checked out
+- **Changes enter through `development` only.** Nothing is committed directly to
+  `staging-1.3` or `AGENT8088-v1.3`. An urgent production fix is merged back into
+  `development` the same day, so the branches never drift apart again.
+- **Merging into `AGENT8088-v1.3` publishes.** It changes:
+  - what the public installers and `--update` install
+  - the GHCR image
+  - the public wiki, when `docs/wiki/` changed
 
-- Merge `development` **into** `staging-1.2` with `--no-ff`, so the staging tip
-  stays the first parent. Never rebase, squash, or cherry-pick: the next
-  promotion reads that first-parent chain to find its own baseline.
-- Derive the deliberate divergence from `staging-1.2` against its own second
-  parent, not from a plain diff against `development`. A plain diff cannot tell
-  "staging keeps this different" apart from "staging is simply behind", and
-  acting on it strips real new source.
-- Restore what auto-merge clobbers without reporting a conflict:
-  `memory_engine=native` and the one-line `sandbox_allowed_domains` comment in
-  `src/agent8088/config.txt`, and staging's `.claude/` form in `.gitignore`.
-- Leave the development harness behind: `tests/`, `.claude/`,
-  `scripts/sync_development.py`, handoff/audit/QA notes, and staging's own
-  `AGENTS.md` and `CLAUDE.md`.
-- Commit as
-  `Merge development PRs <N>-<M> into staging-1.2; preserve staging release settings`,
-  and ask before pushing — `staging-1.2` is what `agent8088 --update` installs
-  from.
+  Ask the release owner before merging.
+- **After each merge**, check `git merge-base --is-ancestor <promoted SHA> origin/<target>`.
 
 # Development memory
 

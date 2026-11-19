@@ -114,6 +114,9 @@ agent8088 = "agent8088.cli:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# The main suite. scripts/installer_checks is a separate release suite with
+# overlapping file names; run it on its own (`python -m pytest scripts/installer_checks`).
+testpaths = ["tests"]
 markers = [
     "browser_integration: slow end-to-end tests that launch a real headless browser and call a real LLM provider",
 ]

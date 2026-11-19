@@ -8879,17 +8879,34 @@ def _git(install_dir, *args):
                           capture_output=True, text=True)
 
 
+def _remote_has_branch(install_dir, branch):
+    probe = _git(install_dir, "ls-remote", "--heads", "origin", branch)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
 def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
-    UPDATE_BRANCH names today's release branch, but branches get renamed and
-    retired. An install pointed at one that no longer exists should still
-    update, and say why it went somewhere else, rather than fail on git's raw
-    'couldn't find remote ref'. So the remote is asked whether the branch is
-    still there, and if it is not, its own default branch is used instead.
+    The branch the install has checked out is the channel the user chose
+    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
+    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    development or staging install to production on its first update. That
+    branch is followed while the remote still has it.
+
+    Otherwise UPDATE_BRANCH, today's release branch, is used. Branches get
+    renamed and retired: an install pointed at one that no longer exists should
+    still update, and say why it went somewhere else, rather than fail on git's
+    raw 'couldn't find remote ref'. If the release branch is gone as well, the
+    remote's own default branch is used.
     """
-    probe = _git(install_dir, "ls-remote", "--heads", "origin", UPDATE_BRANCH)
-    if probe.returncode == 0 and probe.stdout.strip():
+    current = _git(install_dir, "symbolic-ref", "--short", "-q", "HEAD")
+    installed = current.stdout.strip() if current.returncode == 0 else ""
+    if installed and installed != UPDATE_BRANCH and _remote_has_branch(install_dir, installed):
+        return installed, ""
+    if _remote_has_branch(install_dir, UPDATE_BRANCH):
+        if installed and installed != UPDATE_BRANCH:
+            return UPDATE_BRANCH, (f"Branch '{installed}' is no longer on the remote; "
+                                   f"updating to the release branch '{UPDATE_BRANCH}' instead.")
         return UPDATE_BRANCH, ""
     head = _git(install_dir, "ls-remote", "--symref", "origin", "HEAD")
     if head.returncode == 0:
