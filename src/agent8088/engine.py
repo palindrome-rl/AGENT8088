@@ -466,6 +466,11 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     explicit = _configured_dir(config, "project_root", launch)
     if explicit:
         if _is_dir(explicit):
+            reason = _risky_workspace(explicit)
+            if reason:
+                _config_warn(f"project_root is {reason} ({explicit}). New files, artifacts and "
+                             "shell commands work there, and the sandbox lets commands write "
+                             "in it. Set project_root to a project folder unless you mean it.")
             return explicit
         # A project_root copied from another machine or image (an installer
         # default, a container that works in /workspace, not /app) names a
@@ -487,9 +492,79 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
         except OSError:
             continue
         if launch == candidate or candidate in launch.parents:
-            return launch
+            return _guard_workspace(launch, config, launch)
         candidates.append(candidate)
-    return candidates[0] if candidates else launch
+    return _guard_workspace(candidates[0] if candidates else launch, config, launch)
+
+
+# Set when the workspace was moved away from the folder agent8088 started in.
+WORKSPACE_MOVED_FROM: Path | None = None
+SAFE_WORKSPACE_NAME = "agent8088-workspace"
+
+
+def _system_folders() -> list:
+    if sys.platform == "win32":
+        names = [os.environ.get(k, "") for k in ("SystemRoot", "ProgramFiles",
+                                                 "ProgramFiles(x86)", "ProgramData")]
+        return [Path(n).resolve() for n in names if n]
+    return [Path(p) for p in ("/usr", "/etc", "/bin", "/sbin", "/var", "/lib", "/boot",
+                              "/System", "/Library", "/Applications", "/private")]
+
+
+def _risky_workspace(path: Path) -> str:
+    """Why `path` is a bad default workspace, or "" when it is fine."""
+    path = Path(path).resolve()
+    if path == Path.home().resolve():
+        return "your home folder"
+    if path.parent == path:
+        return "the root of a drive" if sys.platform == "win32" else "the filesystem root"
+    if any(path == folder or folder in path.parents for folder in _system_folders()):
+        return "a system folder"
+    return ""
+
+
+def _guard_workspace(chosen: Path, config: dict, launch: Path) -> Path:
+    """Move a workspace that would be the home folder, a drive root or a system
+    folder to ~/agent8088-workspace.
+
+    Seen live: started from a terminal that opened in the home folder, the home
+    folder became the project, files landed loose in it, and once the user named
+    a path there the shell's writable folder became the whole home folder.
+    Only a workspace nobody chose is moved; an explicit project_root is kept.
+    The move is skipped when allowed_paths would refuse writes to the new folder.
+    """
+    global WORKSPACE_MOVED_FROM
+    reason = _risky_workspace(chosen)
+    if not reason:
+        return chosen
+    safe = (Path.home() / SAFE_WORKSPACE_NAME).resolve()
+    configured = [Path(raw.strip()).expanduser() for raw in str(config.get("allowed_paths", "")).split(",")
+                  if raw.strip()]
+    configured = [(p if p.is_absolute() else launch / p).resolve() for p in configured]
+    if configured and not any(safe == base or base in safe.parents for base in configured):
+        _config_warn(f"The workspace is {reason} ({chosen}). Start agent8088 in a project folder "
+                     "or set project_root.")
+        return chosen
+    try:
+        safe.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _config_warn(f"The workspace is {reason} ({chosen}), and {safe} could not be created ({exc}).")
+        return chosen
+    WORKSPACE_MOVED_FROM = chosen
+    _config_warn(f"Started in {reason}, so the workspace is {safe} instead. New files, artifacts and "
+                 "shell commands go there; other files can still be named by their path. To work "
+                 "in another folder, start agent8088 there or set project_root.")
+    return safe
+
+
+def _default_allowed_paths(project_root: Path, moved_from: Path | None) -> list:
+    """allowed_paths when config.txt sets none: the workspace, plus the home folder
+    it was moved away from, so a file there named by path still works."""
+    paths = [str(project_root)]
+    if moved_from is not None and Path(moved_from).parent != Path(moved_from) \
+            and Path(moved_from).resolve() == Path.home().resolve():
+        paths.append(str(moved_from))
+    return paths
 
 
 LAUNCH_DIR = Path(os.getcwd()).resolve()
@@ -1076,7 +1151,8 @@ def _resolve_allowed_path(raw: str) -> Path:
 
 ALLOWED_PATHS = [
     _resolve_allowed_path(p.strip())
-    for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
+    for p in APP_CONFIG.get("allowed_paths",
+                            ",".join(_default_allowed_paths(PROJECT_ROOT, WORKSPACE_MOVED_FROM))).split(",")
     if p.strip()
 ]
 
