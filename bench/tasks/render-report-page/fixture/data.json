@@ -1,0 +1,54 @@
+{
+  "title": "Support tickets closed per month, 2026",
+  "unit": "tickets",
+  "months": [
+    {
+      "month": "Jan",
+      "value": 271
+    },
+    {
+      "month": "Feb",
+      "value": 326
+    },
+    {
+      "month": "Mar",
+      "value": 278
+    },
+    {
+      "month": "Apr",
+      "value": 271
+    },
+    {
+      "month": "May",
+      "value": 300
+    },
+    {
+      "month": "Jun",
+      "value": 340
+    },
+    {
+      "month": "Jul",
+      "value": 137
+    },
+    {
+      "month": "Aug",
+      "value": 134
+    },
+    {
+      "month": "Sep",
+      "value": 302
+    },
+    {
+      "month": "Oct",
+      "value": 283
+    },
+    {
+      "month": "Nov",
+      "value": 362
+    },
+    {
+      "month": "Dec",
+      "value": 354
+    }
+  ]
+}

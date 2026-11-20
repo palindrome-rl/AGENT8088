@@ -1,0 +1,194 @@
+{
+  "schema": "teamboard-1",
+  "exportedAt": "2026-10-14",
+  "columns": [
+    "To Do",
+    "In Progress",
+    "In Review",
+    "Done"
+  ],
+  "cards": [
+    {
+      "id": "C1",
+      "title": "Set up repository",
+      "assignee": "Ana",
+      "priority": "High",
+      "due": "2026-10-12",
+      "column": "Done",
+      "checklist": [
+        {
+          "text": "Create repo",
+          "done": true
+        },
+        {
+          "text": "Add CI",
+          "done": true
+        }
+      ],
+      "daysInColumn": 3
+    },
+    {
+      "id": "C2",
+      "title": "Design login page",
+      "assignee": "Ben",
+      "priority": "Medium",
+      "due": "2026-10-20",
+      "column": "In Progress",
+      "checklist": [
+        {
+          "text": "Wireframe",
+          "done": true
+        },
+        {
+          "text": "Mockup",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C3",
+      "title": "Write API docs",
+      "assignee": "Ben",
+      "priority": "Low",
+      "due": "2026-10-25",
+      "column": "In Progress",
+      "checklist": [
+        {
+          "text": "Draft",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C4",
+      "title": "Fix signup bug",
+      "assignee": "Ben",
+      "priority": "High",
+      "due": "2026-10-18",
+      "column": "In Progress",
+      "checklist": [
+        {
+          "text": "Reproduce",
+          "done": true
+        },
+        {
+          "text": "Patch",
+          "done": false
+        },
+        {
+          "text": "Test",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C5",
+      "title": "Add search",
+      "assignee": "Chen",
+      "priority": "Medium",
+      "due": "2026-10-22",
+      "column": "In Progress",
+      "checklist": [
+        {
+          "text": "Index",
+          "done": false
+        },
+        {
+          "text": "UI",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C6",
+      "title": "Review payment flow",
+      "assignee": "Ana",
+      "priority": "High",
+      "due": "2026-10-16",
+      "column": "In Review",
+      "checklist": [
+        {
+          "text": "Read code",
+          "done": true
+        },
+        {
+          "text": "Try it",
+          "done": true
+        }
+      ],
+      "daysInColumn": 1
+    },
+    {
+      "id": "C7",
+      "title": "Review onboarding copy",
+      "assignee": "Dina",
+      "priority": "Low",
+      "due": "2026-10-24",
+      "column": "In Review",
+      "checklist": [
+        {
+          "text": "Spelling",
+          "done": true
+        },
+        {
+          "text": "Tone",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C8",
+      "title": "Review dashboard",
+      "assignee": "Chen",
+      "priority": "Medium",
+      "due": "2026-10-19",
+      "column": "In Review",
+      "checklist": [
+        {
+          "text": "Layout",
+          "done": true
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C9",
+      "title": "Plan sprint demo",
+      "assignee": "Ben",
+      "priority": "Medium",
+      "due": "2026-10-30",
+      "column": "To Do",
+      "checklist": [
+        {
+          "text": "Agenda",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    },
+    {
+      "id": "C10",
+      "title": "Update onboarding emails",
+      "assignee": "Chen",
+      "priority": "Low",
+      "due": "2026-10-27",
+      "column": "To Do",
+      "checklist": [
+        {
+          "text": "Draft",
+          "done": false
+        },
+        {
+          "text": "Send for review",
+          "done": false
+        }
+      ],
+      "daysInColumn": 0
+    }
+  ]
+}

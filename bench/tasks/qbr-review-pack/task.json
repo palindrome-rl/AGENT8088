@@ -1,0 +1,10 @@
+{
+  "id": "qbr-review-pack",
+  "title": "Build a quarterly review workbook, deck and memo from messy CSV, Excel and PDF inputs",
+  "kind": "long",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 7200,
+  "needs": []
+}

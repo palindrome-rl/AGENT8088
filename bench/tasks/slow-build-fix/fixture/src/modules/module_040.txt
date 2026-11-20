@@ -1,0 +1,5 @@
+# module_040
+def parse_header
+def sym_040
+use sym_079
+use sym_083

@@ -193,13 +193,22 @@ def latest_trace(folder: Path):
         return traces[-1], None
 
 
-def grade(task: dict, workspace: Path, run_dir: Path) -> dict:
+def grader_env(profile: dict) -> dict:
+    """The grader's environment: this one, plus the shared browser download when there is one."""
+    env = dict(os.environ)
+    browsers = Path(profile.get("shared_from") or "").expanduser() / "playwright-browsers"
+    if profile.get("shared_from") and browsers.is_dir() and "PLAYWRIGHT_BROWSERS_PATH" not in env:
+        env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+    return env
+
+
+def grade(task: dict, workspace: Path, run_dir: Path, profile: dict | None = None) -> dict:
     """Run the task's grader on the finished workspace; it writes a JSON report."""
     report = run_dir / "grade.json"
     command = [sys.executable, str(task["dir"] / task["grader"]), str(workspace), "--json", str(report)]
     try:
         done = subprocess.run(command, capture_output=True, text=True, timeout=GRADER_TIMEOUT_SEC, check=False,
-                              cwd=run_dir, encoding="utf-8", errors="replace")
+                              cwd=run_dir, encoding="utf-8", errors="replace", env=grader_env(profile or {}))
     except subprocess.TimeoutExpired:
         return {"error": f"grader timed out after {GRADER_TIMEOUT_SEC}s"}
     (run_dir / "grade.log").write_text(done.stdout + done.stderr, encoding="utf-8")
@@ -272,7 +281,7 @@ def run_one(task: dict, profile: dict, run_dir: Path, agent: str) -> dict:
         **facts, **summary,
     }
     result["cost_usd"] = benchlib.cost_usd(summary["input_tokens"], summary["output_tokens"], profile)
-    result["grader"] = grade(task, workspace, run_dir)
+    result["grader"] = grade(task, workspace, run_dir, profile)
     result["outcome"] = benchlib.outcome(result)
     (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
