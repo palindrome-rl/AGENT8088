@@ -250,26 +250,29 @@ def inventory(roots: Iterable[Path]) -> dict[str, list[int]]:
         stack = [(Path(root), 0)]
         while stack and len(found) < INVENTORY_LIMIT and visited < INVENTORY_VISIT_LIMIT:
             folder, depth = stack.pop()
+            # Read entries lazily and stop once the budget is spent. Slicing the
+            # listing to the number of files still needed counted folders
+            # against it too, so a skipped folder such as node_modules in that
+            # slice left the inventory short of files that were there.
             try:
-                # Consume at most the remaining budget, rather than eagerly
-                # materialising every entry of a potentially enormous folder.
-                from itertools import islice
-                remaining = min(INVENTORY_LIMIT - len(found), INVENTORY_VISIT_LIMIT - visited)
-                with os.scandir(folder) as scan:
-                    entries = list(islice(scan, remaining))
+                scan = os.scandir(folder)
             except OSError:
                 continue
-            for entry in entries:
-                visited += 1
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if depth < INVENTORY_DEPTH and entry.name not in _INVENTORY_SKIP:
-                            stack.append((Path(entry.path), depth + 1))
-                    elif entry.is_file(follow_symlinks=False) and len(found) < INVENTORY_LIMIT:
-                        info = entry.stat()
-                        found.setdefault(_file_id(entry.path), [info.st_size, info.st_mtime_ns])
-                except OSError:
-                    continue
+            with scan as entries:
+                for entry in entries:
+                    visited += 1
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if depth < INVENTORY_DEPTH and entry.name not in _INVENTORY_SKIP:
+                                stack.append((Path(entry.path), depth + 1))
+                        elif entry.is_file(follow_symlinks=False):
+                            info = entry.stat()
+                            found.setdefault(_file_id(entry.path), [info.st_size, info.st_mtime_ns])
+                    except OSError:
+                        pass
+                    # Checked after the entry, so no entry past the budget is read.
+                    if len(found) >= INVENTORY_LIMIT or visited >= INVENTORY_VISIT_LIMIT:
+                        break
     return found
 
 

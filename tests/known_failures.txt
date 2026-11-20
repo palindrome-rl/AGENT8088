@@ -5,9 +5,6 @@
 # rest of the suite is unaffected. A new failure is NOT on this list and fails CI.
 #
 # Fix a test, then delete its line. Format: <node id> <TAB> <platforms seen>
-tests/test_app_check.py::test_browser_context_is_unavailable_not_verified_startup	linux
-tests/test_audit_loop_guards.py::test_time_spent_verifying_does_not_count_against_the_turn	linux-ci
-tests/test_completion_checks.py::test_the_inventory_is_bounded_and_skips_dependency_folders	linux-ci (order-dependent: completion.inventory reads only as many entries as files it still needs, so a skipped folder such as node_modules in that slice leaves it short; fix in its own PR)
 tests/test_document_access.py::test_extraction_survives_an_os_that_refuses_memory_limits	windows
 tests/test_genuine_user_turns.py::test_every_loop_injected_turn_carries_a_marker	linux,windows
 tests/test_git_branch_and_subdir.py::test_commit_stages_inside_the_named_repo	linux
@@ -18,11 +15,6 @@ tests/test_installer_web_ui.py::TestInstallNodeBridgeDependencies::test_partial_
 tests/test_installer_web_ui.py::TestInstallNodeBridgeDependencies::test_partial_bridge_is_reinstalled_before_marked_ready[powershell-1]	windows
 tests/test_issue_sheet_39b.py::test_a_run_timeout_kills_the_whole_probe_tree	linux
 tests/test_native_sandbox_windows.py::test_exec_native_sandbox_builds_dsh_argv_on_windows	linux
-tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[//example.com/main.js]	linux
-tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[client/main.js]	linux
-tests/test_page_check_controls.py::test_a_page_does_not_load_a_different_script_with_the_same_basename[https://example.com/main.js]	linux
-tests/test_page_check_controls.py::test_a_page_script_is_not_started_alone	linux
-tests/test_page_check_controls.py::test_a_script_no_page_loads_is_still_started_and_names_its_error	linux
 tests/test_prompt_token_budget.py::test_fixed_overhead_within_budget	linux,windows
 tests/test_prompt_token_budget.py::test_hybrid_request_is_the_path_that_actually_ships	linux,windows
 tests/test_repository_access.py::test_the_resolved_commit_is_recorded_in_a_git_worktree	windows

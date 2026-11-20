@@ -416,6 +416,18 @@ def test_the_inventory_is_bounded_and_skips_dependency_folders(tmp_path, monkeyp
     assert len(c.inventory([tmp_path])) == 3
 
 
+def test_skipped_folders_do_not_use_up_the_file_budget(tmp_path, monkeypatch):
+    # Many skipped and empty folders listed before the files: the inventory must
+    # still find the files, whatever order the filesystem lists entries in.
+    for i in range(20):
+        (tmp_path / f"a{i:02d}").mkdir()
+    (tmp_path / "node_modules").mkdir()
+    for i in range(5):
+        (tmp_path / f"z{i}.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(c, "INVENTORY_LIMIT", 3)
+    assert len(c.inventory([tmp_path])) == 3
+
+
 # --- throwaway helpers ---------------------------------------------------------------------------
 
 def test_a_probe_nobody_uses_is_a_throwaway_helper(tmp_path):
