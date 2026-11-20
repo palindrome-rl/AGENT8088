@@ -23,22 +23,37 @@ gets back only the final answer — intermediate steps never enter its context.
 
 | Profile | Tools | Max turns | For |
 |---|---|---|---|
-| `explore` | `execute_shell`, `read_text`, `repository_read`, `web_search`, `get_page_title`, `last_output` | 6 | Read-only codebase search. No write tool at all. |
-| `researcher` | `web_search`, `get_page_title`, `read_text`, `last_output` | 8 | Web research with citations. No shell. |
+| `explore` | `execute_shell`, `read_text`, `repository_read`, `web_search`, `get_page_title`, `last_output` | 6 | Codebase search. Pinned readonly. |
+| `researcher` | `web_search`, `get_page_title`, `read_text`, `last_output` | 8 | Web research with citations. No shell. Pinned readonly. |
 | `coder` | `execute_shell`, `read_text`, `write_file`, `last_output` | 10 | Write code and verify it runs. |
 | `auditor` | `read_text`, `execute_shell`, `last_output` | 6 | Verify a completed step against the environment. Pinned readonly. |
 | `test-writer` | `read_text`, `run_tests`, `write_file`, `edit_file`, `execute_shell`, `last_output` | 12 | Write and run tests for an existing file, via `generate_tests`. Refuses to change the code under test — the file is hashed and checked. |
 | `general-purpose` | `execute_shell`, `read_text`, `write_file`, `web_search`, `get_page_title`, `calculate`, `last_output` | 8 | Mixed multi-step work. |
 
-Note the tool restriction is real isolation, not advice: `explore` has no
-`write_file`, so an explore sub-agent physically cannot write, whatever the
-model decides.
+A missing tool is real isolation, not advice: `researcher` has no shell and no
+write tool, so it cannot change files whatever the model decides. A tool list
+alone is not enough when it includes `execute_shell`, since a shell command can
+write; that is why `explore` is also pinned readonly (below). The
+`spawn_subagent` schema lists the valid profile names, so the model picks one
+from the list.
 
 ### The permission floor
 
 A profile may add `permission: readonly` to its frontmatter. The sub-run is then
 pinned to readonly for its whole lifetime, whatever mode the caller was in —
-including `full-auto`. `auditor` is the one bundled profile that uses it.
+including `full-auto`. `explore`, `researcher` and `auditor` use it.
+
+What a pinned sub-agent can still do:
+
+- **Read the web** when its caller could. Searches and page fetches follow the
+  caller's mode, so a pinned `researcher` under a `full-auto` caller does not
+  ask before every search, and under a `readonly` caller it gets nothing more.
+- **Run shell commands on a copy.** Each command runs in a temporary copy of
+  the folder the caller's shell works in (the project folder, or `artifacts/`),
+  without `.env*`, keys, `.git`, `node_modules`, virtual environments and build
+  output. Nothing the command changes is kept. A folder with more than 20,000
+  files or 500 MB is not copied; the sub-agent is told to use `read_text` or
+  `repository_read` instead.
 
 The floor only ever restricts. There is no frontmatter value that grants a
 sub-agent more than the caller already had, so a profile cannot widen its own
