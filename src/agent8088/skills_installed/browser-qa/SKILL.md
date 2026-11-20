@@ -17,7 +17,7 @@ see `frontend-ui-engineering`.
 | Question | Tool |
 |---|---|
 | Does it load and run without errors? | `check_app` (pages and scripts) |
-| Does the main action work? | a small headless test script, run with `execute_shell` |
+| Does the main action work? | `check_app` (clicks the first button), then a test script if the sandbox can start a browser |
 | Does it look right? | `screenshot_page`, then look at the image it attaches |
 | What does an existing image file show? | `view_image` |
 | Fix a problem you found | `edit_file`, a small targeted change |
@@ -30,7 +30,18 @@ before judging how anything looks: a page that throws can render half its conten
 ## 2. The main action works
 
 When the work has an action (submitting a form, filtering a table, a button that draws or
-updates something), prove it with a short headless script instead of assuming it:
+updates something), prove it instead of assuming it.
+
+Start with `check_app`: it clicks the first button and reports one that does nothing or throws.
+Then render with `screenshot_page` and confirm the starting state is what the action expects.
+
+To go further than the first button, a short headless test script can drive the page. It needs a
+browser inside the sandbox, which not every setup can start: the Windows sandbox, for one, cannot
+start a browser (it fails with `spawn EPERM` or a crash at launch). If the browser cannot start, do
+not retry, install anything or switch tools to get around it. Say that the action was not verified
+beyond what `check_app` showed.
+
+When a browser can start, run a script like this with `execute_shell`:
 
 ```python
 # test_signup.py: run with  python -m pytest -q test_signup.py

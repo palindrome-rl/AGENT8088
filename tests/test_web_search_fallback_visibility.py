@@ -445,7 +445,10 @@ def _auto_on_ddgs(eng, monkeypatch, last_probe):
     _local_searxng(eng)
     eng.APP_CONFIG["web_search_provider"] = "auto"
     eng.resolve_auto_search_provider(probe=lambda ctx: False)
-    eng._SEARCH_AUTO["last_probe"] = last_probe
+    # 0.0 means "long ago". The interval is measured on time.monotonic(), which
+    # starts near zero on a freshly booted machine (a CI runner), so a literal 0
+    # there is less than 300 s ago and no reprobe is due.
+    eng._SEARCH_AUTO["last_probe"] = time.monotonic() - 100_000 if last_probe == 0.0 else last_probe
     return searxng, ddgs
 
 
@@ -636,9 +639,11 @@ def test_api_status_and_api_doctor_carry_the_rows(cli, monkeypatch):
     _degrade()
     client = TestClient(web_server.app)
     status = client.get("/api/status").json()
-    assert status["capabilities"][0]["name"] == "search"
-    assert status["capabilities"][0]["state"] == "degraded"
-    assert client.get("/api/doctor").json()["limited"][0]["active"] == "ddgs"
+    # Other capabilities (a context limit, say) may be registered too, in any order.
+    search = [row for row in status["capabilities"] if row["name"] == "search"]
+    assert len(search) == 1 and search[0]["state"] == "degraded"
+    limited = [row for row in client.get("/api/doctor").json()["limited"] if row["name"] == "search"]
+    assert len(limited) == 1 and limited[0]["active"] == "ddgs"
 
 
 def test_api_search_use_resolves_auto(cli, monkeypatch, tmp_path):

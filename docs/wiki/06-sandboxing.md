@@ -50,6 +50,16 @@ in favor of a supported PATH version. If neither is suitable, sandbox setup
 downloads the pinned Node.js 22.11.0 build and verifies its SHA-256 checksum.
 Setup requires npm; running an already-installed sandbox only requires Node.
 
+**Secret files.** On macOS and Linux a sandboxed command cannot read or change
+`.env*`, `*.pem`, `*.key`, `*.p12` and `*_KEY*`, `*_SECRET*`, `*_TOKEN*`,
+`*_PASSWORD*` files in the project folder and in the folder the command runs in,
+nor `~/.ssh`, `~/.aws`, `~/.gnupg` and the other credential folders. On Linux the
+runtime takes only literal paths for write rules, so Agent8088 lists the matching
+files that exist before each command; a file the command itself creates is not
+covered (the file tools refuse those names on their own). `node_modules`, `.git`,
+virtual environments and build output are not scanned, and the scan stops after
+50,000 entries.
+
 On Windows the sandbox restricts file writes (a restricted token plus NTFS
 ACLs on the current account); it does not filter the network, and `/sandbox`
 says so.
