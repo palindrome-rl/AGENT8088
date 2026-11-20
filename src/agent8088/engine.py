@@ -5659,6 +5659,27 @@ def render_capability_guidance(specs: dict, *, native_tools: bool) -> str:
     return "\n\n" + "\n\n".join(sections) if sections else ""
 
 
+# Checks a plan can name for its verification steps, with what each answers.
+# Plan mode lists only the tools it may call while planning, so without this a
+# plan never knew they existed and fell back to "open it in a browser and look".
+_PLAN_CHECK_TOOLS = (
+    ("check_app", "load a page or script and report errors and an inert first button"),
+    ("screenshot_page", "render a page or image file and show you the picture"),
+    ("view_image", "look at an image file"),
+    ("run_tests", "run the project's tests"),
+)
+
+
+def _plan_check_tools() -> str:
+    """The verification tools the approved plan will have, or "" when none."""
+    names = set(TOOL_NAMES)
+    present = [f"{name} ({what})" for name, what in _PLAN_CHECK_TOOLS if name in names]
+    if not present:
+        return ""
+    return ("After approval the plan runs with the full tool set. For its checks, name these tools "
+            "rather than manual steps in a browser: " + "; ".join(present) + ".")
+
+
 def render_permission_context(mode: str | None = None) -> str:
     """State the live permission boundary once for every front end."""
     mode = mode or PERMISSION_MODE
@@ -5679,6 +5700,9 @@ def render_permission_context(mode: str | None = None) -> str:
             "then call present_plan with the complete plan. Do not claim work is complete "
             "until the user approves and the actions succeed."
         )
+        checks = _plan_check_tools()
+        if checks:
+            lines.append(checks)
     elif mode == "full-auto":
         lines.append(
             f"{where} Catastrophic commands and credential-path writes remain blocked."
