@@ -21,6 +21,7 @@ COLUMNS = (
     ("mean_score", "score", "{:.2f}"),
     ("false_done_rate", "false done", "pct"),
     ("false_not_verified_rate", "false NV", "pct"),
+    ("no_answer_rate", "no answer", "pct"),
     ("input_tokens", "tokens in", "{:,}"),
     ("output_tokens", "tokens out", "{:,}"),
     ("cost_usd", "cost $", "{:.2f}"),

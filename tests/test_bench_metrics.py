@@ -165,7 +165,20 @@ def test_false_not_verified_is_a_run_the_harness_doubted_that_the_grader_passed(
 def test_agreeing_verdicts_are_correct():
     assert benchlib.outcome(_result("verified", True)) == "correct"
     assert benchlib.outcome(_result("not_verified", False)) == "correct"
-    assert benchlib.outcome(_result("no_answer", False)) == "correct"
+
+
+
+def test_a_run_that_never_answered_is_its_own_outcome_whatever_the_grader_found():
+    # The user was told nothing, so the run is neither a correct verdict nor a false one.
+    assert benchlib.outcome(_result("no_answer", False)) == "no_answer"
+    assert benchlib.outcome(_result("no_answer", True)) == "no_answer"
+
+
+def test_the_summary_counts_runs_without_an_answer():
+    summary = benchlib.aggregate([_result("no_answer", True), _result("verified", True)])
+    assert summary["overall"]["no_answer_rate"] == pytest.approx(0.5)
+    # The grader still decides success.
+    assert summary["overall"]["success_rate"] == pytest.approx(1.0)
 
 
 def test_a_run_whose_grader_did_not_run_is_not_scored():

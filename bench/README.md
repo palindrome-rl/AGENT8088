@@ -9,6 +9,7 @@ Each run records:
 - what the harness told the user (its verdict)
 - **false done:** the harness called the work done, the grader failed it
 - **false not verified:** the harness doubted the work, the grader passed it
+- **no answer:** the run ended (time budget, model error, watchdog) without telling the user anything
 - input and output tokens, and the cost when the profile gives prices. Runs turn on
   `model_telemetry` so streamed replies carry the server's own counts; a result whose
   server still sent none is marked `tokens_estimated` (output is then a length estimate)

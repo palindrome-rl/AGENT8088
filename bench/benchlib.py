@@ -144,10 +144,15 @@ def cost_usd(tokens_in: int, tokens_out: int, profile: dict):
 # ----------------------------------------------------------------- scoring
 
 def outcome(result: dict) -> str:
-    """correct | false_done | false_not_verified | ungraded."""
+    """correct | false_done | false_not_verified | no_answer | ungraded.
+
+    no_answer: the run ended (time budget, model error, watchdog) without telling
+    the user anything, so there is no verdict to score, whatever the grader found."""
     grader = result.get("grader") or {}
     if "passed" not in grader:
         return "ungraded"
+    if result.get("harness_verdict") == "no_answer":
+        return "no_answer"
     done = result.get("harness_verdict") in DONE_VERDICTS
     if done and not grader["passed"]:
         return "false_done"
@@ -175,6 +180,7 @@ def _group(results: list) -> dict:
         "mean_score": sum(scores) / len(scores) if scores else None,
         "false_done_rate": _rate(sum(outcome(r) == "false_done" for r in said_done), len(said_done)),
         "false_not_verified_rate": _rate(sum(outcome(r) == "false_not_verified" for r in doubted), len(doubted)),
+        "no_answer_rate": _rate(sum(outcome(r) == "no_answer" for r in graded), len(graded)),
         "input_tokens": sum(int(r.get("input_tokens") or 0) for r in results),
         "output_tokens": sum(int(r.get("output_tokens") or 0) for r in results),
         "cost_usd": sum(costs) if costs else None,
