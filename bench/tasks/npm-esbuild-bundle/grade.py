@@ -17,9 +17,10 @@ HERE = Path(__file__).resolve().parent
 
 
 def _run(command, cwd, timeout):
-    # npm is npm.cmd on Windows, which needs the shell to start.
+    # The commands are fixed strings. The shell starts npm.cmd on Windows and
+    # finds npm on PATH elsewhere; without it, POSIX takes the whole string as a program name.
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          shell=sys.platform == "win32", encoding="utf-8", errors="replace", check=False)
+                          shell=True, encoding="utf-8", errors="replace", check=False)
 
 
 def grade(workspace: Path) -> dict:
