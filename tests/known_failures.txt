@@ -5,6 +5,7 @@
 # rest of the suite is unaffected. A new failure is NOT on this list and fails CI.
 #
 # Fix a test, then delete its line. Format: <node id> <TAB> <platforms seen>
+tests/test_audit_loop_guards.py::test_time_spent_verifying_does_not_count_against_the_turn	linux-ci (passes on Windows 10 and in a local Linux container; fails on the GitHub runner)
 tests/test_document_access.py::test_extraction_survives_an_os_that_refuses_memory_limits	windows
 tests/test_genuine_user_turns.py::test_every_loop_injected_turn_carries_a_marker	linux,windows
 tests/test_git_branch_and_subdir.py::test_commit_stages_inside_the_named_repo	linux
