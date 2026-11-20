@@ -8,6 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
+import fnmatch
 import inspect
 import queue
 try:
@@ -11064,6 +11065,48 @@ def set_sandbox_backend(backend: str) -> dict:
     return status
 
 
+# Secret files inside the folders a sandboxed command can reach.
+_SECRET_FILE_GLOBS = (".env*", "*.pem", "*.key", "*.p12", "*_KEY*", "*_SECRET*",
+                      "*_TOKEN*", "*_PASSWORD*")
+# Folders the per-command scan skips: large, rebuilt by tools, never hand-written.
+_SECRET_SCAN_SKIP = frozenset(("node_modules", ".git", ".venv", "venv", "__pycache__",
+                               "dist", "build", ".tox", ".mypy_cache"))
+_SECRET_SCAN_MAX_ENTRIES = 50000
+
+
+def _secret_scan_roots(workspace: Path | None) -> list:
+    roots = [PROJECT_ROOT.resolve()]
+    if workspace is not None:
+        resolved = Path(workspace).resolve()
+        if resolved != roots[0] and roots[0] not in resolved.parents:
+            roots.append(resolved)
+    return roots
+
+
+def _existing_secret_files(roots: list) -> list:
+    """Secret files that exist under `roots` now, as literal paths.
+
+    sandbox-runtime applies write rules on Linux as literal paths only and skips
+    any other pattern, and a skipped pattern protects nothing. The settings are
+    written before every command, so listing the files that exist at that moment
+    gives Linux the protection macOS gets from patterns. A file a command creates
+    while it runs is not covered; the file tools refuse those names on their own.
+    """
+    found, seen = [], 0
+    for root in roots:
+        for current, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in _SECRET_SCAN_SKIP)
+            for name in sorted(names):
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in _SECRET_FILE_GLOBS):
+                    found.append(Path(current) / name)
+            seen += len(names) + len(dirs)
+            if seen > _SECRET_SCAN_MAX_ENTRIES:
+                _log.warning("secret-file scan stopped after %d entries under %s; files deeper "
+                             "in the tree are not listed for the sandbox", _SECRET_SCAN_MAX_ENTRIES, root)
+                return found
+    return found
+
+
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
@@ -11072,13 +11115,13 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
-        PROJECT_ROOT / "**" / ".env*", PROJECT_ROOT / "**" / "*.pem",
-        PROJECT_ROOT / "**" / "*.key", PROJECT_ROOT / "**" / "*.p12",
-        PROJECT_ROOT / "**" / "*_KEY*",
-        PROJECT_ROOT / "**" / "*_SECRET*", PROJECT_ROOT / "**" / "*_TOKEN*",
-        PROJECT_ROOT / "**" / "*_PASSWORD*",
     ]
-    deny_paths = [str(path.expanduser().resolve()) for path in denied]
+    roots = _secret_scan_roots(workspace)
+    if sys.platform.startswith("linux"):
+        denied += _existing_secret_files(roots)
+    else:
+        denied += [root / "**" / pattern for root in roots for pattern in _SECRET_FILE_GLOBS]
+    deny_paths = list(dict.fromkeys(str(path.expanduser().resolve()) for path in denied))
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
     allow_write = [str(sandbox_tmp)]
