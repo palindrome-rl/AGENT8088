@@ -1,0 +1,10 @@
+{
+  "id": "slow-build-fix",
+  "title": "Run a three-minute build, fix the link error in the sources, rebuild",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 1500,
+  "needs": []
+}
