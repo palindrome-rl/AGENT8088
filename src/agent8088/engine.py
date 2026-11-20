@@ -5972,11 +5972,45 @@ def resolve_user_path(raw_path: str) -> Path:
     else:
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
-        p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
+        if len(p.parts) == 1 and _both_files(project_path, artifact_path):
+            # A bare-name write always goes to artifacts/, so a bare-name read
+            # that preferred the project copy found an older file than the one
+            # just written. Take the newer copy; the read names the other.
+            p = artifact_path if _mtime(artifact_path) >= _mtime(project_path) else project_path
+        else:
+            p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
     resolved = p.resolve()
     if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
+
+
+def _both_files(first: Path, second: Path) -> bool:
+    try:
+        return first.is_file() and second.is_file()
+    except OSError:
+        return False
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _other_bare_name_copy(raw_path: str, read: Path) -> str:
+    """A note naming the other copy of a bare filename, or "" when there is one copy."""
+    p = Path(_from_container_path(str(raw_path or ""))).expanduser()
+    if p.is_absolute() or len(p.parts) != 1:
+        return ""
+    project_path, artifact_path = (PROJECT_ROOT / p).resolve(), (ARTIFACTS_ROOT / p).resolve()
+    if not _both_files(project_path, artifact_path):
+        return ""
+    other = project_path if read.resolve() == artifact_path else artifact_path
+    age = "older" if _mtime(other) <= _mtime(read) else "newer"
+    return (f"\n\n[note: this is {read}. An {age} copy also exists at {other}; a bare filename "
+            "reads the newer one. Use the full path to read the other.]")
 
 
 def resolve_pasted_path(raw_path: str) -> Path:
@@ -14368,6 +14402,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         result = _strip_special_tokens(_paginate_read(text, args, read_target))
         if name == "read_text":
             _PENDING_LOCALIZATION.discard(read_target.resolve())
+            result += _other_bare_name_copy(_tool_path(spec, args), read_target)
         return result
 
     if mode == "write_text":
