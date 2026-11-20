@@ -1,0 +1,28 @@
+{
+  "revenue_total": 31929.42,
+  "orders_counted": 132,
+  "duplicate_order_ids": [
+    "ORD-1057",
+    "ORD-1119"
+  ],
+  "revenue_by_month": {
+    "2026-07": 10207.0,
+    "2026-08": 10263.5,
+    "2026-09": 11458.92
+  },
+  "revenue_by_region": {
+    "North": 9739.45,
+    "West": 6133.46,
+    "South": 8479.5,
+    "East": 7577.0
+  },
+  "budget_total": 32500.0,
+  "variance": -570.58,
+  "variance_pct": -1.8,
+  "supplier_cost": 9279.5,
+  "invoice_issues": {
+    "duplicate": "INV-004",
+    "mismatch": "INV-005",
+    "unreadable": "INV-006"
+  }
+}

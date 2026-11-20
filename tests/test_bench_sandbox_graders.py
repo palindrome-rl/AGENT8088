@@ -38,9 +38,14 @@ def _all_tasks_have_a_grader_test():
     return {"pip-venv-report", "slow-build-fix", "npm-esbuild-bundle", "http-api-server", "render-report-page"}
 
 
+# Long tasks are covered in test_bench_long_graders.py.
+LONG_TASKS = {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app"}
+
+
 def test_every_task_has_grader_tests():
     shipped = {folder.name for folder in TASKS.iterdir() if (folder / "task.json").is_file()}
-    assert shipped <= _all_tasks_have_a_grader_test(), shipped - _all_tasks_have_a_grader_test()
+    covered = _all_tasks_have_a_grader_test() | LONG_TASKS
+    assert shipped == covered, shipped ^ covered
 
 
 @pytest.mark.parametrize("task", sorted(_all_tasks_have_a_grader_test()))

@@ -1,0 +1,45 @@
+date,order_id,customer,region,product,quantity,unit_price,currency
+2026-07-07,ORD-1001,Isle Boats,North,Anchor 5kg,8,64.5,USD
+2026-07-27,ORD-1002,Estuary Rentals,West,Rope 20m,1,38.0,USD
+2026-07-13,ORD-1003,Estuary Rentals,West,Marine paint 2L,7,55.0,USD
+2026-07-22,ORD-1004,Dockside Co,North,Rope 20m,4,38.0,USD
+2026-07-22,ORD-1005,Gull Harbor,South,Life vest,2,41.0,USD
+2026-07-09,ORD-1006,Dockside Co,North,Marine paint 2L,-2,55.0,USD
+2026-07-02,ORD-1007,Isle Boats,West,Bilge pump,1,89.0,USD
+2026-07-06,ORD-1008,Isle Boats,North,Rope 20m,8,38.0,USD
+2026-07-04,ORD-1009,Estuary Rentals,North,Bilge pump,2,89.0,USD
+2026-07-15,ORD-1010,Isle Boats,North,Marine paint 2L,4,55.0,USD
+2026-07-15,ORD-1011,Fjord Charters,South,Marine paint 2L,3,55.0,USD
+2026-07-13,ORD-1012,Cove Yachts,East,Anchor 5kg,3,64.5,USD
+2026-07-02,ORD-1013,Gull Harbor,South,Rope 20m,7,38.0,USD
+2026-07-14,ORD-1014,Isle Boats,North,Marine paint 2L,8,55.0,USD
+2026-07-10,ORD-1015,Fjord Charters,South,Anchor 5kg,1,64.5,USD
+2026-07-08,ORD-1016,Helm & Sail,East,Deck brush,8,12.5,USD
+2026-07-27,ORD-1017,Helm & Sail,North,Anchor 5kg,3,64.5,USD
+2026-07-23,ORD-1018,Helm & Sail,West,Deck brush,2,12.5,USD
+2026-07-18,ORD-1019,Cove Yachts,West,Rope 20m,4,38.0,USD
+2026-07-12,ORD-1020,Bayside Marine,North,Life vest,1,41.0,USD
+2026-07-19,ORD-1021,Dockside Co,South,Rope 20m,1,38.0,USD
+2026-07-10,ORD-1022,Cove Yachts,North,Life vest,6,41.0,USD
+2026-07-05,ORD-1023,Cove Yachts,East,Bilge pump,5,89.0,USD
+2026-07-24,ORD-1024,Gull Harbor,West,Life vest,7,41.0,USD
+2026-07-02,ORD-1025,Gull Harbor,East,Anchor 5kg,6,64.5,USD
+2026-07-08,ORD-1026,Dockside Co,South,Bilge pump,2,89.0,USD
+2026-07-20,ORD-1027,Bayside Marine,South,Anchor 5kg,7,64.5,USD
+2026-07-28,ORD-1028,Bayside Marine,South,Anchor 5kg,9,64.5,USD
+2026-07-26,ORD-1029,Fjord Charters,East,Marine paint 2L,7,55.0,USD
+2026-07-04,ORD-1030,Dockside Co,West,Rope 20m,3,38.0,USD
+2026-07-12,ORD-1031,Helm & Sail,North,Anchor 5kg,7,64.5,USD
+2026-07-22,ORD-1032,Cove Yachts,North,Deck brush,6,12.5,USD
+2026-07-17,ORD-1033,Helm & Sail,North,Rope 20m,2,38.0,USD
+2026-07-09,ORD-1034,Cove Yachts,West,Anchor 5kg,9,64.5,USD
+2026-07-02,ORD-1035,Bayside Marine,North,Anchor 5kg,2,64.5,USD
+2026-07-28,ORD-1036,Estuary Rentals,North,Life vest,8,41.0,USD
+2026-07-28,ORD-1037,Cove Yachts,East,Marine paint 2L,9,55.0,USD
+2026-07-10,ORD-1038,Dockside Co,West,Anchor 5kg,1,64.5,USD
+2026-07-19,ORD-1039,Cove Yachts,North,Anchor 5kg,3,64.5,USD
+2026-07-17,ORD-1040,Fjord Charters,North,Anchor 5kg,8,64.5,USD
+2026-07-02,ORD-1041,Fjord Charters,South,Deck brush,1,12.5,USD
+2026-07-09,ORD-1042,Estuary Rentals,South,Rope 20m,8,38.0,USD
+2026-07-19,ORD-1043,Gull Harbor,North,Deck brush,8,12.5,USD
+2026-07-23,ORD-1044,Gull Harbor,East,Marine paint 2L,5,55.0,USD
