@@ -8,6 +8,7 @@ A single shared agent loop (run_agent) drives both modes:
 """
 import ast, asyncio, hashlib, math, operator, random, signal, sys, subprocess, json, re, os, shlex, shutil, stat, tempfile, threading, time, uuid, atexit, warnings, urllib.error, urllib.parse, urllib.request, platform, zipfile  # readline enables input history
 from collections import Counter
+import fnmatch
 import inspect
 import queue
 try:
@@ -466,6 +467,11 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
     explicit = _configured_dir(config, "project_root", launch)
     if explicit:
         if _is_dir(explicit):
+            reason = _risky_workspace(explicit)
+            if reason:
+                _config_warn(f"project_root is {reason} ({explicit}). New files, artifacts and "
+                             "shell commands work there, and the sandbox lets commands write "
+                             "in it. Set project_root to a project folder unless you mean it.")
             return explicit
         # A project_root copied from another machine or image (an installer
         # default, a container that works in /workspace, not /app) names a
@@ -487,9 +493,79 @@ def _configured_project_root(config: dict, cwd: Path | None = None) -> Path:
         except OSError:
             continue
         if launch == candidate or candidate in launch.parents:
-            return launch
+            return _guard_workspace(launch, config, launch)
         candidates.append(candidate)
-    return candidates[0] if candidates else launch
+    return _guard_workspace(candidates[0] if candidates else launch, config, launch)
+
+
+# Set when the workspace was moved away from the folder agent8088 started in.
+WORKSPACE_MOVED_FROM: Path | None = None
+SAFE_WORKSPACE_NAME = "agent8088-workspace"
+
+
+def _system_folders() -> list:
+    if sys.platform == "win32":
+        names = [os.environ.get(k, "") for k in ("SystemRoot", "ProgramFiles",
+                                                 "ProgramFiles(x86)", "ProgramData")]
+        return [Path(n).resolve() for n in names if n]
+    return [Path(p) for p in ("/usr", "/etc", "/bin", "/sbin", "/var", "/lib", "/boot",
+                              "/System", "/Library", "/Applications", "/private")]
+
+
+def _risky_workspace(path: Path) -> str:
+    """Why `path` is a bad default workspace, or "" when it is fine."""
+    path = Path(path).resolve()
+    if path == Path.home().resolve():
+        return "your home folder"
+    if path.parent == path:
+        return "the root of a drive" if sys.platform == "win32" else "the filesystem root"
+    if any(path == folder or folder in path.parents for folder in _system_folders()):
+        return "a system folder"
+    return ""
+
+
+def _guard_workspace(chosen: Path, config: dict, launch: Path) -> Path:
+    """Move a workspace that would be the home folder, a drive root or a system
+    folder to ~/agent8088-workspace.
+
+    Seen live: started from a terminal that opened in the home folder, the home
+    folder became the project, files landed loose in it, and once the user named
+    a path there the shell's writable folder became the whole home folder.
+    Only a workspace nobody chose is moved; an explicit project_root is kept.
+    The move is skipped when allowed_paths would refuse writes to the new folder.
+    """
+    global WORKSPACE_MOVED_FROM
+    reason = _risky_workspace(chosen)
+    if not reason:
+        return chosen
+    safe = (Path.home() / SAFE_WORKSPACE_NAME).resolve()
+    configured = [Path(raw.strip()).expanduser() for raw in str(config.get("allowed_paths", "")).split(",")
+                  if raw.strip()]
+    configured = [(p if p.is_absolute() else launch / p).resolve() for p in configured]
+    if configured and not any(safe == base or base in safe.parents for base in configured):
+        _config_warn(f"The workspace is {reason} ({chosen}). Start agent8088 in a project folder "
+                     "or set project_root.")
+        return chosen
+    try:
+        safe.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _config_warn(f"The workspace is {reason} ({chosen}), and {safe} could not be created ({exc}).")
+        return chosen
+    WORKSPACE_MOVED_FROM = chosen
+    _config_warn(f"Started in {reason}, so the workspace is {safe} instead. New files, artifacts and "
+                 "shell commands go there; other files can still be named by their path. To work "
+                 "in another folder, start agent8088 there or set project_root.")
+    return safe
+
+
+def _default_allowed_paths(project_root: Path, moved_from: Path | None) -> list:
+    """allowed_paths when config.txt sets none: the workspace, plus the home folder
+    it was moved away from, so a file there named by path still works."""
+    paths = [str(project_root)]
+    if moved_from is not None and Path(moved_from).parent != Path(moved_from) \
+            and Path(moved_from).resolve() == Path.home().resolve():
+        paths.append(str(moved_from))
+    return paths
 
 
 LAUNCH_DIR = Path(os.getcwd()).resolve()
@@ -1076,7 +1152,8 @@ def _resolve_allowed_path(raw: str) -> Path:
 
 ALLOWED_PATHS = [
     _resolve_allowed_path(p.strip())
-    for p in APP_CONFIG.get("allowed_paths", str(PROJECT_ROOT)).split(",")
+    for p in APP_CONFIG.get("allowed_paths",
+                            ",".join(_default_allowed_paths(PROJECT_ROOT, WORKSPACE_MOVED_FROM))).split(",")
     if p.strip()
 ]
 
@@ -1151,6 +1228,10 @@ _declined_plan_reply = ""
 # an escalation is a question the user can say yes to, and "this agent only
 # observes" has to be a guarantee, not a default. See _exec_subagent.
 _permission_floor_readonly = False
+# The caller's permission mode while a read-only pin is active. A pinned child
+# may read the web exactly when its caller could; the pin restricts changes,
+# never what the caller was already allowed to look at.
+_floor_parent_mode = "readonly"
 _sandbox_readonly = False
 # Where sandboxed shell commands run. artifacts/ unless a file the user named
 # was written elsewhere in the project this turn: then the project root, so the
@@ -2237,6 +2318,13 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     """Return True if the tool mode is allowed in the current permission mode."""
     if mode == "shell" and _hard_blocked_shell(command):
         return False
+    # A read-only pin restricts changes, not reading. Searches and GET requests
+    # follow the caller's mode, so a pinned explore or researcher under a
+    # full-auto caller is not turned into a prompt for every search, and under a
+    # readonly caller it gets nothing the caller did not have.
+    if (_permission_floor_readonly and mode in ("search", "http_get")
+            and _floor_parent_mode in ("edit", "full-auto")):
+        return True
     # Read-only subagents may execute verification commands only when the
     # backend guarantees isolation. Their disposable workspace is prepared by
     # _exec_sandbox_command; host execution never enters this exception.
@@ -4854,6 +4942,11 @@ def build_tools_def(tool_specs: dict) -> list:
             for param in spec["args"]:
                 arg_types = spec.get("arg_types", {})
                 props[param] = {"type": arg_types.get(param, "string")}
+            # The profile names are a closed set: listing them in the schema lets
+            # the model pick a valid one instead of guessing and being refused.
+            profiles = sorted(globals().get("SUBAGENT_SPECS") or {})
+            if spec.get("mode") == "subagent" and "agent_type" in props and profiles:
+                props["agent_type"]["enum"] = profiles
             params = {"type": "object", "properties": props,
                       "required": required_params(spec)}
         result.append({
@@ -5659,6 +5752,27 @@ def render_capability_guidance(specs: dict, *, native_tools: bool) -> str:
     return "\n\n" + "\n\n".join(sections) if sections else ""
 
 
+# Checks a plan can name for its verification steps, with what each answers.
+# Plan mode lists only the tools it may call while planning, so without this a
+# plan never knew they existed and fell back to "open it in a browser and look".
+_PLAN_CHECK_TOOLS = (
+    ("check_app", "load a page or script and report errors and an inert first button"),
+    ("screenshot_page", "render a page or image file and show you the picture"),
+    ("view_image", "look at an image file"),
+    ("run_tests", "run the project's tests"),
+)
+
+
+def _plan_check_tools() -> str:
+    """The verification tools the approved plan will have, or "" when none."""
+    names = set(TOOL_NAMES)
+    present = [f"{name} ({what})" for name, what in _PLAN_CHECK_TOOLS if name in names]
+    if not present:
+        return ""
+    return ("After approval the plan runs with the full tool set. For its checks, name these tools "
+            "rather than manual steps in a browser: " + "; ".join(present) + ".")
+
+
 def render_permission_context(mode: str | None = None) -> str:
     """State the live permission boundary once for every front end."""
     mode = mode or PERMISSION_MODE
@@ -5679,6 +5793,9 @@ def render_permission_context(mode: str | None = None) -> str:
             "then call present_plan with the complete plan. Do not claim work is complete "
             "until the user approves and the actions succeed."
         )
+        checks = _plan_check_tools()
+        if checks:
+            lines.append(checks)
     elif mode == "full-auto":
         lines.append(
             f"{where} Catastrophic commands and credential-path writes remain blocked."
@@ -5972,11 +6089,45 @@ def resolve_user_path(raw_path: str) -> Path:
     else:
         project_path = PROJECT_ROOT / p
         artifact_path = ARTIFACTS_ROOT / p
-        p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
+        if len(p.parts) == 1 and _both_files(project_path, artifact_path):
+            # A bare-name write always goes to artifacts/, so a bare-name read
+            # that preferred the project copy found an older file than the one
+            # just written. Take the newer copy; the read names the other.
+            p = artifact_path if _mtime(artifact_path) >= _mtime(project_path) else project_path
+        else:
+            p = artifact_path if artifact_path.exists() and not project_path.exists() else project_path
     resolved = p.resolve()
     if not _path_is_allowed(resolved):
         raise ValueError(f"Path not allowed: {resolved}")
     return resolved
+
+
+def _both_files(first: Path, second: Path) -> bool:
+    try:
+        return first.is_file() and second.is_file()
+    except OSError:
+        return False
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _other_bare_name_copy(raw_path: str, read: Path) -> str:
+    """A note naming the other copy of a bare filename, or "" when there is one copy."""
+    p = Path(_from_container_path(str(raw_path or ""))).expanduser()
+    if p.is_absolute() or len(p.parts) != 1:
+        return ""
+    project_path, artifact_path = (PROJECT_ROOT / p).resolve(), (ARTIFACTS_ROOT / p).resolve()
+    if not _both_files(project_path, artifact_path):
+        return ""
+    other = project_path if read.resolve() == artifact_path else artifact_path
+    age = "older" if _mtime(other) <= _mtime(read) else "newer"
+    return (f"\n\n[note: this is {read}. An {age} copy also exists at {other}; a bare filename "
+            "reads the newer one. Use the full path to read the other.]")
 
 
 def resolve_pasted_path(raw_path: str) -> Path:
@@ -9114,15 +9265,19 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     # escalation. Escalations from a sub-agent do reach the user, so leaving them
     # in place made "this agent only observes" a question the user could answer
     # yes to — including for the very file the auditor was sent to inspect.
-    global _permission_floor_readonly
+    global _permission_floor_readonly, _floor_parent_mode
     floor = profile.get("permission", "")
     saved_permission = None
     saved_grants = None
     if floor == "readonly":
         saved_permission = (PERMISSION_MODE, _plan_execution_grant,
                             _local_fallback_grant, _remote_git_grant,
-                            _permission_floor_readonly, _sandbox_readonly)
+                            _permission_floor_readonly, _sandbox_readonly, _floor_parent_mode)
         saved_grants = set(_one_shot_grants)  # copy -- the live set gets cleared below
+        # A nested pin keeps the outermost caller's mode, never "readonly" from
+        # the pin above it.
+        if not _permission_floor_readonly:
+            _floor_parent_mode = PERMISSION_MODE
         PERMISSION_MODE = "readonly"
         _one_shot_grants.clear()
         _plan_execution_grant = False
@@ -9184,7 +9339,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
         if saved_permission is not None:
             (PERMISSION_MODE, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant,
-             _permission_floor_readonly, _sandbox_readonly) = saved_permission
+             _permission_floor_readonly, _sandbox_readonly, _floor_parent_mode) = saved_permission
             _one_shot_grants.clear()
             _one_shot_grants.update(saved_grants)
 
@@ -11064,6 +11219,48 @@ def set_sandbox_backend(backend: str) -> dict:
     return status
 
 
+# Secret files inside the folders a sandboxed command can reach.
+_SECRET_FILE_GLOBS = (".env*", "*.pem", "*.key", "*.p12", "*_KEY*", "*_SECRET*",
+                      "*_TOKEN*", "*_PASSWORD*")
+# Folders the per-command scan skips: large, rebuilt by tools, never hand-written.
+_SECRET_SCAN_SKIP = frozenset(("node_modules", ".git", ".venv", "venv", "__pycache__",
+                               "dist", "build", ".tox", ".mypy_cache"))
+_SECRET_SCAN_MAX_ENTRIES = 50000
+
+
+def _secret_scan_roots(workspace: Path | None) -> list:
+    roots = [PROJECT_ROOT.resolve()]
+    if workspace is not None:
+        resolved = Path(workspace).resolve()
+        if resolved != roots[0] and roots[0] not in resolved.parents:
+            roots.append(resolved)
+    return roots
+
+
+def _existing_secret_files(roots: list) -> list:
+    """Secret files that exist under `roots` now, as literal paths.
+
+    sandbox-runtime applies write rules on Linux as literal paths only and skips
+    any other pattern, and a skipped pattern protects nothing. The settings are
+    written before every command, so listing the files that exist at that moment
+    gives Linux the protection macOS gets from patterns. A file a command creates
+    while it runs is not covered; the file tools refuse those names on their own.
+    """
+    found, seen = [], 0
+    for root in roots:
+        for current, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if d not in _SECRET_SCAN_SKIP)
+            for name in sorted(names):
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in _SECRET_FILE_GLOBS):
+                    found.append(Path(current) / name)
+            seen += len(names) + len(dirs)
+            if seen > _SECRET_SCAN_MAX_ENTRIES:
+                _log.warning("secret-file scan stopped after %d entries under %s; files deeper "
+                             "in the tree are not listed for the sandbox", _SECRET_SCAN_MAX_ENTRIES, root)
+                return found
+    return found
+
+
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
@@ -11072,13 +11269,13 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
-        PROJECT_ROOT / "**" / ".env*", PROJECT_ROOT / "**" / "*.pem",
-        PROJECT_ROOT / "**" / "*.key", PROJECT_ROOT / "**" / "*.p12",
-        PROJECT_ROOT / "**" / "*_KEY*",
-        PROJECT_ROOT / "**" / "*_SECRET*", PROJECT_ROOT / "**" / "*_TOKEN*",
-        PROJECT_ROOT / "**" / "*_PASSWORD*",
     ]
-    deny_paths = [str(path.expanduser().resolve()) for path in denied]
+    roots = _secret_scan_roots(workspace)
+    if sys.platform.startswith("linux"):
+        denied += _existing_secret_files(roots)
+    else:
+        denied += [root / "**" / pattern for root in roots for pattern in _SECRET_FILE_GLOBS]
+    deny_paths = list(dict.fromkeys(str(path.expanduser().resolve()) for path in denied))
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
     allow_write = [str(sandbox_tmp)]
@@ -12105,6 +12302,34 @@ def _audit_copy_ignore(base_ignore):
     return ignore
 
 
+_READONLY_COPY_SKIP = (".env*", "*.pem", "*.key", "*.p12", "__pycache__",
+                       "node_modules", ".venv", "venv", ".git", "dist", "build")
+# A read-only command runs on a fresh copy, so the copy has to stay cheap.
+_READONLY_COPY_MAX_FILES = 20000
+_READONLY_COPY_MAX_BYTES = 500 * 1024 * 1024
+
+
+def _readonly_copy_too_large(source: Path, ignore) -> str:
+    """Why `source` is too large to copy for one read-only command, or ""."""
+    files = size = 0
+    for root, dirs, names in os.walk(source):
+        skipped = ignore(root, dirs + names)
+        dirs[:] = [d for d in dirs if d not in skipped]
+        for name in names:
+            if name in skipped:
+                continue
+            files += 1
+            try:
+                size += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+            if files > _READONLY_COPY_MAX_FILES:
+                return f"more than {_READONLY_COPY_MAX_FILES} files"
+            if size > _READONLY_COPY_MAX_BYTES:
+                return f"more than {_READONLY_COPY_MAX_BYTES // (1024 * 1024)} MB"
+    return ""
+
+
 def _cleanup_audit_workspace(temporary) -> str:
     """Cleanup must not replace a command result or mask the original error."""
     try:
@@ -12177,19 +12402,26 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     else:
         command = _artifact_workspace_command(command)
     if _sandbox_readonly:
+        # The copy is of the folder the caller's shell works in: a pinned explore
+        # sent to look at the project must see the project, not artifacts/.
+        source = Path(_shell_workspace_root) if _shell_workspace_root is not None else ARTIFACTS_ROOT
+        ignore = _audit_copy_ignore(shutil.ignore_patterns(*_READONLY_COPY_SKIP))
+        too_large = _readonly_copy_too_large(source, ignore)
+        if too_large:
+            return (f"Error: {source} is too large to copy for a read-only command ({too_large}). "
+                    "Nothing was run. Read files with read_text or survey the folder with "
+                    "repository_read instead.")
         temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
         workspace = Path(temporary.name)
         try:
-            shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
-                            ignore=_audit_copy_ignore(shutil.ignore_patterns(
-                                ".env*", "*.pem", "*.key", "*.p12", "__pycache__",
-                                "node_modules", ".venv", "venv", ".git", "dist", "build")))
+            shutil.copytree(source, workspace, dirs_exist_ok=True, ignore=ignore)
         except (shutil.Error, OSError) as exc:
             # Never let a file the workspace happens to hold end the whole request.
             cleanup_note = _cleanup_audit_workspace(temporary)
             return (f"Error: could not copy the workspace for the read-only sandbox: {str(exc)[:300]}. "
                     "Nothing was run." + (f"\n{cleanup_note}" if cleanup_note else ""))
-        command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
+        for spelling in dict.fromkeys((str(source), str(ARTIFACTS_ROOT))):
+            command = command.replace(spelling, str(workspace))
     cleanup_note = ""
     try:
         result = _explain_sandbox_denial(
@@ -14368,6 +14600,7 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
         result = _strip_special_tokens(_paginate_read(text, args, read_target))
         if name == "read_text":
             _PENDING_LOCALIZATION.discard(read_target.resolve())
+            result += _other_bare_name_copy(_tool_path(spec, args), read_target)
         return result
 
     if mode == "write_text":
