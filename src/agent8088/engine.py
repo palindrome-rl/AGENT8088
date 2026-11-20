@@ -1151,6 +1151,10 @@ _declined_plan_reply = ""
 # an escalation is a question the user can say yes to, and "this agent only
 # observes" has to be a guarantee, not a default. See _exec_subagent.
 _permission_floor_readonly = False
+# The caller's permission mode while a read-only pin is active. A pinned child
+# may read the web exactly when its caller could; the pin restricts changes,
+# never what the caller was already allowed to look at.
+_floor_parent_mode = "readonly"
 _sandbox_readonly = False
 # Where sandboxed shell commands run. artifacts/ unless a file the user named
 # was written elsewhere in the project this turn: then the project root, so the
@@ -2237,6 +2241,13 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     """Return True if the tool mode is allowed in the current permission mode."""
     if mode == "shell" and _hard_blocked_shell(command):
         return False
+    # A read-only pin restricts changes, not reading. Searches and GET requests
+    # follow the caller's mode, so a pinned explore or researcher under a
+    # full-auto caller is not turned into a prompt for every search, and under a
+    # readonly caller it gets nothing the caller did not have.
+    if (_permission_floor_readonly and mode in ("search", "http_get")
+            and _floor_parent_mode in ("edit", "full-auto")):
+        return True
     # Read-only subagents may execute verification commands only when the
     # backend guarantees isolation. Their disposable workspace is prepared by
     # _exec_sandbox_command; host execution never enters this exception.
@@ -4854,6 +4865,11 @@ def build_tools_def(tool_specs: dict) -> list:
             for param in spec["args"]:
                 arg_types = spec.get("arg_types", {})
                 props[param] = {"type": arg_types.get(param, "string")}
+            # The profile names are a closed set: listing them in the schema lets
+            # the model pick a valid one instead of guessing and being refused.
+            profiles = sorted(globals().get("SUBAGENT_SPECS") or {})
+            if spec.get("mode") == "subagent" and "agent_type" in props and profiles:
+                props["agent_type"]["enum"] = profiles
             params = {"type": "object", "properties": props,
                       "required": required_params(spec)}
         result.append({
@@ -9114,15 +9130,19 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
     # escalation. Escalations from a sub-agent do reach the user, so leaving them
     # in place made "this agent only observes" a question the user could answer
     # yes to — including for the very file the auditor was sent to inspect.
-    global _permission_floor_readonly
+    global _permission_floor_readonly, _floor_parent_mode
     floor = profile.get("permission", "")
     saved_permission = None
     saved_grants = None
     if floor == "readonly":
         saved_permission = (PERMISSION_MODE, _plan_execution_grant,
                             _local_fallback_grant, _remote_git_grant,
-                            _permission_floor_readonly, _sandbox_readonly)
+                            _permission_floor_readonly, _sandbox_readonly, _floor_parent_mode)
         saved_grants = set(_one_shot_grants)  # copy -- the live set gets cleared below
+        # A nested pin keeps the outermost caller's mode, never "readonly" from
+        # the pin above it.
+        if not _permission_floor_readonly:
+            _floor_parent_mode = PERMISSION_MODE
         PERMISSION_MODE = "readonly"
         _one_shot_grants.clear()
         _plan_execution_grant = False
@@ -9184,7 +9204,7 @@ def _exec_subagent(args: dict, depth: int = 0, history: list | None = None,
         if saved_permission is not None:
             (PERMISSION_MODE, _plan_execution_grant,
              _local_fallback_grant, _remote_git_grant,
-             _permission_floor_readonly, _sandbox_readonly) = saved_permission
+             _permission_floor_readonly, _sandbox_readonly, _floor_parent_mode) = saved_permission
             _one_shot_grants.clear()
             _one_shot_grants.update(saved_grants)
 
@@ -12105,6 +12125,34 @@ def _audit_copy_ignore(base_ignore):
     return ignore
 
 
+_READONLY_COPY_SKIP = (".env*", "*.pem", "*.key", "*.p12", "__pycache__",
+                       "node_modules", ".venv", "venv", ".git", "dist", "build")
+# A read-only command runs on a fresh copy, so the copy has to stay cheap.
+_READONLY_COPY_MAX_FILES = 20000
+_READONLY_COPY_MAX_BYTES = 500 * 1024 * 1024
+
+
+def _readonly_copy_too_large(source: Path, ignore) -> str:
+    """Why `source` is too large to copy for one read-only command, or ""."""
+    files = size = 0
+    for root, dirs, names in os.walk(source):
+        skipped = ignore(root, dirs + names)
+        dirs[:] = [d for d in dirs if d not in skipped]
+        for name in names:
+            if name in skipped:
+                continue
+            files += 1
+            try:
+                size += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+            if files > _READONLY_COPY_MAX_FILES:
+                return f"more than {_READONLY_COPY_MAX_FILES} files"
+            if size > _READONLY_COPY_MAX_BYTES:
+                return f"more than {_READONLY_COPY_MAX_BYTES // (1024 * 1024)} MB"
+    return ""
+
+
 def _cleanup_audit_workspace(temporary) -> str:
     """Cleanup must not replace a command result or mask the original error."""
     try:
@@ -12177,19 +12225,26 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     else:
         command = _artifact_workspace_command(command)
     if _sandbox_readonly:
+        # The copy is of the folder the caller's shell works in: a pinned explore
+        # sent to look at the project must see the project, not artifacts/.
+        source = Path(_shell_workspace_root) if _shell_workspace_root is not None else ARTIFACTS_ROOT
+        ignore = _audit_copy_ignore(shutil.ignore_patterns(*_READONLY_COPY_SKIP))
+        too_large = _readonly_copy_too_large(source, ignore)
+        if too_large:
+            return (f"Error: {source} is too large to copy for a read-only command ({too_large}). "
+                    "Nothing was run. Read files with read_text or survey the folder with "
+                    "repository_read instead.")
         temporary = tempfile.TemporaryDirectory(prefix="agent8088-audit-")
         workspace = Path(temporary.name)
         try:
-            shutil.copytree(ARTIFACTS_ROOT, workspace, dirs_exist_ok=True,
-                            ignore=_audit_copy_ignore(shutil.ignore_patterns(
-                                ".env*", "*.pem", "*.key", "*.p12", "__pycache__",
-                                "node_modules", ".venv", "venv", ".git", "dist", "build")))
+            shutil.copytree(source, workspace, dirs_exist_ok=True, ignore=ignore)
         except (shutil.Error, OSError) as exc:
             # Never let a file the workspace happens to hold end the whole request.
             cleanup_note = _cleanup_audit_workspace(temporary)
             return (f"Error: could not copy the workspace for the read-only sandbox: {str(exc)[:300]}. "
                     "Nothing was run." + (f"\n{cleanup_note}" if cleanup_note else ""))
-        command = command.replace(str(ARTIFACTS_ROOT), str(workspace))
+        for spelling in dict.fromkeys((str(source), str(ARTIFACTS_ROOT))):
+            command = command.replace(spelling, str(workspace))
     cleanup_note = ""
     try:
         result = _explain_sandbox_denial(
