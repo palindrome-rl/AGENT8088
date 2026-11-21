@@ -670,9 +670,20 @@ def deliverable_text(written: Iterable[str], roots: Iterable[Path],
 
 
 def _words_for_evidence(text: str) -> str:
-    """Lower-case text with camelCase, snake_case and kebab-case split into words."""
+    """Lower-case words, with camelCase, snake_case and kebab-case split, and every other non-word character a space.
+
+    A key word is matched as the start of a word (" " + root), so a word that followed a quote, a slash or an equals
+    sign was never found: in a package.json, `"build"`, `"dayjs"`, `src/index.js` and `--outfile=dist/app.js` all
+    read as missing, and finished parts were reported as not addressed until the completion checks ran out."""
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
-    return re.sub(r"[_\-]+", " ", spaced).lower()
+    return re.sub(r"[^a-z0-9]+", " ", spaced.lower())
+
+
+# A part that asks the agent to run something, not to build something: it is met by a command that ran, which no file
+# shows ("Run `npm run build`, then run `node dist/app.js`", "install the dependencies", "start the server").
+_ACTION_PART = re.compile(
+    r"^\W*(?:\d+[.)]\s*)?(?:and\s+|also\s+|then\s+|finally\s+)?(?:run|execute|start|launch|install|test|check|verify|"
+    r"try|call|invoke|serve|open|load|curl|ping|restart|rerun|re-run)\b", re.IGNORECASE)
 
 
 def _root(word: str) -> str:
@@ -687,7 +698,7 @@ _COMMUNICATION = re.compile(
 
 
 def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
-                         evidence: str | None = None) -> list[str]:
+                         evidence: str | None = None, ran: Iterable[str] = ()) -> list[str]:
     """Items whose key words the reply and the written files never mention.
 
     A part counts as addressed when at least half of its key words appear in the
@@ -703,6 +714,10 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     ("explain", "list", "summarize") is still met by the reply. This catches a reply
     that claims a part without the files showing it; it cannot tell a part built
     wrongly from one built right.
+
+    ``ran`` (the shell commands that finished without a failure) is evidence only for a part that asks for
+    something to be run, installed, started or checked, which no file can show. A part that asks for something to
+    be built is never met by a command line, so an `echo` naming its words does not count.
     """
     names = " ".join(PurePath(w).name for w in written)
     if evidence is None:
@@ -714,6 +729,7 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
                 open_items.append(item)
         return open_items
     in_files = " " + _words_for_evidence(evidence + " " + names) + " "
+    in_commands = " " + _words_for_evidence(" ".join(str(c) for c in ran or ())) + " "
     reply_words = _keywords(reply or "")
     open_items = []
     for item in items:
@@ -722,6 +738,8 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
             continue
         if _COMMUNICATION.match(item):
             found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
+        elif _ACTION_PART.match(item):
+            found = sum(1 for w in words if (" " + _root(w)) in in_files or (" " + _root(w)) in in_commands)
         else:
             found = sum(1 for w in words if (" " + _root(w)) in in_files)
         if found * 2 < len(words):

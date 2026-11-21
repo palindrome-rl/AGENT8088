@@ -20411,7 +20411,7 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         if pending:
             unaddressed = completion_checks.unaddressed_subgoals(
                 pending, reply, trajectory.written_paths(),
-                evidence=_delivered_evidence(trajectory.written_paths()))
+                evidence=_delivered_evidence(trajectory.written_paths()), ran=trajectory.ran_commands())
             # What the reply did cover is done; the rest stays open and is listed by
             # _with_task_notes as "Not completed: ...", so it is not repeated here.
             trajectory.mark_subgoals(unaddressed)
@@ -20470,7 +20470,7 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         if pending:
             evidence = _delivered_evidence(written)
             open_items = completion_checks.unaddressed_subgoals(
-                pending, reply, written, evidence=evidence)
+                pending, reply, written, evidence=evidence, ran=trajectory.ran_commands())
             trajectory.mark_subgoals(open_items)
             if open_items:
                 nudge = completion_checks.subgoals_nudge(open_items, evidence=evidence is not None)
