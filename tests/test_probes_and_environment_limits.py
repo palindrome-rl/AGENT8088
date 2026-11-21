@@ -174,6 +174,6 @@ def test_actual_node_code_that_writes_and_fails_is_not_a_probe(tmp_path):
     result = subprocess.run([node, '-e', code], cwd=tmp_path, capture_output=True,
                             text=True, timeout=10, check=False)
     assert result.returncode == 1 and (tmp_path / 'probe-test.txt').is_file()
-    state = _state()
-    _run(state, 'node -e "' + code + '"', 'Command exited with status 1.')
-    assert state.check_failing()
+    # Not excused as an availability probe. Whether it is a check is a separate question: a snippet is not one just
+    # because a file name in its code says "test" (see test_inline_code_is_not_a_check.py).
+    assert not _is_probe('node -e "' + code + '"')
