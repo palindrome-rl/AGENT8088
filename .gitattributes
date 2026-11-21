@@ -10,3 +10,13 @@ docker-entrypoint.sh    text eol=lf
 
 # PowerShell is consumed by Windows hosts; CRLF is the native convention there.
 *.ps1                   text eol=crlf
+
+# Binary documents are never line-ending converted.
+*.pdf                   binary
+*.xlsx                  binary
+*.pptx                  binary
+*.docx                  binary
+*.png                   binary
+
+# Benchmark fixtures stay byte for byte as committed, so every checkout grades the same inputs.
+bench/tasks/*/fixture/** -text

@@ -83,6 +83,24 @@ python bench/report.py new-runs/results.jsonl --baseline baseline.json
 
 ## Tasks
 
+| Task | Kind | Budget | What it exercises |
+|---|---|---|---|
+| `pip-venv-report` | sandbox | 15 min | a venv, a pip install from PyPI, a script run with the venv |
+| `npm-esbuild-bundle` | sandbox | 15 min | npm installs, an esbuild bundle that runs without node_modules |
+| `http-api-server` | sandbox | 15 min | writing a server, starting it, checking it over HTTP, a restart |
+| `render-report-page` | sandbox | 15 min | an offline page with a table and an SVG chart, looked at rendered |
+| `slow-build-fix` | sandbox | 25 min | a three-minute build, a link error fixed in the sources, a rebuild |
+| `kanban-board` | long | 2 h | a board page with written rules, persistence, import and export, undo |
+| `qbr-review-pack` | long | 2 h | a workbook, deck and memo from messy CSV, Excel and PDF inputs |
+| `notes-app` | long | 2 h | a JSON API on SQLite, a page and the app's own tests |
+| `ledger-app` | long | 2 h | money in cents, CSV export, a summary, a page and tests |
+
+The long tasks' original checkers are kept as `check.py`, changed only so they
+start a browser through `graderlib` and so a server that drops a connection
+fails a step instead of crashing the check; `grade.py` maps their reports to
+the benchmark's format. Reference solutions for every grader are in
+`tests/bench_references`, away from the task folders.
+
 Each task folder has:
 
 - `task.json`: `id` (same as the folder), `kind` (`sandbox` or `long`), `prompt`, `grader`, `budget_sec`, and optionally `fixture`, `config` (extra config keys) and `needs` (what the task requires, such as network hosts)

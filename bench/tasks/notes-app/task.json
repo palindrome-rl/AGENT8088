@@ -1,0 +1,12 @@
+{
+  "id": "notes-app",
+  "title": "Build a stdlib notes app: JSON API, SQLite, a page and its own tests",
+  "kind": "long",
+  "prompt": "prompt.md",
+  "fixture": "",
+  "grader": "grade.py",
+  "budget_sec": 7200,
+  "needs": [
+    "local port"
+  ]
+}

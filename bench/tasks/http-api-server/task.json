@@ -1,0 +1,12 @@
+{
+  "id": "http-api-server",
+  "title": "Write a stdlib JSON API, start it, check every endpoint over HTTP, restart it",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": [
+    "local port"
+  ]
+}

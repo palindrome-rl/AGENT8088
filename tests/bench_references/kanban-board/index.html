@@ -1,0 +1,45 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Team Board (reference)</title>
+<style>body{font-family:sans-serif}.cols{display:flex;gap:8px}.col{border:1px solid #999;padding:6px;min-width:220px}.card{border:1px solid #ccc;margin:4px 0;padding:4px}.due.late{color:red}</style></head><body>
+<div><button data-role="add-card">Add card</button> <button data-role="advance-day">Advance day</button> <button data-role="undo">Undo</button>
+<button data-role="export">Export</button> <input type="file" data-role="import"> <input data-role="search" placeholder="Search"> <select data-role="filter-assignee"><option value="">All</option></select></div>
+<div data-role="message"></div>
+<div id="form" hidden><input name="title"><select name="assignee"></select><select name="priority"><option>Low</option><option>Medium</option><option>High</option></select><input name="due"><textarea name="checklist"></textarea><button data-role="save-card">Save</button></div>
+<div class="cols" id="cols"></div>
+<script>
+const COLS=["To Do","In Progress","In Review","Done"];let S=null,undo=[],editing=null,seq=100;const q=s=>document.querySelector(s);
+const save=()=>localStorage.setItem("tb",JSON.stringify({S,undo}));
+function msg(t){q('[data-role=message]').textContent=t}
+function push(){undo.push(JSON.stringify(S));if(undo.length>50)undo.shift()}
+async function init(){const raw=localStorage.getItem("tb");if(raw){({S,undo}=JSON.parse(raw))}else{S=await (await fetch("seed.json")).json();undo=[]}
+ const a=q('select[name=assignee]'),f=q('[data-role=filter-assignee]');S.people.forEach(p=>{a.add(new Option(p,p));f.add(new Option(p,p))});render()}
+function render(){const c=q('#cols');c.innerHTML='';const term=q('[data-role=search]').value.toLowerCase(),fa=q('[data-role=filter-assignee]').value;
+ COLS.forEach(col=>{const d=document.createElement('div');d.className='col';d.dataset.column=col;d.innerHTML='<h3>'+col+'</h3>';
+  let cards=S.cards.filter(x=>x.column==col&&x.title.toLowerCase().includes(term)&&(!fa||x.assignee==fa));
+  const od=x=>col=="In Review"&&x.daysInColumn>=2;cards=[...cards.filter(od),...cards.filter(x=>!od(x))];
+  cards.forEach(x=>{const e=document.createElement('div');e.className='card';e.dataset.cardId=x.id;e.dataset.assignee=x.assignee;e.dataset.priority=x.priority;
+   const late=x.due&&x.due<new Date().toISOString().slice(0,10);
+   e.innerHTML='<b>'+x.title+'</b> ('+x.assignee+', '+x.priority+') <span class="due '+(late?'late':'')+'" '+(late?'style="color:red"':'')+'>'+(x.due||'')+'</span>'+(od(x)?' <span data-role="badge">Overdue review</span>':'')+'<br>';
+   x.checklist.forEach((it,i)=>{const l=document.createElement('label');const k=document.createElement('input');k.type='checkbox';k.dataset.role='check';k.checked=it.done;k.onchange=()=>{push();it.done=k.checked;save();render()};l.append(k,it.text,' ');e.append(l)});
+   const m=document.createElement('select');m.dataset.role='move';COLS.forEach(n=>m.add(new Option(n,n)));m.value=x.column;m.onchange=()=>move(x,m.value);e.append(m);
+   const ed=document.createElement('button');ed.dataset.role='edit-card';ed.textContent='Edit';ed.onclick=()=>openForm(x);e.append(ed);
+   const de=document.createElement('button');de.dataset.role='delete-card';de.textContent='Delete';de.onclick=()=>{push();S.cards=S.cards.filter(y=>y!=x);save();render()};e.append(de);d.append(e)});c.append(d)});}
+function move(x,col){if(col==x.column)return;
+ if(col=="In Progress"&&S.cards.filter(y=>y!=x&&y.assignee==x.assignee&&y.column=="In Progress").length>=3){msg(x.assignee+" already has 3 cards in progress");render();return}
+ if(col=="Done"&&x.checklist.some(i=>!i.done)){msg("The checklist is not finished");render();return}
+ push();x.column=col;x.daysInColumn=0;msg('');save();render()}
+function openForm(x){editing=x;q('#form').hidden=false;q('[name=title]').value=x?x.title:'';q('[name=assignee]').value=x?x.assignee:S.people[0];q('[name=priority]').value=x?x.priority:'Low';q('[name=due]').value=x?x.due||'':'';q('[name=checklist]').value=x?x.checklist.map(i=>i.text).join('\n'):''}
+q('[data-role=add-card]').onclick=()=>openForm(null);
+q('[data-role=save-card]').onclick=()=>{push();const t=q('[name=title]').value,items=q('[name=checklist]').value.split('\n').filter(Boolean);
+ const vals={title:t,assignee:q('[name=assignee]').value,priority:q('[name=priority]').value,due:q('[name=due]').value};
+ if(editing){Object.assign(editing,vals);editing.checklist=items.map((s,i)=>({text:s,done:(editing.checklist[i]||{}).done&&editing.checklist[i].text==s||false}))}
+ else S.cards.push({id:'N'+(++seq),...vals,column:'To Do',daysInColumn:0,checklist:items.map(s=>({text:s,done:false}))});
+ q('#form').hidden=true;save();render()};
+q('[data-role=advance-day]').onclick=()=>{push();S.cards.forEach(x=>x.daysInColumn++);save();render()};
+q('[data-role=undo]').onclick=()=>{if(undo.length){S=JSON.parse(undo.pop());save();render()}};
+q('[data-role=search]').oninput=render;q('[data-role=filter-assignee]').onchange=render;
+q('[data-role=export]').onclick=()=>{const b=new Blob([JSON.stringify({schema:"teamboard-1",exportedAt:new Date().toISOString().slice(0,10),columns:COLS,cards:S.cards},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='teamboard.json';a.click()};
+q('[data-role=import]').onchange=async e=>{const f=e.target.files[0];if(!f)return;let j;try{j=JSON.parse(await f.text())}catch(x){msg("Import refused: not valid JSON");return}
+ if(j.schema!=="teamboard-1"||!Array.isArray(j.cards)||j.cards.some(c=>!COLS.includes(c.column))){msg("Import refused: bad schema or unknown column");return}
+ push();S.cards=j.cards;save();render();msg("Imported")};
+init();
+</script></body></html>
