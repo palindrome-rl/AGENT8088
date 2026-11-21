@@ -23,8 +23,8 @@ PACKAGE = """{
 """
 PARTS = [
     "Create package.json, install `dayjs` as a dependency and `esbuild` as a dev dependency from the npm registry.",
-    "Add an npm script called `build` that uses esbuild to bundle src/index.js into one file, dist/app.js, for Node, "
-    "with dayjs included in the bundle so dist/app.js runs on its own.",
+    ("Add an npm script called `build` that uses esbuild to bundle src/index.js into one file, dist/app.js, for Node, "
+     "with dayjs included in the bundle so dist/app.js runs on its own."),
     "Run `npm run build`, then run `node dist/app.js` and check what it prints.",
 ]
 
