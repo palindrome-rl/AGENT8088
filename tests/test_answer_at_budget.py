@@ -4,7 +4,12 @@ own checks found.
 Seen in benchmark runs: the server the run wrote passed every grader check, but a completion check sent the model back to
 work with half a minute left, the budget then stopped the run, and the user got the budget message and the last tool's
 output, with no verification level and no notes."""
-from tests.test_completion_pipeline import Script, _call, eng, failing_then_ok  # noqa: F401
+from tests.test_completion_pipeline import (  # noqa: F401
+    Script,
+    _call,
+    eng,
+    failing_then_ok,
+)
 
 PYTEST = _call("execute_shell", command="python -m pytest -q")
 PASSED = "3 passed in 0.2s"
