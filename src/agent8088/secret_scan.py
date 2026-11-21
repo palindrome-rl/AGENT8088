@@ -274,6 +274,31 @@ def _codelike(token: str) -> bool:
 # Subresource / lockfile integrity values (`sha512-<base64>==`): public checksums of a download, not secrets.
 _INTEGRITY_RE = re.compile(r"sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}")
 
+# A hex value its own label calls a digest: `"sha256": "<hex>"`, `checksum = <hex>`, `file_hash: <hex>`.
+# Only the exact lengths hashes have (MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512), and never behind a
+# label that also names a key, token, password, salt or secret: a hash of a password is still worth a look.
+# A bare hex string with no label is still reported; the module docstring says why.
+_DIGEST_LENGTHS = frozenset({32, 40, 56, 64, 96, 128})
+_DIGEST_LABEL_RE = re.compile(
+    r"""(?P<label>(?<![\w-])[\w-]*?(?:sha-?(?:1|224|256|384|512)|md5|blake2[bs]?|digest|checksum|hash|etag)"""
+    r"""(?:[_-][\w-]*)?)(?P<sep>["']?\s*[:=]\s*["']?)(?P<hex>[A-Fa-f0-9]+)(?![\w])""",
+    re.IGNORECASE)
+_SECRET_LABEL_RE = re.compile(r"pass|secret|token|key|auth|cred|salt|session|cookie|sign", re.IGNORECASE)
+# `sha256sum` output: the digest, one or two spaces (a `*` marks binary mode), then the file name.
+_SUM_LINE_RE = re.compile(r"^(?P<hex>[A-Fa-f0-9]+)(?P<rest> [ *]\S.*)$", re.MULTILINE)
+
+
+def _labelled_digest(match):
+    if len(match.group("hex")) not in _DIGEST_LENGTHS or _SECRET_LABEL_RE.search(match.group("label")):
+        return match.group(0)
+    return match.group("label") + match.group("sep") + "public-digest"
+
+
+def _sum_line(match):
+    if len(match.group("hex")) not in _DIGEST_LENGTHS:
+        return match.group(0)
+    return "public-digest" + match.group("rest")
+
 
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token) or _INTEGRITY_RE.fullmatch(token):
@@ -319,6 +344,10 @@ def find_secrets(text: str) -> list:
     # Only URL query context excuses version hashes; a standalone v=<hex>
     # assignment remains eligible for the credential detector.
     opaque_text = _LINK_VERSION_RE.sub(lambda m: m.group('prefix') + 'public-version', opaque_text)
+    # Build manifests, lockfiles and checksum lists name their digests; a correct build was reported as
+    # leaking a credential over the SHA-256 in its own manifest.
+    opaque_text = _DIGEST_LABEL_RE.sub(_labelled_digest, opaque_text)
+    opaque_text = _SUM_LINE_RE.sub(_sum_line, opaque_text)
 
     def user_agent(match):
         value = match.group('quoted') or match.group('plain') or ''
