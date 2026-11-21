@@ -339,11 +339,36 @@ def _environment_limit(result) -> str:
     return ""
 
 
+# The code handed to an interpreter on its command line (`node -e "..."`, `python -c "..."`). What it prints or
+# names is not what the command is: `node -e "console.log('spawn test')"` is a snippet, not a test run. Seen in a
+# benchmark run: a one-off snippet with a quoting mistake failed, the word "test" in its own output made it "the
+# latest check", and the run ended NOT VERIFIED although the build and the program both ran cleanly afterwards.
+_INLINE_CODE = re.compile(
+    r"""^(?P<head>\s*(?:"[^"]*[\\/]|\S*[\\/])?(?:node|nodejs|deno|bun|python[\d.]*|py|ruby|perl|php)(?:\.exe)?"?"""
+    r"(?:\s+-{1,2}[\w-]+)*?\s+(?:-e|-p|--eval|--print|-c|-r))(?:\s.*)?$",
+    re.IGNORECASE | re.DOTALL)
+
+
+# Inline code that starts a real test runner, or imports a test module (`python -c "import test_app"`), is still a
+# test run.
+_INLINE_TEST_RUNNER = re.compile(
+    r"\b(?:pytest|unittest)\.main\b|\bimport\s+(?:test_\w+|\w+_tests?)\b|\bfrom\s+(?:test_\w+|\w+_tests?)\s+import\b"
+    r"""|\brequire\(\s*['"][^'"]*(?:[./\\]test_|\.test\.|\.spec\.)[^'"]*['"]""")
+
+
+def _without_inline_code(segment: str) -> str:
+    match = _INLINE_CODE.match(segment or "")
+    if not match or _INLINE_TEST_RUNNER.search(segment):
+        return segment
+    return match.group("head")
+
+
 def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
     if not (command or "").strip():
         return True
-    return any(_CHECK_COMMAND.search(segment) for segment in command_segments(command, split_or=True)
+    return any(_CHECK_COMMAND.search(_without_inline_code(segment))
+               for segment in command_segments(command, split_or=True)
                if segment.strip() and _segment_program(segment) not in _FILE_COMMANDS)
 
 

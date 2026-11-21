@@ -1,0 +1,46 @@
+date,order_id,customer,region,product,quantity,unit_price,currency
+08/13/2026,ORD-1045,Helm & Sail,East,Rope 20m,5,38.0,USD
+08/25/2026,ORD-1046,Gull Harbor,North,Deck brush,3,12.5,USD
+08/06/2026,ORD-1047,Dockside Co,North,Deck brush,4,12.5,USD
+08/12/2026,ORD-1048,Cove Yachts,East,Anchor 5kg,9,64.5,USD
+08/08/2026,ORD-1049,Isle Boats,South,Bilge pump,3,89.0,USD
+08/10/2026,ORD-1050,Gull Harbor,North,Anchor 5kg,6,64.5,USD
+08/19/2026,ORD-1051,Bayside Marine,South,Bilge pump,3,89.0,USD
+08/13/2026,ORD-1052,Gull Harbor,West,Rope 20m,1,38.0,USD
+08/13/2026,ORD-1053,Dockside Co,North,Anchor 5kg,7,64.5,USD
+08/22/2026,ORD-1054,Isle Boats,North,Deck brush,8,12.5,USD
+2026-08-08,ORD-1055,Estuary Rentals,East,Deck brush,9,12.5,USD
+2026-08-04,ORD-1056,Isle Boats,North,Anchor 5kg,5,64.5,USD
+2026-08-18,ORD-1057,Helm & Sail,West,Rope 20m,4,38.0,USD
+2026-08-20,ORD-1058,Estuary Rentals,South,Anchor 5kg,8,64.5,USD
+2026-08-17,ORD-1059,Bayside Marine,South,Rope 20m,1,38.0,USD
+2026-08-22,ORD-1060,Cove Yachts,West,Bilge pump,3,89.0,USD
+2026-08-02,ORD-1061,Bayside Marine,South,Rope 20m,4,38.0,USD
+2026-08-18,ORD-1062,Estuary Rentals,West,Marine paint 2L,8,55.0,USD
+2026-08-17,ORD-1063,Dockside Co,West,Anchor 5kg,6,64.5,USD
+2026-08-16,ORD-1064,Estuary Rentals,South,Life vest,7,41.0,USD
+2026-08-10,ORD-1065,Dockside Co,West,Life vest,7,41.0,USD
+2026-08-26,ORD-1066,Bayside Marine,East,Bilge pump,9,89.0,USD
+2026-08-24,ORD-1067,Gull Harbor,North,Deck brush,3,12.5,USD
+2026-08-20,ORD-1068,Isle Boats,North,Deck brush,7,12.5,USD
+2026-08-15,ORD-1069,Gull Harbor,South,Anchor 5kg,9,64.5,USD
+2026-08-01,ORD-1070,Dockside Co,West,Deck brush,5,12.5,USD
+2026-08-13,ORD-1071,Cove Yachts,North,Life vest,9,41.0,USD
+2026-08-04,ORD-1072,Cove Yachts,South,Deck brush,1,12.5,USD
+2026-08-27,ORD-1073,Bayside Marine,East,Marine paint 2L,7,55.0,USD
+2026-08-14,ORD-1074,Bayside Marine,South,Rope 20m,7,38.0,USD
+2026-08-14,ORD-1075,Bayside Marine,West,Life vest,8,41.0,USD
+2026-08-04,ORD-1076,Fjord Charters,East,Marine paint 2L,4,55.0,USD
+2026-08-15,ORD-1077,Estuary Rentals,North,Bilge pump,1,89.0,USD
+2026-08-19,ORD-1078,Dockside Co,South,Anchor 5kg,3,64.5,USD
+2026-08-06,ORD-1079,Isle Boats,North,Marine paint 2L,4,55.0,USD
+2026-08-04,ORD-1080,Fjord Charters,North,Deck brush,6,12.5,USD
+2026-08-07,ORD-1081,Estuary Rentals,South,Deck brush,6,12.5,USD
+2026-08-07,ORD-1082,Dockside Co,East,Rope 20m,4,38.0,USD
+2026-08-26,ORD-1083,Fjord Charters,North,Rope 20m,3,38.0,USD
+2026-08-20,ORD-1084,Dockside Co,East,Rope 20m,7,38.0,USD
+2026-08-22,ORD-1085,Isle Boats,East,Rope 20m,5,38.0,USD
+2026-08-10,ORD-1086,Bayside Marine,West,Life vest,1,41.0,USD
+2026-08-09,ORD-1087,Helm & Sail,North,Life vest,1,41.0,USD
+2026-08-15,ORD-1088,Gull Harbor,North,Life vest,8,41.0,USD
+2026-08-18,ORD-1057,Helm & Sail,West,Rope 20m,4,38.0,USD

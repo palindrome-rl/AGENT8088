@@ -18306,7 +18306,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             )
         return answer
     except TurnBudgetExceeded as exc:
-        answer = _guard_answer(f"{exc}\n\nPartial result so far:\n{_last_tool_output[:1000] or '(none)'}")
+        answer = _budget_answer(str(exc), run_trajectory)
         if kwargs.get("on_answer"):
             kwargs["on_answer"](answer)
         if isinstance(kwargs.get("trace"), list):
@@ -20560,6 +20560,39 @@ _ASSURANCE_LINES = {
 _NO_AUTOMATED_PASS_SENTENCE = "Changed work was inspected, but no automated verification passed."
 
 
+# With this little time left a completion check cannot get anything done: the model is sent back to work and the
+# budget ends the run before it answers. Seen in benchmark runs: correct work, a check sent at the last turn, and the
+# run ended with no answer at all. Below this the reply is taken, and what the checks would have asked is noted.
+ANSWER_TIME_FLOOR_SECONDS = 90
+ANSWER_TIME_SHARE = 0.05
+
+
+def _answer_time(budget) -> bool:
+    """True in the last stretch of a wall-clock budget, when a reply should be taken as the answer."""
+    if budget is None or not getattr(budget, "max_seconds", 0):
+        return False
+    left = budget.seconds_left()
+    return left is not None and left <= max(ANSWER_TIME_FLOOR_SECONDS, ANSWER_TIME_SHARE * budget.max_seconds)
+
+
+def _budget_answer(reason: str, trajectory) -> str:
+    """The answer when a time, token or cost budget stops the run before the model answered.
+
+    It used to be the budget message and the last tool output, with none of the end-of-run notes, so a run whose
+    work was done and tested read the same as one that had done nothing. It now carries the same notes as any other
+    finish: the verification level, the NOT VERIFIED headline and what was left undone."""
+    partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
+    answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
+                           f"Partial result so far:\n{partial}")
+    if trajectory is None:
+        return answer
+    try:
+        return _with_task_notes(answer, trajectory)
+    except Exception:  # noqa: BLE001 - the stop must still return what it has
+        _log.warning("end-of-run notes failed after a budget stop", exc_info=True)
+        return answer
+
+
 def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
@@ -20897,9 +20930,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         over = budget.exceeded() if budget else None
         if over:
             _log.warning("turn budget hit at turn %d: %s", turn, over)
-            answer = _guard_answer(
-                f"{over}\n\nPartial result so far:\n"
-                f"{_last_tool_output[:1000] if _last_tool_output else '(none)'}")
+            answer = _budget_answer(over, trajectory)
             if on_answer:
                 on_answer(answer)
             if trace is not None:
@@ -21592,7 +21623,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             last_text_answer = answer
             # Once told to answer, take this reply: a gate firing again here is
             # exactly the open-ended checking the cap exists to end.
-            gates_open = not post_check_told
+            gates_open = not post_check_told and not _answer_time(budget)
             if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()

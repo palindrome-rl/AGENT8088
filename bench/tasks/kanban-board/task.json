@@ -1,0 +1,12 @@
+{
+  "id": "kanban-board",
+  "title": "Build an offline team board page with rules, persistence, import/export and undo",
+  "kind": "long",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 7200,
+  "needs": [
+    "chromium for the grader"
+  ]
+}

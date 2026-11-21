@@ -1,0 +1,10 @@
+{
+  "id": "npm-esbuild-bundle",
+  "title": "npm install a dependency and esbuild, bundle with an npm script, run the bundle",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["node", "npm", "network:registry.npmjs.org"]
+}
