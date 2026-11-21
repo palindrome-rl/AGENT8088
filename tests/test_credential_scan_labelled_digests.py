@@ -46,5 +46,5 @@ def test_unlabelled_or_secret_labelled_hex_is_still_reported(text):
 
 def test_a_manifest_file_scans_clean(tmp_path):
     manifest = tmp_path / "manifest.json"
-    manifest.write_text('{\n  "modules": 120,\n  "sha256": "%s"\n}\n' % SHA256, encoding="utf-8")
+    manifest.write_text('{\n  "modules": 120,\n  "sha256": "' + SHA256 + '"\n}\n', encoding="utf-8")
     assert ss.scan_files([str(manifest)]) == []
