@@ -1,0 +1,32 @@
+{
+  "id": "price-watch",
+  "title": "Compare prices from four local shop sites, write a brief, and build a daily re-check script",
+  "kind": "long",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 7200,
+  "services": [
+    {
+      "command": [
+        "{python}",
+        "mock_sites.py",
+        "serve",
+        "{state}"
+      ],
+      "ports": [
+        8901,
+        8902,
+        8903,
+        8904
+      ]
+    }
+  ],
+  "config": {
+    "ssrf_allow_hosts": "127.0.0.1:8901,127.0.0.1:8902,127.0.0.1:8903,127.0.0.1:8904,localhost:8901,localhost:8902,localhost:8903,localhost:8904"
+  },
+  "needs": [
+    "four mock shop sites on ports 8901-8904, started by the runner",
+    "a page reader or browser for the JavaScript-loaded site"
+  ]
+}

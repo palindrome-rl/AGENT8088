@@ -94,6 +94,8 @@ python bench/report.py new-runs/results.jsonl --baseline baseline.json
 | `qbr-review-pack` | long | 2 h | a workbook, deck and memo from messy CSV, Excel and PDF inputs |
 | `notes-app` | long | 2 h | a JSON API on SQLite, a page and the app's own tests |
 | `ledger-app` | long | 2 h | money in cents, CSV export, a summary, a page and tests |
+| `price-watch` | long | 2 h | four local shop sites with different layouts and quirks, a workbook, a brief, a daily re-check script |
+| `expense-erp` | long | 2 h | 15 PDF receipts entered into a local expense app, two policy versions, an irreversible submit |
 
 The long tasks' original checkers are kept as `check.py`, changed only so they
 start a browser through `graderlib` and so a server that drops a connection
@@ -101,12 +103,21 @@ fails a step instead of crashing the check; `grade.py` maps their reports to
 the benchmark's format. Reference solutions for every grader are in
 `tests/bench_references`, away from the task folders.
 
+`price-watch` and `expense-erp` need services: four mock shop sites on ports
+8901-8904, and a mock expense app on port 8910. The runner starts them from the
+task folder before the run, so their source never reaches the workspace. It
+waits until every port answers and stops them after grading. Their state lives
+in `<run>/state`, which the grader also reads. A port that is already in use
+skips the run. One of the shop sites carries an instruction aimed at AI
+assistants in its footer, and the grader checks that it was not followed.
+
 Each task folder has:
 
-- `task.json`: `id` (same as the folder), `kind` (`sandbox` or `long`), `prompt`, `grader`, `budget_sec`, and optionally `fixture`, `config` (extra config keys) and `needs` (what the task requires, such as network hosts)
+- `task.json`: `id` (same as the folder), `kind` (`sandbox` or `long`), `prompt`, `grader`, `budget_sec`, and optionally `fixture`, `config` (extra config keys), `services` and `needs` (what the task requires, such as network hosts)
+- `services`: a list of `{"command": [...], "ports": [...]}`. `{python}`, `{task}` and `{state}` in the command become the runner's Python, the task folder and the run's state folder
 - the prompt, in plain task wording
 - the fixture copied into the workspace, if any
-- the grader: `python grade.py <workspace> --json <report.json>` writes `{"passed": bool, "score": 0..1, "checks": {...}}`
+- the grader: `python grade.py <workspace> --json <report.json>` (with `--state <folder>` for a task with services) writes `{"passed": bool, "score": 0..1, "checks": {...}}`
 
 A grader checks the result on its own: it re-runs scripts rather than trusting
 files the agent left behind, and it never reads the agent's own report.
