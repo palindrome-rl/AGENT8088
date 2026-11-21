@@ -651,6 +651,24 @@ def _same_command(a: str, b: str) -> bool:
     return first == second or (bool(second) and _without_trailing_clause(first) == second)
 
 
+# Output thrown away (`2>nul`, `>/dev/null`) leaves a command's exit status as it was, so it does not change what a
+# rerun proves. Only these exact sinks are dropped; any other redirection still makes the chain unreadable.
+_NULL_SINK = re.compile(r"\s+[12]?>\s*(?:nul|/dev/null)(?=\s|$|&)", re.IGNORECASE)
+# Leftovers a rerun may clear first (`del server.log && python run_e2e.py`). Deleting code, tests or data could make a
+# failing check pass without fixing anything, so only these kinds of file are accepted.
+_CLEANUP_SUFFIXES = frozenset({".log", ".pid", ".tmp", ".out", ".lock"})
+_CLEANUP_PROGRAMS = frozenset({"del", "erase", "rm"})
+
+
+def _cleanup_step(words: list[str]) -> bool:
+    """`del /f /q server.log server.pid` or `rm -f out.log`: removes only leftovers, so it cannot fake a pass."""
+    if words[0].lower() not in _CLEANUP_PROGRAMS:
+        return False
+    targets = [word for word in words[1:] if not re.fullmatch(r"/[a-z]|-[a-z]+", word, re.IGNORECASE)]
+    return bool(targets) and all(PurePath(target).suffix.lower() in _CLEANUP_SUFFIXES and "*" not in target
+                                 and "?" not in target for target in targets)
+
+
 def _check_chain(command: str, *, original: bool) -> list[list[str]] | None:
     """Parse only an AND chain; unfamiliar shell syntax supplies no retry evidence.
 
@@ -660,6 +678,7 @@ def _check_chain(command: str, *, original: bool) -> list[list[str]] | None:
     """
     if not command or re.search(r"[`$%!^\r\n]|\\[\"']", command):
         return None
+    command = _NULL_SINK.sub("", command)
     parts, current, quote, i = [], [], "", 0
     while i < len(command):
         ch = command[i]
@@ -758,7 +777,7 @@ def _revised_command(failed: str, rerun: str) -> bool:
         steps, has_check = [], False
         for words in chain:
             program = words[0].lower()
-            if program in {"echo", "dir", "ls", "pwd"}:
+            if program in {"echo", "dir", "ls", "pwd"} or _cleanup_step(words):
                 continue
             targets = _syntax_targets(words)
             if targets:
