@@ -83,7 +83,8 @@ def test_a_reply_that_finishes_with_nothing_is_retried_once_with_thinking_off(en
     answer = run(engine, tools=("read_text",))
     assert answer == "Hello!"
     assert model.thinking == [None, "length_retry"]
-    assert "You did not provide an answer" in model.sent[1]
+    # Nothing has run yet for a request to build something, so the retry asks it to start, not to answer.
+    assert "No tool has been called yet" in model.sent[1]
 
 
 def test_thinking_goes_back_to_normal_after_the_retry(engine, monkeypatch):
