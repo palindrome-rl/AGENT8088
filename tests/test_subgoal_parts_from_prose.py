@@ -63,3 +63,48 @@ def test_a_named_flag_missing_from_the_files_stays_open():
     part = "Add a `--verbose` flag to `cli.py` that prints each step taken."
     code = "import argparse\nparser.add_argument('--quiet', action='store_true')\n"
     assert unaddressed_subgoals([part], "", ["cli.py"], evidence=code) == [part]
+
+
+# 3. In a later benchmark run the sandbox refused writes to `.venv` in the folder, so the model made the venv under
+#    artifacts/ and ran `cd artifacts && .venv\Scripts\python.exe ...`. The commands named `.venv`, so the part was
+#    met, and the run was called verified while the folder the request asked for did not exist. A path the part names
+#    must be where the run is checked, not only somewhere in a command line.
+
+def test_a_named_folder_that_is_not_in_the_project_keeps_the_part_open(tmp_path):
+    ran = [r"cd /d artifacts && mkdir .venv\Scripts",
+           r"cd /d artifacts && .venv\Scripts\python.exe -m pip install tabulate"]
+    assert unaddressed_subgoals([VENV_PART], "", ["report.py"], evidence=REPORT_PY, ran=ran,
+                                roots=[tmp_path]) == [VENV_PART]
+
+
+def test_a_named_folder_in_the_project_still_meets_the_part(tmp_path):
+    (tmp_path / ".venv").mkdir()
+    ran = [r"python -m venv .venv", r".venv\Scripts\python.exe -m pip install tabulate"]
+    assert unaddressed_subgoals([VENV_PART], "", ["report.py"], evidence=REPORT_PY, ran=ran,
+                                roots=[tmp_path]) == []
+
+
+def test_a_named_file_missing_from_the_project_keeps_a_part_to_write_it_open(tmp_path):
+    part = "Write `totals.json`, an object that maps each region to its units."
+    evidence = "json.dump(totals, open('totals.json', 'w'))  # region units"
+    assert unaddressed_subgoals([part], "", ["report.py"], evidence=evidence, roots=[tmp_path]) == [part]
+    (tmp_path / "totals.json").write_text("{}")
+    assert unaddressed_subgoals([part], "", ["report.py"], evidence=evidence, roots=[tmp_path]) == []
+
+
+def test_a_part_to_remove_a_named_file_is_not_held_open_by_its_absence(tmp_path):
+    part = "Delete `old.log` and remove the logging setup that wrote it."
+    ran = ["del old.log"]
+    assert unaddressed_subgoals([part], "", ["app.py"], evidence="old log logging setup wrote", ran=ran,
+                                roots=[tmp_path]) == []
+
+
+def test_names_that_are_not_paths_are_not_looked_up_on_disk(tmp_path):
+    part = "Install the `tabulate` package and run `npm run build`."
+    ran = ["pip install tabulate", "npm run build"]
+    assert unaddressed_subgoals([part], "", [], evidence="", ran=ran, roots=[tmp_path]) == []
+
+
+def test_without_roots_the_check_is_unchanged():
+    ran = [r"cd /d artifacts && .venv\Scripts\python.exe -m pip install tabulate"]
+    assert unaddressed_subgoals([VENV_PART], "", ["report.py"], evidence=REPORT_PY, ran=ran) == []

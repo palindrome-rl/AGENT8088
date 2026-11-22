@@ -19,7 +19,7 @@ import re
 from itertools import islice
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PureWindowsPath
 
 DEFAULT_CONTINUATIONS = 3
 # Progress earns more continuations, but never an unbounded number.
@@ -706,6 +706,36 @@ def _named_things_found(item: str, *haystacks: str) -> bool:
         any(all(f" {w} " in hay for w in words) for hay in haystacks) for words in named)
 
 
+# A name in backticks that is a path: a dot folder (`.venv`), a path with a slash (`out/app.bin`) or a file name
+# (`totals.json`). A command (`npm run build`), a flag (`--verbose`) or a package (`tabulate`) is not one.
+_DOT_FOLDER = re.compile(r"^\.[\w-][\w.-]*[\\/]?$")
+_SLASH_PATH = re.compile(r"^[\w.-]+(?:[\\/][\w.-]+)+[\\/]?$")
+_REMOVAL = re.compile(r"\b(?:delete|remove|drop|uninstall|rename|move|clean\s+up|get\s+rid\s+of)\b", re.IGNORECASE)
+_MAKES = re.compile(r"\b(?:exists?)\b", re.IGNORECASE)
+
+
+def _named_paths(item: str) -> list[str]:
+    paths = []
+    for name in (n.strip() for n in _NAMED.findall(item)):
+        if " " in name or PurePath(name).is_absolute() or PureWindowsPath(name).is_absolute():
+            continue
+        if _DOT_FOLDER.match(name) or _SLASH_PATH.match(name) or _PATH_TOKEN.fullmatch(name):
+            paths.append(name.rstrip("/\\"))
+    return paths
+
+
+def _named_path_missing(item: str, roots: list[Path]) -> bool:
+    """A part asks for a path to be made (`Create ... in a folder called `.venv``) and no such path is in the project.
+
+    The words of the part may all be in a command line (`cd artifacts && .venv\\Scripts\\python.exe ...`) while the
+    thing asked for was made somewhere else, so the place is what decides. A part to delete or move a path is
+    met by its absence, and is left to the other checks.
+    """
+    if not roots or _REMOVAL.search(item) or not (_OUTPUT_CUE.search(item) or _MAKES.search(item)):
+        return False
+    return any(not any((root / name).exists() for root in roots) for name in _named_paths(item))
+
+
 def _root(word: str) -> str:
     """The start of a word that its inflections share ("remove" and "removing" -> "remo")."""
     return word[: max(4, len(word) - 2)] if len(word) >= 6 else word
@@ -718,7 +748,8 @@ _COMMUNICATION = re.compile(
 
 
 def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
-                         evidence: str | None = None, ran: Iterable[str] = ()) -> list[str]:
+                         evidence: str | None = None, ran: Iterable[str] = (),
+                         roots: Iterable[Path] = ()) -> list[str]:
     """Items whose key words the reply and the written files never mention.
 
     A part counts as addressed when at least half of its key words appear in the
@@ -738,7 +769,12 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     ``ran`` (the shell commands that finished without a failure) is evidence only for a part that asks for
     something to be run, installed, started or checked, which no file can show. A part that asks for something to
     be built is never met by a command line, so an `echo` naming its words does not count.
+
+    ``roots`` (the project folders) are where a path the part asks to make (`.venv`, `out/app.bin`) must be. When
+    one is in none of them the part stays open, whatever the commands and files mention: a write the sandbox sent
+    to another folder is not the thing the request asked for.
     """
+    roots = [Path(r) for r in roots or ()]
     names = " ".join(PurePath(w).name for w in written)
     if evidence is None:
         haystack = _keywords(reply or "") | _keywords(names)
@@ -755,6 +791,9 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     for item in items:
         words = _keywords(item)
         if not words:
+            continue
+        if _named_path_missing(item, roots):
+            open_items.append(item)
             continue
         acts = bool(_ACTION_PART.match(item) or _ACTION_WORD.search(item))
         if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
