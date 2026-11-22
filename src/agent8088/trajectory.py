@@ -321,11 +321,26 @@ _REAL_TEST_FAILURE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
+# A check that stops because the test or browser tool it imports is not installed where it ran never tested anything.
+# Seen in a benchmark run: the model's own browser test stopped at `import playwright` in a shell with no Playwright,
+# and the run ended "the latest check failed" with a page that passed every grader check. Only test and browser tools
+# count: a package the work itself needs (`requests`) or a module of the project is a real failure.
+_MISSING_TEST_TOOL = re.compile(
+    r"""No module named ['"]?(?P<py>playwright|selenium|pyppeteer|pytest|splinter)\b"""
+    r"""|Cannot find (?:module|package) ['"](?P<js>@playwright/test|playwright(?:-core)?|puppeteer(?:-core)?|jsdom|"""
+    r"""happy-dom|mocha|jest|vitest|chai|cypress|selenium-webdriver)['"/]""",
+    re.IGNORECASE)
+
+
 def _environment_limit(result) -> str:
-    """Why a check could not run here ("" when it ran): the sandbox refused to start a process or no browser could be started."""
+    """Why a check could not run here ("" when it ran): the sandbox refused to start a process, no browser could be
+    started, or the test tool the check imports is not installed where it ran."""
     text = str(result or "")
     if _REAL_TEST_FAILURE.search(text):
         return ""
+    if missing := _MISSING_TEST_TOOL.search(text):
+        name = missing.group("py") or missing.group("js")
+        return f"the test tool '{name}' is not installed where the check ran"
     if _SPAWN_BLOCKED.search(text):
         return "the sandbox did not allow a process to be started"
     # Access denied for a data file is not evidence of a browser-launch limit,
