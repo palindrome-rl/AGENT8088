@@ -18303,7 +18303,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             )
         return answer
     except TurnBudgetExceeded as exc:
-        answer = _budget_answer(str(exc), run_trajectory)
+        # Inside the run's messages again: the end-of-run notes ask which paths the person named, and leaving the
+        # `with` above already forgot the conversation, so a stop raised during a model call placed no file.
+        with _running_on(messages):
+            answer = _budget_answer(str(exc), run_trajectory)
         if kwargs.get("on_answer"):
             kwargs["on_answer"](answer)
         if isinstance(kwargs.get("trace"), list):

@@ -73,3 +73,24 @@ def test_the_missing_file_finding_is_dropped_once_the_file_is_placed(engine, tmp
                                   "the latest check failed"]
     engine._drop_resolved_missing(state)
     assert state.data["unmet_checks"] == ["missing or empty files: notes.md", "the latest check failed"]
+
+
+def test_a_budget_stop_during_a_model_call_still_places_the_named_file(eng, monkeypatch):
+    # Seen in a benchmark run: the clock ran out while the model was answering, the stop was raised out of the loop,
+    # and the copy-back ran after the run had already forgotten the person's message, so nothing counted as named and
+    # the working page stayed in artifacts/.
+    from tests.test_completion_pipeline import _reply
+    calls = {"n": 0}
+
+    def completion(messages, *_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _reply(_call("write_file", filename=str(eng.ARTIFACTS_ROOT / "board.html"), content=PAGE))
+        raise eng.TurnBudgetExceeded("Time budget exceeded: 901 seconds elapsed (limit 900s).")
+
+    monkeypatch.setattr(eng, "_create_completion_with_fallback", completion)
+    monkeypatch.setattr(eng, "exec_tool", _writer(eng))
+    answer = eng.run_agent([{"role": "user", "content": "Please make a page as `board.html` that shows the board."}],
+                           max_turns=6, tools_def=[], allowed_tools={"write_file"})
+    assert "Time budget exceeded" in answer
+    assert (eng.PROJECT_ROOT / "board.html").read_text(encoding="utf-8") == PAGE
