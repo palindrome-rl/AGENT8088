@@ -19,7 +19,7 @@ import re
 from itertools import islice
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PureWindowsPath
 
 DEFAULT_CONTINUATIONS = 3
 # Progress earns more continuations, but never an unbounded number.
@@ -609,7 +609,9 @@ def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     if len(items) < 2:
         parts = [p.strip(" ,;.") for p in _CLAUSE_SPLIT.split(text)]
         items = [p for p in parts if len(p.split()) >= 3]
-        if len(items) < 2:
+        # A clause that runs across a sentence or a paragraph is prose that happened to contain "then", not one part of
+        # a list: no file can show a paragraph of description, so such a split is not a checklist.
+        if len(items) < 2 or any("\n" in p or _SENTENCE_SPLIT.search(p) for p in items):
             items = []
     if not items and sentences:
         flat = " ".join(text.split())
@@ -670,9 +672,68 @@ def deliverable_text(written: Iterable[str], roots: Iterable[Path],
 
 
 def _words_for_evidence(text: str) -> str:
-    """Lower-case text with camelCase, snake_case and kebab-case split into words."""
+    """Lower-case words, with camelCase, snake_case and kebab-case split, and every other non-word character a space.
+
+    A key word is matched as the start of a word (" " + root), so a word that followed a quote, a slash or an equals
+    sign was never found: in a package.json, `"build"`, `"dayjs"`, `src/index.js` and `--outfile=dist/app.js` all
+    read as missing, and finished parts were reported as not addressed until the completion checks ran out."""
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text or "")
-    return re.sub(r"[_\-]+", " ", spaced).lower()
+    return re.sub(r"[^a-z0-9]+", " ", spaced.lower())
+
+
+# A part that asks the agent to run something, not to build something: it is met by a command that ran, which no file
+# shows ("Run `npm run build`, then run `node dist/app.js`", "install the dependencies", "start the server").
+_ACTION_PART = re.compile(
+    r"^\W*(?:\d+[.)]\s*)?(?:and\s+|also\s+|then\s+|finally\s+)?(?:run|execute|start|launch|install|test|check|verify|"
+    r"try|call|invoke|serve|open|load|curl|ping|restart|rerun|re-run)\b", re.IGNORECASE)
+
+
+# A part that also asks for something to be installed or run, anywhere in it ("Create a virtual environment in `.venv`
+# and install `tabulate`"): the things it names may be made by a command.
+_ACTION_WORD = re.compile(r"\b(?:run|execute|start|launch|install|serve|restart|rerun|re-run)\b", re.IGNORECASE)
+_NAMED = re.compile(r"`([^`\n]+)`")
+
+
+def _named_things_found(item: str, *haystacks: str) -> bool:
+    """Whether every thing the part names in backticks (`.venv`, `--verbose`, `cli.py`) shows up, word for word.
+
+    The named things are the checkable core of a part, so when each of them is there the part is not forgotten, even
+    when the rest of it is described in other words.
+    """
+    named = [_words_for_evidence(n).split() for n in _NAMED.findall(item)]
+    named = [words for words in named if words]
+    return bool(named) and all(
+        any(all(f" {w} " in hay for w in words) for hay in haystacks) for words in named)
+
+
+# A name in backticks that is a path: a dot folder (`.venv`), a path with a slash (`out/app.bin`) or a file name
+# (`totals.json`). A command (`npm run build`), a flag (`--verbose`) or a package (`tabulate`) is not one.
+_DOT_FOLDER = re.compile(r"^\.[\w-][\w.-]*[\\/]?$")
+_SLASH_PATH = re.compile(r"^[\w.-]+(?:[\\/][\w.-]+)+[\\/]?$")
+_REMOVAL = re.compile(r"\b(?:delete|remove|drop|uninstall|rename|move|clean\s+up|get\s+rid\s+of)\b", re.IGNORECASE)
+_MAKES = re.compile(r"\b(?:exists?)\b", re.IGNORECASE)
+
+
+def _named_paths(item: str) -> list[str]:
+    paths = []
+    for name in (n.strip() for n in _NAMED.findall(item)):
+        if " " in name or PurePath(name).is_absolute() or PureWindowsPath(name).is_absolute():
+            continue
+        if _DOT_FOLDER.match(name) or _SLASH_PATH.match(name) or _PATH_TOKEN.fullmatch(name):
+            paths.append(name.rstrip("/\\"))
+    return paths
+
+
+def _named_path_missing(item: str, roots: list[Path]) -> bool:
+    """A part asks for a path to be made (`Create ... in a folder called `.venv``) and no such path is in the project.
+
+    The words of the part may all be in a command line (`cd artifacts && .venv\\Scripts\\python.exe ...`) while the
+    thing asked for was made somewhere else, so the place is what decides. A part to delete or move a path is
+    met by its absence, and is left to the other checks.
+    """
+    if not roots or _REMOVAL.search(item) or not (_OUTPUT_CUE.search(item) or _MAKES.search(item)):
+        return False
+    return any(not any((root / name).exists() for root in roots) for name in _named_paths(item))
 
 
 def _root(word: str) -> str:
@@ -687,7 +748,8 @@ _COMMUNICATION = re.compile(
 
 
 def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
-                         evidence: str | None = None) -> list[str]:
+                         evidence: str | None = None, ran: Iterable[str] = (),
+                         roots: Iterable[Path] = ()) -> list[str]:
     """Items whose key words the reply and the written files never mention.
 
     A part counts as addressed when at least half of its key words appear in the
@@ -703,7 +765,16 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     ("explain", "list", "summarize") is still met by the reply. This catches a reply
     that claims a part without the files showing it; it cannot tell a part built
     wrongly from one built right.
+
+    ``ran`` (the shell commands that finished without a failure) is evidence only for a part that asks for
+    something to be run, installed, started or checked, which no file can show. A part that asks for something to
+    be built is never met by a command line, so an `echo` naming its words does not count.
+
+    ``roots`` (the project folders) are where a path the part asks to make (`.venv`, `out/app.bin`) must be. When
+    one is in none of them the part stays open, whatever the commands and files mention: a write the sandbox sent
+    to another folder is not the thing the request asked for.
     """
+    roots = [Path(r) for r in roots or ()]
     names = " ".join(PurePath(w).name for w in written)
     if evidence is None:
         haystack = _keywords(reply or "") | _keywords(names)
@@ -714,14 +785,23 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
                 open_items.append(item)
         return open_items
     in_files = " " + _words_for_evidence(evidence + " " + names) + " "
+    in_commands = " " + _words_for_evidence(" ".join(str(c) for c in ran or ())) + " "
     reply_words = _keywords(reply or "")
     open_items = []
     for item in items:
         words = _keywords(item)
         if not words:
             continue
+        if _named_path_missing(item, roots):
+            open_items.append(item)
+            continue
+        acts = bool(_ACTION_PART.match(item) or _ACTION_WORD.search(item))
+        if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
+            continue
         if _COMMUNICATION.match(item):
             found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
+        elif _ACTION_PART.match(item):
+            found = sum(1 for w in words if (" " + _root(w)) in in_files or (" " + _root(w)) in in_commands)
         else:
             found = sum(1 for w in words if (" " + _root(w)) in in_files)
         if found * 2 < len(words):

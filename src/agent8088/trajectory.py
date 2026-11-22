@@ -19,6 +19,7 @@ MAX_EVIDENCE = 6
 
 
 MAX_WRITTEN = 50
+MAX_RAN_COMMANDS = 40
 MAX_UNTESTED = 8
 MAX_FAILING_NUDGES = 2   # follow-ups per request about a check that is still failing
 MAX_VERIFICATION_REQUESTS = 2
@@ -978,6 +979,13 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
+            if not _TRACEBACK.search(str(result)) and not _RUN_FAILED_RE.search(str(result)):
+                # Evidence for a part of the request that asks for something to be run, not built.
+                ran = self.data.setdefault("ran_commands", [])
+                core = " ".join(command.split())[:300]
+                if core not in ran:
+                    ran.append(core)
+                    del ran[:-MAX_RAN_COMMANDS]
         written_now = self.data.get("written_paths")
         probe_only = _is_probe(command) and not _REAL_TEST_FAILURE.search(str(result))
         limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
@@ -1181,6 +1189,10 @@ class TrajectoryState:
     def written_paths(self) -> list[str]:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
+
+    def ran_commands(self) -> list[str]:
+        """Shell commands this run finished without a failure, oldest first (at most MAX_RAN_COMMANDS)."""
+        return list(self.data.get("ran_commands") or [])
 
     def landed_paths(self) -> list[str]:
         """The files this run wrote, each at the place it actually is.
