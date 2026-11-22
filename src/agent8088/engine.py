@@ -687,6 +687,9 @@ EDIT_CHECK_REMINDERS = max(0, _config_int("edit_check_reminders", 3))
 # them; a follow-up that makes progress hands its slot back. 0 turns the checks off.
 MAX_COMPLETION_CONTINUATIONS = max(0, _config_int(
     "max_completion_continuations", completion_checks.DEFAULT_CONTINUATIONS))
+# Times a request that asks for work may be sent back to start it when no tool has run yet and the reply is
+# empty or only says what comes next. Outside the completion budget: nothing has been done to check.
+NOT_STARTED_ASKS = max(0, _config_int("max_not_started_asks", 2))
 # The parts of a request are checked against what the run delivered. With this on, a
 # paragraph that states three or more requirements builds a checklist too, and a part
 # that asks for something to be built counts as done only when the delivered files show
@@ -20821,6 +20824,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    not_started_asks = 0  # times a reply before any tool call was sent back to start the work
     length_retries = 0   # consecutive token-limited calls; incomplete, never executed
     last_call_tokens = 0  # completion tokens of the last call that finished normally
     recent_call_tokens = []  # the last few, for the adaptive first-call cap
@@ -21541,6 +21545,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             # for an empty reply and must never be offered to the user as a plan.
             model_replied = bool(answer.strip())
 
+            # No tool has run yet for a request that asks for work, and the reply is empty or only says what comes
+            # next: the work has not started. Asking for "your final answer, no tools" here, or spending the
+            # completion checks on it, once ended a run in 16 seconds with nothing done. Ask it to start instead,
+            # outside the completion budget and a bounded number of times.
+            if (not seen_signatures and not forcing and not unknown and round_allowed_tools
+                    and not_started_asks < NOT_STARTED_ASKS and PERMISSION_MODE != "plan-only"
+                    and completion_checks.asks_for_work(request_text)
+                    and (not answer or completion_checks.only_announces_next_step(answer))):
+                not_started_asks += 1
+                if not answer:
+                    thinking_off_retry = True
+                if on_result:
+                    on_result("error", "No work started yet — asking the model to begin.")
+                messages.append(_harness_turn(completion_checks.NOT_STARTED_ASK))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "not_started", "empty": not answer,
+                                  "asks": not_started_asks})
+                continue
+
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
             work_pending = (trajectory is not None and completion_budget.enabled
                             and trajectory.has_open_items())
@@ -21561,8 +21584,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 thinking_off_retry = True
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
-                if work_pending:
-                    # Mid-task an empty reply is a stall, not a finish: ask to carry on.
+                if work_pending or (not seen_signatures and round_allowed_tools
+                                    and completion_checks.asks_for_work(request_text)):
+                    # Mid-task an empty reply is a stall, not a finish: ask to carry on. So is one before any tool has
+                    # run on a request for work: "do not call any tools" there ends the run with nothing done.
                     messages.append(_harness_turn(completion_checks.EMPTY_REPLY_ASK))
                 else:
                     messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "

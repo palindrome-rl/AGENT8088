@@ -103,6 +103,48 @@ def is_advice_request(request: str) -> bool:
     return bool(_ADVICE_START.match(first))
 
 
+# --- 1a. A reply that only says what the model will do next ----------------------------
+
+# "Let me read the data file first." with no tool call does none of the work. Seen in benchmark runs: the reply
+# went to the completion checks as if it were an answer, each check got another sentence like it, and the run
+# ended in 16 seconds with nothing done.
+_NEXT_STEP_START = re.compile(
+    r"^\W*(?:(?:ok(?:ay)?|sure|alright|great|got\s+it|understood)\W+)?"
+    r"(?:(?:first|now|next|then|to\s+start|to\s+begin)\W+)?"
+    r"(?:let\s+me|let['’]s|i['’]ll|i\s+will|i\s+am\s+going\s+to|i['’]m\s+going\s+to|i\s+need\s+to|"
+    r"i\s+should|i['’]m\s+(?:now\s+)?(?:starting|going)|starting\s+(?:with|by))\b", re.IGNORECASE)
+NEXT_STEP_MAX_CHARS = 400
+
+
+def only_announces_next_step(reply: str) -> bool:
+    """A short reply that only says what the model is about to do ("Let me read the data first.",
+    "I'll build the page, then check it."). A longer reply, or one with code in it, may be a real answer."""
+    text = (reply or "").strip()
+    if not text or len(text) > NEXT_STEP_MAX_CHARS or "```" in text:
+        return False
+    return bool(_NEXT_STEP_START.match(text))
+
+
+_WORK_VERB = re.compile(
+    r"\b(?:build|create|make|implement|develop|write|generate|design|code|produce|set\s+up|fix|repair|patch|"
+    r"add|update|change|edit|refactor|rename|remove|delete|install|run|start|serve|deploy|test|debug|convert|"
+    r"migrate|port|configure|bundle|compile|render|upgrade|clean|organi[sz]e|download|scrape|analy[sz]e)\b",
+    re.IGNORECASE)
+
+
+def asks_for_work(request: str) -> bool:
+    """A request to do something with the tools ("build the page", "fix module_077"), not a greeting or a
+    question. A request that names an output file asks for work whatever its verb."""
+    if is_advice_request(request):
+        return False
+    text = _prose(request or "")
+    return bool(_WORK_VERB.search(text) or named_output_paths(request or ""))
+
+
+NOT_STARTED_ASK = ("No tool has been called yet, so none of the task is done. Start now: call the tool for the "
+                   "first step. A reply that only says what you will do does not do it.")
+
+
 # --- 1b. A reply that hands the work back to the user --------------------------------
 
 # These phrases ask the user to do, personally, a step the agent's own tools
