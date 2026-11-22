@@ -503,7 +503,8 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
 # says something about the page only when the control is one that must act. A control that is already the current
 # tab is not one. An action button or a pressed toggle can still be expected to act.
 _COMMITTAL_JS = """
-  const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme)\\b/i;
+  // Starting again ("New game", "Restart", "Play again") changes nothing on a page that has only just started.
+  const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme|restart|replay|rewind|refresh|reload|new\\s+game|start\\s+over|play\\s+again|try\\s+again)\\b/i;
   const emptyField = x => {
     const t = (x.getAttribute('type') || 'text').toLowerCase();
     if (['button', 'submit', 'checkbox', 'radio', 'hidden', 'file', 'reset', 'image'].includes(t)) return false;

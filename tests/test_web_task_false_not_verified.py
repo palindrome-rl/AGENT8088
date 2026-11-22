@@ -59,3 +59,38 @@ def test_a_crash_in_the_code_is_still_a_crash(tmp_path):
                "NameError: name 'urljoin' is not defined\nCommand exited with status 1.")
     assert app_check._run_briefly(script, lambda command, timeout: crashed, soft=[])
     assert app_check.check_script(script, run=lambda command, timeout: crashed).failed
+
+
+# 3. The page check clicks the first control and fails the page when nothing changes. On four game pages from the
+#    benchmark, the first control was "New game" or "Restart"; on a fresh board that changes nothing, by design, and
+#    each page that passed every grader check was reported "the page/script check failed".
+from tests.test_app_check import _page, chromium, needs_chromium  # noqa: E402,F401
+
+FRESH_GAME = """<!doctype html><html><body>
+<button id="{id}">{label}</button>
+<div id="board"><button class="cell" data-cell="0"></button><button class="cell" data-cell="1"></button></div>
+<p id="status">X to move</p>
+<script>
+let turn = 'X';
+const fresh = () => { document.querySelectorAll('.cell').forEach(c => c.textContent = '');
+  turn = 'X'; document.getElementById('status').textContent = 'X to move'; };
+document.getElementById('{id}').onclick = fresh;
+document.querySelectorAll('.cell').forEach(c => c.onclick = () => { if (!c.textContent) { c.textContent = turn;
+  turn = turn === 'X' ? 'O' : 'X'; document.getElementById('status').textContent = turn + ' to move'; } });
+</script></body></html>"""
+
+
+@needs_chromium
+@pytest.mark.parametrize("control_id, label", [
+    ("new-game", "New game"), ("restart", "Restart"), ("again", "Play again"), ("over", "Start over"),
+])
+def test_a_start_again_control_on_a_fresh_board_is_not_dead(tmp_path, control_id, label):
+    report = app_check.check_web_page(_page(tmp_path, FRESH_GAME.replace("{id}", control_id).replace("{label}", label)))
+    assert not any("changed nothing" in f for f in report.failures), report.failures
+
+
+@needs_chromium
+def test_a_dead_play_button_still_fails(tmp_path):
+    dead = "<!doctype html><html><body><button id='play'>Play</button><p id='out'>waiting</p></body></html>"
+    report = app_check.check_web_page(_page(tmp_path, dead))
+    assert report.failed and any("changed nothing" in f for f in report.failures)
