@@ -18580,6 +18580,17 @@ def _time_left_nudge(seconds_left: float, final: bool = False) -> str:
             "finish the most important remaining step first." + _wrap_up_ask(final))
 
 
+ANSWER_NOW_MIN_BUDGET = 270  # seconds; three times the answer floor (ANSWER_TIME_FLOOR_SECONDS)
+
+
+def _answer_now_nudge(seconds_left: float) -> str:
+    """Sent once in the last stretch of the clock, when a reply is taken as the answer (see _answer_time)."""
+    left = f"about {max(1, int(seconds_left))} seconds"
+    return (f"Time is almost up: {left} left. Stop calling tools and give your final answer now, in plain text. "
+            "A run the clock stops has no answer at all. Say what is done, what is not done and what you could "
+            "not verify.")
+
+
 def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
     left = f"about {rounds_left} rounds" if rounds_left > 1 else "one round"
     return (f"Round check: {left} left before this run is stopped. Make sure every "
@@ -20844,6 +20855,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     edit_check = _new_edit_check_reminder()
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
+    answer_asked = False  # the last-stretch "answer now" ask was sent
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     compaction_cooldown_turn = 0  # a successful one waits COMPACTION_COOLDOWN_TURNS turns
@@ -20937,7 +20949,17 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         if (DISPOSABLE_CONTAINER or depth == 0) and budget and budget.max_seconds:
             left = budget.seconds_left()
             crossed = sum(1 - left / budget.max_seconds >= at for at in TIME_LEFT_NUDGE_AT)
-            if crossed > time_nudges:
+            # The time checks say to finish the outputs; in the last stretch the model is told to answer instead.
+            # Without this, runs whose outputs were in place went on checking until the clock stopped them. A short
+            # clock is left alone: there the last stretch would be most of the run.
+            if (depth == 0 and not answer_asked and budget.max_seconds >= ANSWER_NOW_MIN_BUDGET
+                    and _answer_time(budget)):
+                answer_asked = True
+                time_nudges = max(time_nudges, crossed)
+                messages.append(_harness_turn(_answer_now_nudge(left)))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "answer_now", "content": int(left)})
+            elif crossed > time_nudges:
                 time_nudges = crossed
                 messages.append(_harness_turn(
                     _time_left_nudge(left, final=crossed >= len(TIME_LEFT_NUDGE_AT))))
