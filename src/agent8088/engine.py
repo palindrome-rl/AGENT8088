@@ -832,6 +832,10 @@ API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio
 # an attack — which is exactly why the permission gate does not catch it.
 # 0 disables either check.
 MAX_WRITES_PER_TURN = _config_int("max_writes_per_turn", 0)
+# Tool calls run from one model reply. Seen in a benchmark run: a first reply held 483 calls (the same few lookups over
+# and over), all of them ran, and the conversation grew past what the model can read before any work was done. An
+# approved plan's batch is routinely a dozen calls, well under this.
+MAX_CALLS_PER_REPLY = 24
 MAX_WRITE_BYTES = _config_int("max_write_bytes", 0)
 
 # --- Runtime-adjustable limits ---------------------------------------------
@@ -21343,6 +21347,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             content = "\n".join(part for part in (content, native_text) if part)
 
         calls = find_tool_calls(content, round_allowed_tools)
+        dropped_calls = max(0, len(calls) - MAX_CALLS_PER_REPLY)
+        if dropped_calls:
+            calls = calls[:MAX_CALLS_PER_REPLY]
+            _log.warning("turn %d: %d tool calls in one reply; ran the first %d", turn,
+                         MAX_CALLS_PER_REPLY + dropped_calls, MAX_CALLS_PER_REPLY)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "calls_dropped", "count": dropped_calls,
+                              "kept": MAX_CALLS_PER_REPLY})
         for call in calls:
             if (call["name"] == "browse_page" and browser_goal
                     and _STATEFUL_BROWSER_REQUEST.search(browser_goal)):
@@ -22362,6 +22374,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+        if dropped_calls:
+            messages.append(_harness_turn(
+                f"Your last reply held {MAX_CALLS_PER_REPLY + dropped_calls} tool calls. Only the first "
+                f"{MAX_CALLS_PER_REPLY} ran; the other {dropped_calls} were not run. Do not repeat the same lookup: "
+                "call only what the next step needs, a few calls at a time."))
 
         # A successful test of changed work starts the same bounded check phase
         # even when the model has not attempted a final answer yet. Mere reads
