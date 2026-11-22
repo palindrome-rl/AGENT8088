@@ -136,4 +136,5 @@ def test_app_fails_when_data_does_not_persist(task, folder, tmp_path):
 def test_every_long_task_has_grader_tests():
     long_tasks = {f.name for f in TASKS.iterdir()
                   if (f / "task.json").is_file() and json.loads((f / "task.json").read_text())["kind"] == "long"}
-    assert long_tasks == {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app"}
+    # price-watch and expense-erp need their services running; their grader tests are in test_bench_service_tasks.py.
+    assert long_tasks == {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app", "price-watch", "expense-erp"}

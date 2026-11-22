@@ -1,0 +1,3 @@
+Expense system: http://127.0.0.1:8910/
+User: clerk
+Password: harbor-demo-1

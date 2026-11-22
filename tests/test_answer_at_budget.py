@@ -97,3 +97,100 @@ def test_a_budget_stop_with_unchecked_changes_says_so(eng, monkeypatch):
     monkeypatch.setattr(eng._TurnBudget, "exceeded", exceeded)
     answer, _trace = _run(eng, script, used=0)
     assert "no fresh automated verification" in answer or answer.startswith("NOT VERIFIED")
+
+
+def test_the_last_stretch_covers_one_more_turn_at_the_run_pace(engine):
+    # Seen on a slow model: turns took 60 to 200 s, and with a fixed 90 s the answer ask came too late to be answered.
+    clock = engine._TurnBudget(max_seconds=1485)
+    clock.started -= 1485 - 146
+    assert not engine._answer_time(clock)                     # 146 s left is outside the fixed stretch
+    assert engine._answer_time(clock, turn_seconds=100)       # but one more 100 s turn would not fit
+    assert not engine._answer_time(clock, turn_seconds=60)    # a 60 s turn still fits
+    early = engine._TurnBudget(max_seconds=1485)
+    early.started -= 1485 - 400
+    assert not engine._answer_time(early, turn_seconds=1000)  # capped at a fifth of the clock (297 s)
+
+
+# Seen in a benchmark run: with about 150 s left the model answered (the fix checked, the output hash matched), a
+# completion check sent it back for "fresh verification evidence", it started the three-minute build again, and the
+# clock stopped the run with no answer at all. The reply a check sends back is now kept, and a clock that stops the
+# follow-up work gives that reply, with what was not settled.
+
+def _clock_stops_on(eng, monkeypatch, command_word: str):
+    """The clock runs out when the model runs a command containing command_word."""
+    stopped = {"now": False}
+    base = failing_then_ok(["ok"])
+
+    def tool(name, arguments, depth=0):
+        if command_word in arguments:
+            stopped["now"] = True
+        return base(name, arguments, depth)
+
+    monkeypatch.setattr(eng._TurnBudget, "exceeded",
+                        lambda self: "Time budget exceeded: 901 seconds elapsed (limit 900s)." if stopped["now"] else None)
+    return tool
+
+
+def test_a_reply_sent_back_is_the_answer_when_the_clock_stops_the_follow_up(eng, monkeypatch):
+    tool = _clock_stops_on(eng, monkeypatch, "build.py")
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename="module.txt", content="use parse_header"),
+        "Fixed the typo in module.txt; the build output is in place.",
+        _call("execute_shell", command="python build.py"),
+        "unused",
+    ], tool=tool)
+    answer, trace = _run(eng, script, used=0, request="fix the build and say what you changed")
+    assert script.calls >= 3, "the reply must have been sent back for this test to mean anything"
+    assert "Fixed the typo in module.txt" in answer
+    assert "stopped after this reply" in answer
+    assert "stopped before the model gave a final answer" not in answer
+    finals = [s for s in trace if s.get("type") == "final_answer"]
+    assert finals and finals[-1].get("after_budget") is True
+
+
+def test_a_held_reply_with_changes_after_it_is_not_verified(eng, monkeypatch):
+    tool = _clock_stops_on(eng, monkeypatch, "second.txt")
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename="module.txt", content="use parse_header"),
+        "Fixed the typo in module.txt.",
+        _call("write_file", filename="second.txt", content="more"),
+        "unused",
+    ], tool=tool)
+    answer, _trace = _run(eng, script, used=0, request="fix the build and say what you changed")
+    assert "Fixed the typo in module.txt." in answer
+    assert answer.startswith("NOT VERIFIED")
+    assert "changed files after the reply above" in answer
+
+
+def test_a_reply_that_says_the_work_goes_on_is_not_held(eng, monkeypatch):
+    tool = _clock_stops_on(eng, monkeypatch, "build.py")
+    script = Script(eng, monkeypatch, [
+        _call("write_file", filename="module.txt", content="use parse_header"),
+        "Next, I'll run the build and then check the output.",
+        _call("execute_shell", command="python build.py"),
+        "unused",
+    ], tool=tool)
+    answer, _trace = _run(eng, script, used=0, request="fix the build and say what you changed")
+    assert "stopped before the model gave a final answer" in answer
+    assert "Next, I'll run the build" not in answer.split("Partial result")[0]
+
+
+def test_the_held_reply_belongs_to_its_run():
+    from agent8088.trajectory import TrajectoryState
+    state = TrajectoryState({}, goal="fix it", message_count=1)
+    assert state.held_reply() == "" and not state.held_reply_stale()
+    state.hold_reply("done")
+    assert state.held_reply() == "done" and not state.held_reply_stale()
+    state.data["mutation_count"] = state.mutation_count() + 1
+    # Only the held reply given as the answer can be stale: a later reply describes the work as it is.
+    assert not state.held_reply_stale()
+    assert state.use_held_reply() == "done"
+    assert state.held_reply_stale()
+    state.drop_held_reply()
+    assert state.held_reply() == "" and not state.held_reply_stale()
+    assert "done" not in json_dump(state.data)
+
+
+def json_dump(data) -> str:
+    import json
+    return json.dumps(data)

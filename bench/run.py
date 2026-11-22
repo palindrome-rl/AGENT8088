@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -46,6 +47,7 @@ import benchlib
 SELF_STOP_SEC = 15
 WATCHDOG_GRACE_SEC = 60
 GRADER_TIMEOUT_SEC = 900
+SERVICE_START_SEC = 30
 _END_RE = re.compile(r"\[agent8088\] run ended: ([a-z_]+)")
 
 
@@ -158,6 +160,71 @@ def _stop(process: subprocess.Popen) -> None:
             pass
 
 
+class ServiceError(RuntimeError):
+    """A task's service could not be started, so the task cannot run."""
+
+
+def _port_open(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+def service_command(command: list, task: dict, state: Path) -> list:
+    """A service's command with {python}, {task} and {state} filled in."""
+    values = {"{python}": sys.executable, "{task}": str(task["dir"]), "{state}": str(state)}
+    filled = []
+    for part in command:
+        for key, value in values.items():
+            part = part.replace(key, value)
+        filled.append(part)
+    return filled
+
+
+def start_services(task: dict, run_dir: Path, wait_sec: float = SERVICE_START_SEC) -> list:
+    """Start the task's services (mock web sites, a mock app) and wait until every port answers.
+
+    They run from the task folder, so the agent's workspace never holds their source. Their state lives in
+    <run>/state, which the grader also reads. A port that is already in use stops the run: answering with some
+    other program would make the grade meaningless."""
+    services = task.get("services") or []
+    if not services:
+        return []
+    state = run_dir / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    busy = [port for service in services for port in service["ports"] if _port_open(port)]
+    if busy:
+        raise ServiceError(f"ports already in use before the run: {', '.join(map(str, busy))}")
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    processes = []
+    try:
+        with open(run_dir / "services.log", "a", encoding="utf-8", errors="replace") as log:
+            for service in services:
+                process = subprocess.Popen(service_command(service["command"], task, state), cwd=task["dir"],
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+                processes.append(process)
+                deadline = time.monotonic() + wait_sec
+                while not all(_port_open(port) for port in service["ports"]):
+                    if process.poll() is not None:
+                        raise ServiceError(f"service {service['command']} exited with {process.returncode}")
+                    if time.monotonic() > deadline:
+                        raise ServiceError(f"service {service['command']} did not open {service['ports']}")
+                    time.sleep(0.2)
+    except BaseException:
+        stop_services(processes)
+        raise
+    return processes
+
+
+def stop_services(processes: list) -> None:
+    for process in processes:
+        _stop(process)
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def run_agent(agent: str, prompt: Path, workspace: Path, env: dict, log: Path, limit_sec: int) -> dict:
     started, clock_start = benchlib.now_iso(), time.monotonic()
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
@@ -206,6 +273,8 @@ def grade(task: dict, workspace: Path, run_dir: Path, profile: dict | None = Non
     """Run the task's grader on the finished workspace; it writes a JSON report."""
     report = run_dir / "grade.json"
     command = [sys.executable, str(task["dir"] / task["grader"]), str(workspace), "--json", str(report)]
+    if task.get("services"):
+        command += ["--state", str(run_dir / "state")]
     try:
         done = subprocess.run(command, capture_output=True, text=True, timeout=GRADER_TIMEOUT_SEC, check=False,
                               cwd=run_dir, encoding="utf-8", errors="replace", env=grader_env(profile or {}))
@@ -268,6 +337,15 @@ def run_one(task: dict, profile: dict, run_dir: Path, agent: str) -> dict:
         "PYTHONIOENCODING": "utf-8",
     })
     budget = int(task["budget_sec"])
+    services = start_services(task, run_dir)
+    try:
+        return _run_and_grade(task, profile, run_dir, agent, env, keys, shared, budget, services)
+    finally:
+        stop_services(services)
+
+
+def _run_and_grade(task, profile, run_dir, agent, env, keys, shared, budget, services) -> dict:
+    workspace, traces, prompt = run_dir / "workspace", run_dir / "trace", run_dir / "prompt.md"
     facts = run_agent(agent, prompt, workspace, env, run_dir / "agent.log", budget + WATCHDOG_GRACE_SEC)
     trace_path, trace = latest_trace(traces)
     summary = benchlib.summarize_trace(trace, end_reason=facts["end_reason"])
@@ -285,6 +363,24 @@ def run_one(task: dict, profile: dict, run_dir: Path, agent: str) -> dict:
     result["outcome"] = benchlib.outcome(result)
     (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
+
+
+def resolve_agent(agent: str) -> str:
+    """The agent executable as a full path. Each run starts it from inside the task's workspace, so a relative path or
+    a bare name that is not on PATH would not be found there; the first baseline launch failed that way."""
+    candidate = Path(agent).expanduser()
+    if candidate.parent != Path(".") or candidate.exists():
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return str(resolved)
+        for suffix in (".exe", ".cmd", ".bat"):
+            if resolved.with_name(resolved.name + suffix).is_file():
+                return str(resolved.with_name(resolved.name + suffix))
+        raise SystemExit(f"agent executable not found: {agent}")
+    found = shutil.which(agent)
+    if not found:
+        raise SystemExit(f"agent executable not found on PATH: {agent}")
+    return str(Path(found).resolve())
 
 
 def main(argv=None) -> int:
@@ -312,6 +408,7 @@ def main(argv=None) -> int:
         tasks = [task for task in tasks if task["id"] in args.task]
     if args.kind:
         tasks = [task for task in tasks if task["kind"] == args.kind]
+    agent = resolve_agent(args.agent)
     profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -320,7 +417,11 @@ def main(argv=None) -> int:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             run_dir = out / f"{stamp}_{task['id']}_{profile.get('name', 'unnamed')}_{trial}"
             print(f"{benchlib.clock(benchlib.now_iso())} start {run_dir.name}", flush=True)
-            result = run_one(task, profile, run_dir, args.agent)
+            try:
+                result = run_one(task, profile, run_dir, agent)
+            except ServiceError as error:
+                print(f"{benchlib.clock(benchlib.now_iso())} skip  {run_dir.name}: {error}", flush=True)
+                continue
             with open(out / "results.jsonl", "a", encoding="utf-8") as lines:
                 lines.write(json.dumps(result) + "\n")
             grader = result["grader"]
