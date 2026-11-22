@@ -42,6 +42,20 @@ def test_a_limit_on_checking_is_not_a_part_not_done():
     assert not reports_part_not_done("I could not run the page in a browser here.")
 
 
+def test_a_check_that_could_not_be_completed_is_not_a_part_not_done():
+    # From a benchmark run whose page passed every grader check: the model meant its own click-through check.
+    assert not reports_part_not_done(
+        'One small caveat to flag honestly: the "no errors in the console" claim is based on the load-time render '
+        "(clean), not on a full click-through, since that last part is the part I couldn't complete.")
+    assert not reports_part_not_done("I could not finish the playthrough in a live browser.")
+
+
+def test_work_that_could_not_be_completed_still_is():
+    assert reports_part_not_done("I couldn't complete the build: the linker still fails on module_077.")
+    assert reports_part_not_done("I could not finish the tests for the parser.")
+    assert reports_part_not_done("I was unable to create the restart button.")
+
+
 def test_a_blocked_step_worked_around_is_not():
     assert not reports_part_not_done("I could not write to out/ directly, so I built under artifacts/ and copied "
                                      "the files back.")

@@ -103,6 +103,16 @@ _WORKED_AROUND = re.compile(r"(?:,?\s+so\s+i\b|\binstead\b|\bworked\s+around\b|\
                             re.IGNORECASE)
 
 
+# A sentence about checking the work, not doing it: "the click-through is the part I couldn't complete", "I could
+# not finish the browser playthrough". Seen in a benchmark run whose page passed every grader check. The verification
+# level already says what was not checked. "Tests" is left out on purpose: "I couldn't finish the tests" can be a
+# part of the request that was not done.
+_ABOUT_CHECKING = re.compile(
+    r"\b(?:verif\w*|confirm\w*|click[- ]?through|play[- ]?through|walk[- ]?through|smoke\s+test|screenshot\w*|"
+    r"(?:in|with)\s+a\s+(?:live\s+|real\s+)?browser|the\s+claim|end[- ]to[- ]end\s+check)\b",
+    re.IGNORECASE)
+
+
 def reports_part_not_done(reply: str) -> bool:
     """True when the reply itself says a part of what was asked was not done."""
     text = _prose(reply).replace("**", "").replace("__", "")
@@ -115,7 +125,8 @@ def reports_part_not_done(reply: str) -> bool:
         if rest and not _NOTHING.match(rest):
             return True
     for sentence in _SENTENCE_SPLIT.split(text):
-        if _COULD_NOT_DO.search(sentence) and not _WORKED_AROUND.search(sentence):
+        if (_COULD_NOT_DO.search(sentence) and not _WORKED_AROUND.search(sentence)
+                and not _ABOUT_CHECKING.search(sentence)):
             return True
     return False
 
