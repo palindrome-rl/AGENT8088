@@ -64,7 +64,7 @@ def test_a_crash_in_the_code_is_still_a_crash(tmp_path):
 # 3. The page check clicks the first control and fails the page when nothing changes. On four game pages from the
 #    benchmark, the first control was "New game" or "Restart"; on a fresh board that changes nothing, by design, and
 #    each page that passed every grader check was reported "the page/script check failed".
-from tests.test_app_check import _page, chromium, needs_chromium  # noqa: E402,F401
+from tests.test_app_check import _page, chromium, needs_chromium  # noqa: F401
 
 FRESH_GAME = """<!doctype html><html><body>
 <button id="{id}">{label}</button>
