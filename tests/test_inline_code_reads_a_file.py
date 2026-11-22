@@ -45,11 +45,12 @@ def test_the_run_from_the_benchmark_no_longer_leaves_a_failed_check():
     assert not state.check_failing()
 
 
-def test_a_written_script_that_crashes_is_still_a_failed_check():
+def test_a_written_script_that_crashes_is_still_a_failed_check(tmp_path):
+    # A path of this platform: on Linux a Windows path is one file name, backslashes included.
     state = TrajectoryState({}, goal="g", message_count=1)
     write = state.before_tool("write_file")
     state.after_tool(write, "Wrote 300 bytes", failed=False, blocked=False, mutated=True, verdict="unknown",
-                     path=r"E:\w\report.py")
+                     path=str(tmp_path / "report.py"))
     shell = state.before_tool("execute_shell")
     state.after_tool(shell, "Traceback (most recent call last):\nKeyError: 'month'\nCommand exited with status 1.",
                      failed=True, blocked=False, mutated=False, verdict="failed", command="python report.py")
