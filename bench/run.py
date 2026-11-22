@@ -385,7 +385,7 @@ def resolve_agent(agent: str) -> str:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--profile", required=True, help="model profile JSON, kept outside the repository")
+    parser.add_argument("--profile", help="model profile JSON, kept outside the repository (needed to run)")
     parser.add_argument("--task", action="append", default=[], help="task id (repeatable); default all")
     parser.add_argument("--kind", choices=benchlib.TASK_KINDS, help="only tasks of this kind")
     parser.add_argument("--trials", type=int, default=1, help="runs per task")
@@ -399,6 +399,8 @@ def main(argv=None) -> int:
         for task in tasks:
             print(f"{task['id']:<28} {task['kind']:<8} {task['budget_sec']:>6}s  {task.get('title', '')}")
         return 0
+    if not args.profile:
+        parser.error("the following arguments are required: --profile")
     if args.task:
         unknown = set(args.task) - {task["id"] for task in tasks}
         if unknown:

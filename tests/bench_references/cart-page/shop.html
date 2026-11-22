@@ -1,0 +1,66 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Shop</title>
+<style>
+  body { font-family: sans-serif; display: flex; gap: 40px; }
+  [data-product], [data-cart-item] { margin: 6px 0; }
+</style></head>
+<body>
+<section><h2>Products</h2><div id="products"></div></section>
+<section><h2>Cart</h2><div id="cart"></div>
+  <p>Subtotal <span id="subtotal"></span><br>Discount <span id="discount"></span><br>Total <span id="total"></span></p>
+  <input id="code" placeholder="Code"> <button id="apply">Apply</button> <span id="code-message"></span>
+</section>
+<script>
+const PRODUCTS = [
+  {id: "P1", name: "Notebook", cents: 350}, {id: "P2", name: "Pen set", cents: 425},
+  {id: "P3", name: "Desk lamp", cents: 2499}, {id: "P4", name: "Backpack", cents: 3995},
+  {id: "P5", name: "Water bottle", cents: 1200}];
+const KEY = "shop-state";
+const money = c => "$" + Math.floor(c / 100) + "." + String(c % 100).padStart(2, "0");
+let state = {cart: {}, code: ""};
+try { state = Object.assign(state, JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) {}
+const save = () => localStorage.setItem(KEY, JSON.stringify(state));
+const list = document.getElementById("products");
+for (const p of PRODUCTS) {
+  const row = document.createElement("div");
+  row.dataset.product = p.id;
+  row.innerHTML = `${p.name} ${money(p.cents)} <button class="add">Add</button>`;
+  row.querySelector(".add").addEventListener("click", () => change(p.id, 1));
+  list.appendChild(row);
+}
+function change(id, by) {
+  const qty = (state.cart[id] || 0) + by;
+  if (qty > 0) state.cart[id] = qty; else delete state.cart[id];
+  save(); draw();
+}
+document.getElementById("apply").addEventListener("click", () => {
+  const code = document.getElementById("code").value.trim();
+  state.code = code === "SAVE10" ? code : "";
+  document.getElementById("code-message").textContent = code === "SAVE10" ? "Code applied" : "Invalid code";
+  save(); draw();
+});
+function draw() {
+  const box = document.getElementById("cart");
+  box.innerHTML = "";
+  let subtotal = 0;
+  for (const p of PRODUCTS) {
+    const qty = state.cart[p.id];
+    if (!qty) continue;
+    subtotal += qty * p.cents;
+    const row = document.createElement("div");
+    row.dataset.cartItem = p.id;
+    row.innerHTML = `${p.name} x <span class="qty">${qty}</span> <button class="inc">+</button>` +
+      `<button class="dec">-</button><button class="remove">Remove</button>`;
+    row.querySelector(".inc").addEventListener("click", () => change(p.id, 1));
+    row.querySelector(".dec").addEventListener("click", () => change(p.id, -1));
+    row.querySelector(".remove").addEventListener("click", () => change(p.id, -qty));
+    box.appendChild(row);
+  }
+  const discount = state.code === "SAVE10" && subtotal >= 5000 ? Math.floor((subtotal * 10 + 50) / 100) : 0;
+  document.getElementById("subtotal").textContent = money(subtotal);
+  document.getElementById("discount").textContent = money(discount);
+  document.getElementById("total").textContent = money(subtotal - discount);
+}
+draw();
+</script>
+</body></html>

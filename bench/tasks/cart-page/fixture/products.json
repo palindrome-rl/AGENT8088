@@ -1,0 +1,10 @@
+{
+  "currency": "USD",
+  "products": [
+    {"id": "P1", "name": "Notebook", "price": "3.50"},
+    {"id": "P2", "name": "Pen set", "price": "4.25"},
+    {"id": "P3", "name": "Desk lamp", "price": "24.99"},
+    {"id": "P4", "name": "Backpack", "price": "39.95"},
+    {"id": "P5", "name": "Water bottle", "price": "12.00"}
+  ]
+}
