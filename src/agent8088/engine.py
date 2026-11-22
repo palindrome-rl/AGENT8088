@@ -20527,11 +20527,17 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
-def _not_verified_reasons(trajectory) -> list:
-    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones."""
+def _not_verified_reasons(trajectory, reply: str = "") -> list:
+    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones.
+
+    ``reply`` is the model's own answer, before the harness notes. When it says a part was not done ("I could not
+    create the folder where it was asked for"), the run is not verified, whatever its checks found.
+    """
     if trajectory is None:
         return []
     reasons = []
+    if reply and completion_checks.reports_part_not_done(reply):
+        reasons.append("the reply says part of the request was not done")
     if trajectory.no_runnable_app():
         reasons.append("no runnable app (a page or a server) was produced for a request to build a web app")
     failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
@@ -20599,6 +20605,7 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
+    model_reply = answer
     assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
     if assurance_line:
         notes.append(assurance_line)
@@ -20639,7 +20646,7 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
-    reasons = _not_verified_reasons(trajectory) if NOT_VERIFIED_HEADLINE else []
+    reasons = _not_verified_reasons(trajectory, model_reply) if NOT_VERIFIED_HEADLINE else []
     if reasons and not answer.startswith("NOT VERIFIED:"):
         answer = ("NOT VERIFIED: " + "; ".join(reasons[:4])
                   + ". Details are in the notes at the end.\n\n" + answer)
