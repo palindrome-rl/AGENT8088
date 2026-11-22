@@ -40,11 +40,13 @@ def _all_tasks_have_a_grader_test():
 
 # Long tasks are covered in test_bench_long_graders.py.
 LONG_TASKS = {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app"}
+# Tasks whose graders need the task's services running; tested in test_bench_service_tasks.py.
+SERVICE_TASKS = {"price-watch", "expense-erp"}
 
 
 def test_every_task_has_grader_tests():
     shipped = {folder.name for folder in TASKS.iterdir() if (folder / "task.json").is_file()}
-    covered = _all_tasks_have_a_grader_test() | LONG_TASKS
+    covered = _all_tasks_have_a_grader_test() | LONG_TASKS | SERVICE_TASKS
     assert shipped == covered, shipped ^ covered
 
 

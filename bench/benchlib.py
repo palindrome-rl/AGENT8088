@@ -53,6 +53,13 @@ def load_task(task_dir) -> dict:
     data["dir"] = task_dir
     data.setdefault("fixture", "")
     data.setdefault("needs", [])
+    data.setdefault("services", [])
+    for service in data["services"]:
+        command, ports = service.get("command"), service.get("ports")
+        if not (isinstance(command, list) and command and all(isinstance(part, str) for part in command)):
+            raise ValueError(f"{data['id']}: a service needs a command, a list of strings")
+        if not (isinstance(ports, list) and ports and all(isinstance(p, int) and 0 < p < 65536 for p in ports)):
+            raise ValueError(f"{data['id']}: a service needs ports, a list of port numbers")
     return data
 
 
