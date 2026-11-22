@@ -18308,6 +18308,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             kwargs["on_answer"](answer)
         if isinstance(kwargs.get("trace"), list):
             kwargs["trace"].append({"type": "budget_exceeded", "content": str(exc)})
+            _trace_held_answer(kwargs["trace"], run_trajectory, answer)
         return answer
     finally:
         run_trajectory.finish(answer)
@@ -20554,6 +20555,8 @@ def _not_verified_reasons(trajectory) -> list:
         if text.lower().startswith(_STRONG_UNMET) and not any(text.lower().startswith(w) for w in
                                                               ("the smoke test failed", "the latest check failed")):
             reasons.append(text[:120])
+    if trajectory.held_reply_stale():
+        reasons.append("the clock stopped work that changed files after the reply above")
     return list(dict.fromkeys(reasons))
 
 
@@ -20599,9 +20602,16 @@ def _budget_answer(reason: str, trajectory) -> str:
     It used to be the budget message and the last tool output, with none of the end-of-run notes, so a run whose
     work was done and tested read the same as one that had done nothing. It now carries the same notes as any other
     finish: the verification level, the NOT VERIFIED headline and what was left undone."""
-    partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
-    answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
-                           f"Partial result so far:\n{partial}")
+    held = trajectory.held_reply() if trajectory is not None else ""
+    if held:
+        # The model had answered; a completion check sent it back, and the clock stopped what it did next. Its answer
+        # is still the best account of the work, and the notes below say what was not settled.
+        answer = _guard_answer(f"{held}\n\n{reason}\nThe run was stopped after this reply, while it was doing "
+                               "more checks.")
+    else:
+        partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
+        answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
+                               f"Partial result so far:\n{partial}")
     if trajectory is None:
         return answer
     try:
@@ -20609,6 +20619,15 @@ def _budget_answer(reason: str, trajectory) -> str:
     except Exception:  # noqa: BLE001 - the stop must still return what it has
         _log.warning("end-of-run notes failed after a budget stop", exc_info=True)
         return answer
+
+
+def _trace_held_answer(trace: list, trajectory, answer: str, turn=None) -> None:
+    """A budget stop that gave the model's held reply records it as the run's final answer."""
+    if trajectory is not None and trajectory.held_reply():
+        step = {"type": "final_answer", "content": answer, "after_budget": True}
+        if turn is not None:
+            step["turn"] = turn
+        trace.append(step)
 
 
 def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
@@ -20866,6 +20885,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     answer_asked = False  # the last-stretch "answer now" ask was sent
+    if depth == 0 and trajectory is not None:
+        trajectory.drop_held_reply()  # a reply from an earlier request is not this one's answer
     turn_mark = None      # when the current turn started (monotonic seconds)
     recent_turns: list = []  # how long the last few turns took, for the length of the last stretch
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
@@ -20960,6 +20981,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 on_answer(answer)
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
+                _trace_held_answer(trace, trajectory, answer, turn=turn)
             return answer
         # Only when a clock was configured: with no limit set there is nothing to announce.
         # A sub-agent's clock is its parent's remainder, so only the main run is told.
@@ -21637,6 +21659,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 continue
 
             last_text_answer = answer
+            if depth == 0 and trajectory is not None and not _reply_admits_unfinished(trajectory, answer,
+                                                                                         request_text):
+                trajectory.hold_reply(answer)
             # Once told to answer, take this reply: a gate firing again here is
             # exactly the open-ended checking the cap exists to end.
             # The reply to the answer ask is taken too: sending it back to work then is what left runs with no answer.

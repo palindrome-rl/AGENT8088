@@ -1288,6 +1288,26 @@ class TrajectoryState:
             done.append(_file_key(path))
             del done[:-20]
 
+    # The model's latest reply that a completion check sent back, kept so that a clock that stops the follow-up work
+    # still has an answer to give. Not part of `data`: it is for this run only and never saved with the state.
+    def hold_reply(self, reply: str) -> None:
+        self._held = (reply, self.mutation_count(), self.check_failing())
+
+    def drop_held_reply(self) -> None:
+        self._held = None
+
+    def held_reply(self) -> str:
+        held = getattr(self, "_held", None)
+        return held[0] if held else ""
+
+    def held_reply_stale(self) -> bool:
+        """Files changed, or a check started failing, after the held reply: what it says may no longer be true."""
+        held = getattr(self, "_held", None)
+        if not held:
+            return False
+        _, mutations, failing = held
+        return self.mutation_count() != mutations or (self.check_failing() and not failing)
+
     def progress_mark(self) -> tuple:
         """A value that changes when the run makes real progress."""
         return (int(self.data.get("mutation_count") or 0),
