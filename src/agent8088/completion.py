@@ -197,12 +197,25 @@ _DIR_WORD = re.compile(
     re.IGNORECASE)
 
 
+def _dir_word_name(match) -> str:
+    """The folder name after "folder", "directory" or "dir", or "" when there is none.
+
+    The pattern takes the next word, whatever it is. Seen in a benchmark run: "in the current folder with the header"
+    made the run look for a folder called `with/`. A plain word ("with", "that", "for") is a name only when quoted
+    ("a folder called `with`"). A full stop that ends the sentence is not part of the name ("named results.")."""
+    name = match.group(1).rstrip(".")
+    quoted = match.group(0)[match.start(1) - match.start(0) - 1:match.start(1) - match.start(0)] in ("`", "'", '"')
+    if not quoted and name.lower() in _STOPWORDS:
+        return ""
+    return name
+
+
 def named_output_dirs(request: str) -> list[str]:
     """Directories the request asks to be filled (`out/`, "a folder named results")."""
     found: list[str] = []
     for sentence in _SENTENCE_SPLIT.split(_prose(request)):
         spots = [(m.start(), m.group(1).rstrip("/\\")) for m in _DIR_TOKEN.finditer(sentence)]
-        spots += [(m.start(), m.group(1)) for m in _DIR_WORD.finditer(sentence)]
+        spots += [(m.start(), _dir_word_name(m)) for m in _DIR_WORD.finditer(sentence)]
         for start, path in spots:
             before = sentence[:start]
             output = [m.end() for m in _OUTPUT_CUE.finditer(before)]
