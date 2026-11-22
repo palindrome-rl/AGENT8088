@@ -379,12 +379,22 @@ _RUNNER = (r"(?:python[\d.]*|py|node|nodejs|deno|bun|ruby|php|perl|bash|sh|pwsh|
            r"go\s+run|cargo\s+run|ts-node|tsx)")
 
 
+# A file named inside inline code (`powershell -Command "Get-Content report.html ..."`, `python -c "open('a.json')"`)
+# is read by that code, not run. Seen in a benchmark run: a PowerShell one-liner that pulled the rows out of the page
+# the run wrote failed on a path, and the finished page was reported as a failed check.
+_INLINE_FLAG = re.compile(r"\s(?:-c|-e|-p|--eval|--print|-command|-encodedcommand|-ec)(?=\s|$)", re.IGNORECASE)
+
+
 def _runs_a_written_file(command: str, written) -> bool:
     for path in written or []:
         name = PurePath(str(path)).name
-        if name and re.search(rf"(?<![\w.-]){_RUNNER}(?![\w-])[^&|;\n]*?(?<![\w.-]){re.escape(name)}(?![\w-])",
-                              command or "", re.IGNORECASE):
-            return True
+        if not name:
+            continue
+        # A lookahead, so every interpreter on the line is tried: `bash -c "python app.py"` runs app.py.
+        pattern = rf"(?=(?<![\w.-]){_RUNNER}(?![\w-])([^&|;\n]*?)(?<![\w.-]){re.escape(name)}(?![\w-]))"
+        for match in re.finditer(pattern, command or "", re.IGNORECASE):
+            if not _INLINE_FLAG.search(match.group(1)):
+                return True
     return False
 
 
