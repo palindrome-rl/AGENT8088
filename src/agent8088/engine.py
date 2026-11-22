@@ -21582,8 +21582,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 thinking_off_retry = True
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
-                if work_pending:
-                    # Mid-task an empty reply is a stall, not a finish: ask to carry on.
+                if work_pending or (not seen_signatures and round_allowed_tools
+                                    and completion_checks.asks_for_work(request_text)):
+                    # Mid-task an empty reply is a stall, not a finish: ask to carry on. So is one before any tool has
+                    # run on a request for work: "do not call any tools" there ends the run with nothing done.
                     messages.append(_harness_turn(completion_checks.EMPTY_REPLY_ASK))
                 else:
                     messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "

@@ -83,6 +83,21 @@ def test_the_start_ask_is_bounded(eng, monkeypatch):
     assert answer
 
 
+def test_an_empty_reply_after_the_start_asks_is_asked_to_continue_not_to_answer(eng, monkeypatch):
+    # Seen in the after-fix benchmark run: after both start asks the next empty reply was told "Reply now with your
+    # final answer ... do not call any tools", and the run ended in 18 seconds with nothing done.
+    script = Script(eng, monkeypatch, [
+        "", "", "",
+        _call("execute_shell", command="make"),
+        "Built.",
+    ], tool=failing_then_ok(["built"]))
+    answer = run(eng, "build the project", script)
+    assert len(script.nudges("No tool has been called yet")) == 2
+    assert not script.nudges("do not call any tools")
+    assert script.nudges(cc.EMPTY_REPLY_ASK)
+    assert answer.startswith("Built.")
+
+
 def test_after_work_has_started_an_announcement_is_left_to_the_completion_checks(eng, monkeypatch):
     script = Script(eng, monkeypatch, [
         _call("execute_shell", command="make"),
