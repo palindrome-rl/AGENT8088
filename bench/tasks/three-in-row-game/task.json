@@ -1,0 +1,10 @@
+{
+  "id": "three-in-row-game",
+  "title": "Make an offline two-player three-in-a-row game page with win and draw detection and a saved score",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"]
+}

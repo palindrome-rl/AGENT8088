@@ -1,0 +1,10 @@
+{
+  "id": "catalog-scrape",
+  "title": "Write a stdlib scraper that follows next links over HTTP and writes the product list as CSV",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["local port"]
+}

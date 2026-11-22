@@ -90,6 +90,10 @@ python bench/report.py new-runs/results.jsonl --baseline baseline.json
 | `http-api-server` | sandbox | 15 min | writing a server, starting it, checking it over HTTP, a restart |
 | `render-report-page` | sandbox | 15 min | an offline page with a table and an SVG chart, looked at rendered |
 | `slow-build-fix` | sandbox | 25 min | a three-minute build, a link error fixed in the sources, a rebuild |
+| `tile-flip-game` | sandbox | 15 min | a puzzle page: grid rules, a start pattern from the address, a move count, restart |
+| `three-in-row-game` | sandbox | 15 min | a two-player game page: turns, win and draw detection, a score kept across reloads |
+| `cart-page` | sandbox | 15 min | a shop page: a cart, a discount code at a threshold, money in cents, state kept across reloads |
+| `catalog-scrape` | sandbox | 15 min | a stdlib scraper over HTTP that follows next links; graded on a second shop it has not seen |
 | `kanban-board` | long | 2 h | a board page with written rules, persistence, import and export, undo |
 | `qbr-review-pack` | long | 2 h | a workbook, deck and memo from messy CSV, Excel and PDF inputs |
 | `notes-app` | long | 2 h | a JSON API on SQLite, a page and the app's own tests |
@@ -99,7 +103,9 @@ The long tasks' original checkers are kept as `check.py`, changed only so they
 start a browser through `graderlib` and so a server that drops a connection
 fails a step instead of crashing the check; `grade.py` maps their reports to
 the benchmark's format. Reference solutions for every grader are in
-`tests/bench_references`, away from the task folders.
+`tests/bench_references`, away from the task folders. The page graders share
+`graderlib.OfflinePage` and `graderlib.grade_in_browser`, which block requests that leave the machine and turn a
+browser that cannot start into an ungraded report.
 
 Each task folder has:
 

@@ -36,6 +36,97 @@ def launch_chromium(driver):
     raise failures[0]
 
 
+class OfflinePage:
+    """A headless page that blocks every request leaving the machine and records console errors.
+
+        with graderlib.OfflinePage() as session:
+            page = session.open(path)          # a file on disk, as a file:// address
+            ...
+            session.errors, session.outside   # what the page logged and tried to fetch
+
+    Raises when no browser can be started; graders turn that into an ungraded report."""
+
+    def __init__(self):
+        self.errors: list = []
+        self.outside: list = []
+        self._driver = self._browser = self._context = None
+
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        self._manager = sync_playwright()
+        self._driver = self._manager.__enter__()
+        try:
+            self._browser = launch_chromium(self._driver)
+        except Exception:
+            self._manager.__exit__(None, None, None)
+            raise
+        self._context = self._browser.new_context()
+        self._context.route("**/*", self._route)
+        return self
+
+    def _route(self, request_route):
+        url = request_route.request.url
+        if url.startswith(("file:", "data:", "about:", "blob:")):
+            request_route.continue_()
+        else:
+            self.outside.append(url)
+            request_route.abort()
+
+    def open(self, path: Path, query: str = ""):
+        page = self._context.new_page()
+        page.on("console", lambda message: self.errors.append(message.text) if message.type == "error" else None)
+        page.on("pageerror", lambda error: self.errors.append(str(error)))
+        page.goto(Path(path).resolve().as_uri() + query)
+        page.wait_for_timeout(300)
+        return page
+
+    def __exit__(self, *exc):
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        finally:
+            self._manager.__exit__(None, None, None)
+        return False
+
+
+def browser_error(exc: Exception) -> dict:
+    """The report for a run the grader could not check because no browser started."""
+    return {"error": f"the grader could not start a browser: {str(exc).splitlines()[0][:200] if str(exc) else exc!r}"}
+
+
+def report(checks: dict, total: int | None = None, **extra) -> dict:
+    """{"passed", "score", "checks"}; with `total`, checks that never ran count as failed."""
+    total = total or len(checks) or 1
+    return {"passed": len(checks) == total and all(checks.values()),
+            "score": round(sum(bool(v) for v in checks.values()) / total, 3), "checks": checks, **extra}
+
+
+def grade_in_browser(play, total: int) -> dict:
+    """Run `play(session, checks)` in an OfflinePage and report what it found.
+
+    No Playwright or no browser: an ungraded report (an "error", no "passed"). A step that fails part way (an
+    element that is not there, a click that times out) ends the play; the checks it never reached count as failed."""
+    checks: dict = {}
+    try:
+        session = OfflinePage().__enter__()
+    except ImportError:
+        return {"error": "playwright is not installed for the grader"}
+    except Exception as exc:  # noqa: BLE001 - every launch failure means the run cannot be graded here
+        return browser_error(exc)
+    failure = ""
+    try:
+        play(session, checks)
+    except Exception as exc:  # noqa: BLE001 - the work under test failed a step
+        failure = (str(exc).splitlines() or [repr(exc)])[0][:200]
+    finally:
+        errors, outside = session.errors[:5], session.outside[:5]
+        session.__exit__(None, None, None)
+    extra = {"console_errors": errors, "outside_requests": outside}
+    if failure:
+        extra["failure"] = failure
+    return report(checks, total=total, **extra)
+
+
 def run_checker(check: Path, args: list, timeout: int = 1800) -> dict:
     """Run a task's original checker, which prints one JSON report, and return that report.
 

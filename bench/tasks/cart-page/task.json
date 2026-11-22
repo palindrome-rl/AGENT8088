@@ -1,0 +1,10 @@
+{
+  "id": "cart-page",
+  "title": "Make an offline shop page with a cart, a discount code, amounts in cents and a cart that survives a reload",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"]
+}
