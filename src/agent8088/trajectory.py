@@ -364,11 +364,16 @@ def _without_inline_code(segment: str) -> str:
     return match.group("head")
 
 
+# PowerShell's file-exists test. Seen in a benchmark run: `if (Test-Path .venv) { Remove-Item ... }; python -m venv
+# .venv` failed on a syntax error, and the word "Test" made the whole setup command "the latest check".
+_FILE_TEST_WORD = re.compile(r"\btest-path\b", re.IGNORECASE)
+
+
 def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
     if not (command or "").strip():
         return True
-    return any(_CHECK_COMMAND.search(_without_inline_code(segment))
+    return any(_CHECK_COMMAND.search(_FILE_TEST_WORD.sub(" ", _without_inline_code(segment)))
                for segment in command_segments(command, split_or=True)
                if segment.strip() and _segment_program(segment) not in _FILE_COMMANDS)
 

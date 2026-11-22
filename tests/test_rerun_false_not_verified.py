@@ -48,3 +48,18 @@ def test_a_probe_with_a_bracketed_echo_is_not_a_check():
 
 def test_a_bracketed_test_run_is_still_a_check():
     assert _is_check_run("cd app && (python -m pytest -q || echo FAILED)")
+
+
+SETUP = ("if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }; python -m venv --without-pip .venv; "
+         r'if (Test-Path .venv\Scripts\python.exe) { Write-Output "venv made" } else { Write-Output "no venv" }')
+
+
+def test_a_powershell_file_test_is_not_a_check():
+    # 3. A setup command that failed on a syntax error was "the latest check" because of the word "Test" in Test-Path.
+    assert not _is_check_run(SETUP)
+    assert not _is_check_run(r"Test-Path out\app.bin")
+
+
+def test_a_real_test_next_to_a_file_test_is_still_a_check():
+    assert _is_check_run("if (Test-Path tests) { python -m pytest -q }")
+    assert _is_check_run("Test-Path dist; npm test")
