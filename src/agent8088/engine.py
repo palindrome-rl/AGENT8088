@@ -20575,12 +20575,22 @@ ANSWER_TIME_FLOOR_SECONDS = 90
 ANSWER_TIME_SHARE = 0.05
 
 
-def _answer_time(budget) -> bool:
-    """True in the last stretch of a wall-clock budget, when a reply should be taken as the answer."""
+# The stretch also covers one more turn at the pace the run is going. Seen in benchmark runs on a slow model: turns
+# took 60 to 200 s, so with a fixed 90 s the answer ask came with 60 s left and the clock stopped the reply to it.
+# Capped so a few very slow turns cannot turn most of the clock into the last stretch.
+ANSWER_TIME_TURN_FACTOR = 1.5
+ANSWER_TIME_CAP_SHARE = 0.2
+
+
+def _answer_time(budget, turn_seconds: float = 0.0) -> bool:
+    """True in the last stretch of a wall-clock budget, when a reply should be taken as the answer.
+
+    turn_seconds is how long a recent turn took; the stretch is long enough for one more turn at that pace."""
     if budget is None or not getattr(budget, "max_seconds", 0):
         return False
     left = budget.seconds_left()
-    return left is not None and left <= max(ANSWER_TIME_FLOOR_SECONDS, ANSWER_TIME_SHARE * budget.max_seconds)
+    pace = min(ANSWER_TIME_TURN_FACTOR * max(0.0, turn_seconds), ANSWER_TIME_CAP_SHARE * budget.max_seconds)
+    return left is not None and left <= max(ANSWER_TIME_FLOOR_SECONDS, ANSWER_TIME_SHARE * budget.max_seconds, pace)
 
 
 def _budget_answer(reason: str, trajectory) -> str:
@@ -20856,6 +20866,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     answer_asked = False  # the last-stretch "answer now" ask was sent
+    turn_mark = None      # when the current turn started (monotonic seconds)
+    recent_turns: list = []  # how long the last few turns took, for the length of the last stretch
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     compaction_cooldown_turn = 0  # a successful one waits COMPACTION_COOLDOWN_TURNS turns
@@ -20916,6 +20928,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     for turn in range(policy.ceiling):
         if turn >= policy.limit:
             break
+        now = time.monotonic()
+        if turn_mark is not None:
+            recent_turns = (recent_turns + [now - turn_mark])[-3:]
+        turn_mark = now
+        turn_pace = max(recent_turns, default=0.0)
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
@@ -20953,7 +20970,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             # Without this, runs whose outputs were in place went on checking until the clock stopped them. A short
             # clock is left alone: there the last stretch would be most of the run.
             if (depth == 0 and not answer_asked and budget.max_seconds >= ANSWER_NOW_MIN_BUDGET
-                    and _answer_time(budget)):
+                    and _answer_time(budget, turn_pace)):
                 answer_asked = True
                 time_nudges = max(time_nudges, crossed)
                 messages.append(_harness_turn(_answer_now_nudge(left)))
@@ -21622,7 +21639,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             last_text_answer = answer
             # Once told to answer, take this reply: a gate firing again here is
             # exactly the open-ended checking the cap exists to end.
-            gates_open = not post_check_told and not _answer_time(budget)
+            # The reply to the answer ask is taken too: sending it back to work then is what left runs with no answer.
+            gates_open = not post_check_told and not answer_asked and not _answer_time(budget, turn_pace)
             if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()

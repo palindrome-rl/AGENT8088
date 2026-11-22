@@ -97,3 +97,15 @@ def test_a_budget_stop_with_unchecked_changes_says_so(eng, monkeypatch):
     monkeypatch.setattr(eng._TurnBudget, "exceeded", exceeded)
     answer, _trace = _run(eng, script, used=0)
     assert "no fresh automated verification" in answer or answer.startswith("NOT VERIFIED")
+
+
+def test_the_last_stretch_covers_one_more_turn_at_the_run_pace(engine):
+    # Seen on a slow model: turns took 60 to 200 s, and with a fixed 90 s the answer ask came too late to be answered.
+    clock = engine._TurnBudget(max_seconds=1485)
+    clock.started -= 1485 - 146
+    assert not engine._answer_time(clock)                     # 146 s left is outside the fixed stretch
+    assert engine._answer_time(clock, turn_seconds=100)       # but one more 100 s turn would not fit
+    assert not engine._answer_time(clock, turn_seconds=60)    # a 60 s turn still fits
+    early = engine._TurnBudget(max_seconds=1485)
+    early.started -= 1485 - 400
+    assert not engine._answer_time(early, turn_seconds=1000)  # capped at a fifth of the clock (297 s)
