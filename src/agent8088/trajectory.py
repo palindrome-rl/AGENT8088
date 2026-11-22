@@ -297,7 +297,8 @@ def _is_probe(command: str) -> bool:
 
 
 def _segment_program(segment: str) -> str:
-    words = segment.strip().split()
+    # A group's opening bracket is not part of the program: `(echo test > x.txt || echo no)` runs echo.
+    words = segment.strip().lstrip("( \t").split()
     while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
         words = words[1:]
     return PurePath(words[0].strip("\"'")).name.lower().removesuffix(".exe") if words else ""

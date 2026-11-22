@@ -566,8 +566,11 @@ def _claimed_but_unwritten(lowered_reply: str, written, search_roots) -> list[st
 
 
 def _exists_somewhere(path: str, roots: Iterable[Path]) -> bool:
-    """A written path may be recorded as the model spelled it, relative to a workspace."""
-    return any(_nonempty_file(c) for c in _candidates(path, roots))
+    """A written path may be recorded as the model spelled it, relative to a workspace.
+
+    A path the run wrote as a file and that is now a folder holding files (a build that makes out/ where a stray out
+    file was) exists too."""
+    return any(_nonempty_file(c) or _has_content(c) for c in _candidates(path, roots))
 
 
 # --- 4. Parts of a multi-part request --------------------------------------------------
