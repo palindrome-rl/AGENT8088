@@ -687,6 +687,9 @@ EDIT_CHECK_REMINDERS = max(0, _config_int("edit_check_reminders", 3))
 # them; a follow-up that makes progress hands its slot back. 0 turns the checks off.
 MAX_COMPLETION_CONTINUATIONS = max(0, _config_int(
     "max_completion_continuations", completion_checks.DEFAULT_CONTINUATIONS))
+# Times a request that asks for work may be sent back to start it when no tool has run yet and the reply is
+# empty or only says what comes next. Outside the completion budget: nothing has been done to check.
+NOT_STARTED_ASKS = max(0, _config_int("max_not_started_asks", 2))
 # The parts of a request are checked against what the run delivered. With this on, a
 # paragraph that states three or more requirements builds a checklist too, and a part
 # that asks for something to be built counts as done only when the delivered files show
@@ -829,6 +832,10 @@ API_RETRY_JITTER_RATIO = max(0.0, min(1.0, _config_float("api_retry_jitter_ratio
 # an attack — which is exactly why the permission gate does not catch it.
 # 0 disables either check.
 MAX_WRITES_PER_TURN = _config_int("max_writes_per_turn", 0)
+# Tool calls run from one model reply. Seen in a benchmark run: a first reply held 483 calls (the same few lookups over
+# and over), all of them ran, and the conversation grew past what the model can read before any work was done. An
+# approved plan's batch is routinely a dozen calls, well under this.
+MAX_CALLS_PER_REPLY = 24
 MAX_WRITE_BYTES = _config_int("max_write_bytes", 0)
 
 # --- Runtime-adjustable limits ---------------------------------------------
@@ -18311,6 +18318,7 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             kwargs["on_answer"](answer)
         if isinstance(kwargs.get("trace"), list):
             kwargs["trace"].append({"type": "budget_exceeded", "content": str(exc)})
+            _trace_held_answer(kwargs["trace"], run_trajectory, answer)
         return answer
     finally:
         run_trajectory.finish(answer)
@@ -18581,6 +18589,17 @@ def _time_left_nudge(seconds_left: float, final: bool = False) -> str:
     return (f"Time check: {left} left before this run is stopped. Make sure every "
             "required output exists now, even if imperfect; stop exploring and "
             "finish the most important remaining step first." + _wrap_up_ask(final))
+
+
+ANSWER_NOW_MIN_BUDGET = 270  # seconds; three times the answer floor (ANSWER_TIME_FLOOR_SECONDS)
+
+
+def _answer_now_nudge(seconds_left: float) -> str:
+    """Sent once in the last stretch of the clock, when a reply is taken as the answer (see _answer_time)."""
+    left = f"about {max(1, int(seconds_left))} seconds"
+    return (f"Time is almost up: {left} left. Stop calling tools and give your final answer now, in plain text. "
+            "A run the clock stops has no answer at all. Say what is done, what is not done and what you could "
+            "not verify.")
 
 
 def _rounds_left_nudge(rounds_left: int, final: bool = False) -> str:
@@ -20469,7 +20488,8 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         if pending:
             unaddressed = completion_checks.unaddressed_subgoals(
                 pending, reply, trajectory.written_paths(),
-                evidence=_delivered_evidence(trajectory.written_paths()))
+                evidence=_delivered_evidence(trajectory.written_paths()), ran=trajectory.ran_commands(),
+                roots=[PROJECT_ROOT, Path.cwd()])
             # What the reply did cover is done; the rest stays open and is listed by
             # _with_task_notes as "Not completed: ...", so it is not repeated here.
             trajectory.mark_subgoals(unaddressed)
@@ -20528,7 +20548,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
         if pending:
             evidence = _delivered_evidence(written)
             open_items = completion_checks.unaddressed_subgoals(
-                pending, reply, written, evidence=evidence)
+                pending, reply, written, evidence=evidence, ran=trajectory.ran_commands(),
+                roots=[PROJECT_ROOT, Path.cwd()])
             trajectory.mark_subgoals(open_items)
             if open_items:
                 nudge = completion_checks.subgoals_nudge(open_items, evidence=evidence is not None)
@@ -20580,11 +20601,17 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
-def _not_verified_reasons(trajectory) -> list:
-    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones."""
+def _not_verified_reasons(trajectory, reply: str = "") -> list:
+    """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones.
+
+    ``reply`` is the model's own answer, before the harness notes. When it says a part was not done ("I could not
+    create the folder where it was asked for"), the run is not verified, whatever its checks found.
+    """
     if trajectory is None:
         return []
     reasons = []
+    if reply and completion_checks.reports_part_not_done(reply):
+        reasons.append("the reply says part of the request was not done")
     if trajectory.no_runnable_app():
         reasons.append("no runnable app (a page or a server) was produced for a request to build a web app")
     failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
@@ -20601,6 +20628,8 @@ def _not_verified_reasons(trajectory) -> list:
         if text.lower().startswith(_STRONG_UNMET) and not any(text.lower().startswith(w) for w in
                                                               ("the smoke test failed", "the latest check failed")):
             reasons.append(text[:120])
+    if trajectory.held_reply_stale():
+        reasons.append("the clock stopped work that changed files after the reply above")
     return list(dict.fromkeys(reasons))
 
 
@@ -20622,12 +20651,22 @@ ANSWER_TIME_FLOOR_SECONDS = 90
 ANSWER_TIME_SHARE = 0.05
 
 
-def _answer_time(budget) -> bool:
-    """True in the last stretch of a wall-clock budget, when a reply should be taken as the answer."""
+# The stretch also covers one more turn at the pace the run is going. Seen in benchmark runs on a slow model: turns
+# took 60 to 200 s, so with a fixed 90 s the answer ask came with 60 s left and the clock stopped the reply to it.
+# Capped so a few very slow turns cannot turn most of the clock into the last stretch.
+ANSWER_TIME_TURN_FACTOR = 1.5
+ANSWER_TIME_CAP_SHARE = 0.2
+
+
+def _answer_time(budget, turn_seconds: float = 0.0) -> bool:
+    """True in the last stretch of a wall-clock budget, when a reply should be taken as the answer.
+
+    turn_seconds is how long a recent turn took; the stretch is long enough for one more turn at that pace."""
     if budget is None or not getattr(budget, "max_seconds", 0):
         return False
     left = budget.seconds_left()
-    return left is not None and left <= max(ANSWER_TIME_FLOOR_SECONDS, ANSWER_TIME_SHARE * budget.max_seconds)
+    pace = min(ANSWER_TIME_TURN_FACTOR * max(0.0, turn_seconds), ANSWER_TIME_CAP_SHARE * budget.max_seconds)
+    return left is not None and left <= max(ANSWER_TIME_FLOOR_SECONDS, ANSWER_TIME_SHARE * budget.max_seconds, pace)
 
 
 def _budget_answer(reason: str, trajectory) -> str:
@@ -20636,9 +20675,16 @@ def _budget_answer(reason: str, trajectory) -> str:
     It used to be the budget message and the last tool output, with none of the end-of-run notes, so a run whose
     work was done and tested read the same as one that had done nothing. It now carries the same notes as any other
     finish: the verification level, the NOT VERIFIED headline and what was left undone."""
-    partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
-    answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
-                           f"Partial result so far:\n{partial}")
+    held = trajectory.use_held_reply() if trajectory is not None else ""
+    if held:
+        # The model had answered; a completion check sent it back, and the clock stopped what it did next. Its answer
+        # is still the best account of the work, and the notes below say what was not settled.
+        answer = _guard_answer(f"{held}\n\n{reason}\nThe run was stopped after this reply, while it was doing "
+                               "more checks.")
+    else:
+        partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
+        answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
+                               f"Partial result so far:\n{partial}")
     if trajectory is None:
         return answer
     try:
@@ -20648,10 +20694,20 @@ def _budget_answer(reason: str, trajectory) -> str:
         return answer
 
 
+def _trace_held_answer(trace: list, trajectory, answer: str, turn=None) -> None:
+    """A budget stop that gave the model's held reply records it as the run's final answer."""
+    if trajectory is not None and trajectory.held_reply():
+        step = {"type": "final_answer", "content": answer, "after_budget": True}
+        if turn is not None:
+            step["turn"] = turn
+        trace.append(step)
+
+
 def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str:
     """The controller's end-of-run notes, on every way a run can finish: an
     unverified change, the task-state review, and where any writes landed."""
     notes = []
+    model_reply = answer
     # First: the copy-back changes which files are missing, and the notes and the headline below report that.
     mirror_note = "" if read_only else _mirror_redirected_writes(trajectory)
     assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
@@ -20694,7 +20750,7 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
-    reasons = _not_verified_reasons(trajectory) if NOT_VERIFIED_HEADLINE else []
+    reasons = _not_verified_reasons(trajectory, model_reply) if NOT_VERIFIED_HEADLINE else []
     if reasons and not answer.startswith("NOT VERIFIED:"):
         answer = ("NOT VERIFIED: " + "; ".join(reasons[:4])
                   + ". Details are in the notes at the end.\n\n" + answer)
@@ -20879,6 +20935,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     missing_args_retries = 0  # times a call arrived without its arguments
     parse_error_retries = 0   # times a call's arguments were unparseable JSON
     empty_retries = 0    # times the model returned no answer (reasoning-only turn)
+    not_started_asks = 0  # times a reply before any tool call was sent back to start the work
     length_retries = 0   # consecutive token-limited calls; incomplete, never executed
     last_call_tokens = 0  # completion tokens of the last call that finished normally
     recent_call_tokens = []  # the last few, for the adaptive first-call cap
@@ -20904,6 +20961,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     edit_check = _new_edit_check_reminder()
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
+    answer_asked = False  # the last-stretch "answer now" ask was sent
+    if depth == 0 and trajectory is not None:
+        trajectory.drop_held_reply()  # a reply from an earlier request is not this one's answer
+    turn_mark = None      # when the current turn started (monotonic seconds)
+    recent_turns: list = []  # how long the last few turns took, for the length of the last stretch
     round_nudges = 0  # ROUND_LEFT_NUDGE_AT thresholds already announced
     compaction_retry_turn = 0  # a failed compaction waits COMPACTION_RETRY_TURNS turns
     compaction_cooldown_turn = 0  # a successful one waits COMPACTION_COOLDOWN_TURNS turns
@@ -20964,6 +21026,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     for turn in range(policy.ceiling):
         if turn >= policy.limit:
             break
+        now = time.monotonic()
+        if turn_mark is not None:
+            recent_turns = (recent_turns + [now - turn_mark])[-3:]
+        turn_mark = now
+        turn_pace = max(recent_turns, default=0.0)
         round_tools_def = tools_def() if callable(tools_def) else tools_def
         round_allowed_tools = set(
             allowed_tools() if callable(allowed_tools) else allowed_tools
@@ -20991,13 +21058,24 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 on_answer(answer)
             if trace is not None:
                 trace.append({"turn": turn, "type": "budget_exceeded", "content": over})
+                _trace_held_answer(trace, trajectory, answer, turn=turn)
             return answer
         # Only when a clock was configured: with no limit set there is nothing to announce.
         # A sub-agent's clock is its parent's remainder, so only the main run is told.
         if (DISPOSABLE_CONTAINER or depth == 0) and budget and budget.max_seconds:
             left = budget.seconds_left()
             crossed = sum(1 - left / budget.max_seconds >= at for at in TIME_LEFT_NUDGE_AT)
-            if crossed > time_nudges:
+            # The time checks say to finish the outputs; in the last stretch the model is told to answer instead.
+            # Without this, runs whose outputs were in place went on checking until the clock stopped them. A short
+            # clock is left alone: there the last stretch would be most of the run.
+            if (depth == 0 and not answer_asked and budget.max_seconds >= ANSWER_NOW_MIN_BUDGET
+                    and _answer_time(budget, turn_pace)):
+                answer_asked = True
+                time_nudges = max(time_nudges, crossed)
+                messages.append(_harness_turn(_answer_now_nudge(left)))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "answer_now", "content": int(left)})
+            elif crossed > time_nudges:
                 time_nudges = crossed
                 messages.append(_harness_turn(
                     _time_left_nudge(left, final=crossed >= len(TIME_LEFT_NUDGE_AT))))
@@ -21329,6 +21407,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             content = "\n".join(part for part in (content, native_text) if part)
 
         calls = find_tool_calls(content, round_allowed_tools)
+        dropped_calls = max(0, len(calls) - MAX_CALLS_PER_REPLY)
+        if dropped_calls:
+            calls = calls[:MAX_CALLS_PER_REPLY]
+            _log.warning("turn %d: %d tool calls in one reply; ran the first %d", turn,
+                         MAX_CALLS_PER_REPLY + dropped_calls, MAX_CALLS_PER_REPLY)
+            if trace is not None:
+                trace.append({"turn": turn, "type": "calls_dropped", "count": dropped_calls,
+                              "kept": MAX_CALLS_PER_REPLY})
         for call in calls:
             if (call["name"] == "browse_page" and browser_goal
                     and _STATEFUL_BROWSER_REQUEST.search(browser_goal)):
@@ -21599,6 +21685,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             # for an empty reply and must never be offered to the user as a plan.
             model_replied = bool(answer.strip())
 
+            # No tool has run yet for a request that asks for work, and the reply is empty or only says what comes
+            # next: the work has not started. Asking for "your final answer, no tools" here, or spending the
+            # completion checks on it, once ended a run in 16 seconds with nothing done. Ask it to start instead,
+            # outside the completion budget and a bounded number of times.
+            if (not seen_signatures and not forcing and not unknown and round_allowed_tools
+                    and not_started_asks < NOT_STARTED_ASKS and PERMISSION_MODE != "plan-only"
+                    and completion_checks.asks_for_work(request_text)
+                    and (not answer or completion_checks.only_announces_next_step(answer))):
+                not_started_asks += 1
+                if not answer:
+                    thinking_off_retry = True
+                if on_result:
+                    on_result("error", "No work started yet — asking the model to begin.")
+                messages.append(_harness_turn(completion_checks.NOT_STARTED_ASK))
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "not_started", "empty": not answer,
+                                  "asks": not_started_asks})
+                continue
+
             # Reasoning-only / empty turn: nudge once for a plain answer rather than
             work_pending = (trajectory is not None and completion_budget.enabled
                             and trajectory.has_open_items())
@@ -21619,8 +21724,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 thinking_off_retry = True
                 if on_result:
                     on_result("error", "No answer produced — asking the model to respond.")
-                if work_pending:
-                    # Mid-task an empty reply is a stall, not a finish: ask to carry on.
+                if work_pending or (not seen_signatures and round_allowed_tools
+                                    and completion_checks.asks_for_work(request_text)):
+                    # Mid-task an empty reply is a stall, not a finish: ask to carry on. So is one before any tool has
+                    # run on a request for work: "do not call any tools" there ends the run with nothing done.
                     messages.append(_harness_turn(completion_checks.EMPTY_REPLY_ASK))
                 else:
                     messages.append(_harness_turn("You did not provide an answer. Reply now with your final answer in "
@@ -21658,9 +21765,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 continue
 
             last_text_answer = answer
+            if depth == 0 and trajectory is not None and not _reply_admits_unfinished(trajectory, answer,
+                                                                                         request_text):
+                trajectory.hold_reply(answer)
             # Once told to answer, take this reply: a gate firing again here is
             # exactly the open-ended checking the cap exists to end.
-            gates_open = not post_check_told and not _answer_time(budget)
+            # The reply to the answer ask is taken too: sending it back to work then is what left runs with no answer.
+            gates_open = not post_check_told and not answer_asked and not _answer_time(budget, turn_pace)
             if gates_open and trajectory is not None and trajectory.request_replan():
                 if on_trajectory_state:
                     on_trajectory_state()
@@ -22323,6 +22434,11 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
 
         if turn_tools:
             trace.append({"turn": turn, "type": "tool_calls", "tools": turn_tools})
+        if dropped_calls:
+            messages.append(_harness_turn(
+                f"Your last reply held {MAX_CALLS_PER_REPLY + dropped_calls} tool calls. Only the first "
+                f"{MAX_CALLS_PER_REPLY} ran; the other {dropped_calls} were not run. Do not repeat the same lookup: "
+                "call only what the next step needs, a few calls at a time."))
 
         # A successful test of changed work starts the same bounded check phase
         # even when the model has not attempted a final answer yet. Mere reads

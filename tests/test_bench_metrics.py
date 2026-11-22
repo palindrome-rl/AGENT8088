@@ -281,3 +281,41 @@ def test_nothing_is_shared_without_a_source(tmp_path):
     import run as bench_run
 
     assert bench_run.share_runtime({}, tmp_path) == []
+
+
+# -- the agent executable ------------------------------------------------------------------------
+
+def test_a_relative_agent_path_becomes_absolute(tmp_path, monkeypatch):
+    import run as bench_run
+    exe = tmp_path / "bin" / "agent8088.exe"
+    exe.parent.mkdir()
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    resolved = bench_run.resolve_agent(str(Path("bin") / "agent8088.exe"))
+    assert Path(resolved).is_absolute() and Path(resolved) == exe.resolve()
+
+
+def test_a_windows_suffix_is_found(tmp_path, monkeypatch):
+    import run as bench_run
+    exe = tmp_path / "bin" / "agent8088.exe"
+    exe.parent.mkdir()
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert Path(bench_run.resolve_agent(str(Path("bin") / "agent8088"))) == exe.resolve()
+
+
+def test_a_bare_name_is_looked_up_on_path(tmp_path, monkeypatch):
+    import run as bench_run
+    monkeypatch.setattr(bench_run.shutil, "which", lambda name: str(tmp_path / "found" / name))
+    monkeypatch.chdir(tmp_path)
+    assert bench_run.resolve_agent("agent8088") == str((tmp_path / "found" / "agent8088").resolve())
+
+
+def test_a_missing_agent_stops_before_any_run(tmp_path, monkeypatch):
+    import run as bench_run
+    monkeypatch.setattr(bench_run.shutil, "which", lambda name: None)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit):
+        bench_run.resolve_agent("agent8088")
+    with pytest.raises(SystemExit):
+        bench_run.resolve_agent(str(Path("missing") / "agent8088.exe"))
