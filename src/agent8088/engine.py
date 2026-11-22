@@ -20602,7 +20602,7 @@ def _budget_answer(reason: str, trajectory) -> str:
     It used to be the budget message and the last tool output, with none of the end-of-run notes, so a run whose
     work was done and tested read the same as one that had done nothing. It now carries the same notes as any other
     finish: the verification level, the NOT VERIFIED headline and what was left undone."""
-    held = trajectory.held_reply() if trajectory is not None else ""
+    held = trajectory.use_held_reply() if trajectory is not None else ""
     if held:
         # The model had answered; a completion check sent it back, and the clock stopped what it did next. Its answer
         # is still the best account of the work, and the notes below say what was not settled.

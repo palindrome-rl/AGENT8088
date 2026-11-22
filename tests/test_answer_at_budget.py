@@ -182,6 +182,9 @@ def test_the_held_reply_belongs_to_its_run():
     state.hold_reply("done")
     assert state.held_reply() == "done" and not state.held_reply_stale()
     state.data["mutation_count"] = state.mutation_count() + 1
+    # Only the held reply given as the answer can be stale: a later reply describes the work as it is.
+    assert not state.held_reply_stale()
+    assert state.use_held_reply() == "done"
     assert state.held_reply_stale()
     state.drop_held_reply()
     assert state.held_reply() == "" and not state.held_reply_stale()

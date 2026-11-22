@@ -1292,18 +1292,29 @@ class TrajectoryState:
     # still has an answer to give. Not part of `data`: it is for this run only and never saved with the state.
     def hold_reply(self, reply: str) -> None:
         self._held = (reply, self.mutation_count(), self.check_failing())
+        self._held_used = False
 
     def drop_held_reply(self) -> None:
         self._held = None
+        self._held_used = False
 
     def held_reply(self) -> str:
         held = getattr(self, "_held", None)
         return held[0] if held else ""
 
+    def use_held_reply(self) -> str:
+        """The held reply, marked as the run's answer (a budget stop gives it); "" when none is held."""
+        reply = self.held_reply()
+        self._held_used = bool(reply)
+        return reply
+
     def held_reply_stale(self) -> bool:
-        """Files changed, or a check started failing, after the held reply: what it says may no longer be true."""
+        """The held reply is the answer, and files changed or a check started failing after it.
+
+        Only an answer that is the held reply can be stale this way: a later reply the run finished with describes the
+        work as it is."""
         held = getattr(self, "_held", None)
-        if not held:
+        if not held or not getattr(self, "_held_used", False):
             return False
         _, mutations, failing = held
         return self.mutation_count() != mutations or (self.check_failing() and not failing)
