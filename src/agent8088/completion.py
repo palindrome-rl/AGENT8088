@@ -84,6 +84,42 @@ def admits_unfinished_work(reply: str) -> bool:
     return any(pattern.search(text) for pattern in _UNFINISHED)
 
 
+# A reply that says, in its own words, that a part of the request was not done: a "Not done" heading with something
+# under it, or "I could not create / install / build ...". Used only to lower the verdict, never to send the model
+# back to work. A limit on checking ("I could not verify it in a browser") is not one: the verification level says
+# that already. A step that was blocked and done another way ("..., so I built it under artifacts/") is not one.
+# "Not completed:" is left out: it is how the end-of-run notes list open parts, not the model's words.
+_NOT_DONE_LABEL = re.compile(r"^[\W_]*not\s+(?:done|finished)\b[^\n:]{0,40}:[ \t]*(?P<rest>[^\n]*)",
+                             re.IGNORECASE | re.MULTILINE)
+_NOTHING = re.compile(r"^\W*(?:none|nothing|n/?a)\b", re.IGNORECASE)
+_LIST_ITEM = re.compile(r"[ \t]*(?:[-*]|\d+[.)])\s+(?P<item>\S[^\n]*)")
+_COULD_NOT_DO = re.compile(
+    r"\b(?:i|we)\s+(?:could|was|were)\s*(?:n['’]?t|\s+not)\s+(?:be\s+)?(?:able\s+to\s+)?"
+    r"(?:create|install|build|write|make|finish|complete|set\s+up|fix|add|produce|generate|implement)\b"
+    r"|\b(?:i|we)\s+(?:am|was|were)\s+unable\s+to\s+"
+    r"(?:create|install|build|write|make|finish|complete|set\s+up|fix|add|produce|generate|implement)\b",
+    re.IGNORECASE)
+_WORKED_AROUND = re.compile(r"(?:,?\s+so\s+i\b|\binstead\b|\bworked\s+around\b|\bby\s+(?:using|copying)\b)",
+                            re.IGNORECASE)
+
+
+def reports_part_not_done(reply: str) -> bool:
+    """True when the reply itself says a part of what was asked was not done."""
+    text = _prose(reply).replace("**", "").replace("__", "")
+    text = re.sub(r"\bif\s+(?:you|your)\b[^.\n]*", " ", text, flags=re.IGNORECASE)
+    for label in _NOT_DONE_LABEL.finditer(text):
+        rest = label.group("rest").strip()
+        if not rest:
+            item = _LIST_ITEM.match(text, label.end() + 1)
+            rest = item.group("item") if item else ""
+        if rest and not _NOTHING.match(rest):
+            return True
+    for sentence in _SENTENCE_SPLIT.split(text):
+        if _COULD_NOT_DO.search(sentence) and not _WORKED_AROUND.search(sentence):
+            return True
+    return False
+
+
 _ADVICE_START = re.compile(
     r"^\W*(?:how|why|what|which|where|when|who|is|are|does|do|did|should|explain|describe|"
     r"tell\s+me|show\s+me\s+how|walk\s+me|what['’]s)\b", re.IGNORECASE)
