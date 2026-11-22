@@ -18310,7 +18310,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
             )
         return answer
     except TurnBudgetExceeded as exc:
-        answer = _budget_answer(str(exc), run_trajectory)
+        # Inside the run's messages again: the end-of-run notes ask which paths the person named, and leaving the
+        # `with` above already forgot the conversation, so a stop raised during a model call placed no file.
+        with _running_on(messages):
+            answer = _budget_answer(str(exc), run_trajectory)
         if kwargs.get("on_answer"):
             kwargs["on_answer"](answer)
         if isinstance(kwargs.get("trace"), list):
@@ -19995,6 +19998,59 @@ def _write_landing(name: str, args: dict) -> str:
     return str(landed) if ARTIFACTS_ROOT in landed.parents else ""
 
 
+def _diverted_and_placed_writes(trajectory) -> list:
+    """(path the person may have named, where the file is) for each file the copy-back may place.
+
+    The sandbox's diverted writes, and the files the run itself wrote under artifacts/: told that relative paths land
+    there, the model often writes `artifacts/board.html` for a request that asks for `board.html`. Seen in benchmark
+    runs: four pages that worked, each left only in artifacts/, each graded as missing. The same rules then apply to
+    both: the person's message must name the exact path, and nothing there is overwritten."""
+    pairs = list(trajectory.redirected_writes())
+    taken = {str(landed) for _, landed in pairs}
+    try:
+        artifacts = ARTIFACTS_ROOT.resolve()
+    except OSError:
+        return pairs
+    for written in trajectory.written_paths():
+        if written in taken:
+            continue
+        try:
+            relative = Path(_from_container_path(written)).resolve().relative_to(artifacts)
+        except (OSError, ValueError):
+            continue
+        if relative.parts:
+            pairs.append((str(PROJECT_ROOT / relative), written))
+    return pairs
+
+
+def _drop_resolved_missing(trajectory) -> None:
+    """Forget "missing or empty files" findings that the copy-back has just put right.
+
+    They were recorded while the files were only in artifacts/; left in place they would put "missing" in the headline
+    of an answer whose files are now where the person asked for them."""
+    unmet = trajectory.data.get("unmet_checks") or []
+    kept = []
+    for entry in unmet:
+        text = str(entry)
+        if text.startswith("missing or empty files: "):
+            names = [item.split(" (", 1)[0].strip() for item in text[len("missing or empty files: "):].split(", ")]
+            if names and all(name and not name.endswith(("/", "\\")) and _nonempty_at_project(name)
+                             for name in names):
+                continue
+        kept.append(entry)
+    if len(kept) != len(unmet):
+        trajectory.data["unmet_checks"] = kept
+
+
+def _nonempty_at_project(name: str) -> bool:
+    path = Path(name)
+    path = path if path.is_absolute() else PROJECT_ROOT / path
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _mirror_redirected_writes(trajectory) -> str:
     """Copy each diverted file back to the path the person named, or return "".
 
@@ -20009,7 +20065,7 @@ def _mirror_redirected_writes(trajectory) -> str:
     if trajectory is None or ARTIFACTS_ROOT == PROJECT_ROOT:
         return ""
     mirrored, failed = [], []
-    for requested_raw, landed_raw in trajectory.redirected_writes():
+    for requested_raw, landed_raw in _diverted_and_placed_writes(trajectory):
         requested = Path(_from_container_path(requested_raw)).expanduser()
         try:
             if not requested.is_absolute():
@@ -20039,6 +20095,8 @@ def _mirror_redirected_writes(trajectory) -> str:
                 failed.append(str(requested))
         except (OSError, ValueError):
             failed.append(requested_raw)
+    if mirrored:
+        _drop_resolved_missing(trajectory)
     parts = []
     if mirrored:
         parts.append("Also copied to the path you named: " + ", ".join(mirrored[:3]) + ".")
@@ -20650,6 +20708,8 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
     unverified change, the task-state review, and where any writes landed."""
     notes = []
     model_reply = answer
+    # First: the copy-back changes which files are missing, and the notes and the headline below report that.
+    mirror_note = "" if read_only else _mirror_redirected_writes(trajectory)
     assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
     if assurance_line:
         notes.append(assurance_line)
@@ -20683,7 +20743,7 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
     if trajectory is not None and trajectory.check_failing():
         which = trajectory.failing_check_note(display_filter=_mask_system_content)
         notes.append(f"{CHECKS_FAILED_NOTE} {which}" if which else CHECKS_FAILED_NOTE)
-    if not read_only and (mirror_note := _mirror_redirected_writes(trajectory)):
+    if mirror_note:
         notes.append(mirror_note)
     location_note = (_workspace_note(trajectory, probe_backend=False) if read_only else _workspace_note(trajectory))
     if location_note:
