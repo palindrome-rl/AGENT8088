@@ -365,6 +365,24 @@ def _run_and_grade(task, profile, run_dir, agent, env, keys, shared, budget, ser
     return result
 
 
+def resolve_agent(agent: str) -> str:
+    """The agent executable as a full path. Each run starts it from inside the task's workspace, so a relative path or
+    a bare name that is not on PATH would not be found there; the first baseline launch failed that way."""
+    candidate = Path(agent).expanduser()
+    if candidate.parent != Path(".") or candidate.exists():
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return str(resolved)
+        for suffix in (".exe", ".cmd", ".bat"):
+            if resolved.with_name(resolved.name + suffix).is_file():
+                return str(resolved.with_name(resolved.name + suffix))
+        raise SystemExit(f"agent executable not found: {agent}")
+    found = shutil.which(agent)
+    if not found:
+        raise SystemExit(f"agent executable not found on PATH: {agent}")
+    return str(Path(found).resolve())
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--profile", required=True, help="model profile JSON, kept outside the repository")
@@ -388,6 +406,7 @@ def main(argv=None) -> int:
         tasks = [task for task in tasks if task["id"] in args.task]
     if args.kind:
         tasks = [task for task in tasks if task["kind"] == args.kind]
+    agent = resolve_agent(args.agent)
     profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -397,7 +416,7 @@ def main(argv=None) -> int:
             run_dir = out / f"{stamp}_{task['id']}_{profile.get('name', 'unnamed')}_{trial}"
             print(f"{benchlib.clock(benchlib.now_iso())} start {run_dir.name}", flush=True)
             try:
-                result = run_one(task, profile, run_dir, args.agent)
+                result = run_one(task, profile, run_dir, agent)
             except ServiceError as error:
                 print(f"{benchlib.clock(benchlib.now_iso())} skip  {run_dir.name}: {error}", flush=True)
                 continue
