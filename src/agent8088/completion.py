@@ -609,7 +609,9 @@ def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     if len(items) < 2:
         parts = [p.strip(" ,;.") for p in _CLAUSE_SPLIT.split(text)]
         items = [p for p in parts if len(p.split()) >= 3]
-        if len(items) < 2:
+        # A clause that runs across a sentence or a paragraph is prose that happened to contain "then", not one part of
+        # a list: no file can show a paragraph of description, so such a split is not a checklist.
+        if len(items) < 2 or any("\n" in p or _SENTENCE_SPLIT.search(p) for p in items):
             items = []
     if not items and sentences:
         flat = " ".join(text.split())
@@ -686,6 +688,24 @@ _ACTION_PART = re.compile(
     r"try|call|invoke|serve|open|load|curl|ping|restart|rerun|re-run)\b", re.IGNORECASE)
 
 
+# A part that also asks for something to be installed or run, anywhere in it ("Create a virtual environment in `.venv`
+# and install `tabulate`"): the things it names may be made by a command.
+_ACTION_WORD = re.compile(r"\b(?:run|execute|start|launch|install|serve|restart|rerun|re-run)\b", re.IGNORECASE)
+_NAMED = re.compile(r"`([^`\n]+)`")
+
+
+def _named_things_found(item: str, *haystacks: str) -> bool:
+    """Whether every thing the part names in backticks (`.venv`, `--verbose`, `cli.py`) shows up, word for word.
+
+    The named things are the checkable core of a part, so when each of them is there the part is not forgotten, even
+    when the rest of it is described in other words.
+    """
+    named = [_words_for_evidence(n).split() for n in _NAMED.findall(item)]
+    named = [words for words in named if words]
+    return bool(named) and all(
+        any(all(f" {w} " in hay for w in words) for hay in haystacks) for words in named)
+
+
 def _root(word: str) -> str:
     """The start of a word that its inflections share ("remove" and "removing" -> "remo")."""
     return word[: max(4, len(word) - 2)] if len(word) >= 6 else word
@@ -735,6 +755,9 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     for item in items:
         words = _keywords(item)
         if not words:
+            continue
+        acts = bool(_ACTION_PART.match(item) or _ACTION_WORD.search(item))
+        if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
             continue
         if _COMMUNICATION.match(item):
             found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
