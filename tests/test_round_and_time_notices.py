@@ -65,3 +65,28 @@ def test_short_runs_get_no_round_message(eng, monkeypatch):
     eng.run_agent([{"role": "user", "content": "count"}], max_turns=10, dynamic_turns=False,
                   tools_def=[], allowed_tools={"execute_shell"})
     assert not script.nudges("Round check")
+
+
+# Seen in benchmark runs: the outputs were in place minutes before the end, the last time check said only to make sure
+# they exist, and the model went on running checks until the clock stopped the run with no answer. In the last stretch
+# of the clock (when a reply is taken as the answer) the model is told once to stop calling tools and answer.
+
+def test_the_last_stretch_of_the_clock_asks_for_the_answer_once(eng, monkeypatch):
+    monkeypatch.setattr(eng, "DISPOSABLE_CONTAINER", False)
+    script = _ran_with_budget(eng, monkeypatch, used=10)
+    assert not script.nudges("give your final answer now")
+    budget = eng._TurnBudget(max_seconds=1000)
+    budget.started -= 950
+    script = Script(eng, monkeypatch, [_call("execute_shell", command="echo a"),
+                                       _call("execute_shell", command="echo b"), "Done."],
+                    tool=failing_then_ok(["a", "b"]))
+    eng.run_agent([{"role": "user", "content": "say hi"}], max_turns=6, tools_def=[],
+                  allowed_tools={"execute_shell"}, budget=budget)
+    asks = script.nudges("give your final answer now")
+    assert len(asks) == 1
+    assert "Stop calling tools" in asks[0]
+
+
+def test_the_answer_ask_names_what_to_report(engine):
+    text = engine._answer_now_nudge(60)
+    assert "Stop calling tools" in text and "what is done, what is not done" in text
