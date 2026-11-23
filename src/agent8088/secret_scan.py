@@ -191,6 +191,9 @@ _CODE_SPLIT_RE = re.compile(r"[:=+/.$-]")
 _SHORT_NUMBER_RE = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,4})?")
 # A size or count with its unit, as model names carry them (0.8b, 70b, 4k, 2x).
 _QUANTITY_RE = re.compile(r"[0-9]{1,4}[A-Za-z]{1,3}")
+# A count with its word, as test labels and debug prints carry them (25ones, 3moves, 10items). Seen in a benchmark
+# run: print(f"5 START=25ones: ...") in a browser check, and the run ended "a credential is written in clear text".
+_COUNT_WORD_RE = re.compile(r"[0-9]{1,4}[a-z]{2,12}")
 # The words inside an identifier: lower, Capitalised, ACRONYM (before a capital+lower), digits.
 _IDENTIFIER_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 _IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in words of three or more
@@ -251,7 +254,7 @@ def _identifier_like(token: str) -> bool:
 def _code_piece(piece: str) -> bool:
     """One identifier-sized word: letters with at most two digits and four capitals (``effectChance``,
     ``f2b``, ``createElement``), or ALL CAPS, or a size with its unit (``8b``)."""
-    if _QUANTITY_RE.fullmatch(piece or ""):
+    if _QUANTITY_RE.fullmatch(piece or "") or _COUNT_WORD_RE.fullmatch(piece or ""):
         return True
     if not piece or len(piece) > 24 or not re.fullmatch(r"[A-Za-z_]\w*", piece):
         return False
