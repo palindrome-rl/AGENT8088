@@ -1,0 +1,10 @@
+{
+  "id": "render-report-page",
+  "title": "Make an offline HTML report with a table and an SVG bar chart, and look at it rendered",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"]
+}

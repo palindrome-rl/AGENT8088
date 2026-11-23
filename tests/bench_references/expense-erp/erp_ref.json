@@ -1,0 +1,148 @@
+{
+ "expenses": [
+  {
+   "id": 1,
+   "date": "2026-09-02",
+   "vendor": "Cafe Bay",
+   "category": "Meals",
+   "amount_usd": 32.0,
+   "receipt_ref": "R-01",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 2,
+   "date": "2026-09-06",
+   "vendor": "City Cab",
+   "category": "Transport",
+   "amount_usd": 85.0,
+   "receipt_ref": "R-03",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 3,
+   "date": "2026-09-10",
+   "vendor": "Bay Hotel",
+   "category": "Lodging",
+   "amount_usd": 190.0,
+   "receipt_ref": "R-05",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 4,
+   "date": "2026-09-12",
+   "vendor": "CodePad",
+   "category": "Software",
+   "amount_usd": 280.0,
+   "receipt_ref": "R-08",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 5,
+   "date": "2026-09-13",
+   "vendor": "PaperHub",
+   "category": "Office supplies",
+   "amount_usd": 120.0,
+   "receipt_ref": "R-09",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 6,
+   "date": "2026-08-28",
+   "vendor": "Dock Diner",
+   "category": "Meals",
+   "amount_usd": 48.0,
+   "receipt_ref": "R-10",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 7,
+   "date": "2026-09-14",
+   "vendor": "Rail Pass",
+   "category": "Transport",
+   "amount_usd": 88.0,
+   "receipt_ref": "R-11",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 8,
+   "date": "2026-09-17",
+   "vendor": "PaperHub",
+   "category": "Office supplies",
+   "amount_usd": 60.0,
+   "receipt_ref": "R-14",
+   "note": "",
+   "comment": "",
+   "status": "submitted"
+  },
+  {
+   "id": 9,
+   "date": "2026-09-05",
+   "vendor": "Harbor Grill",
+   "category": "Meals",
+   "amount_usd": 46.0,
+   "receipt_ref": "R-02",
+   "note": "",
+   "comment": "Meals limit exceeded by this 46.00 USD expense",
+   "status": "draft"
+  },
+  {
+   "id": 10,
+   "date": "2026-09-09",
+   "vendor": "Express Cab",
+   "category": "Transport",
+   "amount_usd": 110.0,
+   "receipt_ref": "R-04",
+   "note": "",
+   "comment": "Transport limit exceeded by this 110.00 USD expense",
+   "status": "draft"
+  },
+  {
+   "id": 11,
+   "date": "2026-09-11",
+   "vendor": "Bay Hotel",
+   "category": "Lodging",
+   "amount_usd": 230.0,
+   "receipt_ref": "R-06",
+   "note": "",
+   "comment": "Lodging limit exceeded by this 230.00 USD expense",
+   "status": "draft"
+  },
+  {
+   "id": 12,
+   "date": "2026-09-15",
+   "vendor": "Bistro Nord",
+   "category": "Meals",
+   "amount_usd": 44.0,
+   "receipt_ref": "R-12",
+   "note": "",
+   "comment": "Meals limit exceeded by this 44.00 USD expense",
+   "status": "draft"
+  },
+  {
+   "id": 13,
+   "date": "2026-09-16",
+   "vendor": "DataSoft",
+   "category": "Software",
+   "amount_usd": 310.0,
+   "receipt_ref": "R-13",
+   "note": "",
+   "comment": "Software limit exceeded by this 310.00 USD expense",
+   "status": "draft"
+  }
+ ],
+ "next_id": 14
+}

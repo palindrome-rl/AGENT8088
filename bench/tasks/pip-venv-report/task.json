@@ -1,0 +1,10 @@
+{
+  "id": "pip-venv-report",
+  "title": "Create a venv, pip install a package, write and run a report script",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["network:pypi.org", "network:files.pythonhosted.org"]
+}

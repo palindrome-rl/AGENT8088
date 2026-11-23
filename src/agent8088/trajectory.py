@@ -7,7 +7,7 @@ import posixpath
 import re
 import shlex
 from copy import deepcopy
-from pathlib import PurePath
+from pathlib import PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from agent8088.completion import SUBGOAL_PREFIX
@@ -19,6 +19,7 @@ MAX_EVIDENCE = 6
 
 
 MAX_WRITTEN = 50
+MAX_RAN_COMMANDS = 40
 MAX_UNTESTED = 8
 MAX_FAILING_NUDGES = 2   # follow-ups per request about a check that is still failing
 MAX_VERIFICATION_REQUESTS = 2
@@ -297,7 +298,8 @@ def _is_probe(command: str) -> bool:
 
 
 def _segment_program(segment: str) -> str:
-    words = segment.strip().split()
+    # A group's opening bracket is not part of the program: `(echo test > x.txt || echo no)` runs echo.
+    words = segment.strip().lstrip("( \t").split()
     while words and (words[0].lower() in ("call", "start", "cmd", "/c") or re.match(r"^[A-Za-z_]\w*=", words[0])):
         words = words[1:]
     return PurePath(words[0].strip("\"'")).name.lower().removesuffix(".exe") if words else ""
@@ -321,11 +323,102 @@ _REAL_TEST_FAILURE = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
-def _environment_limit(result) -> str:
-    """Why a check could not run here ("" when it ran): the sandbox refused to start a process or no browser could be started."""
+# A check that stops because the test or browser tool it imports is not installed where it ran never tested anything.
+# Seen in a benchmark run: the model's own browser test stopped at `import playwright` in a shell with no Playwright,
+# and the run ended "the latest check failed" with a page that passed every grader check. Only test and browser tools
+# count: a package the work itself needs (`requests`) or a module of the project is a real failure.
+_MISSING_TEST_TOOL = re.compile(
+    r"""No module named ['"]?(?P<py>playwright|selenium|pyppeteer|pytest|splinter)\b"""
+    r"""|Cannot find (?:module|package) ['"](?P<js>@playwright/test|playwright(?:-core)?|puppeteer(?:-core)?|jsdom|"""
+    r"""happy-dom|mocha|jest|vitest|chai|cypress|selenium-webdriver)['"/]""",
+    re.IGNORECASE)
+
+
+# A check whose program is not on the PATH where it ran, or whose script file is not where the command named it, never
+# started. Seen in a benchmark run: `node _verify_game_logic.js` ran in a shell with no node ("sh: 1: node: not
+# found"), and `python _verify.py` named the script at the workspace root while it was under artifacts/ ("can't open
+# file ... No such file"). Both runs ended "the latest check failed" over work that passed every grader check, and in
+# the second the same script then passed twice from the right path. Only the program or script the command itself
+# starts counts: a module the work imports, or a file the script opens, is a real failure.
+_PROGRAM_MISSING = re.compile(
+    r"^sh: \d+: (?P<a>[\w.+-]+): not found\b"
+    r"|^(?:/bin/\w+: )?(?:line \d+: )?(?P<b>[\w.+-]+): command not found\b"
+    r"|'(?P<c>[\w.+-]+)' is not recognized as an internal or external command"
+    r"|The term '(?P<d>[\w.+-]+)' is not recognized as (?:the )?name of a cmdlet",
+    re.IGNORECASE | re.MULTILINE)
+_SCRIPT_MISSING = re.compile(
+    r"""can't open file '(?P<py>[^'\n]+)': \[Errno 2\] No such file or directory"""
+    r"""|^Error: Cannot find module '(?P<js>[^'\n]+\.(?:js|mjs|cjs|ts))'""",
+    re.IGNORECASE | re.MULTILINE)
+
+
+# A program path with a space that the command did not quote: the shell cut it at the space and looked for a program
+# named after the first piece. Seen in a benchmark run: `E:\My Work\.venv\Scripts\python.exe -c ...` failed with
+# "'E:\My' is not recognized as an internal or external command", and the run ended "the latest check failed" over
+# work that passed every grader check. Nothing ran, so it is not a check.
+_CUT_PROGRAM = re.compile(
+    r"'(?P<c>[^'\n]+)' is not recognized as an internal or external command"
+    r"|The term '(?P<d>[^'\n]+)' is not recognized as (?:the )?name of a cmdlet"
+    r"|^(?:/bin/)?(?:ba)?sh: (?:\d+: |line \d+: )?(?P<a>[^:\n]+?): (?:command )?not found\b",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _cut_program_path(command: str, result) -> bool:
+    """Whether the command never started because its unquoted program path was cut at a space."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return False
+    for segment in command_segments(command or "", split_or=True):
+        start = segment.lstrip()
+        if not start or start[0] in "\"'":
+            continue
+        for match in _CUT_PROGRAM.finditer(text):
+            name = next(g for g in match.groups() if g).strip()
+            if ("\\" in name or "/" in name) and start.startswith(name + " "):
+                return True
+    return False
+
+
+def _started_programs(command: str) -> set:
+    return {_segment_program(segment) for segment in command_segments(command or "", split_or=True)
+            if segment.strip()} - {""}
+
+
+def _program_missing(command: str, result) -> str:
+    """The program the command starts that is not available where it ran, or ""."""
     text = str(result or "")
     if _REAL_TEST_FAILURE.search(text):
         return ""
+    started = _started_programs(command)
+    for match in _PROGRAM_MISSING.finditer(text):
+        name = next(g for g in match.groups() if g)
+        if name.lower().removesuffix(".exe") in started:
+            return f"the program '{name}' is not available where the check ran"
+    return ""
+
+
+def _script_missing(command: str, result) -> bool:
+    """Whether the command failed only because the script it starts is not at the path it gave."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return False
+    named = {PurePath(word.strip("\"'")).name.lower() for word in re.split(r"\s+", command or "") if word}
+    for match in _SCRIPT_MISSING.finditer(text):
+        path = match.group("py") or match.group("js")
+        if PureWindowsPath(path).name.lower() in named or PurePath(path).name.lower() in named:
+            return True
+    return False
+
+
+def _environment_limit(result) -> str:
+    """Why a check could not run here ("" when it ran): the sandbox refused to start a process, no browser could be
+    started, or the test tool the check imports is not installed where it ran."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return ""
+    if missing := _MISSING_TEST_TOOL.search(text):
+        name = missing.group("py") or missing.group("js")
+        return f"the test tool '{name}' is not installed where the check ran"
     if _SPAWN_BLOCKED.search(text):
         return "the sandbox did not allow a process to be started"
     # Access denied for a data file is not evidence of a browser-launch limit,
@@ -339,11 +432,41 @@ def _environment_limit(result) -> str:
     return ""
 
 
+# The code handed to an interpreter on its command line (`node -e "..."`, `python -c "..."`). What it prints or
+# names is not what the command is: `node -e "console.log('spawn test')"` is a snippet, not a test run. Seen in a
+# benchmark run: a one-off snippet with a quoting mistake failed, the word "test" in its own output made it "the
+# latest check", and the run ended NOT VERIFIED although the build and the program both ran cleanly afterwards.
+_INLINE_CODE = re.compile(
+    r"""^(?P<head>\s*(?:"[^"]*[\\/]|\S*[\\/])?(?:node|nodejs|deno|bun|python[\d.]*|py|ruby|perl|php)(?:\.exe)?"?"""
+    r"(?:\s+-{1,2}[\w-]+)*?\s+(?:-e|-p|--eval|--print|-c|-r))(?:\s.*)?$",
+    re.IGNORECASE | re.DOTALL)
+
+
+# Inline code that starts a real test runner, or imports a test module (`python -c "import test_app"`), is still a
+# test run.
+_INLINE_TEST_RUNNER = re.compile(
+    r"\b(?:pytest|unittest)\.main\b|\bimport\s+(?:test_\w+|\w+_tests?)\b|\bfrom\s+(?:test_\w+|\w+_tests?)\s+import\b"
+    r"""|\brequire\(\s*['"][^'"]*(?:[./\\]test_|\.test\.|\.spec\.)[^'"]*['"]""")
+
+
+def _without_inline_code(segment: str) -> str:
+    match = _INLINE_CODE.match(segment or "")
+    if not match or _INLINE_TEST_RUNNER.search(segment):
+        return segment
+    return match.group("head")
+
+
+# PowerShell's file-exists test. Seen in a benchmark run: `if (Test-Path .venv) { Remove-Item ... }; python -m venv
+# .venv` failed on a syntax error, and the word "Test" made the whole setup command "the latest check".
+_FILE_TEST_WORD = re.compile(r"\btest-path\b", re.IGNORECASE)
+
+
 def _is_check_run(command: str) -> bool:
     """Whether a shell command is a check: no command at all means a dedicated check tool, which is."""
     if not (command or "").strip():
         return True
-    return any(_CHECK_COMMAND.search(segment) for segment in command_segments(command, split_or=True)
+    return any(_CHECK_COMMAND.search(_FILE_TEST_WORD.sub(" ", _without_inline_code(segment)))
+               for segment in command_segments(command, split_or=True)
                if segment.strip() and _segment_program(segment) not in _FILE_COMMANDS)
 
 
@@ -353,12 +476,22 @@ _RUNNER = (r"(?:python[\d.]*|py|node|nodejs|deno|bun|ruby|php|perl|bash|sh|pwsh|
            r"go\s+run|cargo\s+run|ts-node|tsx)")
 
 
+# A file named inside inline code (`powershell -Command "Get-Content report.html ..."`, `python -c "open('a.json')"`)
+# is read by that code, not run. Seen in a benchmark run: a PowerShell one-liner that pulled the rows out of the page
+# the run wrote failed on a path, and the finished page was reported as a failed check.
+_INLINE_FLAG = re.compile(r"\s(?:-c|-e|-p|--eval|--print|-command|-encodedcommand|-ec)(?=\s|$)", re.IGNORECASE)
+
+
 def _runs_a_written_file(command: str, written) -> bool:
     for path in written or []:
         name = PurePath(str(path)).name
-        if name and re.search(rf"(?<![\w.-]){_RUNNER}(?![\w-])[^&|;\n]*?(?<![\w.-]){re.escape(name)}(?![\w-])",
-                              command or "", re.IGNORECASE):
-            return True
+        if not name:
+            continue
+        # A lookahead, so every interpreter on the line is tried: `bash -c "python app.py"` runs app.py.
+        pattern = rf"(?=(?<![\w.-]){_RUNNER}(?![\w-])([^&|;\n]*?)(?<![\w.-]){re.escape(name)}(?![\w-]))"
+        for match in re.finditer(pattern, command or "", re.IGNORECASE):
+            if not _INLINE_FLAG.search(match.group(1)):
+                return True
     return False
 
 
@@ -626,6 +759,24 @@ def _same_command(a: str, b: str) -> bool:
     return first == second or (bool(second) and _without_trailing_clause(first) == second)
 
 
+# Output thrown away (`2>nul`, `>/dev/null`) leaves a command's exit status as it was, so it does not change what a
+# rerun proves. Only these exact sinks are dropped; any other redirection still makes the chain unreadable.
+_NULL_SINK = re.compile(r"\s+[12]?>\s*(?:nul|/dev/null)(?=\s|$|&)", re.IGNORECASE)
+# Leftovers a rerun may clear first (`del server.log && python run_e2e.py`). Deleting code, tests or data could make a
+# failing check pass without fixing anything, so only these kinds of file are accepted.
+_CLEANUP_SUFFIXES = frozenset({".log", ".pid", ".tmp", ".out", ".lock"})
+_CLEANUP_PROGRAMS = frozenset({"del", "erase", "rm"})
+
+
+def _cleanup_step(words: list[str]) -> bool:
+    """`del /f /q server.log server.pid` or `rm -f out.log`: removes only leftovers, so it cannot fake a pass."""
+    if words[0].lower() not in _CLEANUP_PROGRAMS:
+        return False
+    targets = [word for word in words[1:] if not re.fullmatch(r"/[a-z]|-[a-z]+", word, re.IGNORECASE)]
+    return bool(targets) and all(PurePath(target).suffix.lower() in _CLEANUP_SUFFIXES and "*" not in target
+                                 and "?" not in target for target in targets)
+
+
 def _check_chain(command: str, *, original: bool) -> list[list[str]] | None:
     """Parse only an AND chain; unfamiliar shell syntax supplies no retry evidence.
 
@@ -635,6 +786,7 @@ def _check_chain(command: str, *, original: bool) -> list[list[str]] | None:
     """
     if not command or re.search(r"[`$%!^\r\n]|\\[\"']", command):
         return None
+    command = _NULL_SINK.sub("", command)
     parts, current, quote, i = [], [], "", 0
     while i < len(command):
         ch = command[i]
@@ -733,7 +885,7 @@ def _revised_command(failed: str, rerun: str) -> bool:
         steps, has_check = [], False
         for words in chain:
             program = words[0].lower()
-            if program in {"echo", "dir", "ls", "pwd"}:
+            if program in {"echo", "dir", "ls", "pwd"} or _cleanup_step(words):
                 continue
             targets = _syntax_targets(words)
             if targets:
@@ -953,9 +1105,20 @@ class TrajectoryState:
         # including failures from checks that also modify the workspace.
         if operation["status"] == "done" and operation["verdict"] != "failed" and command:
             self._clear_unverified_run(command)
+            if not _TRACEBACK.search(str(result)) and not _RUN_FAILED_RE.search(str(result)):
+                # Evidence for a part of the request that asks for something to be run, not built.
+                ran = self.data.setdefault("ran_commands", [])
+                core = " ".join(command.split())[:300]
+                if core not in ran:
+                    ran.append(core)
+                    del ran[:-MAX_RAN_COMMANDS]
         written_now = self.data.get("written_paths")
         probe_only = _is_probe(command) and not _REAL_TEST_FAILURE.search(str(result))
-        limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
+        failed = operation["verdict"] == "failed"
+        limit = (_environment_limit(result) or _program_missing(command, result)) if failed else ""
+        # A script that was not at the path the command gave never ran: not a check, and nothing the machine lacks.
+        not_started = failed and not limit and (_script_missing(command, result)
+                                                or _cut_program_path(command, result))
         if (limit and not probe_only
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
             self._note_environment_limit(command, limit)
@@ -972,6 +1135,7 @@ class TrajectoryState:
                 or _revised_command(n.get("command") or n.get("what"), command))]
         if (operation["verdict"] == "failed"
                 and not limit
+                and not not_started
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
                 and not probe_only
                 and not _SANDBOX_BLOCKED.search(str(result))
@@ -1157,6 +1321,10 @@ class TrajectoryState:
         """Paths this run wrote successfully, first write first."""
         return list(self.data.get("written_paths") or [])
 
+    def ran_commands(self) -> list[str]:
+        """Shell commands this run finished without a failure, oldest first (at most MAX_RAN_COMMANDS)."""
+        return list(self.data.get("ran_commands") or [])
+
     def landed_paths(self) -> list[str]:
         """The files this run wrote, each at the place it actually is.
 
@@ -1262,6 +1430,37 @@ class TrajectoryState:
         if _file_key(path) not in done:
             done.append(_file_key(path))
             del done[:-20]
+
+    # The model's latest reply that a completion check sent back, kept so that a clock that stops the follow-up work
+    # still has an answer to give. Not part of `data`: it is for this run only and never saved with the state.
+    def hold_reply(self, reply: str) -> None:
+        self._held = (reply, self.mutation_count(), self.check_failing())
+        self._held_used = False
+
+    def drop_held_reply(self) -> None:
+        self._held = None
+        self._held_used = False
+
+    def held_reply(self) -> str:
+        held = getattr(self, "_held", None)
+        return held[0] if held else ""
+
+    def use_held_reply(self) -> str:
+        """The held reply, marked as the run's answer (a budget stop gives it); "" when none is held."""
+        reply = self.held_reply()
+        self._held_used = bool(reply)
+        return reply
+
+    def held_reply_stale(self) -> bool:
+        """The held reply is the answer, and files changed or a check started failing after it.
+
+        Only an answer that is the held reply can be stale this way: a later reply the run finished with describes the
+        work as it is."""
+        held = getattr(self, "_held", None)
+        if not held or not getattr(self, "_held_used", False):
+            return False
+        _, mutations, failing = held
+        return self.mutation_count() != mutations or (self.check_failing() and not failing)
 
     def progress_mark(self) -> tuple:
         """A value that changes when the run makes real progress."""

@@ -503,7 +503,8 @@ def _handler(root: Path, deny: Callable[[str], bool] | None):
 # says something about the page only when the control is one that must act. A control that is already the current
 # tab is not one. An action button or a pressed toggle can still be expected to act.
 _COMMITTAL_JS = """
-  const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme)\\b/i;
+  // Starting again ("New game", "Restart", "Play again") changes nothing on a page that has only just started.
+  const NOOP_OK = /\\b(undo|redo|close|cancel|back|previous|prev|reset|clear|delete|remove|exit|quit|forfeit|export|import|download|upload|print|copy|share|save|mute|sound|audio|music|help|about|settings|menu|more|toggle|theme|restart|replay|rewind|refresh|reload|new\\s+game|start\\s+over|play\\s+again|try\\s+again)\\b/i;
   const emptyField = x => {
     const t = (x.getAttribute('type') || 'text').toLowerCase();
     if (['button', 'submit', 'checkbox', 'radio', 'hidden', 'file', 'reset', 'image'].includes(t)) return false;
@@ -1207,10 +1208,28 @@ def _run_briefly(path: Path, run: Callable[[str, int], str],
             soft.append(f"the interpreter this check uses has no module '{missing}', so the script could not be started here"
                         "; whether it works was not verified")
             return []
-        if soft is not None and ((not crashed) or _ENVIRONMENT_FINAL.search(final)):
+        # A check script that starts the work as a child process prints the child's error and then its own lines,
+        # so the last line is not the error. Seen in a benchmark run: a script that ran the scraper and then read its
+        # output file ended on the scraper's "PermissionError: ... 'products.csv'" in the read-only copy, and was
+        # reported as crashed. The last error line is judged as well as the last line.
+        errors = [line.strip() for line in _SANDBOX_NOTE.sub("", output).splitlines() if _ERROR_LINE.match(line)]
+        last_error = errors[-1] if errors else ""
+        # `urljoin("--help", "products/page1.html")` drops the argument and leaves a relative address, so the error
+        # no longer shows --help: "unknown url type: 'products/page1.html'". Seen in the same run.
+        if "--help" in final or (last_error.startswith("ValueError: unknown url type")
+                                 and "://" not in last_error):
+            # The script took the probe's own argument as its input (an address, a file name) and stopped on that
+            # value: "unknown url type: '--help/products/page1.html'". That says nothing about its code. Seen in a
+            # benchmark run, on a scraper that had just run correctly against the real server.
+            if soft is not None:
+                soft.append("it took --help as its input when started with it, so its startup was not verified")
+            return []
+        environment = _ENVIRONMENT_FINAL.search(final) or (last_error and _ENVIRONMENT_FINAL.search(last_error))
+        if soft is not None and ((not crashed) or environment):
             status = exited.group(1) if exited else "?"
+            shown = final if _ENVIRONMENT_FINAL.search(final) or not last_error else last_error
             soft.append(f"it exited with status {status} when started without arguments in a read-only copy"
-                        + (f" ({final[:100]})" if crashed else "") + "; whether it works was not verified")
+                        + (f" ({shown[:100]})" if crashed else "") + "; whether it works was not verified")
             return []
         # The error itself, not the harness's own "Command exited" line that follows it.
         named = _error_line(_SANDBOX_NOTE.sub("", output))

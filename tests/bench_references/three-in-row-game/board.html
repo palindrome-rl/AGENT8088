@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Three in a row</title>
+<style>
+  body { font-family: sans-serif; }
+  #board { display: grid; grid-template-columns: repeat(3, 64px); gap: 4px; }
+  #board button { width: 64px; height: 64px; font-size: 28px; }
+</style></head>
+<body>
+<div id="board"></div>
+<p id="status"></p>
+<p>X <span id="score-x">0</span> | O <span id="score-o">0</span> | Draws <span id="score-draw">0</span></p>
+<button id="new-game">New game</button>
+<script>
+const LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+const KEY = "three-in-row-scores";
+let scores = { x: 0, o: 0, draw: 0 };
+try { scores = Object.assign(scores, JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) {}
+let cells, turn, over;
+const board = document.getElementById("board");
+for (let i = 0; i < 9; i++) {
+  const cell = document.createElement("button");
+  cell.dataset.cell = i;
+  cell.addEventListener("click", () => move(i));
+  board.appendChild(cell);
+}
+function winner() {
+  for (const [a, b, c] of LINES) if (cells[a] && cells[a] === cells[b] && cells[a] === cells[c]) return cells[a];
+  return "";
+}
+function move(i) {
+  if (over || cells[i]) return;
+  cells[i] = turn;
+  const won = winner();
+  if (won) { over = won + " wins"; scores[won.toLowerCase()]++; }
+  else if (cells.every(Boolean)) { over = "Draw"; scores.draw++; }
+  else turn = turn === "X" ? "O" : "X";
+  if (over) localStorage.setItem(KEY, JSON.stringify(scores));
+  draw();
+}
+function draw() {
+  board.querySelectorAll("button").forEach((b, i) => b.textContent = cells[i]);
+  document.getElementById("status").textContent = over || turn + " to move";
+  for (const k of ["x", "o", "draw"]) document.getElementById("score-" + k).textContent = scores[k];
+}
+function newGame() { cells = Array(9).fill(""); turn = "X"; over = ""; draw(); }
+document.getElementById("new-game").addEventListener("click", newGame);
+newGame();
+</script>
+</body></html>

@@ -1,0 +1,29 @@
+{
+  "id": "expense-erp",
+  "title": "Enter 15 receipts into a local expense web app under a two-version policy, submit only the compliant ones",
+  "kind": "long",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 7200,
+  "services": [
+    {
+      "command": [
+        "{python}",
+        "erp_server.py",
+        "serve",
+        "{state}"
+      ],
+      "ports": [
+        8910
+      ]
+    }
+  ],
+  "config": {
+    "ssrf_allow_hosts": "127.0.0.1:8910,localhost:8910"
+  },
+  "needs": [
+    "a mock expense app on port 8910, started by the runner",
+    "PDF text reading for the receipts and policies"
+  ]
+}
