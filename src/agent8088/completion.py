@@ -838,7 +838,26 @@ def _named_path_missing(item: str, roots: list[Path]) -> bool:
     """
     if not roots or _REMOVAL.search(item) or not (_OUTPUT_CUE.search(item) or _MAKES.search(item)):
         return False
-    return any(not any((root / name).exists() for root in roots) for name in _named_paths(item))
+    return any(not any((root / name).exists() for root in roots)
+               for name in _named_paths(item) if _asked_to_make(item, name))
+
+
+def _asked_to_make(item: str, name: str) -> bool:
+    """Whether the part asks for this path to be made: the closest cue before it in its sentence is an output verb
+    ("create", "called", "writes"), not an input one ("from", "reads"), or the sentence says it exists.
+
+    Seen in a benchmark run: "It is run as `python scrape.py <address>` ... It starts at `products/page1.html` under
+    that address." The page is on the shop the script reads, never in the project, so the part stayed open however
+    the script was built. A path in a sentence with no output cue is one the part refers to, not one to make.
+    """
+    for sentence in _SENTENCE_SPLIT.split(item):
+        for match in re.finditer(r"`" + re.escape(name) + r"[\\/]?`", sentence):
+            before = sentence[:match.start()]
+            output = [m.end() for m in _OUTPUT_CUE.finditer(before)]
+            inputs = [m.end() for m in _INPUT_CUE.finditer(before)]
+            if _MAKES.search(sentence) or (output and not (inputs and max(inputs) > max(output))):
+                return True
+    return False
 
 
 def _root(word: str) -> str:
@@ -850,6 +869,25 @@ def _root(word: str) -> str:
 _COMMUNICATION = re.compile(
     r"^\W*(?:and\s+|also\s+)?(?:explain|tell|describe|summari[sz]e|report|say|mention|answer|state|"
     r"outline|walk|document|list)\b", re.IGNORECASE)
+
+
+# A part that states how the result must behave or what it must not have, with no name to look for and no thing to
+# build: "No scripts, styles or fonts from the internet", "It shows no errors in the browser console", "Diagonal tiles
+# do not change", "The script must work for this shop with other products". Seen in a benchmark run: four of these
+# stayed "not addressed" on pages and a scraper that passed every grader check, because the words of a property are
+# not in the code that has it (a page with no internet fonts never says "internet"). Such a part is met by the files
+# or by the reply; checking the property itself is the page and app checks' job.
+_PART_BUILD_VERB = re.compile(
+    r"\b(?:build|create|make|implement|develop|write|generate|design|code|produce|add|include|draw|save|store|put|"
+    r"export|output)s?\b", re.IGNORECASE)
+
+
+def _property_part(item: str) -> bool:
+    # A path the part only refers to ("not only for the copy in `site/`") is not a name to look for.
+    folders = [n.strip().rstrip("/\\") for n in _NAMED.findall(item) if re.fullmatch(r"[\w.-]+[\\/]", n.strip())]
+    referred = {p for p in [*_named_paths(item), *folders] if not _asked_to_make(item, p)}
+    names = [n for n in _NAMED.findall(item) if n.strip().rstrip("/\\") not in referred]
+    return not names and not _PART_BUILD_VERB.search(item) and not _ACTION_PART.match(item)
 
 
 def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
@@ -903,7 +941,7 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
         acts = bool(_ACTION_PART.match(item) or _ACTION_WORD.search(item))
         if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
             continue
-        if _COMMUNICATION.match(item):
+        if _COMMUNICATION.match(item) or _property_part(item):
             found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
         elif _ACTION_PART.match(item):
             found = sum(1 for w in words if (" " + _root(w)) in in_files or (" " + _root(w)) in in_commands)
