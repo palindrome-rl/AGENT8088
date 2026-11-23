@@ -131,6 +131,42 @@ def reports_part_not_done(reply: str) -> bool:
     return False
 
 
+# A reply that says one of its own checks failed, and lets it stand. Seen in a benchmark run: the model's browser test
+# showed a FAIL in a screenshot, which no check of the run can read. Its answer named the FAIL and called it "a
+# harness timing artifact", and the run ended "verified" over a page whose remove button was broken. A failure the
+# reply says was fixed ("it failed at first; after the fix it passes") is the checks' business, not this rule's.
+_OWN_CHECK_FAILED = re.compile(
+    r"\b(?:one|a|the|two|three|[1-9]\d*)\s+[`'\"]?FAIL(?:ED|S|URES?)?\b[`'\"]?"
+    r"|\b(?:tests?|checks?|assertions?|steps?|cases?|scenarios?)\s+(?:still\s+)?(?:failed|did\s*n[o']t\s+pass)\b"
+    r"|\b(?:failed|failing)\s+(?:tests?|checks?|assertions?|steps?|cases?)\b"
+    r"|\b(?:threw|raised)\s+(?:an?\s+)?(?:[\w-]+\s+){0,2}\w*(?:error|exception)\b"
+    r"|\b[1-9]\d*\s+(?:of\s+\d+\s+)?(?:tests?|checks?|assertions?|cases?)\s+failed\b",
+    re.IGNORECASE)
+_NO_FAILURE = re.compile(
+    r"\b(?:no|zero|0|none|without|never|nothing|not\s+(?:a\s+single|one|any))\b[^.\n]{0,30}"
+    r"\b(?:fail\w*|errors?|exceptions?)\b"
+    r"|\b(?:fail\w*|errors?|exceptions?)\b[^.\n]{0,15}\b(?:none|0|zero)\b"
+    r"|\b(?:would|will|should|could|must|can)\s+(?:\w+\s+)?(?:fail|throw|raise)\b"
+    # The harness's own note about a failing check, which the reply is answering, not a check of the model's.
+    r"|\b(?:recorded|reported|flagged|latest|earlier|harness['’]s)\s+failing\s+check\b|^\W*failing\s+check\s*:",
+    re.IGNORECASE)
+_FAILURE_FIXED = re.compile(
+    r"\b(?:fixed|corrected|resolved|repaired|after\s+the\s+(?:fix|change)|now\s+pass\w*|passe[sd]\s+now|"
+    r"re-?ran|reran|on\s+the\s+(?:second|next|re-?)\s*(?:run|try)|then\s+pass\w*)\b",
+    re.IGNORECASE)
+
+
+def reports_failed_check(reply: str) -> str:
+    """The sentence in which the reply says one of its own checks failed and it was not fixed, or ""."""
+    text = _prose(reply).replace("**", "").replace("__", "")
+    text = re.sub(r"\bif\s+(?:you|your|it|the)\b[^.\n]*", " ", text, flags=re.IGNORECASE)
+    for sentence in _SENTENCE_SPLIT.split(text):
+        if (_OWN_CHECK_FAILED.search(sentence) and not _NO_FAILURE.search(sentence)
+                and not _FAILURE_FIXED.search(sentence)):
+            return " ".join(sentence.split())
+    return ""
+
+
 _ADVICE_START = re.compile(
     r"^\W*(?:how|why|what|which|where|when|who|is|are|does|do|did|should|explain|describe|"
     r"tell\s+me|show\s+me\s+how|walk\s+me|what['’]s)\b", re.IGNORECASE)

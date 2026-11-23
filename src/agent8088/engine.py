@@ -20612,6 +20612,8 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
     reasons = []
     if reply and completion_checks.reports_part_not_done(reply):
         reasons.append("the reply says part of the request was not done")
+    if reply and completion_checks.reports_failed_check(reply):
+        reasons.append("the reply says one of its own checks failed")
     if trajectory.no_runnable_app():
         reasons.append("no runnable app (a page or a server) was produced for a request to build a web app")
     failed = [n.split(":", 1)[0] for n in trajectory.data.get("smoke_notes") or [] if "smoke test FAILED" in n]
