@@ -57,7 +57,11 @@ def apply_code(page, code: str):
 
 def play(session, checks: dict, page_file: Path, products: list):
     page = session.open(page_file)
+    # The product elements, not every element carrying the id: a page may also put data-product on its add button
+    # or its cart buttons (seen in a benchmark run, a working page failed here with 10 "products" for 5). The
+    # outermost element with each id outside the cart is the product.
     shown = page.evaluate("""() => [...document.querySelectorAll('[data-product]')]
+        .filter(e => !e.closest('[data-cart-item]') && !e.parentElement.closest('[data-product]'))
         .map(e => [e.dataset.product, e.innerText, !!e.querySelector('.add')])""")
     by_id = {pid: (text, has_add) for pid, text, has_add in shown}
     checks["every product is shown with its name, price and add button"] = len(shown) == len(products) and all(
