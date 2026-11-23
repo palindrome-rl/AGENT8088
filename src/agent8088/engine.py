@@ -766,6 +766,21 @@ SALVAGE_MIN_CHARS = 1000
 # The largest cap a cut-off tool call (a file being written) may earn on its retry.
 # Doubling alone would climb to the provider's whole limit; 0 = no ceiling beyond it.
 WRITE_OUTPUT_CAP = max(0, _config_int("write_output_cap", 16384))
+_WRITE_CAP_SET = str(APP_CONFIG.get("write_output_cap", "")).strip() != ""
+# Output limits per model (model_profiles.py): the cap of an ordinary call comes from the served model, matched by
+# name, or from its size when the name is not a known model (above 15B the Qwen3.8-27B limits, at or below the Gemma
+# 4 12B limits, the larger when the name gives no size). On a thinking model the context-scaled cap with the adaptive
+# median above sat at 8,192 on 91% of calls and cut off long, useful reasoning; the profile cap is sized from the
+# long replies instead, and the median shrinking is off unless adaptive_completion_cap is set. initial_completion_cap,
+# main_llm_min_tokens, thinking_off_max_tokens, write_output_cap and provider.<name>.max_completion_tokens still win
+# when set. 0 restores the context-scaled caps.
+OUTPUT_PROFILES = str(APP_CONFIG.get("output_profiles", "1")).strip().lower() in ("1", "true", "yes", "on")
+_ADAPTIVE_SET = str(APP_CONFIG.get("adaptive_completion_cap", "")).strip() != ""
+# With model_telemetry on, every length cut-off is logged (cap, tokens, kind, how repetitive the reply was). The
+# reply's own text is only added, its last 1,500 characters with secrets masked, when this is also on: the
+# telemetry file otherwise holds no prompts or replies.
+CUTOFF_TELEMETRY_TEXT = str(APP_CONFIG.get("model_telemetry_cutoff_text", "0")).strip().lower() in (
+    "1", "true", "yes", "on")
 # Tokens a model may spend reasoning on an ordinary turn, where the provider can
 # be told (see _reasoning_budget_extra_body). 0 = leave the provider's default.
 REASONING_BUDGET_TOKENS = max(0, _config_int("reasoning_budget_tokens", 0))
@@ -3391,14 +3406,23 @@ def _parse_rate_limit_headers(provider_name: str, headers) -> dict | None:
         return None
 
 
-def _output_cap_defaults(context: int) -> tuple[int, int, int]:
+def _output_cap_defaults(context: int, profile=None) -> tuple[int, int, int]:
     """(first-call cap, floor after a cut-off, cap with thinking off) for a context window.
 
-    Unset, the first-call cap is a quarter of the context, between 2048 and 16384; the floor is half of that
-    (at least 2048) and the thinking-off cap equals the floor. A 32K context gives 8192 / 4096 / 4096, the
+    With a model profile (model_profiles.py) the first-call cap is the profile's thinking cap and the floor and the
+    thinking-off cap its non-thinking cap; the context window only limits them later, where a request is fitted to
+    it. Without one, the first-call cap is a quarter of the context, between 2048 and 16384; the floor is half of
+    that (at least 2048) and the thinking-off cap equals the floor. A 32K context gives 8192 / 4096 / 4096, the
     old fixed values; 64K and above give 16384 / 8192 / 8192. initial_completion_cap, main_llm_min_tokens and
     thinking_off_max_tokens each override their own value; initial_completion_cap=0 keeps meaning "no cap".
     """
+    if profile is not None:
+        first = INITIAL_COMPLETION_CAP if _INITIAL_CAP_SET else profile.thinking_cap
+        floor = MAIN_LLM_MIN_TOKENS if _MIN_TOKENS_SET else profile.nonthinking_cap
+        if first:
+            floor = min(floor, first)
+        off = THINKING_OFF_MAX_TOKENS if _THINKING_OFF_SET else profile.nonthinking_cap
+        return first, floor, off
     scaled = max(2048, min(16384, int(context or 0) // 4)) if context else 8192
     first = INITIAL_COMPLETION_CAP if _INITIAL_CAP_SET else scaled
     floor = MAIN_LLM_MIN_TOKENS if _MIN_TOKENS_SET else max(2048, scaled // 2)
@@ -3421,17 +3445,39 @@ def _adaptive_first_cap(recent: list, ceiling: int, floor: int) -> int:
     return min(ceiling, max(floor, int(2 * statistics.median(recent))))
 
 
-def _write_retry_cap(failed_cap: int, provider_limit: int) -> int:
+def _write_retry_cap(failed_cap: int, provider_limit: int, profile=None) -> int:
     """The cap a cut-off tool call (a file being written) earns for its retry.
 
-    Double the cap that just failed, but no higher than write_output_cap, and never
-    lower than the failed cap. Past that, a long file belongs in chunks
+    Double the cap that just failed, but no higher than write_output_cap (or the model profile's write cap when
+    write_output_cap is not set), and never lower than the failed cap. Past that, a long file belongs in chunks
     (write_file mode=append), not in one ever-larger call.
     """
+    ceiling = profile.write_cap if profile is not None and not _WRITE_CAP_SET else WRITE_OUTPUT_CAP
     wanted = 2 * failed_cap
-    if WRITE_OUTPUT_CAP:
-        wanted = min(wanted, max(WRITE_OUTPUT_CAP, failed_cap))
+    if ceiling:
+        wanted = min(wanted, max(ceiling, failed_cap))
     return min(provider_limit, wanted)
+
+
+_OUTPUT_PROFILE_SEEN: dict = {}
+
+
+def _active_output_profile(model_name: str):
+    """(profile, one-line description) for the served model, or (None, "") with output_profiles off.
+
+    Logged once per model: an uncalibrated profile (found by size, or the larger model's limits for a name with no
+    size) as a warning, so a model that keeps hitting its cap can be given a measured entry."""
+    if not OUTPUT_PROFILES:
+        return None, ""
+    from agent8088 import model_profiles
+    key = str(model_name or "")
+    if key not in _OUTPUT_PROFILE_SEEN:
+        detection = model_profiles.detect(key)
+        line = model_profiles.describe(key, detection)
+        (_log.info if detection.profile.calibrated else _log.warning)(line)
+        _OUTPUT_PROFILE_SEEN[key] = (detection, line)
+    detection, line = _OUTPUT_PROFILE_SEEN[key]
+    return detection.profile, line
 
 
 def _reasoning_budget_extra_body(provider_name: str) -> dict:
@@ -16531,6 +16577,36 @@ def _record_model_telemetry(provider: str, model: str, attempt: str, started: fl
         _log.debug("model telemetry write failed: %s", exc)
 
 
+CUTOFF_TEXT_CHARS = 1500
+
+
+def record_cutoff_telemetry(event: str, **facts) -> None:
+    """One record per length cut-off, and one when the run recovers from it, for calibrating output limits.
+
+    The cut-off record carries the cap that was sent, the tokens, what was cut off, which profile set the cap, and
+    how repetitive the reasoning and the text were at the end (loop_check.tail_metrics). Without these the cut-offs of
+    a run cannot be told apart: a reasoning loop and long, useful thinking both just end at the cap. The reply's text
+    is only included with model_telemetry_cutoff_text=1, and then only its last characters, secrets masked."""
+    if not MODEL_TELEMETRY_ENABLED:
+        return
+    try:
+        from agent8088 import loop_check
+        entry = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
+                 "task_id": getattr(_active_budget, "task_id", None)}
+        reasoning, content = facts.pop("reasoning", None), facts.pop("content", None)
+        if reasoning is not None:
+            entry["reasoning"] = loop_check.tail_metrics(reasoning)
+        if content is not None:
+            entry["text"] = loop_check.tail_metrics(content)
+        if CUTOFF_TELEMETRY_TEXT and (reasoning or content):
+            entry["tail"] = _redact_secrets(str(content or reasoning or "")[-2 * CUTOFF_TEXT_CHARS:])[
+                -CUTOFF_TEXT_CHARS:]
+        entry.update({k: (_redact_secrets(v) if isinstance(v, str) else v) for k, v in facts.items()})
+        _append_private_jsonl(MODEL_TELEMETRY_PATH, entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry must never affect a turn
+        _log.debug("cut-off telemetry write failed: %s", exc)
+
+
 _MCP_SPECIAL_TOKENS = re.compile(r"<\|[^>]+\|>|\[/(?:INST|SYS)\]")
 
 
@@ -20946,6 +21022,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
     last_cutoff_kind = ""       # kind of the last cut-off
     thinking_sticky_left = 0    # ordinary calls still to run with thinking off after a reasoning-only cut-off
+    profile_traced = ""         # the model whose output limits the trace already names
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
     completion_budget = completion_checks.ContinuationBudget(limit=MAX_COMPLETION_CONTINUATIONS)
@@ -21220,10 +21297,19 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                                   + len(json.dumps(round_tools_def or [], default=str)))})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
-        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window)
+        output_profile, profile_line = _active_output_profile(loop_model or MODEL_NAME)
+        if output_profile is not None and trace is not None and profile_traced != (loop_model or MODEL_NAME):
+            profile_traced = loop_model or MODEL_NAME
+            trace.append({"turn": turn, "type": "output_profile", "content": profile_line,
+                          "thinking_cap": output_profile.thinking_cap,
+                          "nonthinking_cap": output_profile.nonthinking_cap,
+                          "calibrated": output_profile.calibrated})
+        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window, output_profile)
         normal_cap = (min(turn_completion_limit, initial_cap)
                       if initial_cap else turn_completion_limit)
-        if initial_cap:
+        # The median shrinking sized the cap from typical replies and cut the long ones; with a model profile it
+        # runs only when adaptive_completion_cap is set explicitly.
+        if initial_cap and (output_profile is None or (_ADAPTIVE_SET and ADAPTIVE_COMPLETION_CAP)):
             normal_cap = _adaptive_first_cap(recent_call_tokens, normal_cap, min_tokens)
         turn_max_tokens = (
             normal_cap if not length_retries else
@@ -21242,6 +21328,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         sticky_only = bool(thinking_sticky_left) and not retry_kwargs
         if sticky_only:
             retry_kwargs = {"thinking": "length_retry"}
+            if output_profile is not None:
+                # Thinking is off: the model's non-thinking cap, which is what the old normal cap came to (8,192).
+                turn_max_tokens = min(turn_max_tokens, thinking_off_cap)
             if trace is not None:
                 trace.append({"turn": turn, "type": "retry_mode", "mode": "sticky_thinking_off",
                               "calls_left": thinking_sticky_left, "max_tokens": turn_max_tokens})
@@ -21470,7 +21559,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             # and more room only repeats it. Empty output is a hidden runaway
             # (e.g. an unclosed native tool call); it keeps the small retry cap.
             if (content and "✿FUNCTION✿" in content) or partial_native:
-                cutoff_kind, cap_hint = "tool_call", _write_retry_cap(turn_max_tokens, turn_completion_limit)
+                cutoff_kind, cap_hint = "tool_call", _write_retry_cap(turn_max_tokens, turn_completion_limit,
+                                                                      output_profile)
                 prose_cutoffs = 0
             elif content:
                 cutoff_kind, cap_hint = "prose", 0
@@ -21498,6 +21588,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                               # (streamed or on the message) shows a runaway
                               # think apart from a long answer.
                               "reasoning_chars": len(_extract_reasoning(message))})
+            usage = getattr(response, "usage", None)
+            record_cutoff_telemetry(
+                "length_cutoff", turn=turn, cap=turn_max_tokens, finish_reason=finish_reason, kind=cutoff_kind,
+                consecutive=length_retries, thinking_off=bool(retry_kwargs),
+                completion_tokens=getattr(usage, "completion_tokens", None),
+                prompt_tokens=getattr(usage, "prompt_tokens", None),
+                seconds=round(time.monotonic() - call_started, 1), model=str(loop_model or MODEL_NAME),
+                profile=(profile_line or "context-scaled caps"),
+                reasoning=_extract_reasoning(message), content=content)
             # A3.3: the truncated reply is discarded, not stored -- only a short
             # harness note enters the context.
             # A3.4: a cut-off never ends the run until the ladder is spent:
@@ -21580,6 +21679,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         if length_retries:
             if trace is not None:
                 trace.append({"turn": turn, "type": "cap_reset", "after_cutoffs": length_retries})
+            record_cutoff_telemetry("length_cutoff_recovered", turn=turn, after_cutoffs=length_retries,
+                                    last_kind=last_cutoff_kind, cap=turn_max_tokens,
+                                    completion_tokens=last_call_tokens, thinking_off=bool(retry_kwargs))
             length_retries = 0
         cap_hint = prose_cutoffs = 0
         thinking_off_retry, last_cutoff_kind = False, ""
