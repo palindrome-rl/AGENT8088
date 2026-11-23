@@ -11,6 +11,12 @@ from types import SimpleNamespace as N
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _discard_ladder(engine, monkeypatch):
+    """These tests cover the discard-and-retry ladder after a cut-off, which cutoff_keep_reasoning=0 keeps."""
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
+
+
 def _reply(content="", finish="stop", reasoning="", tool_calls=None):
     message = N(content=content, tool_calls=tool_calls, reasoning_content=reasoning)
     return N(choices=[N(message=message, finish_reason=finish)], usage=None)

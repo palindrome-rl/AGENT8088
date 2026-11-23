@@ -12,6 +12,12 @@ def _context_scaled_caps(engine, monkeypatch):
     monkeypatch.setattr(engine, "OUTPUT_PROFILES", False)
 
 
+@pytest.fixture(autouse=True)
+def _discard_ladder(engine, monkeypatch):
+    """These tests cover the discard-and-retry ladder after a cut-off, which cutoff_keep_reasoning=0 keeps."""
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
+
+
 def _read(n):
     # Distinct arguments each time: an identical repeated call ends the run as "no progress".
     return _reply('✿FUNCTION✿: read_text ✿ARGS✿: {"filename": "f%d.txt"}' % n)

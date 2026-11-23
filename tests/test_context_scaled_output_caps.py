@@ -9,6 +9,7 @@ import pytest
 def _context_scaled_caps(engine, monkeypatch):
     """These tests cover the context-scaled caps and the adaptive median, which output_profiles=0 keeps."""
     monkeypatch.setattr(engine, "OUTPUT_PROFILES", False)
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
 
 
 @pytest.mark.parametrize("context, expected", [
