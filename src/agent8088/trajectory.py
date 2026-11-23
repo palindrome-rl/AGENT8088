@@ -352,6 +352,33 @@ _SCRIPT_MISSING = re.compile(
     re.IGNORECASE | re.MULTILINE)
 
 
+# A program path with a space that the command did not quote: the shell cut it at the space and looked for a program
+# named after the first piece. Seen in a benchmark run: `E:\My Work\.venv\Scripts\python.exe -c ...` failed with
+# "'E:\My' is not recognized as an internal or external command", and the run ended "the latest check failed" over
+# work that passed every grader check. Nothing ran, so it is not a check.
+_CUT_PROGRAM = re.compile(
+    r"'(?P<c>[^'\n]+)' is not recognized as an internal or external command"
+    r"|The term '(?P<d>[^'\n]+)' is not recognized as (?:the )?name of a cmdlet"
+    r"|^(?:/bin/)?(?:ba)?sh: (?:\d+: |line \d+: )?(?P<a>[^:\n]+?): (?:command )?not found\b",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _cut_program_path(command: str, result) -> bool:
+    """Whether the command never started because its unquoted program path was cut at a space."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return False
+    for segment in command_segments(command or "", split_or=True):
+        start = segment.lstrip()
+        if not start or start[0] in "\"'":
+            continue
+        for match in _CUT_PROGRAM.finditer(text):
+            name = next(g for g in match.groups() if g).strip()
+            if ("\\" in name or "/" in name) and start.startswith(name + " "):
+                return True
+    return False
+
+
 def _started_programs(command: str) -> set:
     return {_segment_program(segment) for segment in command_segments(command or "", split_or=True)
             if segment.strip()} - {""}
@@ -1090,7 +1117,8 @@ class TrajectoryState:
         failed = operation["verdict"] == "failed"
         limit = (_environment_limit(result) or _program_missing(command, result)) if failed else ""
         # A script that was not at the path the command gave never ran: not a check, and nothing the machine lacks.
-        not_started = failed and not limit and _script_missing(command, result)
+        not_started = failed and not limit and (_script_missing(command, result)
+                                                or _cut_program_path(command, result))
         if (limit and not probe_only
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
             self._note_environment_limit(command, limit)
