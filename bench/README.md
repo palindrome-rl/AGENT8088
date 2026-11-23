@@ -81,6 +81,49 @@ python bench/report.py bench-runs/results.jsonl --json baseline.json
 python bench/report.py new-runs/results.jsonl --baseline baseline.json
 ```
 
+## Tier 1: the smoke set, before a production release
+
+Tier 1 runs on demand, before `staging-1.3` is released to `AGENT8088-v1.3`. It does not run on every PR or before
+`development` goes to staging.
+- **What runs:** seven tasks at two trials each, about two hours on one model: five sandbox tasks that cover the usual
+  verdict decisions, and the two trap tasks. The set and its pass bar are in `bench/tiers.json`.
+- **Infra runs:** a run where the grader could not start, or no model reply came back, is repeated once and its first
+  folder is kept.
+
+```bash
+python bench/run.py --profile <profile> --tier 1 --out tier1-runs
+python bench/report.py tier1-runs/results.jsonl --tier 1 --baseline <last tier 1 summary.json>
+```
+
+The pass bar:
+- no false done
+- no run without an answer
+- false not verified no higher than the baseline
+- a grader score no more than 0.1 below it
+
+Save each passing run's summary (`--json`) as the next baseline.
+
+**Who a failure belongs to.** Every report lists the runs worth reading, each with its likely cause:
+
+| cause | when |
+|---|---|
+| `model` | the work was wrong and the harness said so |
+| `environment` | the sandbox or the machine stopped the run's check, and the answer says so |
+| `harness` | a wrong verdict, or a run that ended without an answer |
+| `infra` | the grader could not run, or no reply came back |
+
+Only `harness` runs are the harness's to fix. The cause is read off the outcome and the answer's own reasons, so it is
+where to start reading, not a finding; the trace decides.
+
+**Trap tasks.** A trap task has a defect that a run which does not check its own work will miss. The defect is stated
+in the prompt, so a careful run can find it, and the grader checks only what the prompt says.
+- `invoice-totals`: one invoice is exported by two systems with its id written another way, and some amounts use a
+  comma as the decimal mark.
+- `discount-rounding`: the tests that come with the task pass with plain floating point, while the prompt asks for
+  exact cents rounded half up after each discount.
+- Each comes with a reference solution, a valid variant and a solution for each missed trap. The grader tests check
+  that the first two pass and the misses fail (`tests/test_bench_trap_tasks.py`). A miss is a test for false done.
+
 ## Tasks
 
 | Task | Kind | Budget | What it exercises |
@@ -94,6 +137,8 @@ python bench/report.py new-runs/results.jsonl --baseline baseline.json
 | `three-in-row-game` | sandbox | 15 min | a two-player game page: turns, win and draw detection, a score kept across reloads |
 | `cart-page` | sandbox | 15 min | a shop page: a cart, a discount code at a threshold, money in cents, state kept across reloads |
 | `catalog-scrape` | sandbox | 15 min | a stdlib scraper over HTTP that follows next links; graded on a second shop it has not seen |
+| `invoice-totals` | sandbox | 15 min | trap: monthly totals from several exports where one invoice appears twice and some amounts use a comma; graded on exports it has not seen |
+| `discount-rounding` | sandbox | 15 min | trap: stacked discounts rounded half up after each one; the tests that come with it also pass with floats |
 | `kanban-board` | long | 2 h | a board page with written rules, persistence, import and export, undo |
 | `qbr-review-pack` | long | 2 h | a workbook, deck and memo from messy CSV, Excel and PDF inputs |
 | `notes-app` | long | 2 h | a JSON API on SQLite, a page and the app's own tests |
