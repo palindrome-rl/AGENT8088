@@ -223,6 +223,17 @@ browser_headless=1
 # 8192 / 4096 / 4096; 64K and larger give 16384 / 8192 / 8192.
 # Either way, each key below overrides its own value (initial_completion_cap=0 means no cap), as does
 # provider.<name>.max_completion_tokens.
+# A reply that repeats itself is stopped while it streams and thrown away: the zlib compression ratio of its last
+# 6,000 characters at least loop_check_ratio, and its share of unique 8-word sequences at most loop_check_unique, on
+# two checks in a row (about every 2K tokens, from 4K on). Ordinary reasoning on Qwen3.8-27B never passed 3.8 and
+# 0.84. No model call is made.
+# loop_check=1
+# loop_check_ratio=6.0
+# loop_check_unique=0.6
+# A reply cut off at the cap while still reasoning or writing text, and not a loop, is kept: the end of it goes back
+# to the model with the ask to make the next tool call or answer, at the full cap. A second cut-off at the same step
+# takes the discard-and-retry ladder. 0 throws the reply away from the first cut-off, as before.
+# cutoff_keep_reasoning=1
 # initial_completion_cap=16384
 # main_llm_min_tokens=8192
 # thinking_off_max_tokens=8192
