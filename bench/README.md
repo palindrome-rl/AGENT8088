@@ -81,6 +81,61 @@ python bench/report.py bench-runs/results.jsonl --json baseline.json
 python bench/report.py new-runs/results.jsonl --baseline baseline.json
 ```
 
+## Tier 0: saved runs, replayed on every PR
+
+A live run takes minutes to hours and a GPU. Most verdict changes do not need one. `tests/verdict_corpus/` holds
+saved runs, each scrubbed of local names, and `tests/test_verdict_corpus.py` judges every one again with the PR's
+verdict code (`bench/corpus.py` does the replay). It takes under a minute and runs in CI on Windows, because the
+saved runs are Windows runs.
+
+What is replayed with the PR's code:
+- the reply's own words
+- every shell command and its output, in order, with the writes between them
+- the model's own `check_app` calls
+- the script check, from the output each script gave when it was started (when that output was saved whole)
+- the secret scan of the files the run wrote
+- the named files the request asked for, and the parts of the request
+
+Kept as recorded:
+- the page check of a page in a browser
+- a file cut off mid-write
+- the run's other unmet checks
+
+Paths keep their length when they are scrubbed, because the trace clips long output at fixed lengths and the verdict
+code reads what is left.
+
+Each case has a label in `tests/verdict_corpus/labels.json`:
+
+| field | meaning |
+|---|---|
+| `expected` | `done` or `not_verified`: the verdict a correct harness gives on this evidence. Not always the grader's: work that passes is still rightly not verified when the run's own check failed and was never run again. |
+| `work` | Why the work failed, when it did: `model`, `environment` (the sandbox or the machine stopped it), `harness`, `grader` (the grader was wrong) or `infra` (no reply came back). `none` when the work was right. |
+| `known_gap` | The current code gets this case wrong. The test expects that. A fix that makes it pass updates the label in the same PR. |
+| `replay_gap` | The replay cannot judge this case the way the run did (clipped output, a browser page check). Skipped. |
+| `note` | One line a reviewer can check. Required when the verdict is not the grader's, and on every gap. |
+
+A PR that changes a case's verdict must change its label in the same PR, so the change is visible in review.
+
+Add a run, for example one the harness got wrong:
+
+```bash
+python bench/corpus.py export <run folder> --id <task>--<batch>--<trial>
+python bench/corpus.py replay <task>--<batch>--<trial>
+```
+
+Then add its label. The replay prints what the current code says. Check the scrub: the test fails on a local network
+address or a user folder name, but read the case for anything else before committing it.
+
+How close the replay is, measured by replaying the two newest batches with the build that made them: 40 of 44 verdicts
+match what those runs said.
+- One of the 4 that differ is a server-restart case, marked `replay_gap`.
+- The other three differ in when the run judged the parts of the request. Their labels follow the grader.
+
+Of the 93 cases, 3 are known gaps:
+- a wrong total the reply called verified
+- a failed check settled only by a different command line
+- a cmd line where `;` ran only the first command
+
 ## Tasks
 
 | Task | Kind | Budget | What it exercises |
