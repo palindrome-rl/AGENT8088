@@ -1,0 +1,41 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Tile flip</title>
+<style>
+  body { font-family: sans-serif; }
+  #grid { display: grid; grid-template-columns: repeat(5, 48px); gap: 4px; }
+  .tile { width: 48px; height: 48px; border: 0; background: #ccc; }
+  .tile[data-lit="1"] { background: #f5c400; }
+</style></head>
+<body>
+<div id="grid"></div>
+<p>Moves: <span id="moves">0</span> <span id="status"></span></p>
+<button id="restart">Restart</button>
+<script>
+const DEFAULT = "0000000100011100010000000";
+const given = new URLSearchParams(location.search).get("start");
+const start = /^[01]{25}$/.test(given || "") ? given : DEFAULT;
+let board, moves;
+const grid = document.getElementById("grid");
+for (let r = 0; r < 5; r++) for (let c = 0; c < 5; c++) {
+  const tile = document.createElement("button");
+  tile.className = "tile"; tile.dataset.row = r; tile.dataset.col = c;
+  tile.addEventListener("click", () => press(r, c));
+  grid.appendChild(tile);
+}
+function solved() { return !board.includes(1); }
+function press(r, c) {
+  if (solved()) return;
+  for (const [y, x] of [[r, c], [r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]])
+    if (y >= 0 && y < 5 && x >= 0 && x < 5) board[y * 5 + x] ^= 1;
+  moves++; draw();
+}
+function draw() {
+  grid.querySelectorAll(".tile").forEach((t, i) => t.dataset.lit = board[i]);
+  document.getElementById("moves").textContent = moves;
+  document.getElementById("status").textContent = solved() ? "Solved" : "";
+}
+function restart() { board = [...start].map(Number); moves = 0; draw(); }
+document.getElementById("restart").addEventListener("click", restart);
+restart();
+</script>
+</body></html>

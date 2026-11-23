@@ -1,0 +1,5 @@
+# module_034
+def sym_034
+use sym_007
+use sym_022
+use sym_032

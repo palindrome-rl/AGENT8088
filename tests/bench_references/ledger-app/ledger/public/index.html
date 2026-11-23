@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledger — Expense Tracker</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #1c2330; --muted: #667085;
+    --line: #e4e7ec; --accent: #2f6fed; --accent-ink: #ffffff;
+    --danger: #d92d20; --ok: #12b76a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  h2 { font-size: 16px; margin: 0 0 10px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  input, select {
+    padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px;
+    font: inherit; background: #fff; color: var(--ink);
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 8px 14px; border: 0; border-radius: 7px; font: inherit;
+    cursor: pointer; background: var(--accent); color: var(--accent-ink);
+  }
+  button:hover { filter: brightness(1.08); }
+  button.danger { background: var(--danger); color: #fff; padding: 4px 10px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  td.amount, th.amount { text-align: right; font-variant-numeric: tabular-nums; }
+  .total-line {
+    display: flex; justify-content: space-between; padding: 10px 0 0;
+    font-weight: 600; border-top: 2px solid var(--line); margin-top: 4px;
+  }
+  .bar-row { display: grid; grid-template-columns: 110px 1fr 90px; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .bar-track { background: #eef1f5; border-radius: 5px; height: 16px; overflow: hidden; }
+  .bar-fill { background: var(--accent); height: 100%; border-radius: 5px; }
+  .bar-label { font-size: 13px; color: var(--muted); }
+  .bar-value { font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 12px 0; }
+  .error { color: var(--danger); font-size: 13px; min-height: 18px; margin-top: 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ledger — Expense Tracker</h1>
+
+  <div class="card">
+    <h2>Add an expense</h2>
+    <form id="add-form">
+      <div class="row">
+        <div class="field">
+          <label for="f-date">Date</label>
+          <input type="date" id="f-date" required>
+        </div>
+        <div class="field">
+          <label for="f-amount">Amount ($)</label>
+          <input type="text" id="f-amount" inputmode="decimal" placeholder="12.50" required>
+        </div>
+        <div class="field">
+          <label for="f-category">Category</label>
+          <input type="text" id="f-category" placeholder="food" required>
+        </div>
+        <div class="field" style="flex:1; min-width:160px;">
+          <label for="f-note">Note (optional)</label>
+          <input type="text" id="f-note" placeholder="lunch">
+        </div>
+        <button type="submit">Add</button>
+      </div>
+      <div class="error" id="add-error"></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Expenses</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <div class="field">
+        <label for="filter-category">Category</label>
+        <input type="text" id="filter-category" placeholder="all">
+      </div>
+      <div class="field">
+        <label for="filter-from">From</label>
+        <input type="date" id="filter-from">
+      </div>
+      <div class="field">
+        <label for="filter-to">To</label>
+        <input type="date" id="filter-to">
+      </div>
+      <button type="button" id="apply-filters">Filter</button>
+      <button type="button" id="clear-filters" style="background:#8a94a6;">Clear</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th><th>Category</th><th>Note</th>
+          <th class="amount">Amount</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="expense-rows"></tbody>
+    </table>
+    <div class="empty" id="empty-msg" hidden>No expenses match.</div>
+    <div class="total-line">
+      <span>Total shown</span>
+      <span id="total-shown">$0.00</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Monthly summary</h2>
+    <div class="row" style="margin-bottom:12px;">
+      <div class="field">
+        <label for="summary-month">Month</label>
+        <input type="month" id="summary-month">
+      </div>
+      <button type="button" id="show-summary">Show</button>
+    </div>
+    <div id="summary-body" class="muted">Pick a month to see the breakdown.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+function dollars(cents) {
+  return "$" + (cents / 100).toFixed(2);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+async function api(path, options) {
+  const res = await fetch(path, options);
+  if (res.status === 204) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+// --- list + filters -------------------------------------------------------
+
+async function loadExpenses() {
+  const params = new URLSearchParams();
+  const cat = $("filter-category").value.trim();
+  const from = $("filter-from").value;
+  const to = $("filter-to").value;
+  if (cat) params.set("category", cat);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  const qs = params.toString();
+  const rows = await api("/api/expenses" + (qs ? "?" + qs : ""));
+
+  const tbody = $("expense-rows");
+  tbody.innerHTML = "";
+  let total = 0;
+  for (const e of rows) {
+    total += e.amount_cents;
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + escapeHtml(e.date) + "</td>" +
+      "<td>" + escapeHtml(e.category) + "</td>" +
+      "<td>" + escapeHtml(e.note) + "</td>" +
+      '<td class="amount">' + dollars(e.amount_cents) + "</td>" +
+      '<td><button class="danger" data-id="' + e.id + '">Delete</button></td>';
+    tbody.appendChild(tr);
+  }
+  $("empty-msg").hidden = rows.length > 0;
+  $("total-shown").textContent = dollars(total);
+}
+
+$("apply-filters").addEventListener("click", () => loadExpenses().catch(showListError));
+$("clear-filters").addEventListener("click", () => {
+  $("filter-category").value = "";
+  $("filter-from").value = "";
+  $("filter-to").value = "";
+  loadExpenses().catch(showListError);
+});
+
+function showListError(err) {
+  alert("Could not load expenses: " + err.message);
+}
+
+$("expense-rows").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-id]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (!confirm("Delete this expense?")) return;
+  try {
+    await api("/api/expenses/" + id, { method: "DELETE" });
+    await loadExpenses();
+  } catch (err) {
+    alert("Delete failed: " + err.message);
+  }
+});
+
+// --- add form ---------------------------------------------------------------
+
+$("add-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("add-error").textContent = "";
+  const payload = {
+    date: $("f-date").value,
+    amount: $("f-amount").value,
+    category: $("f-category").value,
+    note: $("f-note").value
+  };
+  try {
+    await api("/api/expenses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    $("f-amount").value = "";
+    $("f-note").value = "";
+    await loadExpenses();
+  } catch (err) {
+    $("add-error").textContent = err.message;
+  }
+});
+
+// --- monthly summary ----------------------------------------------------------
+
+$("show-summary").addEventListener("click", async () => {
+  const month = $("summary-month").value;
+  const body = $("summary-body");
+  if (!month) {
+    body.textContent = "Pick a month to see the breakdown.";
+    return;
+  }
+  try {
+    const s = await api("/api/summary?month=" + encodeURIComponent(month));
+    if (s.count === 0) {
+      body.innerHTML = '<span class="muted">No expenses in ' + escapeHtml(s.month) + ".</span>";
+      return;
+    }
+    const cats = Object.entries(s.by_category).sort((a, b) => b[1] - a[1]);
+    const max = Math.max(...cats.map(([, c]) => c));
+    let html = '<div class="muted">' + s.count + " expense(s), total " +
+      dollars(s.total_cents) + "</div><div style='margin-top:10px;'>";
+    for (const [cat, cents] of cats) {
+      const pct = max > 0 ? (cents / max) * 100 : 0;
+      html +=
+        '<div class="bar-row">' +
+        '<span class="bar-label">' + escapeHtml(cat) + "</span>" +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+        '<span class="bar-value">' + dollars(cents) + "</span>" +
+        "</div>";
+    }
+    html += "</div>";
+    body.innerHTML = html;
+  } catch (err) {
+    body.innerHTML = '<span class="error">' + escapeHtml(err.message) + "</span>";
+  }
+});
+
+// --- init ---------------------------------------------------------------------
+
+(function init() {
+  const now = new Date();
+  const iso = now.toISOString().slice(0, 10);
+  $("f-date").value = iso;
+  $("summary-month").value = iso.slice(0, 7);
+  loadExpenses().catch(showListError);
+})();
+</script>
+</body>
+</html>

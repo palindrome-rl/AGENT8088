@@ -1,0 +1,10 @@
+{
+  "id": "tile-flip-game",
+  "title": "Make an offline 5 by 5 tile flip puzzle page, with a start pattern from the address, a move count and a restart",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"]
+}

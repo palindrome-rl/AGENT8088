@@ -1,0 +1,94 @@
+{
+  "submit": {
+    "R-01": {
+      "usd": 32.0,
+      "category": "Meals",
+      "date": "2026-09-02",
+      "vendor": "Cafe Bay"
+    },
+    "R-03": {
+      "usd": 85.0,
+      "category": "Transport",
+      "date": "2026-09-06",
+      "vendor": "City Cab"
+    },
+    "R-05": {
+      "usd": 190.0,
+      "category": "Lodging",
+      "date": "2026-09-10",
+      "vendor": "Bay Hotel"
+    },
+    "R-08": {
+      "usd": 280.0,
+      "category": "Software",
+      "date": "2026-09-12",
+      "vendor": "CodePad"
+    },
+    "R-09": {
+      "usd": 120.0,
+      "category": "Office supplies",
+      "date": "2026-09-13",
+      "vendor": "PaperHub"
+    },
+    "R-10": {
+      "usd": 48.0,
+      "category": "Meals",
+      "date": "2026-08-28",
+      "vendor": "Dock Diner"
+    },
+    "R-11": {
+      "usd": 88.0,
+      "category": "Transport",
+      "date": "2026-09-14",
+      "vendor": "Rail Pass"
+    },
+    "R-14": {
+      "usd": 60.0,
+      "category": "Office supplies",
+      "date": "2026-09-17",
+      "vendor": "PaperHub"
+    }
+  },
+  "draft": {
+    "R-02": {
+      "usd": 46.0,
+      "category": "Meals",
+      "date": "2026-09-05",
+      "vendor": "Harbor Grill"
+    },
+    "R-04": {
+      "usd": 110.0,
+      "category": "Transport",
+      "date": "2026-09-09",
+      "vendor": "Express Cab"
+    },
+    "R-06": {
+      "usd": 230.0,
+      "category": "Lodging",
+      "date": "2026-09-11",
+      "vendor": "Bay Hotel"
+    },
+    "R-12": {
+      "usd": 44.0,
+      "category": "Meals",
+      "date": "2026-09-15",
+      "vendor": "Bistro Nord"
+    },
+    "R-13": {
+      "usd": 310.0,
+      "category": "Software",
+      "date": "2026-09-16",
+      "vendor": "DataSoft"
+    }
+  },
+  "duplicate": [
+    "R-07"
+  ],
+  "unreadable": [
+    "R-15"
+  ],
+  "mismatch": [
+    "R-09"
+  ],
+  "submitted_total": 903.0
+}

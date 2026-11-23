@@ -191,6 +191,9 @@ _CODE_SPLIT_RE = re.compile(r"[:=+/.$-]")
 _SHORT_NUMBER_RE = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,4})?")
 # A size or count with its unit, as model names carry them (0.8b, 70b, 4k, 2x).
 _QUANTITY_RE = re.compile(r"[0-9]{1,4}[A-Za-z]{1,3}")
+# A count with its word, as test labels and debug prints carry them (25ones, 3moves, 10items). Seen in a benchmark
+# run: print(f"5 START=25ones: ...") in a browser check, and the run ended "a credential is written in clear text".
+_COUNT_WORD_RE = re.compile(r"[0-9]{1,4}[a-z]{2,12}")
 # The words inside an identifier: lower, Capitalised, ACRONYM (before a capital+lower), digits.
 _IDENTIFIER_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 _IDENTIFIER_LETTERS = 0.7           # share of the letters that must sit in words of three or more
@@ -251,7 +254,7 @@ def _identifier_like(token: str) -> bool:
 def _code_piece(piece: str) -> bool:
     """One identifier-sized word: letters with at most two digits and four capitals (``effectChance``,
     ``f2b``, ``createElement``), or ALL CAPS, or a size with its unit (``8b``)."""
-    if _QUANTITY_RE.fullmatch(piece or ""):
+    if _QUANTITY_RE.fullmatch(piece or "") or _COUNT_WORD_RE.fullmatch(piece or ""):
         return True
     if not piece or len(piece) > 24 or not re.fullmatch(r"[A-Za-z_]\w*", piece):
         return False
@@ -274,9 +277,63 @@ def _codelike(token: str) -> bool:
 # Subresource / lockfile integrity values (`sha512-<base64>==`): public checksums of a download, not secrets.
 _INTEGRITY_RE = re.compile(r"sha(?:1|256|384|512)-[A-Za-z0-9+/]+={0,2}")
 
+# A hex value its own label calls a digest: `"sha256": "<hex>"`, `checksum = <hex>`, `file_hash: <hex>`.
+# Only the exact lengths hashes have (MD5, SHA-1, SHA-224, SHA-256, SHA-384, SHA-512), and never behind a
+# label that also names a key, token, password, salt or secret: a hash of a password is still worth a look.
+# A bare hex string with no label is still reported; the module docstring says why.
+_DIGEST_LENGTHS = frozenset({32, 40, 56, 64, 96, 128})
+_DIGEST_LABEL_RE = re.compile(
+    r"""(?P<label>(?<![\w-])[\w-]*?(?:sha-?(?:1|224|256|384|512)|md5|blake2[bs]?|digest|checksum|hash|etag)"""
+    r"""(?:[_-][\w-]*)?)(?P<sep>["']?\s*[:=]\s*["']?)(?P<hex>[A-Fa-f0-9]+)(?![\w])""",
+    re.IGNORECASE)
+_SECRET_LABEL_RE = re.compile(r"pass|secret|token|key|auth|cred|salt|session|cookie|sign", re.IGNORECASE)
+# `sha256sum` output: the digest, one or two spaces (a `*` marks binary mode), then the file name.
+_SUM_LINE_RE = re.compile(r"^(?P<hex>[A-Fa-f0-9]+)(?P<rest> [ *]\S.*)$", re.MULTILINE)
+
+
+def _labelled_digest(match):
+    if len(match.group("hex")) not in _DIGEST_LENGTHS or _SECRET_LABEL_RE.search(match.group("label")):
+        return match.group(0)
+    return match.group("label") + match.group("sep") + "public-digest"
+
+
+def _sum_line(match):
+    if len(match.group("hex")) not in _DIGEST_LENGTHS:
+        return match.group(0)
+    return "public-digest" + match.group("rest")
+
+
+# A regular expression's character class with its brackets split off: `a-zA-Z0-9_/.`, `A-Fa-f0-9`. Seen in a
+# benchmark run: a script that counted URLs in a page held /(?<![a-zA-Z0-9_/.])\/[\/][a-z]/g, and the run ended
+# "a credential is written in clear text". Two or more ranges, each from a letter or digit to a later one of the same
+# kind, with only class punctuation between them.
+_CLASS_RANGE_RE = re.compile(r"[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]")
+_CHAR_CLASS_RE = re.compile(r"(?:[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]|\\[wdsWDS]|[_./+=:@\\-])+")
+
+
+def _char_class(token: str) -> bool:
+    ranges = _CLASS_RANGE_RE.findall(token)
+    return (bool(_CHAR_CLASS_RE.fullmatch(token)) and len(ranges) >= 2
+            and all(r[0] <= r[2] for r in ranges))
+
+
+# A folder path written with forward slashes, cut where a folder name has a space: `Labs/agent8088_prs/bench_runs/
+# full_step2_20261123/sandbox/` from "E:/Palindrome Labs/...". Seen in a benchmark run, flagged as a credential. Every
+# part is a readable name: words with at most two capitals and numbers, joined by `_`, `-` or `.`, a number only at
+# the end of a word (agent8088, step2). The parts of a base64 key are a mix of capitals, small letters and digits.
+_READABLE_PART_RE = re.compile(r"(?:[A-Za-z]+[0-9]*|[0-9]+)(?:[_.-](?:[A-Za-z]+[0-9]*|[0-9]+))*")
+
+
+def _readable_path(token: str) -> bool:
+    parts = [part for part in token.split("/") if part]
+    return (token.count("/") >= 2 and len(parts) >= 2
+            and all(_READABLE_PART_RE.fullmatch(part) and sum(c.isupper() for c in part) <= 2 for part in parts))
+
 
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token) or _INTEGRITY_RE.fullmatch(token):
+        return True
+    if _char_class(token) or _readable_path(token):
         return True
     if _wordlike(token) or _codelike(token) or _identifier_like(token):
         return True
@@ -319,6 +376,10 @@ def find_secrets(text: str) -> list:
     # Only URL query context excuses version hashes; a standalone v=<hex>
     # assignment remains eligible for the credential detector.
     opaque_text = _LINK_VERSION_RE.sub(lambda m: m.group('prefix') + 'public-version', opaque_text)
+    # Build manifests, lockfiles and checksum lists name their digests; a correct build was reported as
+    # leaking a credential over the SHA-256 in its own manifest.
+    opaque_text = _DIGEST_LABEL_RE.sub(_labelled_digest, opaque_text)
+    opaque_text = _SUM_LINE_RE.sub(_sum_line, opaque_text)
 
     def user_agent(match):
         value = match.group('quoted') or match.group('plain') or ''
