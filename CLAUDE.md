@@ -72,7 +72,8 @@ Claude Code loads it as a skill; Codex and OpenCode read the file directly.
   - the GHCR image
   - the public wiki, when `docs/wiki/` changed
 
-  Ask the release owner before merging.
+  Run the Tier 1 smoke set first (`bench/README.md`, "Tier 1") and put its
+  result in the release PR, then ask the release owner before merging.
 - **After each merge**, check `git merge-base --is-ancestor <promoted SHA> origin/<target>`.
 
 # Development memory

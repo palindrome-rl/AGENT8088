@@ -1,0 +1,10 @@
+{
+  "id": "invoice-totals",
+  "title": "Monthly invoice totals from several exports, with duplicate invoices and comma decimals (trap task)",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": []
+}

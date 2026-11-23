@@ -35,7 +35,8 @@ def _fixture(task: str, tmp_path: Path) -> Path:
 
 
 def _all_tasks_have_a_grader_test():
-    return {"pip-venv-report", "slow-build-fix", "npm-esbuild-bundle", "http-api-server", "render-report-page"}
+    return {"pip-venv-report", "slow-build-fix", "npm-esbuild-bundle", "http-api-server", "render-report-page",
+            "invoice-totals", "discount-rounding"}
 
 
 # Long tasks are covered in test_bench_long_graders.py.
