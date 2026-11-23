@@ -7,7 +7,7 @@ import posixpath
 import re
 import shlex
 from copy import deepcopy
-from pathlib import PurePath
+from pathlib import PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from agent8088.completion import SUBGOAL_PREFIX
@@ -332,6 +332,55 @@ _MISSING_TEST_TOOL = re.compile(
     r"""|Cannot find (?:module|package) ['"](?P<js>@playwright/test|playwright(?:-core)?|puppeteer(?:-core)?|jsdom|"""
     r"""happy-dom|mocha|jest|vitest|chai|cypress|selenium-webdriver)['"/]""",
     re.IGNORECASE)
+
+
+# A check whose program is not on the PATH where it ran, or whose script file is not where the command named it, never
+# started. Seen in a benchmark run: `node _verify_game_logic.js` ran in a shell with no node ("sh: 1: node: not
+# found"), and `python _verify.py` named the script at the workspace root while it was under artifacts/ ("can't open
+# file ... No such file"). Both runs ended "the latest check failed" over work that passed every grader check, and in
+# the second the same script then passed twice from the right path. Only the program or script the command itself
+# starts counts: a module the work imports, or a file the script opens, is a real failure.
+_PROGRAM_MISSING = re.compile(
+    r"^sh: \d+: (?P<a>[\w.+-]+): not found\b"
+    r"|^(?:/bin/\w+: )?(?:line \d+: )?(?P<b>[\w.+-]+): command not found\b"
+    r"|'(?P<c>[\w.+-]+)' is not recognized as an internal or external command"
+    r"|The term '(?P<d>[\w.+-]+)' is not recognized as (?:the )?name of a cmdlet",
+    re.IGNORECASE | re.MULTILINE)
+_SCRIPT_MISSING = re.compile(
+    r"""can't open file '(?P<py>[^'\n]+)': \[Errno 2\] No such file or directory"""
+    r"""|^Error: Cannot find module '(?P<js>[^'\n]+\.(?:js|mjs|cjs|ts))'""",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _started_programs(command: str) -> set:
+    return {_segment_program(segment) for segment in command_segments(command or "", split_or=True)
+            if segment.strip()} - {""}
+
+
+def _program_missing(command: str, result) -> str:
+    """The program the command starts that is not available where it ran, or ""."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return ""
+    started = _started_programs(command)
+    for match in _PROGRAM_MISSING.finditer(text):
+        name = next(g for g in match.groups() if g)
+        if name.lower().removesuffix(".exe") in started:
+            return f"the program '{name}' is not available where the check ran"
+    return ""
+
+
+def _script_missing(command: str, result) -> bool:
+    """Whether the command failed only because the script it starts is not at the path it gave."""
+    text = str(result or "")
+    if _REAL_TEST_FAILURE.search(text):
+        return False
+    named = {PurePath(word.strip("\"'")).name.lower() for word in re.split(r"\s+", command or "") if word}
+    for match in _SCRIPT_MISSING.finditer(text):
+        path = match.group("py") or match.group("js")
+        if PureWindowsPath(path).name.lower() in named or PurePath(path).name.lower() in named:
+            return True
+    return False
 
 
 def _environment_limit(result) -> str:
@@ -1038,7 +1087,10 @@ class TrajectoryState:
                     del ran[:-MAX_RAN_COMMANDS]
         written_now = self.data.get("written_paths")
         probe_only = _is_probe(command) and not _REAL_TEST_FAILURE.search(str(result))
-        limit = _environment_limit(result) if operation["verdict"] == "failed" else ""
+        failed = operation["verdict"] == "failed"
+        limit = (_environment_limit(result) or _program_missing(command, result)) if failed else ""
+        # A script that was not at the path the command gave never ran: not a check, and nothing the machine lacks.
+        not_started = failed and not limit and _script_missing(command, result)
         if (limit and not probe_only
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))):
             self._note_environment_limit(command, limit)
@@ -1055,6 +1107,7 @@ class TrajectoryState:
                 or _revised_command(n.get("command") or n.get("what"), command))]
         if (operation["verdict"] == "failed"
                 and not limit
+                and not not_started
                 and (_is_check_run(command) or _runs_a_written_file(command, written_now))
                 and not probe_only
                 and not _SANDBOX_BLOCKED.search(str(result))
