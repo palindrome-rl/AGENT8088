@@ -300,8 +300,37 @@ def _sum_line(match):
     return "public-digest" + match.group("rest")
 
 
+# A regular expression's character class with its brackets split off: `a-zA-Z0-9_/.`, `A-Fa-f0-9`. Seen in a
+# benchmark run: a script that counted URLs in a page held /(?<![a-zA-Z0-9_/.])\/[\/][a-z]/g, and the run ended
+# "a credential is written in clear text". Two or more ranges, each from a letter or digit to a later one of the same
+# kind, with only class punctuation between them.
+_CLASS_RANGE_RE = re.compile(r"[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]")
+_CHAR_CLASS_RE = re.compile(r"(?:[a-z]-[a-z]|[A-Z]-[A-Z]|[0-9]-[0-9]|\\[wdsWDS]|[_./+=:@\\-])+")
+
+
+def _char_class(token: str) -> bool:
+    ranges = _CLASS_RANGE_RE.findall(token)
+    return (bool(_CHAR_CLASS_RE.fullmatch(token)) and len(ranges) >= 2
+            and all(r[0] <= r[2] for r in ranges))
+
+
+# A folder path written with forward slashes, cut where a folder name has a space: `Labs/agent8088_prs/bench_runs/
+# full_step2_20261123/sandbox/` from "E:/Palindrome Labs/...". Seen in a benchmark run, flagged as a credential. Every
+# part is a readable name: words with at most two capitals and numbers, joined by `_`, `-` or `.`, a number only at
+# the end of a word (agent8088, step2). The parts of a base64 key are a mix of capitals, small letters and digits.
+_READABLE_PART_RE = re.compile(r"(?:[A-Za-z]+[0-9]*|[0-9]+)(?:[_.-](?:[A-Za-z]+[0-9]*|[0-9]+))*")
+
+
+def _readable_path(token: str) -> bool:
+    parts = [part for part in token.split("/") if part]
+    return (token.count("/") >= 2 and len(parts) >= 2
+            and all(_READABLE_PART_RE.fullmatch(part) and sum(c.isupper() for c in part) <= 2 for part in parts))
+
+
 def _is_noise(token: str) -> bool:
     if _URL_RE.search(token) or _INTEGRITY_RE.fullmatch(token):
+        return True
+    if _char_class(token) or _readable_path(token):
         return True
     if _wordlike(token) or _codelike(token) or _identifier_like(token):
         return True
