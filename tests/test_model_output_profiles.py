@@ -130,11 +130,12 @@ def _run(engine, monkeypatch, model_name, replies, context=65536, completion=650
                                        ("llama-3.1-70b", 20000), ("qwen3.5-9b", 10000), ("my-finetune", 20000)])
 def test_every_ordinary_call_gets_the_models_cap_and_does_not_shrink(engine, monkeypatch, name, cap):
     from test_output_cap import _reply, _tool_reply
-    model, trace = _run(engine, monkeypatch, name, [_tool_reply(n, 120) for n in range(5)] + [_reply("done", 50)])
+    model, trace = _run(engine, monkeypatch, name, [_tool_reply(n, 120, reasoning="I should check the file.")
+                                                    for n in range(5)] + [_reply("done", 50)])
     # Five short replies used to pull the cap down to the floor; it now stays at the model's cap.
     assert model.caps == [cap] * 6
     named = [s for s in trace if s.get("type") == "output_profile"]
-    assert len(named) == 1 and named[0]["thinking_cap"] == cap
+    assert named and all(step["thinking_cap"] == cap for step in named)   # again once the replies show it thinks
 
 
 def test_the_context_window_still_limits_the_request(engine, monkeypatch):
@@ -199,3 +200,131 @@ def test_the_calls_with_thinking_off_after_a_reasoning_cutoff_get_the_non_thinki
                          [cut] + [_tool_reply(n, 120) for n in range(5)] + [_reply("done", 50)])
     # The cut-off at the thinking cap, its retry and three sticky calls with thinking off, then thinking again.
     assert model.caps[:6] == [20000, 8192, 8192, 8192, 8192, 20000]
+
+
+# ------------------------------------------------------------------------------------- size and thinking of any model
+
+@pytest.mark.parametrize("name, total, active", [
+    ("Iinkling-2-mini:26b-a5b", 26, 5), ("qwen3-30b-a3b-instruct-2507", 30, 3), ("glm-4.5-air-106b-a12b", 106, 12),
+    ("gemma-3n-e4b-it", 4, None), ("qwen2.5-7b-instruct-1m", 7, None), ("llama3.1:8b", 8, None),
+])
+def test_the_total_and_active_size_of_any_model(name, total, active):
+    assert mp.parameter_counts(name) == (pytest.approx(total), pytest.approx(active) if active else None)
+
+
+def test_a_context_length_alone_is_not_a_size():
+    assert mp.parameter_counts("foo-1m") == (None, None)
+    assert mp.parameter_count("smollm2:135m") == pytest.approx(0.135)
+
+
+@pytest.mark.parametrize("name, thinks", [
+    ("qwen3-30b-a3b-thinking-2507", True), ("deepseek-r1:14b", True), ("qwq:32b", True), ("r1-distill-llama-70b", True),
+    ("phi-4-reasoning", True), ("qwen3-30b-a3b-instruct-2507", False), ("my-model-nothink-32b", False),
+    ("granite-non-thinking-8b", False), ("llama3.1:8b", None), ("Iinkling-2-mini:26b-a5b", None),
+])
+def test_what_a_name_says_about_thinking(name, thinks):
+    assert mp.thinking_from_name(name) is thinks
+
+
+def test_a_new_model_is_described_with_its_size_and_thinking():
+    found = mp.detect("Iinkling-2-mini:26b-a5b")
+    line = mp.describe("Iinkling-2-mini:26b-a5b", found)
+    assert (found.size_b, found.active_b, found.thinking) == (26, 5, None)
+    assert "26B, 5B active" in line and "thinking unknown" in line and found.cap() == 20000
+
+
+def test_a_model_that_does_not_think_gets_the_non_thinking_cap():
+    found = mp.detect("qwen3-30b-a3b-instruct-2507")
+    assert found.thinking is False and found.cap() == 8192
+    assert mp.detect("Iinkling-2-mini:26b-a5b", False, "replies").cap() == 8192
+
+
+def test_the_known_models_think_whatever_the_caller_says():
+    found = mp.detect("qwen3.8:27b", False, "replies")
+    assert found.thinking is True and found.thinking_source == "known"
+
+
+def _fresh_thinking(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_THINKING_PROBED", {})
+    monkeypatch.setattr(engine, "_THINKING_REPLIES", {})
+    monkeypatch.setattr(engine, "_OUTPUT_PROFILE_SEEN", {})
+
+
+def test_replies_without_reasoning_decide_a_new_model_does_not_think(engine, monkeypatch):
+    from test_output_cap import _reply, _tool_reply
+    _fresh_thinking(engine, monkeypatch)
+    model, trace = _run(engine, monkeypatch, "Iinkling-2-mini:26b-a5b",
+                        [_tool_reply(n, 120) for n in range(5)] + [_reply("done", 50)])
+    # The larger cap until three replies came with no reasoning at all, then the non-thinking cap.
+    assert model.caps == [20000, 20000, 20000, 8192, 8192, 8192]
+    named = [s for s in trace if s.get("type") == "output_profile"]
+    assert named[0]["thinking"] is None and named[-1]["thinking"] is False
+    assert named[-1]["thinking_source"] == "replies" and named[-1]["active_b"] == 5
+
+
+def test_one_reply_with_reasoning_decides_it_thinks(engine, monkeypatch):
+    from test_output_cap import _reply, _tool_reply
+    _fresh_thinking(engine, monkeypatch)
+    replies = [_tool_reply(0, 120, reasoning="Let me look at the data first.")] + [
+        _tool_reply(n, 120) for n in range(1, 5)] + [_reply("done", 50)]
+    model, _trace = _run(engine, monkeypatch, "Iinkling-2-mini:26b-a5b", replies)
+    assert model.caps == [20000] * 6
+
+
+@pytest.mark.parametrize("setting, name, cap", [("off", "qwq:32b", 8192), ("on", "qwen3-30b-a3b-instruct-2507", 20000)])
+def test_the_users_setting_decides_thinking(engine, monkeypatch, setting, name, cap):
+    from test_output_cap import _reply, _tool_reply
+    _fresh_thinking(engine, monkeypatch)
+    monkeypatch.setattr(engine, "MODEL_THINKING", setting)
+    model, _trace = _run(engine, monkeypatch, name, [_tool_reply(1, 120), _reply("done", 50)])
+    assert model.caps == [cap, cap]
+
+
+def test_a_provider_with_thinking_switched_off_does_not_think(engine, monkeypatch):
+    _fresh_thinking(engine, monkeypatch)
+    monkeypatch.setattr(engine, "_provider_extra_body",
+                        lambda name: {"chat_template_kwargs": {"enable_thinking": False}})
+    profile, line = engine._active_output_profile("Iinkling-2-mini:26b-a5b", "local")
+    assert profile.thinking_cap == 8192 and "does not think (from the config)" in line
+
+
+def test_what_the_endpoint_says_counts_from_the_next_turn(engine, monkeypatch):
+    import time
+
+    from agent8088 import providers
+    _fresh_thinking(engine, monkeypatch)
+    monkeypatch.setattr(providers, "probe_model_thinking", lambda *a, **k: False)
+    client = type("C", (), {"base_url": "http://127.0.0.1:9/v1", "api_key": ""})()
+    engine._active_output_profile("Iinkling-2-mini:26b-a5b", "local", client)
+    for _ in range(100):
+        if engine._THINKING_PROBED.get(("local", "Iinkling-2-mini:26b-a5b")) is not None:
+            break
+        time.sleep(0.02)
+    profile, line = engine._active_output_profile("Iinkling-2-mini:26b-a5b", "local", client)
+    assert profile.thinking_cap == 8192 and "from the endpoint" in line
+
+
+class _Response:
+    status_code = 200
+
+    def __init__(self, data):
+        self.data = data
+
+    def json(self):
+        return self.data
+
+
+def test_the_endpoint_probe_reads_ollama_capabilities(monkeypatch):
+    import httpx
+
+    from agent8088 import providers
+    monkeypatch.setattr(providers, "_load_disk_cache", dict)
+    monkeypatch.setattr(providers, "_save_disk_cache", lambda data: None)
+    client = type("C", (), {"base_url": "http://localhost:11434/v1", "api_key": ""})()
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: _Response({"capabilities": ["completion", "thinking"]}))
+    assert providers.probe_model_thinking(client, "Iinkling-2-mini:26b-a5b", "ollama") is True
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: _Response({"capabilities": ["completion", "tools"]}))
+    assert providers.probe_model_thinking(client, "Iinkling-2-mini:26b-a5b", "ollama") is False
+    monkeypatch.setattr(httpx, "post", lambda url, **kw: _Response({}))
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _Response({"data": []}))
+    assert providers.probe_model_thinking(client, "Iinkling-2-mini:26b-a5b", "ollama") is None

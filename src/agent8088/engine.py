@@ -3509,22 +3509,91 @@ def _write_retry_cap(failed_cap: int, provider_limit: int, profile=None) -> int:
 _OUTPUT_PROFILE_SEEN: dict = {}
 
 
-def _active_output_profile(model_name: str):
+# Whether the served model reasons before it answers decides the cap of an ordinary call: a model that does not
+# think needs no room for it. model_thinking=on/off says so for the active model; auto (the default) works it out:
+# the known model, the name (thinking, reasoning, r1, qwq; nothink, non-thinking, instruct-2507), the provider's own
+# thinking switch (provider.<name>.extra_body with enable_thinking false), the endpoint (Ollama's capabilities, the
+# /models listing), and finally the replies: reasoning in any reply means it thinks, none in the first
+# THINKING_REPLIES_TO_DECIDE replies means it does not. While unknown, the larger cap stays.
+MODEL_THINKING = str(APP_CONFIG.get("model_thinking", "auto")).strip().lower()
+THINKING_REPLIES_TO_DECIDE = 3
+THINKING_PROBE_TIMEOUT = 3
+_THINKING_PROBED: dict = {}     # (provider, model) -> what the endpoint said (None when it said nothing)
+_THINKING_REPLIES: dict = {}    # model -> [replies seen, replies with reasoning]
+
+
+def _thinking_switched_off(provider_name: str) -> bool:
+    """The provider is configured to send requests with thinking off."""
+    extra = _provider_extra_body(provider_name) if provider_name else {}
+    template = extra.get("chat_template_kwargs") if isinstance(extra, dict) else None
+    effort = str((extra or {}).get("reasoning_effort", "")).strip().lower() if isinstance(extra, dict) else ""
+    return (isinstance(template, dict) and template.get("enable_thinking") is False) or effort in ("none", "off")
+
+
+def _model_thinking(model_name: str, provider_name: str = "", client_obj=None) -> tuple[bool | None, str]:
+    """(thinks, source) from what the run knows besides the name; (None, "") when nothing says."""
+    if MODEL_THINKING in ("on", "1", "true", "yes"):
+        return True, "config"
+    if MODEL_THINKING in ("off", "0", "false", "no"):
+        return False, "config"
+    if _thinking_switched_off(provider_name):
+        return False, "config"
+    key = (provider_name, model_name)
+    if key not in _THINKING_PROBED and client_obj is not None and str(getattr(client_obj, "base_url", "")):
+        # Asked once, in the background: a turn never waits on it, and its answer counts from the next turn on.
+        _THINKING_PROBED[key] = None
+
+        def ask():
+            try:
+                from agent8088 import providers
+                _THINKING_PROBED[key] = providers.probe_model_thinking(client_obj, model_name, provider_name,
+                                                                       timeout=THINKING_PROBE_TIMEOUT)
+            except Exception:  # noqa: BLE001 -- the probe is a hint, never a failure
+                _THINKING_PROBED[key] = None
+        threading.Thread(target=ask, daemon=True, name="thinking-probe").start()
+    if _THINKING_PROBED.get(key) is not None:
+        return _THINKING_PROBED[key], "endpoint"
+    seen, reasoned = _THINKING_REPLIES.get(model_name, (0, 0))
+    if reasoned:
+        return True, "replies"
+    if seen >= THINKING_REPLIES_TO_DECIDE:
+        return False, "replies"
+    return None, ""
+
+
+def _note_reply_thinking(model_name: str, message, response=None) -> None:
+    """Count a finished reply, and whether it carried reasoning (text, or reasoning tokens in the usage)."""
+    details = getattr(getattr(response, "usage", None), "completion_tokens_details", None)
+    tokens = int(getattr(details, "reasoning_tokens", 0) or 0) if details is not None else 0
+    reasoned = bool(_extract_reasoning(message).strip()) or tokens > 0
+    seen, count = _THINKING_REPLIES.get(model_name, (0, 0))
+    _THINKING_REPLIES[model_name] = (seen + 1, count + int(reasoned))
+
+
+def _active_output_profile(model_name: str, provider_name: str = "", client_obj=None):
     """(profile, one-line description) for the served model, or (None, "") with output_profiles off.
 
-    Logged once per model: an uncalibrated profile (found by size, or the larger model's limits for a name with no
-    size) as a warning, so a model that keeps hitting its cap can be given a measured entry."""
+    The profile's ordinary cap is its thinking cap, or its non-thinking cap once the model is known not to think.
+    The line says the model's size (and active part), whether it thinks and how that was found. It is logged when
+    it changes: an uncalibrated profile (found by size, or the larger model's limits for a name with no size) as a
+    warning, so a model that keeps hitting its cap can be given a measured entry."""
     if not OUTPUT_PROFILES:
         return None, ""
+    import dataclasses
     from agent8088 import model_profiles
     key = str(model_name or "")
-    if key not in _OUTPUT_PROFILE_SEEN:
-        detection = model_profiles.detect(key)
-        line = model_profiles.describe(key, detection)
+    thinking, source = _model_thinking(key, provider_name, client_obj)
+    detection = model_profiles.detect(key, thinking, source)
+    if source == "config" and thinking is not None:
+        detection = dataclasses.replace(detection, thinking=thinking, thinking_source="config")
+    line = model_profiles.describe(key, detection)
+    if _OUTPUT_PROFILE_SEEN.get(key, (None, ""))[1] != line:
         (_log.info if detection.profile.calibrated else _log.warning)(line)
         _OUTPUT_PROFILE_SEEN[key] = (detection, line)
-    detection, line = _OUTPUT_PROFILE_SEEN[key]
-    return detection.profile, line
+    profile = detection.profile
+    if detection.thinking is False:
+        profile = dataclasses.replace(profile, thinking_cap=profile.nonthinking_cap)
+    return profile, line
 
 
 def _reasoning_budget_extra_body(provider_name: str) -> dict:
@@ -21082,7 +21151,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     thinking_off_retry = False  # next retry runs with thinking off (empty / reasoning-heavy cut-off)
     last_cutoff_kind = ""       # kind of the last cut-off
     thinking_sticky_left = 0    # ordinary calls still to run with thinking off after a reasoning-only cut-off
-    profile_traced = ""         # the model whose output limits the trace already names
+    profile_traced = ""         # the output limits the trace already names
     keep_full_cap = False       # the last cut-off's reasoning was kept: the next call keeps the full cap and thinking
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
@@ -21358,13 +21427,19 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                                   + len(json.dumps(round_tools_def or [], default=str)))})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
-        output_profile, profile_line = _active_output_profile(loop_model or MODEL_NAME)
-        if output_profile is not None and trace is not None and profile_traced != (loop_model or MODEL_NAME):
-            profile_traced = loop_model or MODEL_NAME
+        output_profile, profile_line = _active_output_profile(
+            loop_model or MODEL_NAME, loop_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER or "",
+            loop_client or client)
+        if output_profile is not None and trace is not None and profile_traced != profile_line:
+            profile_traced = profile_line
+            detected = _OUTPUT_PROFILE_SEEN.get(str(loop_model or MODEL_NAME), (None, ""))[0]
             trace.append({"turn": turn, "type": "output_profile", "content": profile_line,
                           "thinking_cap": output_profile.thinking_cap,
                           "nonthinking_cap": output_profile.nonthinking_cap,
-                          "calibrated": output_profile.calibrated})
+                          "calibrated": output_profile.calibrated,
+                          "size_b": getattr(detected, "size_b", None), "active_b": getattr(detected, "active_b", None),
+                          "thinking": getattr(detected, "thinking", None),
+                          "thinking_source": getattr(detected, "thinking_source", "")})
         initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window, output_profile)
         normal_cap = (min(turn_completion_limit, initial_cap)
                       if initial_cap else turn_completion_limit)
@@ -21779,6 +21854,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             continue
         # A normal finish: store the reply, reset the cap, remember its size.
         messages.append({"role": "assistant", "content": content})
+        _note_reply_thinking(loop_model or MODEL_NAME, message, response)
         # Without a usage report the size is estimated from the text, reasoning
         # included: counting only the answer would teach the adaptive cap that a
         # model which thinks at length writes short replies.

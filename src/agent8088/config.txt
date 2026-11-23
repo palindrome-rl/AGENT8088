@@ -213,8 +213,15 @@ browser_headless=1
 # by its name wherever it runs (qwen3.8:27b, Qwen/Qwen3.8-27B-AWQ, gemma-4-12B-it-Q4_K_M.gguf):
 #   Qwen3.8-27B   20000 tokens with thinking, 8192 without
 #   Gemma 4 12B   10000 with thinking, 8192 without
-# Another model is sized from its name: above 15B it gets the Qwen3.8-27B caps, at or below 15B the Gemma 4 12B
-# caps, and with no size in the name the larger ones. Those are logged as uncalibrated. The context window still
+# Another model is sized from its name (26b-a5b is 26B with 5B active, e4b an effective 4B): above 15B it gets the
+# Qwen3.8-27B caps, at or below 15B the Gemma 4 12B caps, and with no size in the name the larger ones. Those are
+# logged as uncalibrated.
+# A model that does not reason before it answers gets the cap without thinking on every call. Whether it thinks comes
+# from the known model, the name (thinking, reasoning, r1, qwq; nothink, non-thinking, instruct-2507), this
+# provider's thinking switch, the endpoint (Ollama's capabilities, the /models listing), and then the replies: any
+# reasoning means it thinks, none in its first three replies means it does not. Until then the larger cap stays.
+# on or off decides it for the active model.
+# model_thinking=auto The context window still
 # limits every request, and the cap no longer shrinks to twice the median recent reply unless
 # adaptive_completion_cap=1 is set.
 # output_profiles=1
