@@ -1,0 +1,6 @@
+invoice_id,date,customer,amount
+INV-1209,2026-05-08,Acme Ltd,"619,51"
+INV-1210,2026-05-11,Birch & Co,"470,05"
+INV-1212,2026-05-15,Delta Foods,2103.65
+INV-1214,2026-06-25,Fjord AS,1063.21
+INV-1220,2026-07-20,Delta Foods,717.90

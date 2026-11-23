@@ -81,6 +81,104 @@ python bench/report.py bench-runs/results.jsonl --json baseline.json
 python bench/report.py new-runs/results.jsonl --baseline baseline.json
 ```
 
+## Tier 0: saved runs, replayed on every PR
+
+A live run takes minutes to hours and a GPU. Most verdict changes do not need one. `tests/verdict_corpus/` holds
+saved runs, each scrubbed of local names, and `tests/test_verdict_corpus.py` judges every one again with the PR's
+verdict code (`bench/corpus.py` does the replay). It takes under a minute and runs in CI on Windows, because the
+saved runs are Windows runs.
+
+What is replayed with the PR's code:
+- the reply's own words
+- every shell command and its output, in order, with the writes between them
+- the model's own `check_app` calls
+- the script check, from the output each script gave when it was started (when that output was saved whole)
+- the secret scan of the files the run wrote
+- the named files the request asked for, and the parts of the request
+
+Kept as recorded:
+- the page check of a page in a browser
+- a file cut off mid-write
+- the run's other unmet checks
+
+Paths keep their length when they are scrubbed, because the trace clips long output at fixed lengths and the verdict
+code reads what is left.
+
+Each case has a label in `tests/verdict_corpus/labels.json`:
+
+| field | meaning |
+|---|---|
+| `expected` | `done` or `not_verified`: the verdict a correct harness gives on this evidence. Not always the grader's: work that passes is still rightly not verified when the run's own check failed and was never run again. |
+| `work` | Why the work failed, when it did: `model`, `environment` (the sandbox or the machine stopped it), `harness`, `grader` (the grader was wrong) or `infra` (no reply came back). `none` when the work was right. |
+| `known_gap` | The current code gets this case wrong. The test expects that. A fix that makes it pass updates the label in the same PR. |
+| `replay_gap` | The replay cannot judge this case the way the run did (clipped output, a browser page check). Skipped. |
+| `note` | One line a reviewer can check. Required when the verdict is not the grader's, and on every gap. |
+
+A PR that changes a case's verdict must change its label in the same PR, so the change is visible in review.
+
+Add a run, for example one the harness got wrong:
+
+```bash
+python bench/corpus.py export <run folder> --id <task>--<batch>--<trial>
+python bench/corpus.py replay <task>--<batch>--<trial>
+```
+
+Then add its label. The replay prints what the current code says. Check the scrub: the test fails on a local network
+address or a user folder name, but read the case for anything else before committing it.
+
+How close the replay is, measured by replaying the two newest batches with the build that made them: 40 of 44 verdicts
+match what those runs said.
+- One of the 4 that differ is a server-restart case, marked `replay_gap`.
+- The other three differ in when the run judged the parts of the request. Their labels follow the grader.
+
+Of the 93 cases, 3 are known gaps:
+- a wrong total the reply called verified
+- a failed check settled only by a different command line
+- a cmd line where `;` ran only the first command
+
+## Tier 1: the smoke set, before a production release
+
+Tier 1 runs on demand, before `staging-1.3` is released to `AGENT8088-v1.3`. It does not run on every PR or before
+`development` goes to staging.
+- **What runs:** seven tasks at two trials each, about two hours on one model: five sandbox tasks that cover the usual
+  verdict decisions, and the two trap tasks. The set and its pass bar are in `bench/tiers.json`.
+- **Infra runs:** a run where the grader could not start, or no model reply came back, is repeated once and its first
+  folder is kept.
+
+```bash
+python bench/run.py --profile <profile> --tier 1 --out tier1-runs
+python bench/report.py tier1-runs/results.jsonl --tier 1 --baseline <last tier 1 summary.json>
+```
+
+The pass bar:
+- no false done
+- no run without an answer
+- false not verified no higher than the baseline
+- a grader score no more than 0.1 below it
+
+Save each passing run's summary (`--json`) as the next baseline.
+
+**Who a failure belongs to.** Every report lists the runs worth reading, each with its likely cause:
+
+| cause | when |
+|---|---|
+| `model` | the work was wrong and the harness said so |
+| `environment` | the sandbox or the machine stopped the run's check, and the answer says so |
+| `harness` | a wrong verdict, or a run that ended without an answer |
+| `infra` | the grader could not run, or no reply came back |
+
+Only `harness` runs are the harness's to fix. The cause is read off the outcome and the answer's own reasons, so it is
+where to start reading, not a finding; the trace decides.
+
+**Trap tasks.** A trap task has a defect that a run which does not check its own work will miss. The defect is stated
+in the prompt, so a careful run can find it, and the grader checks only what the prompt says.
+- `invoice-totals`: one invoice is exported by two systems with its id written another way, and some amounts use a
+  comma as the decimal mark.
+- `discount-rounding`: the tests that come with the task pass with plain floating point, while the prompt asks for
+  exact cents rounded half up after each discount.
+- Each comes with a reference solution, a valid variant and a solution for each missed trap. The grader tests check
+  that the first two pass and the misses fail (`tests/test_bench_trap_tasks.py`). A miss is a test for false done.
+
 ## Tasks
 
 | Task | Kind | Budget | What it exercises |
@@ -94,6 +192,8 @@ python bench/report.py new-runs/results.jsonl --baseline baseline.json
 | `three-in-row-game` | sandbox | 15 min | a two-player game page: turns, win and draw detection, a score kept across reloads |
 | `cart-page` | sandbox | 15 min | a shop page: a cart, a discount code at a threshold, money in cents, state kept across reloads |
 | `catalog-scrape` | sandbox | 15 min | a stdlib scraper over HTTP that follows next links; graded on a second shop it has not seen |
+| `invoice-totals` | sandbox | 15 min | trap: monthly totals from several exports where one invoice appears twice and some amounts use a comma; graded on exports it has not seen |
+| `discount-rounding` | sandbox | 15 min | trap: stacked discounts rounded half up after each one; the tests that come with it also pass with floats |
 | `kanban-board` | long | 2 h | a board page with written rules, persistence, import and export, undo |
 | `qbr-review-pack` | long | 2 h | a workbook, deck and memo from messy CSV, Excel and PDF inputs |
 | `notes-app` | long | 2 h | a JSON API on SQLite, a page and the app's own tests |

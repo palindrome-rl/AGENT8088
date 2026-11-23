@@ -5,6 +5,13 @@ replies, thinking used the whole allowance, and replies came back empty or file 
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _context_scaled_caps(engine, monkeypatch):
+    """These tests cover the context-scaled caps and the adaptive median, which output_profiles=0 keeps."""
+    monkeypatch.setattr(engine, "OUTPUT_PROFILES", False)
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
+
+
 @pytest.mark.parametrize("context, expected", [
     (8192, (2048, 2048, 2048)),
     (16384, (4096, 2048, 2048)),

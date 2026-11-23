@@ -1,0 +1,10 @@
+{
+  "id": "discount-rounding",
+  "title": "Stacked percentage discounts rounded half up after each step; the given tests also pass with floats (trap task)",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": []
+}
