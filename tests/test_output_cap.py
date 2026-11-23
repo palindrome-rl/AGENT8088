@@ -5,6 +5,12 @@ from types import SimpleNamespace as N
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _context_scaled_caps(engine, monkeypatch):
+    """These tests cover the context-scaled caps and the adaptive median, which output_profiles=0 keeps."""
+    monkeypatch.setattr(engine, "OUTPUT_PROFILES", False)
+
+
 def _usage(tokens):
     return N(completion_tokens=tokens, prompt_tokens=10, total_tokens=tokens + 10)
 
