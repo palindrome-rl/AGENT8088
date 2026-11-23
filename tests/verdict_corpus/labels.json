@@ -1,0 +1,478 @@
+{
+ "cart-page--confirm-step2-20261123--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "cart-page--confirm-step2-20261123--2": {
+  "expected": "done",
+  "work": "grader",
+  "note": "the grader counted buttons that carry data-product (#50); the page works"
+ },
+ "cart-page--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "cart-page--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "cart-page--full-step2-20261123-sandbox--3": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "a var closure in a loop broke remove; the reply named the failed check (#43)"
+ },
+ "cart-page--webtasks2-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "cart-page--webtasks2-20261122--2": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "catalog-scrape--confirm-step2-20261123--1": {
+  "expected": "done",
+  "work": "none",
+  "note": "smoke output of the scripts was saved clipped; #49 fixed the read-only and dropped --help cases",
+  "replay_gap": true
+ },
+ "catalog-scrape--confirm-step2-20261123--2": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "the reply only announced the next step and the run ended there"
+ },
+ "catalog-scrape--full-step2-20261123-sandbox--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "catalog-scrape--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "catalog-scrape--full-step2-20261123-sandbox--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "catalog-scrape--webtasks-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": "smoke output saved clipped; the --help case was fixed by #41",
+  "replay_gap": true
+ },
+ "catalog-scrape--webtasks-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": "smoke output saved clipped; the --help case was fixed by #41",
+  "replay_gap": true
+ },
+ "catalog-scrape--webtasks2-20261122--1": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "catalog-scrape--webtasks2-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "expense-erp--full-step2-20261123-long--1": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the model reported a blocker it could not clear with the tools and permissions here"
+ },
+ "http-api-server--afterfix-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "http-api-server--afterfix-20261122--3": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "the reply only announced the next step and the run ended there"
+ },
+ "http-api-server--baseline-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "http-api-server--baseline-20261122--3": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "its last check failed because its own earlier server still held the log file, and it was never run again"
+ },
+ "http-api-server--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "http-api-server--full-step2-20261123-sandbox--2": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "http-api-server--full-step2-20261123-sandbox--3": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox stopped the server it started; the live run kept a failed check of a server start that the replay settles; the order of the restarts matters",
+  "replay_gap": true
+ },
+ "kanban-board--full-step2-20261123-long--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "ledger-app--full-step2-20261123-long--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "notes-app--full-step2-20261123-long--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--afterfix-20261122--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "the reply only announced the next step and the run ended there"
+ },
+ "npm-esbuild-bundle--afterfix-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--afterfix-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--baseline-20261122--1": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "npm-esbuild-bundle--baseline-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--baseline-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "npm-esbuild-bundle--full-step2-20261123-sandbox--3": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "the reply only announced the next step and the run ended there"
+ },
+ "pip-venv-report--afterfix-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix2-20261122--2": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "pip-venv-report--afterfix2-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix3-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix3-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix3-20261122--3": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "pip-venv-report--afterfix4-20261122--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "pip-venv-report--afterfix4-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--afterfix4-20261122--3": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "pip-venv-report--confirm-step2-20261123--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "pip-venv-report--confirm-step2-20261123--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "pip-venv-report--full-step2-20261123-sandbox--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "qbr-review-pack--full-step2-20261123-long--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": "false done: the supplier total counted a duplicate invoice; only a check that knows the data finds it",
+  "known_gap": true
+ },
+ "render-report-page--afterfix-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--afterfix-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--afterfix-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--baseline-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": "false not verified: the script failed from the wrong folder, then passed with its full path; a different command line never settles the first failure",
+  "known_gap": true
+ },
+ "render-report-page--baseline-20261122--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--confirm-step2-20261123--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--confirm-step2-20261123--2": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "render-report-page--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": "false not verified: in cmd `dir x; echo ---; python make_report.py` runs only dir (`;` is not a separator) and its exit status 1 stayed the failing check",
+  "known_gap": true
+ },
+ "render-report-page--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "render-report-page--full-step2-20261123-sandbox--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "slow-build-fix--afterfix-20261122--1": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "slow-build-fix--afterfix-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "slow-build-fix--afterfix-20261122--3": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "slow-build-fix--afterfix2-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "slow-build-fix--afterfix3-20261122--2": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "slow-build-fix--afterfix4-20261122--1": {
+  "expected": "not_verified",
+  "work": "infra",
+  "note": "empty model replies; no answer came back"
+ },
+ "slow-build-fix--baseline-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "slow-build-fix--baseline-20261122--3": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "slow-build-fix--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "slow-build-fix--full-step2-20261123-sandbox--2": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "slow-build-fix--full-step2-20261123-sandbox--3": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "the sandbox refused the in-place out/ build, so the build the request asked for was never confirmed"
+ },
+ "three-in-row-game--confirm-step2-20261123--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "three-in-row-game--confirm-step2-20261123--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "three-in-row-game--full-step2-20261123-sandbox--1": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "no node where the check ran and its other check failed in the sandbox: nothing confirmed the page"
+ },
+ "three-in-row-game--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "three-in-row-game--full-step2-20261123-sandbox--3": {
+  "expected": "not_verified",
+  "work": "environment",
+  "note": "no browser could start for the run's own page check"
+ },
+ "three-in-row-game--webtasks-20261122--1": {
+  "expected": "not_verified",
+  "work": "harness",
+  "note": "the page sat only under artifacts/ (fixed by #42)"
+ },
+ "three-in-row-game--webtasks-20261122--2": {
+  "expected": "not_verified",
+  "work": "harness",
+  "note": "the page sat only under artifacts/ (fixed by #42)"
+ },
+ "three-in-row-game--webtasks2-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": "page check kept as recorded; its dead-control warning was fixed by #41",
+  "replay_gap": true
+ },
+ "three-in-row-game--webtasks2-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": "page check kept as recorded; fixed by #41",
+  "replay_gap": true
+ },
+ "three-in-row-game--webtasks3-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--confirm-step2-20261123--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--confirm-step2-20261123--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--full-step2-20261123-sandbox--1": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--full-step2-20261123-sandbox--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--full-step2-20261123-sandbox--3": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--webtasks-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ },
+ "tile-flip-game--webtasks2-20261122--1": {
+  "expected": "done",
+  "work": "none",
+  "note": "page check kept as recorded; fixed by #41",
+  "replay_gap": true
+ },
+ "tile-flip-game--webtasks2-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": "page check kept as recorded; fixed by #41",
+  "replay_gap": true
+ },
+ "tile-flip-game--webtasks3-20261122--1": {
+  "expected": "not_verified",
+  "work": "model",
+  "note": ""
+ },
+ "tile-flip-game--webtasks3-20261122--2": {
+  "expected": "done",
+  "work": "none",
+  "note": ""
+ }
+}

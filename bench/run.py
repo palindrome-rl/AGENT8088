@@ -388,7 +388,9 @@ def main(argv=None) -> int:
     parser.add_argument("--profile", help="model profile JSON, kept outside the repository (needed to run)")
     parser.add_argument("--task", action="append", default=[], help="task id (repeatable); default all")
     parser.add_argument("--kind", choices=benchlib.TASK_KINDS, help="only tasks of this kind")
-    parser.add_argument("--trials", type=int, default=1, help="runs per task")
+    parser.add_argument("--trials", type=int, help="runs per task (default 1, or the tier's own)")
+    parser.add_argument("--tier", help="run a tier from bench/tiers.json: its tasks and trials; a run that says "
+                                       "nothing about the agent (infra) is repeated once")
     parser.add_argument("--out", default="bench-runs", help="folder for run folders and results.jsonl")
     parser.add_argument("--agent", default="agent8088", help="the agent8088 executable to run")
     parser.add_argument("--list", action="store_true", help="list the tasks and exit")
@@ -401,6 +403,13 @@ def main(argv=None) -> int:
         return 0
     if not args.profile:
         parser.error("the following arguments are required: --profile")
+    repeat_infra = False
+    if args.tier:
+        tier = benchlib.load_tier(args.tier)
+        args.task = args.task or list(tier["tasks"])
+        args.trials = args.trials or int(tier.get("trials", 1))
+        repeat_infra = True
+    args.trials = args.trials or 1
     if args.task:
         unknown = set(args.task) - {task["id"] for task in tasks}
         if unknown:
@@ -419,6 +428,13 @@ def main(argv=None) -> int:
             print(f"{benchlib.clock(benchlib.now_iso())} start {run_dir.name}", flush=True)
             try:
                 result = run_one(task, profile, run_dir, agent)
+                if repeat_infra and benchlib.is_infra(result):
+                    # The grader could not run, or no model reply came back: the run says nothing about the agent.
+                    # Keep it in its folder and try once more.
+                    print(f"{benchlib.clock(result['ended'])} infra {run_dir.name}: "
+                          f"{benchlib.likely_cause(result)[1]}; repeating once", flush=True)
+                    run_dir = run_dir.with_name(run_dir.name + "_repeat")
+                    result = run_one(task, profile, run_dir, agent)
             except ServiceError as error:
                 print(f"{benchlib.clock(benchlib.now_iso())} skip  {run_dir.name}: {error}", flush=True)
                 continue

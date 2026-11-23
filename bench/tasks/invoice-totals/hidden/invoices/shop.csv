@@ -1,0 +1,8 @@
+invoice_id,date,customer,amount
+INV-1202,2026-04-09,Birch & Co,1603.44
+INV-1205,2026-04-18,Delta Foods,2467.91
+INV-1211,2026-05-17,Ember Studio,1783.10
+INV-1213,2026-06-12,Delta Foods,2266.72
+INV-1217,2026-06-22,Delta Foods,2329.34
+INV-1221,2026-07-10,Fjord AS,2110.20
+inv-1224,2026-07-26,Cobalt GmbH,"2165,62"

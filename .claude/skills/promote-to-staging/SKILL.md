@@ -54,6 +54,18 @@ Merging into `AGENT8088-v1.3`:
 - builds and pushes the GHCR image (`publish-image.yml`)
 - syncs the public wiki when `docs/wiki/` changed (`wiki.yml`)
 
+Before asking, run the Tier 1 smoke set on the staging tip and compare it with the
+last Tier 1 baseline (see `bench/README.md`, "Tier 1"):
+
+```bash
+python bench/run.py --profile <profile> --tier 1 --out tier1-runs
+python bench/report.py tier1-runs/results.jsonl --tier 1 --baseline <last tier 1 summary.json>
+```
+
+Put the result and its "runs to read" list in the release PR. A failed bar is the
+release owner's call, not a silent go: say which rule failed and whether the cause
+is the harness, the model, the environment or infra.
+
 Get the release owner's go-ahead first. Afterwards, check that the image and
 wiki workflow runs succeeded.
 

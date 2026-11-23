@@ -60,6 +60,31 @@ jobs:
           mkdir -p "$AGENT8088_HOME"
           uv run --extra dev --extra gateway --extra repository python -m pytest -q -rfE
 
+  # Tier 0: the saved benchmark runs in tests/verdict_corpus/ are judged again by this change's verdict code. They
+  # are Windows runs with Windows paths, so they run here; the Linux job above skips them.
+  verdict-corpus:
+    name: Verdict corpus (saved benchmark runs)
+    if: >-
+      github.event_name != 'pull_request'
+      || github.base_ref == 'development'
+      || !((github.base_ref == 'staging-1.3' && github.head_ref == 'development')
+           || (github.base_ref == 'AGENT8088-v1.3' && github.head_ref == 'staging-1.3'))
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Replay the saved runs in a throwaway home
+        shell: bash
+        run: |
+          export AGENT8088_HOME="$RUNNER_TEMP/home/.agent8088"
+          mkdir -p "$AGENT8088_HOME"
+          uv run --extra dev python -m pytest -q -rfE tests/test_verdict_corpus.py
+
   promotion:
     name: Promotion carries only the source tree
     if: >-

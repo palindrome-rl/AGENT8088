@@ -6,6 +6,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _discard_ladder(engine, monkeypatch):
+    """These tests cover the discard-and-retry ladder after a cut-off, which cutoff_keep_reasoning=0 keeps."""
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
+
+
+@pytest.fixture(autouse=True)
 def _fixed_output_caps(engine, monkeypatch):
     """These tests are about the retry ladder at the old fixed caps (8192 / 4096 / 4096); the context-scaled defaults have their own tests."""
     for flag in ("_INITIAL_CAP_SET", "_MIN_TOKENS_SET", "_THINKING_OFF_SET"):

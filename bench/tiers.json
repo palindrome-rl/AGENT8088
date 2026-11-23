@@ -1,0 +1,21 @@
+{
+  "1": {
+    "title": "Tier 1 smoke set: run on demand before staging-1.3 is released to production",
+    "trials": 2,
+    "tasks": [
+      "cart-page",
+      "catalog-scrape",
+      "pip-venv-report",
+      "slow-build-fix",
+      "tile-flip-game",
+      "invoice-totals",
+      "discount-rounding"
+    ],
+    "bar": {
+      "false_done": 0,
+      "no_answer": 0,
+      "false_not_verified_above_baseline": 0,
+      "score_below_baseline": 0.1
+    }
+  }
+}

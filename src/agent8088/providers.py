@@ -534,6 +534,70 @@ def probe_model_vision(client, model_id, provider_name="", timeout=MODEL_LIST_TI
     return answer
 
 
+def _ollama_thinking(base_url, model_id, headers, timeout):
+    """Ollama's /api/show `capabilities`: "thinking" for a model that reasons first. An absent or empty list is None."""
+    import httpx
+    show_url = base_url.replace("/v1", "") + "/api/show"
+    r = httpx.post(show_url, json={"model": model_id}, headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    capabilities = r.json().get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities:
+        return None
+    return "thinking" in [str(item).lower() for item in capabilities]
+
+
+def _listing_thinking(base_url, model_id, headers, timeout):
+    """`supported_parameters` from an OpenAI-compatible /models list: "reasoning" or "include_reasoning" for a model
+    that reasons. OpenRouter publishes it; an endpoint that lists no parameters says nothing (None)."""
+    import httpx
+    r = httpx.get(f"{base_url}/models", headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    for entry in r.json().get("data", []):
+        if not isinstance(entry, dict) or str(entry.get("id", "")) != str(model_id):
+            continue
+        parameters = entry.get("supported_parameters")
+        if not isinstance(parameters, list) or not parameters:
+            return None
+        names = {str(item).lower() for item in parameters}
+        return bool(names & {"reasoning", "include_reasoning", "reasoning_effort"})
+    return None
+
+
+def probe_model_thinking(client, model_id, provider_name="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
+    """Best-effort: does the endpoint say this model reasons before it answers? True, False or None. Never raises.
+
+    The same rules as probe_model_vision: only True and False are cached (for VISION_CACHE_SECONDS), and a silent
+    or failing endpoint stays None to be asked again. Ollama's /api/show first, then the /models listing."""
+    base_url = str(getattr(client, "base_url", "")).rstrip("/")
+    api_key = str(getattr(client, "api_key", ""))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    identity = hashlib.sha256(api_key.encode()).hexdigest()[:12] if api_key else "anonymous"
+    cache_key = f"thinking|{provider_name}|{base_url}|{identity}|{model_id}"
+    now = time.time()
+    disk = _load_disk_cache()
+    cached = disk.get(cache_key)
+    if (isinstance(cached, dict) and isinstance(cached.get("thinking"), bool)
+            and (now - cached.get("ts", 0)) < VISION_CACHE_SECONDS):
+        return cached["thinking"]
+    answer = None
+    if provider_name in ("ollama", "ollama-cloud") or "ollama" in base_url:
+        try:
+            answer = _ollama_thinking(base_url, model_id, headers, timeout)
+        except Exception:
+            answer = None
+    if answer is None:
+        try:
+            answer = _listing_thinking(base_url, model_id, headers, timeout)
+        except Exception:
+            answer = None
+    if answer is not None:
+        disk[cache_key] = {"ts": now, "thinking": answer}
+        _save_disk_cache(disk)
+    return answer
+
+
 # --- live image probe ----------------------------------------------------------------------------------
 #
 # When neither the catalog nor the endpoint says whether a model reads images, ask it: send one small

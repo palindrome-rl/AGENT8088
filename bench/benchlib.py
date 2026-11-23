@@ -168,6 +168,87 @@ def outcome(result: dict) -> str:
     return "correct"
 
 
+# Reasons in a NOT VERIFIED answer that come from where the run was, not from the work or the harness.
+_ENVIRONMENT = re.compile(
+    r"not available where the check ran|no browser could be started|is not installed where the check ran"
+    r"|the sandbox (?:refus|block|stopp)|could not be started here|refused to start|no network",
+    re.IGNORECASE)
+
+
+# What the harness answers when the model sent nothing back.
+_NO_REPLY = "I wasn't able to produce an answer to that."
+
+
+def is_infra(result: dict) -> bool:
+    """The run says nothing about the agent: the grader could not run, or no model reply did any work."""
+    if outcome(result) == "ungraded":
+        return True
+    if _NO_REPLY in str(result.get("final_answer_head") or "")[:600]:
+        return True
+    return result.get("harness_verdict") == "no_answer" and not int(result.get("tool_calls") or 0)
+
+
+def likely_cause(result: dict) -> tuple[str, str]:
+    """(who, why) for a run, as a starting point for the person reading the report.
+
+    who is "none" for right work with the right verdict, else "model", "environment", "harness" or "infra". It is
+    read off the outcome and the answer's own reasons, so it is a guess: the trace says what happened."""
+    kind = outcome(result)
+    answer = str(result.get("final_answer_head") or "")
+    problems = result.get("problems") or {}
+    passed = bool((result.get("grader") or {}).get("passed"))
+    environment = bool(_ENVIRONMENT.search(answer))
+    if is_infra(result):
+        return "infra", ("the grader could not run" if kind == "ungraded"
+                         else "no reply came back from the model (empty replies or model errors)")
+    if kind == "no_answer":
+        if result.get("stopped_by") == "watchdog":
+            return "harness", "the watchdog stopped the run before an answer"
+        if int(problems.get("length_cutoff") or 0) >= 3:
+            return "model", "replies kept hitting the length limit and no answer came back"
+        return "harness", "the run ended without an answer"
+    if kind == "false_done":
+        return "harness", "the work failed the grader but the run said done: the model's checks missed it, and so did the harness"
+    if kind == "false_not_verified":
+        if environment:
+            return "environment", "the work passed, but the environment stopped the run's own check"
+        return "harness", "the work passed the grader but the run said not verified"
+    if passed:
+        return "none", ""
+    if environment:
+        return "environment", "the work failed and the environment stopped its check; the verdict was right"
+    return "model", "the work failed and the run said so"
+
+
+def load_tier(name: str, path: Path | None = None) -> dict:
+    tiers = json.loads((path or Path(__file__).resolve().parent / "tiers.json").read_text(encoding="utf-8"))
+    if name not in tiers:
+        raise KeyError(f"unknown tier {name!r}; known: {', '.join(sorted(tiers))}")
+    return tiers[name]
+
+
+def tier_check(summary: dict, bar: dict, baseline: dict | None = None) -> list[tuple[str, bool, str]]:
+    """(rule, passed, detail) for each part of a tier's pass bar. Rules against a baseline need one."""
+    now = summary["overall"]
+    rows = []
+    rate = lambda value: 0.0 if value is None else float(value)
+    rows.append(("no false done", rate(now.get("false_done_rate")) <= bar.get("false_done", 0),
+                 f"false done {rate(now.get('false_done_rate')):.0%}"))
+    rows.append(("no run without an answer", rate(now.get("no_answer_rate")) <= bar.get("no_answer", 0),
+                 f"no answer {rate(now.get('no_answer_rate')):.0%}"))
+    if baseline:
+        then = baseline["overall"]
+        rows.append(("false not verified no higher than the baseline",
+                     rate(now.get("false_not_verified_rate"))
+                     <= rate(then.get("false_not_verified_rate")) + bar.get("false_not_verified_above_baseline", 0),
+                     (f"{rate(now.get('false_not_verified_rate')):.0%} now, "
+                      f"{rate(then.get('false_not_verified_rate')):.0%} then")))
+        rows.append(("grader score close to the baseline",
+                     rate(now.get("mean_score")) >= rate(then.get("mean_score")) - bar.get("score_below_baseline", 0.1),
+                     f"{rate(now.get('mean_score')):.2f} now, {rate(then.get('mean_score')):.2f} then"))
+    return rows
+
+
 def _rate(numerator: int, denominator: int):
     return numerator / denominator if denominator else None
 

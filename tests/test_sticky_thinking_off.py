@@ -1,7 +1,21 @@
 """After a cut-off whose whole budget went to reasoning, the next few ordinary calls
 also run with thinking off, at the normal cap, then thinking returns.
 """
+import pytest
 from test_cutoff_recovery import Model, _reply, run
+
+
+@pytest.fixture(autouse=True)
+def _context_scaled_caps(engine, monkeypatch):
+    """These tests cover the sticky calls at the context-scaled caps, which output_profiles=0 keeps; the profile
+    rule (a sticky call gets the model's non-thinking cap) is tested in test_model_output_profiles.py."""
+    monkeypatch.setattr(engine, "OUTPUT_PROFILES", False)
+
+
+@pytest.fixture(autouse=True)
+def _discard_ladder(engine, monkeypatch):
+    """These tests cover the discard-and-retry ladder after a cut-off, which cutoff_keep_reasoning=0 keeps."""
+    monkeypatch.setattr(engine, "CUTOFF_KEEP_REASONING", False)
 
 
 def _read(n):
