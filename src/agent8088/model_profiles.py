@@ -49,6 +49,7 @@ class KnownModel:
     name: str
     pattern: re.Pattern
     profile: OutputProfile
+    thinking: bool              # whether the model reasons before it answers
 
 
 # Family, version and size, with any separators and anything before or after: provider paths (`Qwen/`,
@@ -57,11 +58,11 @@ KNOWN_MODELS = (
     KnownModel("qwen3.8-27b",
                re.compile(r"qwen[\s_.-]*3[._-]?8(?![0-9])[^0-9]{0,24}?(?<![0-9.])27(?:\.0)?\s*b(?![a-z0-9])",
                           re.IGNORECASE),
-               QWEN38_27B),
+               QWEN38_27B, thinking=True),
     KnownModel("gemma-4-12b",
                re.compile(r"gemma[\s_.-]*4(?![0-9.])[^0-9]{0,24}?(?<![0-9.])12(?:\.0)?\s*b(?![a-z0-9])",
                           re.IGNORECASE),
-               GEMMA4_12B),
+               GEMMA4_12B, thinking=True),
 )
 
 
@@ -70,37 +71,95 @@ class Detection:
     profile: OutputProfile
     source: str                 # "known", "size" or "unknown size"
     matched: str                # the known model, or "larger than 15B" / "15B or smaller" / "no size in the name"
-    size_b: float | None        # parameters in billions read from the name, when there was one
+    size_b: float | None        # total parameters in billions read from the name, when there was one
+    active_b: float | None = None       # active parameters of a mixture-of-experts model (`-a5b`), when named
+    thinking: bool | None = None        # whether the model reasons before it answers; None while unknown
+    thinking_source: str = "unknown"    # "known", "name", "config", "endpoint", "replies" or "unknown"
+
+    def cap(self) -> int:
+        """The cap of an ordinary call: the thinking cap unless the model is known not to think. While unknown,
+        the larger cap, for the reason the larger limits are the default."""
+        return self.profile.nonthinking_cap if self.thinking is False else self.profile.thinking_cap
 
 
-# A parameter count in a name: 27b, 12B, 0.6b, 1.5B, 270m, 2.4t, 8x7b. A count right after a letter is not the
-# model's size (a3b and e4b are active or effective parameters, a sub-part of a larger model).
+# A parameter count in a name: 27b, 12B, 0.6b, 1.5B, 270m, 2.4t, 8x7b. A count right after a letter is a part of a
+# larger model, not its size: a5b is the active part of a mixture of experts, e4b the effective size of a model that
+# loads more. Counted apart, below.
 _SIZE = re.compile(r"(?<![a-z0-9.])(?:(\d+)\s*x\s*)?(\d+(?:\.\d+)?)\s*([bmt])(?![a-z0-9])", re.IGNORECASE)
+_ACTIVE = re.compile(r"(?<![a-z0-9.])a(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.IGNORECASE)
+_EFFECTIVE = re.compile(r"(?<![a-z0-9.])e(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", re.IGNORECASE)
 _UNIT = {"m": 0.001, "b": 1.0, "t": 1000.0}
+# Below this many millions an `m` is a context length (`-1m`, `-32m`), not a model: the smallest models named in
+# millions are around 100M.
+_MIN_MILLIONS = 50
 
 
-def parameter_count(model: str) -> float | None:
-    """Billions of parameters named in a model id, the largest one when several appear, or None."""
+def parameter_counts(model: str) -> tuple[float | None, float | None]:
+    """(total, active) billions of parameters named in a model id, or None for what it does not say.
+
+    The total is the largest plain count (`26b` in `26b-a5b`, `176` for `8x22b`). A name that gives only an
+    effective size (`gemma-3n-e4b`) is sized by it. The active part is the `a`-prefixed count of a mixture of
+    experts."""
+    name = str(model or "")
     sizes = []
-    for experts, number, unit in _SIZE.findall(str(model or "")):
+    for experts, number, unit in _SIZE.findall(name):
+        if unit.lower() == "m" and float(number) < _MIN_MILLIONS:
+            continue
         size = float(number) * _UNIT[unit.lower()] * (int(experts) if experts else 1)
         if size > 0:
             sizes.append(size)
-    return max(sizes) if sizes else None
+    total = max(sizes) if sizes else None
+    if total is None:
+        effective = [float(n) for n in _EFFECTIVE.findall(name) if float(n) > 0]
+        total = max(effective) if effective else None
+    active = [float(n) for n in _ACTIVE.findall(name) if float(n) > 0]
+    return total, (max(active) if active else None)
 
 
-def detect(model: str) -> Detection:
-    """The output limits for a served model id, and how they were found."""
+def parameter_count(model: str) -> float | None:
+    """Billions of parameters named in a model id (the total), or None."""
+    return parameter_counts(model)[0]
+
+
+# What a name says about thinking. A name that says neither is unknown, not "no": most model names do not say.
+_NOT_THINKING = re.compile(r"no[\s_-]?think|non[\s_-]?(?:thinking|reasoning)|instruct[\s_-]?2507", re.IGNORECASE)
+_THINKING = re.compile(r"think|reason(?:ing|er)?(?![a-z])|(?<![a-z0-9])r1(?![0-9])|(?<![a-z])qwq(?![a-z])",
+                       re.IGNORECASE)
+
+
+def thinking_from_name(model: str) -> bool | None:
+    """True when the name says the model reasons first, False when it says it does not, else None."""
     name = str(model or "")
+    if _NOT_THINKING.search(name):
+        return False
+    if _THINKING.search(name):
+        return True
+    return None
+
+
+def detect(model: str, thinking: bool | None = None, thinking_source: str = "") -> Detection:
+    """The output limits for a served model id, and what is known about it.
+
+    `thinking`, with its source, is what the caller learned elsewhere (the user's setting, the endpoint, the
+    replies); it is used when the known model or the name does not already say."""
+    name = str(model or "")
+    total, active = parameter_counts(name)
     for known in KNOWN_MODELS:
         if known.pattern.search(name):
-            return Detection(known.profile, "known", known.name, parameter_count(name))
-    size = parameter_count(name)
-    if size is None:
-        return Detection(fallback(QWEN38_27B), "unknown size", "no size in the name", None)
-    if size > SMALL_MODEL_MAX_B:
-        return Detection(fallback(QWEN38_27B), "size", "larger than 15B", size)
-    return Detection(fallback(GEMMA4_12B), "size", "15B or smaller", size)
+            return Detection(known.profile, "known", known.name, total, active, known.thinking, "known")
+    named = thinking_from_name(name)
+    if named is not None:
+        thinking, thinking_source = named, "name"
+    elif thinking is None:
+        thinking_source = "unknown"
+    if total is None:
+        return Detection(fallback(QWEN38_27B), "unknown size", "no size in the name", None, active,
+                         thinking, thinking_source or "unknown")
+    if total > SMALL_MODEL_MAX_B:
+        return Detection(fallback(QWEN38_27B), "size", "larger than 15B", total, active, thinking,
+                         thinking_source or "unknown")
+    return Detection(fallback(GEMMA4_12B), "size", "15B or smaller", total, active, thinking,
+                     thinking_source or "unknown")
 
 
 def fallback(profile: OutputProfile) -> OutputProfile:
@@ -109,10 +168,20 @@ def fallback(profile: OutputProfile) -> OutputProfile:
                          False, f"uncalibrated: the limits of {profile.note.split(' on ')[0]}")
 
 
+def _size_text(detection: Detection) -> str:
+    if detection.size_b is None:
+        return "size unknown"
+    text = f"{detection.size_b:g}B"
+    return text + (f", {detection.active_b:g}B active" if detection.active_b else "")
+
+
 def describe(model: str, detection: Detection) -> str:
-    """One line for the log and the trace."""
+    """One line for the log and the trace: the model, its size, whether it thinks, and the cap that follows."""
     profile = detection.profile
-    how = (f"known model {detection.matched}" if detection.source == "known"
-           else f"{detection.matched}" + (f" ({detection.size_b:g}B)" if detection.size_b else ""))
-    return (f"output limits for {model or 'the model'}: {profile.thinking_cap} tokens with thinking, "
-            f"{profile.nonthinking_cap} without ({how}{'' if profile.calibrated else ', uncalibrated'})")
+    how = f"known model {detection.matched}" if detection.source == "known" else detection.matched
+    thinks = {True: "thinks", False: "does not think", None: "thinking unknown"}[detection.thinking]
+    if detection.thinking is not None and detection.thinking_source not in ("known", "unknown"):
+        thinks += f" (from the {detection.thinking_source})"
+    return (f"output limits for {model or 'the model'}: {detection.cap()} tokens per call, {profile.nonthinking_cap} "
+            f"with thinking off ({how}; {_size_text(detection)}; {thinks}"
+            f"{'' if profile.calibrated else '; uncalibrated'})")
