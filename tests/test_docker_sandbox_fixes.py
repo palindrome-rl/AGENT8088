@@ -264,3 +264,33 @@ def test_the_managed_search_still_starts_docker_desktop(engine, monkeypatch, tmp
     started.clear()
     monkeypatch.setitem(engine.APP_CONFIG, "docker_autostart", "0")
     assert engine._start_docker_desktop(sleep=lambda s: None, purpose="searxng") is False and not started
+
+
+
+def test_a_host_allowed_this_session_reaches_docker(docker_engine, monkeypatch):
+    engine = docker_engine
+    monkeypatch.setattr(engine, "_session_allowed_hosts", [])
+    before = engine._docker_egress_key(engine._docker_allowed_domains())
+    engine.grant_escalation("sandbox_host:api.example.com", "api.example.com")
+    assert "api.example.com" in engine._docker_allowed_domains()
+    assert engine._docker_egress_key(engine._docker_allowed_domains()) != before
+
+
+def test_docker_commands_share_the_package_caches(engine, run, tmp_path):
+    argv = run(tmp_path / "ws")
+    cache = str((tmp_path / "data" / "sandbox-cache").resolve())
+    assert f"type=bind,src={cache},dst=/cache" in argv
+    assert "PIP_CACHE_DIR=/cache/pip" in argv and "npm_config_cache=/cache/npm" in argv
+
+
+def test_a_read_only_docker_run_gets_no_cache(engine, tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(engine, "_docker_sandbox_broken", False)
+    monkeypatch.setattr(engine, "_ensure_docker_image", lambda image: "")
+    monkeypatch.setattr(engine, "_sandbox_image", lambda: "img")
+    monkeypatch.setattr(engine, "_docker_egress_args", lambda: ("none", []))
+    monkeypatch.setattr(engine, "_clean_stale_docker_sandbox", lambda: None)
+    monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "data")
+    monkeypatch.setattr(engine, "_exec_process", lambda argv, timeout=25: seen.setdefault("argv", argv) and "ok")
+    engine._exec_docker_command("ls", 10, workspace=tmp_path / "ws", readonly=True)
+    assert not any("dst=/cache" in part for part in seen["argv"])
