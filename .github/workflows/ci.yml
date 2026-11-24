@@ -120,10 +120,12 @@ jobs:
           npm install -g "@anthropic-ai/sandbox-runtime@${version}"
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update -q && sudo apt-get install -y -q bubblewrap socat ripgrep
-            # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor: bubblewrap needs
-            # them, and srt's seccomp helper needs a nested one, which the second switch also limits.
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 || true
+            # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. Ubuntu's way to let
+            # one program use them is a profile for it; this is the one install.sh suggests.
+            printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+              'profile agent8088-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' \
+              '  include if exists <local/agent8088-bwrap>' '}' | sudo tee /etc/apparmor.d/agent8088-bwrap >/dev/null
+            sudo apparmor_parser -r /etc/apparmor.d/agent8088-bwrap
           else
             brew install ripgrep
           fi
