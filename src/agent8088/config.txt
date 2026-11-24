@@ -281,7 +281,14 @@ sandbox_runtime_version=0.0.73
 # code the model runs cannot read a token set in your shell. Name any a task
 # really needs inside the sandbox here.
 # sandbox_pass_env=GITHUB_TOKEN
-# sandbox_allowed_domains=api.example.com
+# Hosts sandboxed commands may reach. With no line here they get `default`: the
+# common package registries and code hosts (PyPI, npm, GitHub, crates.io, ...), so
+# installs and clones work. Add your own after it, or set `none` to close the network.
+# sandbox_allowed_domains=default,api.example.com
+# When a command is refused a host, the model is told which one. In an interactive
+# session you are also asked once whether to allow it for the session; set 0 to
+# never ask.
+# sandbox_ask_hosts=1
 # `open` lets sandboxed commands reach anything this computer can: the internet,
 # its own services (mail, databases, dev servers on localhost) and the local
 # network. File-write limits still apply. In auto mode, Linux/macOS commands

@@ -11,10 +11,10 @@ import pytest
 from agent8088 import capabilities, egress_proxy
 
 
-def test_network_closed_unless_configured(engine):
-    assert engine._sandbox_allowed_domains({}) == []
+def test_no_setting_means_the_registry_preset_and_none_closes_it(engine):
+    assert engine._sandbox_allowed_domains({}) == list(engine._DEFAULT_SANDBOX_ALLOWED_DOMAINS)
+    assert engine._sandbox_allowed_domains({"sandbox_allowed_domains": "none"}) == []
     assert engine.DOCKER_NETWORK == "none"
-    assert engine._docker_egress_args() == ("none", [])
 
 
 def test_default_keyword_opts_into_the_builtin_list(engine):
