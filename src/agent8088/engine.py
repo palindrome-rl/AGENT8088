@@ -20683,8 +20683,11 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
         missing = _missing_required_files(trajectory, reply, request)
         if missing:
             reasons.append("missing or empty files: " + ", ".join(missing[:6]))
-        leaked = secret_scan.scan_files(trajectory.secrets_unchecked(
-            _secret_scan_paths(trajectory, trajectory.written_paths())))
+        # Only strings that carry a digit or a known key prefix end the run unverified. One that only looks like a key
+        # (words, no digit) is what the in-run check asks about once and then takes as the model's answer; it was
+        # never a reason for the headline there, and is not one here, where that question is skipped.
+        leaked = [hit for hit in secret_scan.scan_files(trajectory.secrets_unchecked(
+            _secret_scan_paths(trajectory, trajectory.written_paths()))) if not hit[2].weak]
         if leaked:
             names = sorted({Path(path).name for path, _l, _f in leaked})
             reasons.append("a credential is written in clear text in: "
