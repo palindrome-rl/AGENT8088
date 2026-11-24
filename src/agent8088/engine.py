@@ -12556,6 +12556,12 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                     + (",readonly" if readonly else "")),
     ]
     if not readonly:
+        # The same package caches the native sandbox keeps, mounted at /cache, so a
+        # second install in Docker does not download everything again.
+        cache = _sandbox_cache_dir()
+        argv.extend(["--mount", f"type=bind,src={cache},dst=/cache"])
+        for name, folder in _SANDBOX_CACHE_VARS:
+            argv.extend(["-e", f"{name}=/cache/{folder}"])
         # The project's repository metadata stays read-only inside a writable mount.
         for protected in _protected_repo_paths(workspace_path):
             argv.extend(["--mount", f"type=bind,src={protected},dst=/workspace/.git,readonly"])
@@ -12635,9 +12641,11 @@ def _docker_network_mode() -> str:
 def _docker_allowed_domains() -> list:
     """The hosts the Docker proxy allows: sandbox_allowed_domains when it is set,
     the registry preset when no line sets it (as the native sandbox gets)."""
-    if "sandbox_allowed_domains" in APP_CONFIG:
-        return list(SANDBOX_ALLOWED_DOMAINS)
-    return list(dict.fromkeys([*SANDBOX_ALLOWED_DOMAINS, *_DEFAULT_SANDBOX_ALLOWED_DOMAINS]))
+    base = (list(SANDBOX_ALLOWED_DOMAINS) if "sandbox_allowed_domains" in APP_CONFIG
+            else [*SANDBOX_ALLOWED_DOMAINS, *_DEFAULT_SANDBOX_ALLOWED_DOMAINS])
+    # Hosts the user allowed this session reach Docker too: a changed list gets its own
+    # proxy (the proxy's name is the list's hash), started on the next command.
+    return list(dict.fromkeys([*base, *_session_allowed_hosts]))
 
 
 def _docker_egress_key(domains) -> str:
