@@ -126,7 +126,9 @@ Used automatically under `auto` when native isolation is missing or cannot run.
 - **Clean-up.** At the first command of a session, containers left by an
   Agent8088 process that has ended, and proxies for an allowlist that is no
   longer configured, are removed.
-- **Docker Desktop** is not started for you unless `docker_autostart=1`.
+- **Docker Desktop** is not started for the sandbox unless `docker_autostart=1` (the managed SearXNG still starts it unless `docker_autostart=0`).
+- **Many secret files.** A folder with four or more secret-looking files (a `certs/` or test-fixture folder) is covered with an empty folder as a whole, so its other files are hidden too. More than 200 masks in one project stops the command rather than running it unmasked.
+- **Pinned images.** The fallback and proxy images are pinned by digest.
 
 Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that

@@ -57,7 +57,7 @@ jobs:
         shell: bash
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
-            grep -q "blocks unprivileged user namespaces" "$RUNNER_TEMP/install.log"
+            grep -q "restricts unprivileged user namespaces" "$RUNNER_TEMP/install.log"
           fi
       - name: Check the installed sandbox
         shell: bash

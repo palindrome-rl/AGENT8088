@@ -278,10 +278,10 @@ sandbox_runtime_version=0.0.73
 # Off by default: a command steered by a malicious page or email could send
 # project files anywhere.
 # sandbox_network=open
-# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running,
-# for the sandbox fallback or the managed SearXNG. Off by default: start Docker
-# Desktop yourself, or set 1 to let Agent8088 start it.
-# docker_autostart=0
+# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running.
+# For the sandbox fallback it is off unless this is 1; for the managed SearXNG you
+# set up with /search setup it is on unless this is 0.
+# docker_autostart=
 # The Docker fallback runs commands in Agent8088's sandbox image (Python, Node,
 # git), or python:3.11-slim when that cannot be pulled. Set an image to use it
 # instead. With no docker_network line, Docker used in place of a missing native

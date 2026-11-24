@@ -10968,7 +10968,8 @@ def _exec_browser(args: dict) -> str:
 # no network, a registry that refuses it -- the plain Python image is used, as
 # before. docker_image in config.txt picks any other image, with no fallback.
 _SANDBOX_IMAGE = "ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0"
-_SANDBOX_IMAGE_FALLBACK = "python:3.11-slim"
+# Pinned by digest: a tag can be moved to other content, a digest cannot.
+_SANDBOX_IMAGE_FALLBACK = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
 DOCKER_IMAGE_CONFIGURED = bool(str(APP_CONFIG.get("docker_image", "")).strip())
 DOCKER_IMAGE = str(APP_CONFIG.get("docker_image", "")).strip() or _SANDBOX_IMAGE
 GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
@@ -10997,7 +10998,7 @@ def _open_docker_network() -> str:
 
 if SANDBOX_NETWORK_OPEN:
     DOCKER_NETWORK = _open_docker_network()
-_EGRESS_PROXY_IMAGE = "python:3.11-slim"
+_EGRESS_PROXY_IMAGE = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
@@ -11251,13 +11252,17 @@ _DOCKER_DESKTOP_APPS = {
 _docker_start_lock = threading.Lock()
 
 
-def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep) -> bool:
-    """Make sure the Docker daemon answers, launching Docker Desktop if needed."""
+def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep, purpose: str = "sandbox") -> bool:
+    """Make sure the Docker daemon answers, launching Docker Desktop if needed.
+
+    For the sandbox fallback this is off unless docker_autostart=1: a sandbox the user
+    did not set up should not start a desktop application. For the managed SearXNG
+    that the user set up with /search setup it stays on unless docker_autostart=0, as
+    before, so web search comes back after a restart."""
     if _docker_available():
         return True
-    # Off unless asked for: starting a desktop application is a change on the
-    # user's computer that a shell command they never saw should not make.
-    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", "0")
+    default = "1" if purpose == "searxng" else "0"
+    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", default)
     if str(setting).strip() == "0" or not _which_executable("docker"):
         return False
     app = next((p for p in _DOCKER_DESKTOP_APPS.get(sys.platform, []) if p.exists()), None)
@@ -12197,6 +12202,10 @@ def _git_config_has_credentials(path: Path) -> bool:
 
 
 _docker_stale_cleaned = False
+# Masking: a folder with at least this many secret-looking files is covered whole,
+# and at most this many mounts are added (each is one argument on the command line).
+_MASK_FOLDER_AT = 4
+_MASK_MAX_MOUNTS = 200
 
 
 def _other_agent8088_running(psutil) -> bool:
@@ -12308,7 +12317,9 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     # test keys and certificates, not the user's. build/ and dist/ are, since a
     # build can copy a .env into them, and so is a .git/config holding a token.
     package_dirs = {".venv", "venv", "node_modules", "__pycache__"}
-    sensitive_mounts = 0
+    empty_dir = _agent_data_dir() / "sandbox-empty-dir"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    masks = []   # (path, is a folder)
     for root, dirs, files in os.walk(workspace_path):
         if ".git" in dirs:
             dirs.remove(".git")
@@ -12316,18 +12327,25 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             if _git_config_has_credentials(git_config):
                 files = [*files, str(Path(".git") / "config")]
         dirs[:] = [name for name in dirs if name not in package_dirs]
-        for filename in files:
-            path = Path(root) / filename
-            if not (_is_sensitive_path(str(path)) or path.parts[-2:] == (".git", "config")):
-                continue
-            sensitive_mounts += 1
-            if sensitive_mounts > 128:
-                return "Error: too many sensitive workspace files to mask safely."
-            relative = path.relative_to(workspace_path).as_posix()
-            destination = f"/workspace/{relative}"
-            argv.extend([
-                "--mount", f"type=bind,src={empty},dst={destination},readonly",
-            ])
+        hits = [Path(root) / name for name in files
+                if _is_sensitive_path(str(Path(root) / name)) or (Path(root) / name).parts[-2:] == (".git", "config")]
+        if not hits:
+            continue
+        # A folder of keys or certificates (test fixtures, a certs/ folder) is covered
+        # with an empty folder as a whole: one mount instead of one per file, so a
+        # project with many of them is still masked and can still run.
+        if len(hits) >= _MASK_FOLDER_AT and Path(root) != workspace_path:
+            masks.append((Path(root), True))
+            dirs[:] = []
+        else:
+            masks.extend((path, False) for path in hits)
+    if len(masks) > _MASK_MAX_MOUNTS:
+        return (f"Error: more than {_MASK_MAX_MOUNTS} secret files or folders to mask in {workspace_path}, so the "
+                "Docker sandbox cannot cover them all safely. Nothing was run.")
+    for path, folder in masks:
+        relative = path.relative_to(workspace_path).as_posix()
+        source = empty_dir if folder else empty
+        argv.extend(["--mount", f"type=bind,src={source},dst=/workspace/{relative},readonly"])
     if sys.platform.startswith("linux") and hasattr(os, "getuid"):
         # Files the command writes belong to the user, not root. Docker Desktop
         # (macOS, Windows) maps ownership itself.
@@ -17902,7 +17920,7 @@ def _revive_managed_searxng(wait=None) -> bool:
     """
     from agent8088 import searxng_provision
     url = urllib.parse.urlparse(str(_search_config().get("search_base_url") or ""))
-    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop():
+    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop(purpose="searxng"):
         return False
     if not searxng_provision.status().get("running") and not searxng_provision.resume():
         return False

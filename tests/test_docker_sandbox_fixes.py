@@ -89,7 +89,7 @@ def test_the_sandbox_image_falls_back_when_it_cannot_be_pulled(engine, monkeypat
     monkeypatch.setattr(engine, "DOCKER_IMAGE", engine._SANDBOX_IMAGE)
     monkeypatch.setattr(engine, "_sandbox_image_chosen", "")
     monkeypatch.setattr(engine, "_ensure_docker_image", lambda image: "pull refused")
-    assert engine._sandbox_image() == "python:3.11-slim"
+    assert engine._sandbox_image() == engine._SANDBOX_IMAGE_FALLBACK
     monkeypatch.setattr(engine, "_sandbox_image_chosen", "")
     monkeypatch.setattr(engine, "_ensure_docker_image", lambda image: "")
     assert engine._sandbox_image() == engine._SANDBOX_IMAGE
@@ -216,3 +216,51 @@ def test_another_session_is_recognised(engine, monkeypatch):
     assert engine._other_agent8088_running(psutil) is True
     monkeypatch.setattr(psutil, "process_iter", lambda attrs: iter(procs[:1]))
     assert engine._other_agent8088_running(psutil) is False
+
+
+def test_a_folder_of_keys_is_masked_as_one(run, tmp_path):
+    ws = tmp_path / "ws"
+    certs = ws / "tests" / "certs"
+    certs.mkdir(parents=True)
+    for n in range(6):
+        (certs / f"key{n}.pem").write_text("x", encoding="utf-8")
+    (ws / ".env").write_text("x", encoding="utf-8")
+    argv = run(ws)
+    mounts = [p for p in argv if "sandbox-empty" in p]
+    assert any("sandbox-empty-dir" in p and p.endswith("dst=/workspace/tests/certs,readonly") for p in mounts)
+    assert any(p.endswith("dst=/workspace/.env,readonly") and "sandbox-empty-dir" not in p for p in mounts)
+    assert len(mounts) == 2
+
+
+def test_too_many_to_mask_is_refused_not_run(engine, run, tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "_MASK_MAX_MOUNTS", 3)
+    ws = tmp_path / "ws"
+    for n in range(5):
+        (ws / f"d{n}").mkdir(parents=True)
+        (ws / f"d{n}" / ".env").write_text("x", encoding="utf-8")
+    seen = {}
+    monkeypatch.setattr(engine, "_exec_process", lambda argv, timeout=25: seen.setdefault("argv", argv) and "ok")
+    out = engine._exec_docker_command("ls", 10, workspace=ws)
+    assert out.startswith("Error: more than 3 secret files") and "argv" not in seen
+
+
+def test_the_fallback_and_proxy_images_are_pinned(engine):
+    for image in (engine._SANDBOX_IMAGE_FALLBACK, engine._EGRESS_PROXY_IMAGE):
+        assert "@sha256:" in image and engine._DOCKER_IMAGE_RE.fullmatch(image)
+
+
+def test_the_managed_search_still_starts_docker_desktop(engine, monkeypatch, tmp_path):
+    started = []
+    monkeypatch.delenv("AGENT8088_DOCKER_AUTOSTART", raising=False)
+    monkeypatch.delitem(engine.APP_CONFIG, "docker_autostart", raising=False)
+    monkeypatch.setattr(engine, "_docker_available", lambda: bool(started))
+    monkeypatch.setattr(engine, "_which_executable", lambda name: "docker")
+    app = tmp_path / "Docker Desktop.exe"
+    app.write_text("", encoding="utf-8")
+    monkeypatch.setitem(engine._DOCKER_DESKTOP_APPS, engine.sys.platform, [app])
+    monkeypatch.setattr(engine.subprocess, "Popen", lambda *a, **k: started.append(a))
+    assert engine._start_docker_desktop(sleep=lambda s: None) is False and not started
+    assert engine._start_docker_desktop(sleep=lambda s: None, purpose="searxng") is True and started
+    started.clear()
+    monkeypatch.setitem(engine.APP_CONFIG, "docker_autostart", "0")
+    assert engine._start_docker_desktop(sleep=lambda s: None, purpose="searxng") is False and not started
