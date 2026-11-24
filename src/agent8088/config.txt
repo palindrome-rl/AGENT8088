@@ -276,6 +276,11 @@ sandbox_runtime_version=0.0.73
 # starts them in artifacts/, the project folder only after a file you named there
 # was written.
 # shell_workspace=project
+# Services: service_start runs a long-lived process the task needs (a dev server,
+# an API) in the sandbox and keeps it running, reachable from this computer on
+# 127.0.0.1 (on Docker and Linux only there; on Windows native and macOS a service
+# that binds 0.0.0.0 is reachable from the network). 0 turns the tools off.
+# services=1
 # Variables that look like secrets (names with TOKEN, SECRET, PASSWORD, API_KEY,
 # CREDENTIALS, ...) are removed from the environment of sandboxed commands, so
 # code the model runs cannot read a token set in your shell. Name any a task

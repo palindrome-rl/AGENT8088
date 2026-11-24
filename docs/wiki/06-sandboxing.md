@@ -114,6 +114,33 @@ data folder or a drive root, commands use `artifacts/` instead.
 `shell_workspace=artifacts` always starts them in `artifacts/`, and in the project
 folder only after a file you named there was written.
 
+## Services
+
+A shell command ends with the command that started it, so a server started by one
+command is gone before the next one can test it. `service_start` runs a command in
+the same sandbox a shell command would, keeps it running, and waits until it
+answers on its port; `service_status`, `service_logs` and `service_stop` manage it.
+
+- **Port.** `{port}` in the command is replaced with a free port, also in `PORT`.
+  The service is reached from this computer at `http://127.0.0.1:<port>/`. On
+  Docker and Linux nothing else can reach it. On Windows native and macOS the
+  service binds its own address: the model is told to bind `127.0.0.1`, but a
+  service that binds `0.0.0.0` there is reachable from the local network.
+- **How the port gets out of the sandbox:**
+  - Windows native and macOS: directly (the Windows runner does not isolate the
+    network; on macOS the sandbox may listen on local ports).
+  - Docker: the service stays on its own network (the allowlist network, or an
+    internal one with no way out under `docker_network=none`), and a small relay
+    container publishes that one port on `127.0.0.1`.
+  - Linux (srt): every command has its own network namespace, so the port is
+    bridged out through a unix socket. Unix sockets are allowed for that service
+    only, with the container engines', the system and session buses' and the
+    user runtime folder's sockets hidden from it.
+- **Limits.** At most four at once. Each belongs to the agent that started it.
+  All stop when the session ends; a session that crashed leaves a record, and the
+  next one stops what it left running.
+- `services=0` turns the tools off.
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run.
