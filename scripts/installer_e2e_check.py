@@ -10,7 +10,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-from agent8088 import engine
+# An ordinary folder (not owner-only like mkdtemp), and the engine started from inside it,
+# as a user starts agent8088 in their project: the project folder is then the allowed one.
+project = Path(tempfile.gettempdir()) / f"agent8088-e2e-{os.getpid()}"
+(project / "artifacts").mkdir(parents=True, exist_ok=True)
+subprocess.run(["git", "init", "-q", str(project)], check=True)
+(project / "build.py").write_text("import os\nos.makedirs('out', exist_ok=True)\n"
+                                  "open(os.path.join('out', 'app.txt'), 'w').write('built')\n", encoding="utf-8")
+os.chdir(project)
+
+from agent8088 import engine  # noqa: E402
 
 failures = []
 
@@ -32,15 +41,8 @@ if backend not in ("native", "docker"):
     sys.exit(1)
 windows_native = backend == "native" and sys.platform == "win32"
 
-# An ordinary folder (not owner-only like mkdtemp), as a user's project would be.
-project = Path(tempfile.gettempdir()) / f"agent8088-e2e-{os.getpid()}"
-(project / "artifacts").mkdir(parents=True, exist_ok=True)
-subprocess.run(["git", "init", "-q", str(project)], check=True)
-(project / "build.py").write_text("import os\nos.makedirs('out', exist_ok=True)\n"
-                                  "open(os.path.join('out', 'app.txt'), 'w').write('built')\n", encoding="utf-8")
-engine.PROJECT_ROOT = project
-engine.ARTIFACTS_ROOT = project / "artifacts"
 engine.reset_turn_counters()
+print("project:", engine.PROJECT_ROOT, "| shell folder:", engine._shell_workspace_root)
 python = "python" if backend == "docker" else f'"{sys.executable}"'
 os.environ["E2E_SERVICE_TOKEN"] = "e2e-secret-value"
 

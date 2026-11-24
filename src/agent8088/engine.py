@@ -1309,6 +1309,9 @@ _sandbox_readonly = False
 # and never a folder that holds the user's home (see _project_shell_root).
 SHELL_WORKSPACE = str(APP_CONFIG.get("shell_workspace", "project")).strip().lower() or "project"
 _shell_workspace_root = None
+# A read-only run's copy source when it is not the shell's folder (a smoke test of a
+# script in a project too large to copy whole copies the script's folder).
+_readonly_copy_source = None
 
 
 def _project_shell_root():
@@ -11573,15 +11576,39 @@ def _existing_secret_files(roots: list) -> list:
     return found
 
 
+# Nested repositories (submodules, vendored checkouts) have their own .git with their
+# own hooks, which git runs when it works in them. The search for them is bounded and
+# kept for a short while, since the settings are written for every command.
+_NESTED_REPO_MAX_ENTRIES = 20000
+_NESTED_REPO_MAX = 64
+_NESTED_REPO_SKIP = frozenset(("node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache",
+                               "dist", "build", "artifacts", ".git"))
+_nested_repo_cache: dict = {}   # resolved folder -> (monotonic time, [paths])
+
+
 def _protected_repo_paths(workspace) -> list:
-    """The repository metadata inside a writable shell folder: `.git` (a folder, or
-    the file a linked worktree has instead). Shell commands may not change it --
-    git runs its hooks and reads its config on this computer, outside any sandbox."""
+    """The repository metadata inside a writable shell folder: its `.git` (a folder, or
+    the file a linked worktree has instead) and those of repositories nested in it.
+    Shell commands may not change them -- git runs their hooks and reads their config
+    on this computer, outside any sandbox."""
     try:
-        candidate = Path(workspace).resolve() / ".git"
+        root = Path(workspace).resolve()
     except (OSError, RuntimeError, TypeError):
         return []
-    return [candidate] if candidate.exists() else []
+    cached = _nested_repo_cache.get(root)
+    if cached and time.monotonic() - cached[0] < 30:
+        return [p for p in cached[1] if p.exists()]
+    found = [root / ".git"] if (root / ".git").exists() else []
+    seen = 0
+    for current, dirs, files in os.walk(root):
+        seen += len(dirs) + len(files)
+        if Path(current) != root and (".git" in dirs or ".git" in files):
+            found.append(Path(current) / ".git")
+        dirs[:] = [d for d in dirs if d not in _NESTED_REPO_SKIP]
+        if seen > _NESTED_REPO_MAX_ENTRIES or len(found) >= _NESTED_REPO_MAX:
+            break
+    _nested_repo_cache[root] = (time.monotonic(), found)
+    return found
 
 
 # The Windows runner grants one folder and cannot deny part of it, so a command
@@ -12313,11 +12340,12 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         wrapped = _native_sandbox_shell_argv(command, cwd=None if readonly else cwd)
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
                             "--mode", mode, "--"] + wrapped
-        guarded = None if readonly else _git_guard_snapshot(cwd)
+        guarded = [] if readonly else [(git.parent, _git_guard_snapshot(git.parent))
+                                       for git in _protected_repo_paths(cwd) if git.is_dir()]
         if _spawn_service is not None:
             return _spawn_service(full_argv)
         result = _exec_process(full_argv, timeout=timeout)
-        note = _git_guard_restore(cwd, guarded)
+        note = "".join(_git_guard_restore(repo, saved) for repo, saved in guarded)
         return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
     if _spawn_service is not None:
@@ -12950,7 +12978,11 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
             argv.extend(["-e", f"{name}=/cache/{folder}"])
         # The project's repository metadata stays read-only inside a writable mount.
         for protected in _protected_repo_paths(workspace_path):
-            argv.extend(["--mount", f"type=bind,src={protected},dst=/workspace/.git,readonly"])
+            try:
+                inside = protected.relative_to(workspace_path).as_posix()
+            except ValueError:
+                continue
+            argv.extend(["--mount", f"type=bind,src={protected},dst=/workspace/{inside},readonly"])
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
@@ -13507,7 +13539,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     if _sandbox_readonly:
         # The copy is of the folder the caller's shell works in: a pinned explore
         # sent to look at the project must see the project, not artifacts/.
-        source = Path(_shell_workspace_root) if _shell_workspace_root is not None else ARTIFACTS_ROOT
+        source = Path(_readonly_copy_source or _shell_workspace_root or ARTIFACTS_ROOT)
         ignore = _audit_copy_ignore(shutil.ignore_patterns(*_READONLY_COPY_SKIP))
         too_large = _readonly_copy_too_large(source, ignore)
         if too_large:
@@ -21307,16 +21339,26 @@ def _smoke_script_runner(target):
         return None
 
     def run(command: str, timeout: int) -> str:
-        global _sandbox_readonly
+        global _sandbox_readonly, _readonly_copy_source
+        here = resolved.parent
+        # A read-only run works on a copy of the shell's folder. When that is the whole
+        # project and too large to copy, the script's own folder is copied instead, so a
+        # large project still gets its scripts started rather than an error.
+        copy_root = root
+        ignore = _audit_copy_ignore(shutil.ignore_patterns(*_READONLY_COPY_SKIP))
+        if _readonly_copy_too_large(root, ignore) and not _readonly_copy_too_large(here, ignore):
+            copy_root = here
         previous, _sandbox_readonly = _sandbox_readonly, True
+        previous_source, _readonly_copy_source = _readonly_copy_source, copy_root
         try:
-            here = resolved.parent
-            prefix = _smoke_cd_prefix(here, relative,
+            # The folder to start in, relative to the copy: the script's folder.
+            prefix = _smoke_cd_prefix(here, here.relative_to(copy_root),
                                       sys.platform == "win32" and backend == "native"
                                       and _native_sandbox_ready(root, readonly=True))
             return _run_sandbox_command(prefix + command, timeout)
         finally:
             _sandbox_readonly = previous
+            _readonly_copy_source = previous_source
     return run
 
 
