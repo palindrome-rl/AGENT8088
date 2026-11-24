@@ -70,14 +70,21 @@ else:
     probe = ("import urllib.request as u, sys\n"
              "try:\n    print('STATUS', u.urlopen(sys.argv[1], timeout=20).status)\n"
              "except Exception as e:\n    print('REFUSED', type(e).__name__)\n")
-    (project / "probe.py").write_text(probe, encoding="utf-8")
+    # The shell's own folder: the project, or artifacts/ on a build where commands start there.
+    shell_folder = Path(engine._shell_workspace_root or engine.ARTIFACTS_ROOT)
+    shell_folder.mkdir(parents=True, exist_ok=True)
+    (shell_folder / "probe.py").write_text(probe, encoding="utf-8")
+
+    def ran(out):
+        return "STATUS" in out or "REFUSED" in out
+
     if "pypi.org" in str(status.get("network")):
         out = run(f"{python} probe.py https://pypi.org/simple/six/")
         check("PyPI is reachable through the allowlist", "STATUS 200" in out, out.strip()[-200:])
     out = run(f"{python} probe.py https://example.com/")
-    check("a host off the allowlist is refused", "STATUS" not in out, out.strip()[-200:])
+    check("a host off the allowlist is refused", ran(out) and "STATUS" not in out, out.strip()[-200:])
     out = run(f"{python} probe.py http://169.254.169.254/latest/meta-data/")
-    check("the metadata address is refused", "STATUS" not in out, out.strip()[-200:])
+    check("the metadata address is refused", ran(out) and "STATUS" not in out, out.strip()[-200:])
 
 print(f"{len(failures)} failed" + (f": {', '.join(failures)}" if failures else ""))
 sys.exit(1 if failures else 0)
