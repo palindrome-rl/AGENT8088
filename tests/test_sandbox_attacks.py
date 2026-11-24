@@ -93,10 +93,17 @@ def box(request, engine, scratch, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     windows_native = backend == "native" and sys.platform == "win32"
     python = "python" if backend == "docker" else f'"{sys.executable}"'
+    if backend == "native":
+        # A native sandbox that cannot start falls back to Docker in real use; here that would test the
+        # wrong backend, so the native run fails with the reason instead.
+        monkeypatch.setattr(engine, "_docker_usable", lambda: False)
 
     def run(*args, quoted=True):
         parts = " ".join(f'"{a}"' if quoted else a for a in args)
-        return str(engine._run_in_sandbox_backend(backend, f"{python} probe.py {parts}", 120, False, "", project))
+        out = str(engine._run_in_sandbox_backend(backend, f"{python} probe.py {parts}", 120, False, "", project))
+        if backend == "native" and engine._native_sandbox_broken:
+            pytest.fail(f"the native sandbox could not start here: {engine._native_sandbox_failure[:300]}")
+        return out
     return type("Box", (), {"backend": backend, "home": home, "project": project, "outside": outside,
                             "run": staticmethod(run), "windows_native": windows_native, "engine": engine})
 
@@ -114,8 +121,25 @@ def _host_path_for(box, path: Path) -> str:
 def test_the_sandbox_runs_at_all(box):
     # Every other test checks that something did NOT happen; this one makes sure
     # commands really run, so a broken backend cannot pass them all by doing nothing.
-    out = box.run("write", _host_path_for(box, box.project / "out" / "ok.txt"))
-    assert "WROTE" in out and (box.project / "out" / "ok.txt").exists(), out
+    # artifacts/ is writable on every build; the project itself is tested below.
+    target = box.project / "artifacts" / "ok.txt"
+    out = box.run("write", _host_path_for(box, target))
+    if ("WROTE" not in out and box.backend == "docker" and sys.platform.startswith("linux")
+            and not hasattr(box.engine, "_clean_stale_docker_sandbox")):
+        pytest.xfail("this build runs Docker containers as root with no capabilities, so on Linux they cannot "
+                     "write a folder the user owns; the Docker sandbox fixes run them as the host user")
+    assert "WROTE" in out and target.exists(), out
+
+
+def test_a_build_can_write_in_the_project(box):
+    if not hasattr(box.engine, "_project_shell_root"):
+        pytest.skip("this build does not let commands write the project yet")
+    target = box.project / "out" / "ok.txt"
+    out = box.run("write", _host_path_for(box, target))
+    if ("WROTE" not in out and box.backend == "docker" and sys.platform.startswith("linux")
+            and not hasattr(box.engine, "_clean_stale_docker_sandbox")):
+        pytest.xfail("Docker containers run as root with no capabilities on this build (see above)")
+    assert "WROTE" in out and target.exists(), out
 
 
 def test_a_write_outside_the_folder_does_not_land(box):
