@@ -11044,12 +11044,24 @@ def _exec_browser(args: dict) -> str:
 # ---------------------------------------------------------------------------
 # Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
-DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+# The image sandboxed commands run in: Agent8088's own (docker/sandbox.Dockerfile:
+# Python, Node and git), published with each release. Until it can be pulled --
+# no network, a registry that refuses it -- the plain Python image is used, as
+# before. docker_image in config.txt picks any other image, with no fallback.
+_SANDBOX_IMAGE = "ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0"
+# Pinned by digest: a tag can be moved to other content, a digest cannot.
+_SANDBOX_IMAGE_FALLBACK = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
+DOCKER_IMAGE_CONFIGURED = bool(str(APP_CONFIG.get("docker_image", "")).strip())
+DOCKER_IMAGE = str(APP_CONFIG.get("docker_image", "")).strip() or _SANDBOX_IMAGE
 GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
-# docker_network=none (the default) gives the container no network.
-# `allowlist` puts it on an --internal network whose only way out is a proxy
-# container enforcing sandbox_allowed_domains, the list the native runtime
-# enforces. Any other value is passed to `docker run --network` unfiltered.
+# docker_network=none gives the container no network. `allowlist` puts it on an
+# --internal network whose only way out is a proxy container enforcing
+# sandbox_allowed_domains, the list the native runtime enforces. Any other value
+# is passed to `docker run --network` unfiltered. With no docker_network line,
+# Docker chosen automatically (the native sandbox is missing) gets `allowlist`
+# with the registry preset, so installs work the way they do natively; Docker
+# chosen with sandbox_backend=docker keeps `none`.
+DOCKER_NETWORK_CONFIGURED = bool(str(APP_CONFIG.get("docker_network", "")).strip())
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none").strip() or "none"
 # sandbox_network=open lets sandboxed commands reach anything this computer can:
 # the internet, its own services (IMAP, databases, dev servers) and the LAN.
@@ -11067,7 +11079,7 @@ def _open_docker_network() -> str:
 
 if SANDBOX_NETWORK_OPEN:
     DOCKER_NETWORK = _open_docker_network()
-_EGRESS_PROXY_IMAGE = "python:3.11-slim"
+_EGRESS_PROXY_IMAGE = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
@@ -11321,7 +11333,7 @@ def _docker_available() -> bool:
 # Docker Desktop is installed but not running: the sandbox fallback and the
 # managed SearXNG then fail although nothing is wrong (feature suggestion:
 # self-launch Docker; issue sheet row 33). Linux needs root to start the daemon,
-# so it is left to the operator there. docker_autostart=0 turns this off.
+# so it is left to the operator there. Off by default; docker_autostart=1 turns it on.
 _DOCKER_DESKTOP_APPS = {
     "win32": [Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
               / "Docker" / "Docker" / "Docker Desktop.exe"],
@@ -11330,11 +11342,17 @@ _DOCKER_DESKTOP_APPS = {
 _docker_start_lock = threading.Lock()
 
 
-def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep) -> bool:
-    """Make sure the Docker daemon answers, launching Docker Desktop if needed."""
+def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep, purpose: str = "sandbox") -> bool:
+    """Make sure the Docker daemon answers, launching Docker Desktop if needed.
+
+    For the sandbox fallback this is off unless docker_autostart=1: a sandbox the user
+    did not set up should not start a desktop application. For the managed SearXNG
+    that the user set up with /search setup it stays on unless docker_autostart=0, as
+    before, so web search comes back after a restart."""
     if _docker_available():
         return True
-    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", "1")
+    default = "1" if purpose == "searxng" else "0"
+    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", default)
     if str(setting).strip() == "0" or not _which_executable("docker"):
         return False
     app = next((p for p in _DOCKER_DESKTOP_APPS.get(sys.platform, []) if p.exists()), None)
@@ -11470,7 +11488,7 @@ def sandbox_status() -> dict:
         "network": _sandbox_network_summary(resolved) if resolved == "docker" else network,
         "network_enforced": (None if resolved == "unavailable" else
                              not unenforced and (resolved != "docker" or
-                                                 DOCKER_NETWORK in ("allowlist", "none"))),
+                                                 _docker_network_mode() in ("allowlist", "none"))),
         "host_processes_shared": unenforced,
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
@@ -12012,7 +12030,8 @@ def _docker_sandbox_ready(workspace: Path, image: str = "") -> bool:
     key = str(workspace)
     if key in _docker_workspace_verified:
         return _docker_workspace_verified[key]
-    selected_image = image or DOCKER_IMAGE
+    # The probe never pulls (it runs at start-up): it tries what is already here.
+    selected_image = image or _sandbox_image_present()
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image) or not _docker_image_present(selected_image):
         return False
     try:
@@ -12089,11 +12108,12 @@ def verify_sandbox_backend() -> dict:
 
 def _docker_network_closed() -> bool:
     """True when Docker sandbox containers get no network at all."""
-    if DOCKER_NETWORK == "none":
+    mode = _docker_network_mode()
+    if mode == "none":
         return True
-    if DOCKER_NETWORK != "allowlist":
+    if mode != "allowlist":
         return False
-    return not SANDBOX_ALLOWED_DOMAINS or ("none", []) in _docker_egress.values()
+    return not _docker_allowed_domains() or ("none", []) in _docker_egress.values()
 
 
 def _sandbox_network_summary(backend: str) -> str:
@@ -12101,10 +12121,12 @@ def _sandbox_network_summary(backend: str) -> str:
     if backend == "native" and sys.platform == "win32":
         # The DSH Windows backend confines writes only; it has no network policy.
         return "not restricted (the Windows sandbox limits file writes only)"
-    if backend == "docker" and DOCKER_NETWORK not in ("allowlist", "none"):
-        return f"Docker network {DOCKER_NETWORK!r} (not filtered)"
+    if backend == "docker" and _docker_network_mode() not in ("allowlist", "none"):
+        return f"Docker network {_docker_network_mode()!r} (not filtered)"
     if backend == "docker" and _docker_network_closed():
         return "blocked"
+    if backend == "docker":
+        return ", ".join(_docker_allowed_domains()) or "blocked"
     return ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked"
 
 
@@ -12120,10 +12142,10 @@ def _sandbox_docker_note() -> str:
     where = f"/workspace here is {ARTIFACTS_ROOT} on the host and the only folder visible"
     if _docker_network_closed():
         net = "no network, so pip/npm installs and downloads fail here"
-    elif DOCKER_NETWORK == "allowlist":
+    elif _docker_network_mode() == "allowlist":
         net = "network limited to sandbox_allowed_domains"
     else:
-        net = f"Docker network {DOCKER_NETWORK!r}"
+        net = f"Docker network {_docker_network_mode()!r}"
     return f"[note: this ran in the Docker sandbox — {where}; {net}]"
 
 
@@ -12413,10 +12435,94 @@ def _running_in_container() -> bool:
     return os.path.exists("/.dockerenv")
 
 
+_GIT_CONFIG_CREDENTIAL_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@|extraheader\s*=|\btoken\s*=", re.IGNORECASE)
+
+
+def _git_config_has_credentials(path: Path) -> bool:
+    """A repository config with a password in a remote URL or an auth header."""
+    try:
+        return path.is_file() and bool(_GIT_CONFIG_CREDENTIAL_RE.search(
+            path.read_text(encoding="utf-8", errors="replace")[:200000]))
+    except OSError:
+        return False
+
+
+_docker_stale_cleaned = False
+# Masking: a folder with at least this many secret-looking files is covered whole,
+# and at most this many mounts are added (each is one argument on the command line).
+_MASK_FOLDER_AT = 4
+_MASK_MAX_MOUNTS = 200
+
+
+def _other_agent8088_running(psutil) -> bool:
+    """Another Agent8088 process (a CLI, the web UI, a gateway) is running now."""
+    me = os.getpid()
+    try:
+        ancestors = {proc.pid for proc in psutil.Process(me).parents()}
+    except Exception:  # noqa: BLE001 -- unknown parents: assume nothing extra
+        ancestors = set()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            pid, cmdline = proc.info["pid"], proc.info["cmdline"] or []
+        except Exception:  # noqa: BLE001
+            continue
+        if pid == me or pid in ancestors:
+            continue
+        head = [re.split(r"[\\/]", str(part))[-1].lower().removesuffix(".exe") for part in cmdline[:2]]
+        if "agent8088" in head or any(str(part).startswith("agent8088.") for part in cmdline[:4]):
+            return True
+    return False
+
+
+def _clean_stale_docker_sandbox() -> None:
+    """Once per process, remove what earlier sessions left behind.
+
+    Run containers whose Agent8088 process has ended (a crash or a kill skips
+    --rm's cleanup). Egress proxies and networks for an allowlist that is no
+    longer the configured one, but only when no other Agent8088 process is
+    running: another session with its own config may be using one right now.
+    Never anything that is not Agent8088's."""
+    global _docker_stale_cleaned
+    if _docker_stale_cleaned:
+        return
+    _docker_stale_cleaned = True
+
+    def docker(*args):
+        try:
+            return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a dependency
+        psutil = None
+    listed = docker("ps", "-a", "--filter", "name=^agent8088-", "--format", "{{.Names}}")
+    current = _docker_egress_key(_docker_allowed_domains())
+    proxies_free = psutil is not None and not _other_agent8088_running(psutil)
+    removed = []
+    for name in (listed.stdout.split() if listed and listed.returncode == 0 else []):
+        run = re.fullmatch(r"agent8088-(\d+)-[0-9a-f]{12}", name)
+        proxy = re.fullmatch(r"agent8088-egress-proxy-([0-9a-f]{10})", name)
+        if run and psutil is not None and int(run.group(1)) != os.getpid() \
+                and not psutil.pid_exists(int(run.group(1))):
+            removed.append(name)
+        elif proxy and proxy.group(1) != current and proxies_free:
+            removed.append(name)
+    if removed:
+        docker("rm", "-f", *removed)
+    networks = docker("network", "ls", "--filter", "name=^agent8088-egress-", "--format", "{{.Name}}")
+    for name in (networks.stdout.split() if networks and networks.returncode == 0 and proxies_free else []):
+        if re.fullmatch(r"agent8088-egress-[0-9a-f]{10}", name) and not name.endswith(current):
+            docker("network", "rm", name)  # refused while in use, which is fine
+    if removed:
+        _log.info("removed stale Docker sandbox containers: %s", ", ".join(removed))
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
-    selected_image = image or DOCKER_IMAGE
+    selected_image = image or _sandbox_image()
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
     if _docker_sandbox_broken:
@@ -12456,25 +12562,48 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
-    skipped_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
-    sensitive_mounts = 0
+    # Rebuilt on every command, so a secret written since the last one is masked
+    # too. Installed package trees are not searched: they hold the packages' own
+    # test keys and certificates, not the user's. build/ and dist/ are, since a
+    # build can copy a .env into them, and so is a .git/config holding a token.
+    package_dirs = {".venv", "venv", "node_modules", "__pycache__"}
+    empty_dir = _agent_data_dir() / "sandbox-empty-dir"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    masks = []   # (path, is a folder)
     for root, dirs, files in os.walk(workspace_path):
-        dirs[:] = [name for name in dirs if name not in skipped_dirs]
-        for filename in files:
-            path = Path(root) / filename
-            if not _is_sensitive_path(str(path)):
-                continue
-            sensitive_mounts += 1
-            if sensitive_mounts > 128:
-                return "Error: too many sensitive workspace files to mask safely."
-            relative = path.relative_to(workspace_path).as_posix()
-            destination = f"/workspace/{relative}"
-            argv.extend([
-                "--mount", f"type=bind,src={empty},dst={destination},readonly",
-            ])
+        if ".git" in dirs:
+            dirs.remove(".git")
+            git_config = Path(root) / ".git" / "config"
+            if _git_config_has_credentials(git_config):
+                files = [*files, str(Path(".git") / "config")]
+        dirs[:] = [name for name in dirs if name not in package_dirs]
+        hits = [Path(root) / name for name in files
+                if _is_sensitive_path(str(Path(root) / name)) or (Path(root) / name).parts[-2:] == (".git", "config")]
+        if not hits:
+            continue
+        # A folder of keys or certificates (test fixtures, a certs/ folder) is covered
+        # with an empty folder as a whole: one mount instead of one per file, so a
+        # project with many of them is still masked and can still run.
+        if len(hits) >= _MASK_FOLDER_AT and Path(root) != workspace_path:
+            masks.append((Path(root), True))
+            dirs[:] = []
+        else:
+            masks.extend((path, False) for path in hits)
+    if len(masks) > _MASK_MAX_MOUNTS:
+        return (f"Error: more than {_MASK_MAX_MOUNTS} secret files or folders to mask in {workspace_path}, so the "
+                "Docker sandbox cannot cover them all safely. Nothing was run.")
+    for path, folder in masks:
+        relative = path.relative_to(workspace_path).as_posix()
+        source = empty_dir if folder else empty
+        argv.extend(["--mount", f"type=bind,src={source},dst=/workspace/{relative},readonly"])
+    if sys.platform.startswith("linux") and hasattr(os, "getuid"):
+        # Files the command writes belong to the user, not root. Docker Desktop
+        # (macOS, Windows) maps ownership itself.
+        argv.extend(["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"])
     if git_image:
         argv.extend(["--entrypoint", "/bin/sh"])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
+    _clean_stale_docker_sandbox()
     result = _exec_process(argv, timeout=timeout)
     if "timed out" in result:
         try:
@@ -12493,13 +12622,66 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     return result
 
 
+def _docker_network_mode() -> str:
+    """The network a sandbox container gets: docker_network, or `allowlist` when
+    Docker stands in for a missing native sandbox and nothing was configured."""
+    if DOCKER_NETWORK_CONFIGURED or SANDBOX_NETWORK_OPEN or DOCKER_NETWORK != "none":
+        return DOCKER_NETWORK
+    if SANDBOX_BACKEND == "docker":
+        return DOCKER_NETWORK  # chosen on purpose: keep its default, no network
+    return "allowlist"
+
+
+def _docker_allowed_domains() -> list:
+    """The hosts the Docker proxy allows: sandbox_allowed_domains when it is set,
+    the registry preset when no line sets it (as the native sandbox gets)."""
+    if "sandbox_allowed_domains" in APP_CONFIG:
+        return list(SANDBOX_ALLOWED_DOMAINS)
+    return list(dict.fromkeys([*SANDBOX_ALLOWED_DOMAINS, *_DEFAULT_SANDBOX_ALLOWED_DOMAINS]))
+
+
+def _docker_egress_key(domains) -> str:
+    return hashlib.sha256(",".join(sorted(domains)).encode()).hexdigest()[:10]
+
+
+_sandbox_image_chosen = ""
+
+
+def _sandbox_image() -> str:
+    """The image for sandbox containers: Agent8088's own, or the plain Python
+    image when that cannot be pulled. A configured docker_image is used as is."""
+    global _sandbox_image_chosen
+    if DOCKER_IMAGE_CONFIGURED or DOCKER_IMAGE != _SANDBOX_IMAGE:
+        return DOCKER_IMAGE
+    if not _sandbox_image_chosen:
+        problem = _ensure_docker_image(_SANDBOX_IMAGE)
+        if problem:
+            _log.warning("Sandbox image %s is unavailable (%s); using %s", _SANDBOX_IMAGE,
+                         str(problem)[:200], _SANDBOX_IMAGE_FALLBACK)
+            _sandbox_image_chosen = _SANDBOX_IMAGE_FALLBACK
+        else:
+            _sandbox_image_chosen = _SANDBOX_IMAGE
+    return _sandbox_image_chosen
+
+
+def _sandbox_image_present() -> str:
+    """The sandbox image to probe without pulling anything."""
+    if DOCKER_IMAGE_CONFIGURED or DOCKER_IMAGE != _SANDBOX_IMAGE:
+        return DOCKER_IMAGE
+    if _sandbox_image_chosen:
+        return _sandbox_image_chosen
+    return _SANDBOX_IMAGE if _docker_image_present(_SANDBOX_IMAGE) else _SANDBOX_IMAGE_FALLBACK
+
+
 def _docker_egress_args() -> tuple:
     """The --network value and proxy environment for a sandbox container."""
-    if DOCKER_NETWORK != "allowlist":
-        return DOCKER_NETWORK, []
-    if not SANDBOX_ALLOWED_DOMAINS:
+    mode = _docker_network_mode()
+    if mode != "allowlist":
+        return mode, []
+    domains = _docker_allowed_domains()
+    if not domains:
         return "none", []
-    key = hashlib.sha256(",".join(sorted(SANDBOX_ALLOWED_DOMAINS)).encode()).hexdigest()[:10]
+    key = _docker_egress_key(domains)
     if key not in _docker_egress:
         _docker_egress[key] = _start_docker_egress(key)
     return _docker_egress[key]
@@ -12534,7 +12716,7 @@ def _start_docker_egress(key: str) -> tuple:
                 "--memory", "128m", "--cpus", "0.5", "--pids-limit", "128",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--entrypoint", "python", _EGRESS_PROXY_IMAGE, "-u", "-B", "-c", source,
-                str(_EGRESS_PROXY_PORT), *SANDBOX_ALLOWED_DOMAINS)
+                str(_EGRESS_PROXY_PORT), *_docker_allowed_domains())
             if started.returncode != 0:
                 raise RuntimeError(started.stderr.strip() or "proxy did not start")
         joined = docker("network", "connect", network, proxy)
@@ -13423,7 +13605,7 @@ def _exec_docker(args: dict) -> str:
     if not code:
         return ("Error: sandboxed execution requires 'code'. Pass the Python "
                 "source as code=\"...\" (newlines escaped as \\n).")
-    image = str(args.get("image") or DOCKER_IMAGE)
+    image = str(args.get("image") or _sandbox_image())
     timeout = min(max(1, int(args.get("timeout") or 60)), MAX_TOOL_TIMEOUT_SECONDS)
     return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
 
@@ -18083,7 +18265,7 @@ def _revive_managed_searxng(wait=None) -> bool:
     """
     from agent8088 import searxng_provision
     url = urllib.parse.urlparse(str(_search_config().get("search_base_url") or ""))
-    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop():
+    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop(purpose="searxng"):
         return False
     if not searxng_provision.status().get("running") and not searxng_provision.resume():
         return False

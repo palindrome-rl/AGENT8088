@@ -2444,10 +2444,34 @@ install_native_sandbox() {
         log_success "Native sandbox runtime installed and verified"
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
-        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
-        record_skip "Native sandbox runtime" "setup did not complete" \
-            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when it is running"
+        if userns_restricted; then
+            # Ubuntu 23.10+ restricts the unprivileged user namespaces bubblewrap needs, through
+            # AppArmor. On Ubuntu 24.04 srt started only with an AppArmor profile for bwrap AND both
+            # restriction switches off (either alone was not enough). These are system security
+            # settings, so the installer only explains them.
+            log_warn "This system restricts unprivileged user namespaces through AppArmor, which the native sandbox (bubblewrap) needs."
+            log_info "  To allow them (system security settings, your decision), as root:"
+            log_info "    printf '%s\\n' 'abi <abi/4.0>,' 'include <tunables/global>' 'profile agent8088-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' > /etc/apparmor.d/agent8088-bwrap"
+            log_info "    apparmor_parser -r /etc/apparmor.d/agent8088-bwrap"
+            log_info "    printf '%s\\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 > /etc/sysctl.d/60-agent8088-userns.conf"
+            log_info "    sysctl --system"
+            log_info "  then run: agent8088 --sandbox-setup"
+            record_skip "Native sandbox runtime" "unprivileged user namespaces are restricted by AppArmor" \
+                "add an AppArmor profile for bwrap and set kernel.apparmor_restrict_unprivileged_userns=0 and kernel.apparmor_restrict_unprivileged_unconfined=0 (commands in the install log), then agent8088 --sandbox-setup   (Docker is used meanwhile when running)"
+        else
+            record_skip "Native sandbox runtime" "setup did not complete" \
+                "agent8088 --sandbox-setup   (Docker is used automatically meanwhile when it is running)"
+        fi
     fi
+}
+
+# True when the kernel restricts unprivileged user namespaces through AppArmor
+# (Ubuntu 23.10 and later), which is what stops bubblewrap.
+userns_restricted() {
+    [ "$OS" = linux ] || return 1
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] ||
+        [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined 2>/dev/null)" = "1" ]
 }
 
 # ----------------------------------------------------------------------------
@@ -2728,7 +2752,8 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "  Sandbox:  Docker fallback is automatic when Docker is running"
+        echo "            (package registries only; Agent8088 does not start Docker itself)"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
     echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"

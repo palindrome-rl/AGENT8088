@@ -297,9 +297,18 @@ sandbox_runtime_version=0.0.73
 # Off by default: a command steered by a malicious page or email could send
 # project files anywhere.
 # sandbox_network=open
-# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running,
-# for the sandbox fallback or the managed SearXNG. 0 turns this off.
-# docker_autostart=1
+# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running.
+# For the sandbox fallback it is off unless this is 1; for the managed SearXNG you
+# set up with /search setup it is on unless this is 0.
+# docker_autostart=
+# The Docker fallback runs commands in Agent8088's sandbox image (Python, Node,
+# git), or python:3.11-slim when that cannot be pulled. Set an image to use it
+# instead. With no docker_network line, Docker used in place of a missing native
+# sandbox reaches only sandbox_allowed_domains (the registry preset by default),
+# through a proxy that also refuses this computer, the local network and cloud
+# metadata addresses; sandbox_backend=docker on its own keeps docker_network=none.
+# docker_image=ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0
+# docker_network=allowlist
 # Seconds allowed for pulling a missing container image. This is deliberately
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.

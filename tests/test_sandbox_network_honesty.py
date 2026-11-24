@@ -41,7 +41,8 @@ def test_enforcing_native_backends_report_as_before(status_for):
     assert allowed["network"] == "pypi.org, github.com"
 
 
-def test_docker_keeps_its_network_claim_on_any_os(status_for):
+def test_docker_keeps_its_network_claim_on_any_os(status_for, engine, monkeypatch):
+    monkeypatch.setattr(engine, "DOCKER_NETWORK_CONFIGURED", True)  # docker_network=none written down
     status = status_for("docker", enforces=False)
     assert status["network_enforced"] is True and status["network"] == "blocked"
     assert status["host_processes_shared"] is False

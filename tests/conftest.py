@@ -24,6 +24,13 @@ def _load_engine():
     # Tests that overwrite files must not drop backups in the developer's real data
     # directory; the backup tests switch this back on and point it at a tmp path.
     mod.FILE_BACKUPS = False
+    # Never start an egress proxy or clear Docker containers on the developer's
+    # Docker from an ordinary test: a test of a command path that reaches Docker
+    # gets no network instead. The opt-in attack tests use the real proxy.
+    if os.environ.get("AGENT8088_ATTACK_TESTS") != "1":
+        mod._unguarded_start_docker_egress = mod._start_docker_egress  # for tests that fake `docker`
+        mod._start_docker_egress = lambda key: ("none", [])
+    mod._docker_stale_cleaned = True
     return mod
 
 
