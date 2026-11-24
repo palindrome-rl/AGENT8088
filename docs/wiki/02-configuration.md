@@ -155,7 +155,8 @@ not per call.
 |---|---|---|
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
-| `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
+| `sandbox_allowed_domains` | `default` | Domains reachable from inside the sandbox; `default` is the common package registries and code hosts, `none` closes the network. |
+| `sandbox_ask_hosts` | `1` | In an interactive session, ask once whether to allow a host a sandboxed command was refused, for the session. |
 | `sandbox_network` | (empty) | Explicitly setting `open` removes network filtering for Docker commands. In `auto` mode this prefers Docker on Linux/macOS; an explicit `native` backend remains native. Linux uses host networking; macOS uses bridge networking, where host services need `host.docker.internal`, not `localhost`. This can expose reachable services and allow project data to leave the sandbox; enable only for trusted work. Filesystem protections still apply. |
 | `docker_autostart` | `1` | Start an already-installed Docker Desktop on Windows/macOS when needed for sandbox fallback or managed SearXNG recovery. Set `0` to disable; `AGENT8088_DOCKER_AUTOSTART=0` also disables it. Does not install Docker or start a Linux system daemon. |
 | `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |

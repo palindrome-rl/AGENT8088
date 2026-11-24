@@ -122,18 +122,29 @@ Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
 ## Network egress
 
-Sandboxed commands have no network unless you allow specific domains
+Sandboxed commands reach only the hosts in `sandbox_allowed_domains`
 (**macOS, Linux and Docker** -- the Windows native backend does not enforce this,
-see above):
+see above). With no `sandbox_allowed_domains` line the list is `default`: the
+common package registries, code hosts and docs sites (PyPI, npm, GitHub,
+crates.io, Go proxy, Maven Central, RubyGems, conda, Hugging Face, ...), so
+`npm install` / `pip install` / `git clone` work out of the box. Add your own
+hosts after it, or close the network with `none`:
 
 ```ini
-sandbox_allowed_domains=api.example.com,pypi.org
+sandbox_allowed_domains=default,api.example.com
+sandbox_allowed_domains=none
 ```
 
-`default` in the list adds the common package registries, code hosts and docs
-sites (PyPI, npm, GitHub, crates.io, Go proxy, Maven Central, RubyGems, conda,
-Hugging Face, ...), so `sandbox_allowed_domains=default` is enough for most
-`npm install` / `pip install` / `git clone` tasks.
+When a command is refused a host, the model is told which host it was and that
+retrying will not help, and the refusal is written to the audit log. In an
+interactive session you are also asked once whether to allow that host for the
+rest of the session; a host you decline is not asked about again, and
+`sandbox_ask_hosts=0` turns the question off. Nothing is written to `config.txt`.
+
+Package caches (pip, uv, npm, yarn, pnpm, cargo, Go) go to `sandbox-cache` in the
+Agent8088 data folder, which sandboxed commands may write and which is kept
+between commands. On macOS, commands may also listen on local ports, so a dev
+server or test runner can start inside the sandbox.
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP
