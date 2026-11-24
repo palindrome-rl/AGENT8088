@@ -157,8 +157,8 @@ not per call.
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `sandbox_allowed_domains` | (empty) | Domains reachable from inside the sandbox; `default` adds common package registries and code hosts. |
 | `sandbox_network` | (empty) | Explicitly setting `open` removes network filtering for Docker commands. In `auto` mode this prefers Docker on Linux/macOS; an explicit `native` backend remains native. Linux uses host networking; macOS uses bridge networking, where host services need `host.docker.internal`, not `localhost`. This can expose reachable services and allow project data to leave the sandbox; enable only for trusted work. Filesystem protections still apply. |
-| `docker_autostart` | `1` | Start an already-installed Docker Desktop on Windows/macOS when needed for sandbox fallback or managed SearXNG recovery. Set `0` to disable; `AGENT8088_DOCKER_AUTOSTART=0` also disables it. Does not install Docker or start a Linux system daemon. |
-| `docker_image` / `docker_network` | `python:3.11-slim` / `none` | Docker fallback settings; `docker_network=allowlist` applies `sandbox_allowed_domains` through a proxy container. |
+| `docker_autostart` | `0` | Start an already-installed Docker Desktop on Windows/macOS when needed for sandbox fallback or managed SearXNG recovery. Off by default; set `1` to enable (`AGENT8088_DOCKER_AUTOSTART=1` also works). Does not install Docker or start a Linux system daemon. |
+| `docker_image` / `docker_network` | Agent8088's sandbox image / `allowlist` when Docker stands in for a missing native sandbox (`none` with `sandbox_backend=docker`) | Docker fallback settings. The sandbox image has Python, Node and git; `python:3.11-slim` is used when it cannot be pulled. `allowlist` applies `sandbox_allowed_domains` through a proxy container that also refuses this computer, the local network and metadata addresses. |
 | `docker_pull_seconds` | `300` | Time allowed for pulling a missing container image. Separate from a tool's own timeout, so a first-run pull does not fail as an unexplained timeout. |
 
 ## Gateway

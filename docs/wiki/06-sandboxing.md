@@ -101,19 +101,32 @@ run `npm install` again on Windows before you run the project yourself.
 
 ## Docker fallback
 
-Used automatically under `auto` when native isolation is missing or cannot run:
+Used automatically under `auto` when native isolation is missing or cannot run.
 
-```ini
-docker_image=python:3.11-slim
-docker_network=none
-```
-
-`docker_network=none` is the safer default — no network from inside the
-container at all. `docker_network=allowlist` gives the container the same
-allowlist the native runtime enforces: it joins an internal Docker network
-whose only way out is a small proxy container (`agent8088-egress-proxy-*`,
-left running between sessions) that allows only `sandbox_allowed_domains`.
-If the proxy cannot start, the container gets no network.
+- **Image.** Commands run in Agent8088's sandbox image
+  (`ghcr.io/palindrome-rl/agent8088-sandbox`, built from
+  `docker/sandbox.Dockerfile`: Python, Node and git, on a base pinned by digest),
+  so `pip install`, `npm install` and `git clone` work in one container. When it
+  cannot be pulled, `python:3.11-slim` is used. `docker_image=` picks any other.
+- **Network.** Docker standing in for a missing native sandbox gets
+  `docker_network=allowlist`: the container joins an internal Docker network
+  whose only way out is a small proxy container (`agent8088-egress-proxy-*`)
+  that allows only `sandbox_allowed_domains` (the registry preset unless set).
+  The proxy also refuses any name that resolves to this computer, the local
+  network or a cloud metadata address, and connects to the address it checked.
+  If the proxy cannot start, the container gets no network. With
+  `sandbox_backend=docker` chosen on purpose, `docker_network=none` stays the
+  default: no network at all.
+- **Secrets.** Before each command, secret files in the folder are covered with
+  an empty file, including in `build/` and `dist/`, and a `.git/config` that
+  holds a token. Installed package trees (`node_modules`, `.venv`) are not
+  searched.
+- **Ownership.** On Linux the container runs as your user id, so the files it
+  writes are yours.
+- **Clean-up.** At the first command of a session, containers left by an
+  Agent8088 process that has ended, and proxies for an allowlist that is no
+  longer configured, are removed.
+- **Docker Desktop** is not started for you unless `docker_autostart=1`.
 
 Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that

@@ -2444,10 +2444,29 @@ install_native_sandbox() {
         log_success "Native sandbox runtime installed and verified"
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
-        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
-        record_skip "Native sandbox runtime" "setup did not complete" \
-            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when it is running"
+        if userns_restricted; then
+            # Ubuntu 23.10+ blocks the unprivileged user namespaces bubblewrap needs.
+            # This is a system security setting, so the installer only explains it.
+            log_warn "This system blocks unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1), which the native sandbox needs."
+            log_info "  To allow them (a system-wide security setting, your decision):"
+            log_info "    echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-agent8088-userns.conf"
+            log_info "    sudo sysctl --system"
+            log_info "  then run: agent8088 --sandbox-setup"
+            record_skip "Native sandbox runtime" "unprivileged user namespaces are blocked (kernel.apparmor_restrict_unprivileged_userns=1)" \
+                "allow them (sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0, kept in /etc/sysctl.d), then agent8088 --sandbox-setup   (Docker is used meanwhile when running)"
+        else
+            record_skip "Native sandbox runtime" "setup did not complete" \
+                "agent8088 --sandbox-setup   (Docker is used automatically meanwhile when it is running)"
+        fi
     fi
+}
+
+# True when the kernel refuses unprivileged user namespaces through AppArmor
+# (Ubuntu 23.10 and later), which is what stops bubblewrap.
+userns_restricted() {
+    [ "$OS" = linux ] || return 1
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]
 }
 
 # ----------------------------------------------------------------------------
@@ -2728,7 +2747,8 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "  Sandbox:  Docker fallback is automatic when Docker is running"
+        echo "            (package registries only; Agent8088 does not start Docker itself)"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
     echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"
