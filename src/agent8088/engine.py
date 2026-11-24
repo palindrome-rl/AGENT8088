@@ -12314,15 +12314,21 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
                             "--mode", mode, "--"] + wrapped
         guarded = None if readonly else _git_guard_snapshot(cwd)
+        if _spawn_service is not None:
+            return _spawn_service(full_argv)
         result = _exec_process(full_argv, timeout=timeout)
         note = _git_guard_restore(cwd, guarded)
         return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
+    if _spawn_service is not None:
+        settings = _write_service_settings(cwd)
     # Exported, not a prefix: `VAR=x a && b` sets VAR for `a` only.
     exports = {"TMPDIR": str(sandbox_tmp), **_sandbox_cache_env()}
     command = (f"cd {shlex.quote(str(cwd))} && export "
                + " ".join(f"{name}={shlex.quote(value)}" for name, value in exports.items())
                + f" && {command}")
+    if _spawn_service is not None:
+        return _spawn_service(argv + ["--settings", str(settings), "-c", command])
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
@@ -12519,6 +12525,386 @@ def _clean_stale_docker_sandbox() -> None:
         _log.info("removed stale Docker sandbox containers: %s", ", ".join(removed))
 
 
+# ---------------------------------------------------------------------------
+# Services: long-lived processes in the sandbox (services.py)
+# ---------------------------------------------------------------------------
+# While set, the sandbox command builders hand their final argv to this instead of
+# running it to completion, so a service starts in exactly the sandbox a command
+# would, with every protection that applies to commands.
+_spawn_service = None
+_services_registry = None
+SERVICES_ENABLED = str(APP_CONFIG.get("services", "1")).strip().lower() in ("1", "true", "yes", "on")
+# Host sockets a service on Linux must not reach once unix sockets are allowed for
+# its bridge: container engines, the session and system buses, the user's runtime folder.
+_HOST_DAEMON_SOCKETS = ("/var/run/docker.sock", "/run/docker.sock", "/run/containerd", "/run/podman",
+                        "/var/run/dbus", "/run/dbus", "/run/user", "/var/run/libvirt", "/run/libvirt",
+                        "/run/snapd.socket", "/run/systemd")
+
+
+def _services():
+    global _services_registry
+    if _services_registry is None:
+        from agent8088 import services
+        data = _agent_data_dir()
+        _services_registry = services.Registry(data / "services.json", data / "service-logs")
+        try:
+            import psutil
+            _services_registry.reap_stale(psutil.pid_exists, _kill_process_tree, _remove_containers)
+        except Exception:  # noqa: BLE001 -- clean-up of an earlier crash must never stop this one
+            _log.debug("stale service clean-up failed", exc_info=True)
+        import atexit
+        atexit.register(_services_registry.stop_all)
+    return _services_registry
+
+
+def _kill_process_tree(pid: int) -> None:
+    try:
+        import psutil
+        root = psutil.Process(pid)
+        for proc in [*root.children(recursive=True), root]:
+            try:
+                proc.kill()
+            except psutil.Error:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _remove_containers(names: list) -> None:
+    if names:
+        try:
+            subprocess.run(["docker", "rm", "-f", *names], capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _write_service_settings(cwd: Path) -> Path:
+    """srt settings for a service. On Linux the service's port leaves its network
+    namespace through a unix socket, so unix sockets are allowed, with the host's
+    daemon sockets hidden (they would be a way out of the sandbox)."""
+    data = _sandbox_settings_data(False, cwd)
+    if sys.platform.startswith("linux"):
+        data["network"]["allowAllUnixSockets"] = True
+        hidden = [path for path in _HOST_DAEMON_SOCKETS if os.path.exists(path)]
+        data["filesystem"]["denyRead"] = list(dict.fromkeys([*data["filesystem"]["denyRead"], *hidden]))
+        data["filesystem"]["denyWrite"] = list(dict.fromkeys([*data["filesystem"]["denyWrite"], *hidden]))
+    path = _agent_data_dir() / f"srt-settings-service-{os.getpid()}.json"
+    _write_private_text(path, json.dumps(data, indent=2) + "\n")
+    return path
+
+
+def _service_popen(argv: list, log_path: Path):
+    log = open(log_path, "ab")
+    kwargs = {"stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        return subprocess.Popen(argv, **kwargs)
+    finally:
+        log.close()
+
+
+_RELAY_CODE = r"""
+import socket, sys, threading
+target, port = sys.argv[1], int(sys.argv[2])
+server = socket.create_server(("0.0.0.0", 8000))
+def pipe(a, b):
+    try:
+        while True:
+            data = a.recv(65536)
+            if not data:
+                break
+            b.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+while True:
+    client, _ = server.accept()
+    try:
+        upstream = socket.create_connection((target, port), timeout=10)
+    except OSError:
+        client.close()
+        continue
+    threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+    threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+"""
+
+
+def _start_docker_relay(service_container: str, network: str, port: int, host_port: int) -> str:
+    """A relay container that publishes the service on 127.0.0.1 only.
+
+    The service stays on its network (the allowlist network, whose only way out is the
+    egress proxy); Docker cannot publish a port from an internal network, so a relay
+    that only forwards one TCP port joins that network and is published instead."""
+    relay = f"{service_container}-relay"
+    started = subprocess.run(
+        ["docker", "run", "-d", "--rm", "--name", relay, "--network", "bridge",
+         "-p", f"127.0.0.1:{host_port}:8000", "--memory", "64m", "--cpus", "0.25", "--pids-limit", "64",
+         "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--entrypoint", "python",
+         _EGRESS_PROXY_IMAGE, "-u", "-B", "-c", _RELAY_CODE, service_container, str(port)],
+        capture_output=True, text=True, timeout=120)
+    if started.returncode != 0:
+        raise RuntimeError(started.stderr.strip() or "the relay did not start")
+    joined = subprocess.run(["docker", "network", "connect", network, relay],
+                            capture_output=True, text=True, timeout=60)
+    if joined.returncode != 0:
+        _remove_containers([relay])
+        raise RuntimeError(joined.stderr.strip() or "the relay could not join the service's network")
+    return relay
+
+
+class _UnixBridge:
+    """Host side of the Linux bridge: 127.0.0.1:<host_port> -> the service's unix socket."""
+
+    def __init__(self, socket_path: Path, host_port: int):
+        import socket as socket_module
+        self.socket_module = socket_module
+        self.path = str(socket_path)
+        self.server = socket_module.create_server(("127.0.0.1", host_port))
+        self.closed = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        sock = self.socket_module
+        while not self.closed:
+            try:
+                client, _ = self.server.accept()
+            except OSError:
+                return
+            try:
+                upstream = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
+                upstream.connect(self.path)
+            except OSError:
+                client.close()
+                continue
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pipe, args=(a, b), daemon=True).start()
+
+    @staticmethod
+    def _pipe(a, b):
+        try:
+            while True:
+                data = a.recv(65536)
+                if not data:
+                    break
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def ready(self) -> bool:
+        """The service behind the socket accepts: socat closes a connection at once when it cannot reach it."""
+        # Twice in a row, each held open for long enough that socat's own refusal (it
+        # forks, then connects) would have closed it: one quick open is not an answer.
+        return self._held_open() and self._held_open()
+
+    def _held_open(self) -> bool:
+        sock = self.socket_module
+        try:
+            probe = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
+            probe.settimeout(1.5)
+            probe.connect(self.path)
+        except OSError:
+            return False
+        try:
+            return probe.recv(1) != b""      # data, or an open connection (timeout below)
+        except sock.timeout:
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    def close(self):
+        self.closed = True
+        try:
+            self.server.close()
+        except OSError:
+            pass
+
+
+def _service_launcher(backend: str, cwd: Path, name: str):
+    """launch(command, port, log_path) -> services.Handle for the active backend."""
+    from agent8088 import services
+
+    def launch(command: str, port: int, log_path: Path):
+        global _spawn_service
+        command = command.replace("{port}", str(port))
+        windows_native = backend == "native" and sys.platform == "win32"
+        linux_native = backend == "native" and sys.platform.startswith("linux")
+        socket_path = None
+        if windows_native:
+            command = f'set "PORT={port}" && {command}'
+        elif linux_native:
+            socket_dir = (_agent_data_dir() / "sandbox-tmp" / "services").resolve()
+            socket_dir.mkdir(parents=True, exist_ok=True)
+            socket_path = socket_dir / f"{os.getpid()}-{name}.sock"
+            if socket_path.exists():
+                socket_path.unlink()
+            # Inside the service's own network namespace: the bridge's other end.
+            command = (f"export PORT={port} && (socat UNIX-LISTEN:{shlex.quote(str(socket_path))},fork,mode=600 "
+                       f"TCP:127.0.0.1:{port} 2>/dev/null &) && {command}")
+        else:
+            command = f"export PORT={port} && {command}"
+        spawned = {}
+        # The per-command git guard cannot wrap a process that keeps running: on Windows
+        # the hooks and config are saved now and put back when the service stops.
+        guarded = ([(git.parent, _git_guard_snapshot(git.parent)) for git in _protected_repo_paths(cwd)
+                    if git.is_dir()] if windows_native else [])
+
+        def spawn(argv):
+            if backend == "docker":
+                # The container's name, to stop it and to reach it from the relay.
+                spawned["container"] = argv[argv.index("--name") + 1]
+                at = argv.index("--network") + 1
+                if argv[at] == "none":
+                    # No network: a network of its own instead, internal (no way out at all),
+                    # so the relay can still reach the one port.
+                    own = f"{spawned['container']}-net"
+                    made = subprocess.run(["docker", "network", "create", "--internal", own],
+                                          capture_output=True, text=True, timeout=60)
+                    if made.returncode == 0:
+                        argv = [*argv[:at], own, *argv[at + 1:]]
+                        spawned["own_network"] = own
+                spawned["network"] = argv[at]
+            spawned["proc"] = _service_popen(argv, log_path)
+            return spawned["proc"]
+
+        # The same readiness step a command goes through: it prepares the sandbox's
+        # folders and its grant for this one, and says why the sandbox cannot run.
+        if backend == "native" and not _native_sandbox_ready(cwd):
+            raise RuntimeError(f"the native sandbox is not ready: {_native_sandbox_failure[:200]}")
+        if backend == "docker" and not _docker_sandbox_ready(cwd):
+            raise RuntimeError("the Docker sandbox is not ready")
+        previous, _spawn_service = _spawn_service, spawn
+        try:
+            if backend == "docker":
+                _exec_docker_command(command, 3600, workspace=cwd)
+            else:
+                _exec_native_sandbox(command, 3600, cwd=cwd)
+        finally:
+            _spawn_service = previous
+        proc = spawned.get("proc")
+        if proc is None:
+            raise RuntimeError("the sandbox did not start the service")
+        containers, closers, host_port, note, ready = [], [], port, "", None
+        if backend == "docker":
+            containers.append(spawned["container"])
+            host_port = services.free_port()
+            if spawned["network"] in ("none", "host"):  # "none": its own network could not be made
+                note = ("this Docker network cannot be reached from this computer"
+                        if spawned["network"] == "none" else "")
+                if spawned["network"] == "host":
+                    host_port = port
+            else:
+                try:
+                    containers.append(_start_docker_relay(spawned["container"], spawned["network"], port, host_port))
+                except Exception as exc:  # noqa: BLE001
+                    note = f"not reachable from this computer: {str(exc)[:160]}"
+            note = note or "published on 127.0.0.1 through a relay container"
+        elif linux_native:
+            host_port = services.free_port()
+            bridge = _UnixBridge(socket_path, host_port)
+            closers.append(bridge.close)
+            ready = bridge.ready
+            note = "bridged out of the sandbox's network through a unix socket"
+
+        def stop():
+            for close in closers:
+                close()
+            _remove_containers(containers)
+            if spawned.get("own_network"):
+                subprocess.run(["docker", "network", "rm", spawned["own_network"]], capture_output=True, timeout=60)
+            if proc.poll() is None:
+                _kill_process_tree(proc.pid)
+            if socket_path is not None:
+                try:
+                    socket_path.unlink()
+                except OSError:
+                    pass
+            for repo, saved in guarded:
+                _git_guard_restore(repo, saved)
+
+        return services.Handle(stop=stop, alive=lambda: proc.poll() is None, host_port=host_port,
+                               pid=proc.pid, containers=list(containers), note=note, ready=ready)
+    return launch
+
+
+_SERVICE_TOOLS = frozenset(("service_start", "service_status", "service_logs", "service_stop"))
+
+
+def _exec_service(name: str, args: dict) -> str:
+    """The four service tools. Their commands passed the same checks as execute_shell."""
+    if not SERVICES_ENABLED:
+        return "Error: services are turned off (services=0 in config.txt)."
+    registry = _services()
+    owner = "main"
+    if name == "service_status":
+        running = registry.status(owner)
+        if not running:
+            return "No services are running."
+        return "\n".join(
+            f"- {s['name']}: {s['url']} ({'running' if s['running'] else 'stopped'}, {s['seconds']} s, "
+            f"{s['backend']}{'; ' + s['note'] if s.get('note') else ''}) -- {s['command']}" for s in running)
+    if name == "service_logs":
+        service = registry.get(args.get("name"), owner)
+        if service is None:
+            return f"Error: no service named {args.get('name')!r} is running. service_status lists them."
+        try:
+            lines = int(args.get("lines") or 40)
+        except (TypeError, ValueError):
+            lines = 40
+        from agent8088 import services
+        text = services.tail(service.log_path, lines)
+        state = "running" if service.handle.alive() else "stopped"
+        return _wrap_untrusted(f"[{service.name}, {state}]\n{text or '(no output yet)'}", f"service {service.name}")
+    if name == "service_stop":
+        stopped = registry.stop(args.get("name"), owner)
+        return (f"Stopped {stopped.name}." if stopped else
+                f"Error: no service named {args.get('name')!r} is running. service_status lists them.")
+    # service_start
+    backend = _resolve_sandbox_backend()
+    if backend not in ("native", "docker"):
+        return _sandbox_required_error()
+    cwd = Path(_shell_workspace_root or ARTIFACTS_ROOT).resolve()
+    port = args.get("port")
+    try:
+        service = registry.start(args.get("name"), str(args.get("command") or ""), owner, backend,
+                                 _service_launcher(backend, cwd, str(args.get("name") or "").strip().lower()),
+                                 port=int(port) if str(port or "").strip() else None)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except Exception as exc:  # noqa: BLE001 -- a launch problem is the model's to read, not a crash
+        return f"Error: the service could not start: {str(exc)[:300]}"
+    from agent8088 import services
+    listening = registry.answers(service)
+    log = services.tail(service.log_path, 15)
+    if listening:
+        head = (f"Service {service.name} is running and answering at {service.url} "
+                f"(port {service.port} inside the sandbox; {service.handle.note or backend}).")
+    elif service.handle.alive():
+        head = (f"Service {service.name} started but nothing answered at {service.url} within "
+                f"{int(services.READY_SECONDS)} s. It may still be starting; check service_logs, and that it "
+                f"listens on the port it was given ({service.port}, also in PORT).")
+    else:
+        registry.stop(service.name)
+        head = f"Service {service.name} exited before it answered. Its last output is below."
+    return head + (f"\n{_wrap_untrusted(log, f'service {service.name}')}" if log else "")
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
@@ -12610,6 +12996,8 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         argv.extend(["--entrypoint", "/bin/sh"])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
     _clean_stale_docker_sandbox()
+    if _spawn_service is not None:
+        return _spawn_service(argv)
     result = _exec_process(argv, timeout=timeout)
     if "timed out" in result:
         try:
@@ -15530,6 +15918,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             return str(_safe_calculate(expression))
         except (SyntaxError, TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
             return f"Error: invalid arithmetic expression: {exc}"
+
+    if mode == "shell" and name in _SERVICE_TOOLS:
+        return _exec_service(name, args)
 
     if mode == "shell":
         reuse = _reuse_known_verdict(ledger_command)
