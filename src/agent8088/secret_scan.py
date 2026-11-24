@@ -123,6 +123,25 @@ _HASHISH_WORDS = frozenset({
 _TOKEN_SPLIT_RE = re.compile(r"[^\w./+=:@-]+")
 _EDGE_PUNCT = "\"'`()[]{}<>,;!?*"
 
+# `name=value` with no spaces, as a keyword argument or a setting is written (`creationflags=CREATE_NEW_PROCESS_GROUP`).
+# The scan keeps `=` inside a token, so the name and its `=` made a long token, and the `=` passed for the base64
+# punctuation the blob rule asks for: every long `name=CONSTANT` and `name=some_function_name` in code was reported.
+# The value is judged alone when the name is not one a credential goes by; a name like key, token, secret or
+# password keeps the whole token judged, as before. Base64 padding (`abc==`, `abc=`) has no name before the `=`.
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][\w.-]{0,63}=(?!=)(?P<value>.+)$")
+_CREDENTIAL_NAME_RE = re.compile(r"key|token|secret|pass|pwd|auth|cred|bearer|private", re.IGNORECASE)
+
+
+def _assigned_value(token: str) -> str:
+    """The value of a `name=value` token whose name is not a credential name; any other token unchanged."""
+    match = _ASSIGNMENT_RE.match(token)
+    if not match:
+        return token
+    name = token[:token.index("=")]
+    if _CREDENTIAL_NAME_RE.search(name):
+        return token
+    return match.group("value").strip(_EDGE_PUNCT) or token
+
 
 class Finding:
     """One credential-shaped string. ``masked`` is safe to show or log."""
@@ -395,7 +414,7 @@ def find_secrets(text: str) -> list:
 
     opaque_text = _USER_AGENT_RE.sub(user_agent, opaque_text)
     for raw in _TOKEN_SPLIT_RE.split(opaque_text):
-        token = raw.strip(_EDGE_PUNCT)
+        token = _assigned_value(raw.strip(_EDGE_PUNCT))
         if len(token) < _MIN_MIXED or token in seen or _is_noise(token):
             continue
         if looks_like_opaque_credential(token):
