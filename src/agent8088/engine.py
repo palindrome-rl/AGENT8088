@@ -1271,10 +1271,43 @@ _permission_floor_readonly = False
 # never what the caller was already allowed to look at.
 _floor_parent_mode = "readonly"
 _sandbox_readonly = False
-# Where sandboxed shell commands run. artifacts/ unless a file the user named
-# was written elsewhere in the project this turn: then the project root, so the
-# shell sees that file at the same mapped path (never wider than the project).
+# Where sandboxed shell commands run and may write. shell_workspace=project (the
+# default) starts them in the project folder, so a build that writes next to its
+# own sources (out/, dist/, a venv) works in place; the repository's .git stays
+# read-only to them on every backend. shell_workspace=artifacts keeps the older
+# behaviour: artifacts/ unless a file the user named was written elsewhere in the
+# project this turn, then the project root. Either way never wider than the project,
+# and never a folder that holds the user's home (see _project_shell_root).
+SHELL_WORKSPACE = str(APP_CONFIG.get("shell_workspace", "project")).strip().lower() or "project"
 _shell_workspace_root = None
+
+
+def _project_shell_root():
+    """The project folder when shell commands may write there from the start, else None.
+
+    Not when the setting says artifacts, inside a disposable container (which has
+    its own rules), or when the project folder is too wide to hand to a shell: the
+    home folder, a folder above it, or the root of a drive. There the shell keeps
+    artifacts/, as before."""
+    if SHELL_WORKSPACE != "project" or DISPOSABLE_CONTAINER:
+        return None
+    try:
+        root = Path(PROJECT_ROOT).resolve()
+        artifacts = Path(ARTIFACTS_ROOT).resolve()
+        home = Path.home().resolve()
+        # reset_turn_counters also runs while this module is still loading,
+        # before the data-folder helper below exists.
+        data_dir = globals().get("_agent_data_dir")
+        data = data_dir().resolve() if data_dir else home
+    except (OSError, RuntimeError):
+        return None
+    if artifacts == root or not root.is_dir() or root == Path(root.anchor):
+        return None
+    if root == home or root in home.parents or root == data or root in data.parents:
+        return None
+    if not _path_is_allowed(root):
+        return None
+    return root
 _last_audit_share = 0.0     # verification's share of the last completed turn's tokens
 
 
@@ -1368,7 +1401,7 @@ def reset_turn_counters() -> None:
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     global _failure_streak, _diagnostic_shown, _shell_workspace_root, _declined_plan_reply
     _turn_writes = 0
-    _shell_workspace_root = None
+    _shell_workspace_root = _project_shell_root()
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
@@ -1378,6 +1411,8 @@ def reset_turn_counters() -> None:
     _pending_blocker_note = ""
     _failure_streak = 0
     _diagnostic_shown = False
+    if "_sandbox_denials" in globals():  # also runs while the module loads
+        _sandbox_denials.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -5283,6 +5318,11 @@ def _ground_execute_shell_description(specs: dict) -> None:
     if cwd is None:
         where = (f"none: the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)}, so "
                  f"commands cannot run until the user sets shell_cwd")
+    elif not spec.get("host") and _project_shell_root() is not None:
+        # Commands start in the project folder and may write there, so a build
+        # can write its output next to its sources.
+        where = (f"{PROJECT_ROOT} (the project folder; commands may write here, except in .git. "
+                 f"A file the file tools save under a bare name is in {ARTIFACTS_ROOT})")
     elif not spec.get("host"):
         # The sandbox moves every command into the artifacts workspace, so
         # naming the shell folder here was one folder off from what `pwd` prints.
@@ -11167,7 +11207,11 @@ def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
         "import base64, os, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
-        "env = dict(os.environ)\n"
+        "import re\n"
+        f"secret = re.compile({_SECRET_ENV_RE.pattern!r}, re.IGNORECASE)\n"
+        f"keep = {sorted(SANDBOX_PASS_ENV)!r}\n"
+        "env = {k: v for k, v in os.environ.items() if not secret.search(k) or k.upper() in keep\n"
+        "       or k.upper().startswith('AGENT8088_')}\n"
         "key = next((k for k in env if k.lower() == 'path'), 'PATH')\n"
         "env[key] = os.pathsep.join(p for p in env.get(key, '').split(os.pathsep) if not\n"
         "    p.strip().strip('\"').rstrip('\\\\/').lower().replace('/', '\\\\').endswith('\\\\git\\\\usr\\\\bin'))\n"
@@ -11419,6 +11463,28 @@ def set_sandbox_backend(backend: str) -> dict:
     return status
 
 
+# Secret environment variables. A sandboxed command inherits the environment
+# Agent8088 was started in, so a token set in the user's shell (GITHUB_TOKEN,
+# AWS_SECRET_ACCESS_KEY, OPENAI_API_KEY) was readable by any code the model ran.
+# They are removed from that environment; sandbox_pass_env names any the task
+# really needs inside the sandbox. The Windows bridge below carries the same rule.
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY)(?:_|$)"
+    r"|(?:API|ACCESS|PRIVATE|SECRET|SIGNING|ENCRYPTION|MASTER|CLIENT|SERVICE)_KEY(?:_|$)"
+    r"|_KEY$|^(?:PGPASSWORD|NPM_TOKEN|NODE_AUTH_TOKEN|HF_TOKEN|DATABASE_URL)$",
+    re.IGNORECASE)
+SANDBOX_PASS_ENV = frozenset(
+    name.strip().upper() for name in str(APP_CONFIG.get("sandbox_pass_env", "")).split(",") if name.strip())
+
+
+def _secret_env_names(environ=None) -> list:
+    """Names (never values) of the variables kept out of sandboxed commands."""
+    environ = os.environ if environ is None else environ
+    return sorted(name for name in environ
+                  if _SECRET_ENV_RE.search(name) and name.upper() not in SANDBOX_PASS_ENV
+                  and not name.upper().startswith("AGENT8088_"))
+
+
 # Secret files inside the folders a sandboxed command can reach.
 _SECRET_FILE_GLOBS = (".env*", "*.pem", "*.key", "*.p12", "*_KEY*", "*_SECRET*",
                       "*_TOKEN*", "*_PASSWORD*")
@@ -11461,6 +11527,81 @@ def _existing_secret_files(roots: list) -> list:
     return found
 
 
+def _protected_repo_paths(workspace) -> list:
+    """The repository metadata inside a writable shell folder: `.git` (a folder, or
+    the file a linked worktree has instead). Shell commands may not change it --
+    git runs its hooks and reads its config on this computer, outside any sandbox."""
+    try:
+        candidate = Path(workspace).resolve() / ".git"
+    except (OSError, RuntimeError, TypeError):
+        return []
+    return [candidate] if candidate.exists() else []
+
+
+# The Windows runner grants one folder and cannot deny part of it, so a command
+# working in the project could write .git. What git would run or obey on this
+# computer -- the hooks and the config -- is saved before the command and put
+# back after it; any other change to .git is reported, not undone.
+_GIT_GUARD_MAX_FILES = 200
+_GIT_GUARD_MAX_BYTES = 1024 * 1024
+
+
+def _git_guard_snapshot(workspace) -> dict | None:
+    """{relative path: bytes} of .git/config and every file under .git/hooks, or None."""
+    git_dir = Path(workspace) / ".git"
+    if not git_dir.is_dir():
+        return None
+    saved = {}
+    candidates = [git_dir / "config"]
+    hooks = git_dir / "hooks"
+    if hooks.is_dir():
+        candidates += sorted(path for path in hooks.rglob("*") if path.is_file())
+    for path in candidates[:_GIT_GUARD_MAX_FILES]:
+        try:
+            if path.is_file() and path.stat().st_size <= _GIT_GUARD_MAX_BYTES:
+                saved[path.relative_to(git_dir).as_posix()] = path.read_bytes()
+        except OSError:
+            continue
+    return saved
+
+
+def _git_guard_restore(workspace, saved: dict | None) -> str:
+    """Put back hooks and config a shell command changed; a note for the model, or ""."""
+    if saved is None:
+        return ""
+    git_dir = Path(workspace) / ".git"
+    changed = []
+    hooks = git_dir / "hooks"
+    now = [git_dir / "config"] + (sorted(p for p in hooks.rglob("*") if p.is_file())
+                                  if hooks.is_dir() else [])
+    for path in now:
+        relative = path.relative_to(git_dir).as_posix()
+        try:
+            if relative not in saved:
+                if path.exists():
+                    path.unlink()
+                    changed.append(relative)
+            elif path.read_bytes() != saved[relative]:
+                path.write_bytes(saved[relative])
+                changed.append(relative)
+        except OSError:
+            changed.append(relative + " (could not be put back)")
+    for relative, data in saved.items():
+        path = git_dir / relative
+        if not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                changed.append(relative)
+            except OSError:
+                changed.append(relative + " (could not be put back)")
+    if not changed:
+        return ""
+    _audit("sandbox_git_guard", workspace=str(workspace), restored=changed[:20])
+    return ("\n[sandbox] The command changed the repository's git settings, which shell commands may not do "
+            f"(.git/{', .git/'.join(changed[:5])}); they were put back. Use the git tools for repository changes.")
+
+
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
@@ -11479,8 +11620,15 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
     allow_write = [str(sandbox_tmp)]
+    protected = []
     if not readonly:
         allow_write.append(str(ARTIFACTS_ROOT))
+        # The shell's own folder: the project once commands work there. Its
+        # repository metadata stays read-only, as it was when only artifacts/
+        # was writable: hooks and config are run by git on this computer.
+        if workspace is not None:
+            allow_write.append(str(Path(workspace).resolve()))
+            protected = [str(path) for path in _protected_repo_paths(workspace)]
     elif workspace is not None:
         allow_write.append(str(workspace.resolve()))
     return {
@@ -11494,11 +11642,14 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
             "denyRead": deny_paths,
             "allowRead": [],
             "allowWrite": list(dict.fromkeys(allow_write)),
-            "denyWrite": deny_paths + [str(path) for path in BLOCKED_PATHS],
+            "denyWrite": list(dict.fromkeys(deny_paths + [str(path) for path in BLOCKED_PATHS] + protected)),
         },
         "enableWeakerNestedSandbox": False,
         "enableWeakerNetworkIsolation": False,
         "allowAppleEvents": False,
+        # srt unsets each of these in the sandboxed command (mode deny).
+        **({"credentials": {"envVars": [{"name": name, "mode": "deny"} for name in secret_env]}}
+           if (secret_env := _secret_env_names()) else {}),
     }
 
 
@@ -12043,6 +12194,11 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     argv = _native_sandbox_argv()
     if not argv:
         return "Native sandbox runtime is unavailable."
+    secret_env = [name for name in _secret_env_names() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)]
+    if sys.platform != "win32" and secret_env:
+        # srt unsets them too (credentials in its settings); this keeps them out
+        # if a runtime ever ignored that section.
+        command = f"unset {' '.join(secret_env)}; {command}"
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     if sys.platform == "win32":
@@ -12073,7 +12229,10 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         wrapped = _native_sandbox_shell_argv(command, cwd=None if readonly else cwd)
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
                             "--mode", mode, "--"] + wrapped
-        return _exec_process(full_argv, timeout=timeout)
+        guarded = None if readonly else _git_guard_snapshot(cwd)
+        result = _exec_process(full_argv, timeout=timeout)
+        note = _git_guard_restore(cwd, guarded)
+        return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
     command = (f"cd {shlex.quote(str(cwd))} && "
                f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
@@ -12309,6 +12468,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         "--mount", (f"type=bind,src={workspace},dst=/workspace"
                     + (",readonly" if readonly else "")),
     ]
+    if not readonly:
+        # The project's repository metadata stays read-only inside a writable mount.
+        for protected in _protected_repo_paths(workspace_path):
+            argv.extend(["--mount", f"type=bind,src={protected},dst=/workspace/.git,readonly"])
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
@@ -12612,6 +12775,44 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    explained = _sandbox_denial_hint(result, workspace, command)
+    return explained + _repeated_denial_note(command)
+
+
+# How many times each command was refused by the sandbox this turn. A model that
+# runs the same refused command again rarely does anything else differently, so
+# the second refusal says plainly that it will keep failing.
+_sandbox_denials: dict = {}
+
+
+def _repeated_denial_note(command: str) -> str:
+    key = " ".join(str(command or "").split())[:300]
+    if not key:
+        return ""
+    _sandbox_denials[key] = _sandbox_denials.get(key, 0) + 1
+    count = _sandbox_denials[key]
+    if count < 2:
+        return ""
+    return (f"\n[sandbox] This exact command has now been refused {count} times this turn, for the same reason. "
+            "It will be refused again: do not run it again. Change the approach (another folder, another tool), "
+            "or say in your answer what the task needs that the sandbox does not allow.")
+
+
+def _denied_secret_path(result: str) -> str:
+    """A protected credential path named in a refusal, or ""."""
+    for match in re.finditer(r"""['"]?((?:[A-Za-z]:)?[\\/~][^\s'":]*|\.env[^\s'":]*)['"]?""", result or ""):
+        path = match.group(1)
+        if _is_sensitive_path(path):
+            return path
+    return ""
+
+
+def _sandbox_denial_hint(result: str, workspace: Path, command: str = "") -> str:
+    """The refusal with the sentence that explains it."""
+    if secret := _denied_secret_path(result):
+        return (f"{result}\n[sandbox] {secret} holds credentials, which sandboxed commands may not read or "
+                "write. This is deliberate: do not look for another way to reach it. If the task needs a "
+                "credential, say so in your answer and the user will provide what is needed.")
     if (sys.platform == "win32" and "spawn EPERM" in (result or "")
             and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
         return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
@@ -12625,14 +12826,14 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only to them. To create "
-            "or change a file elsewhere in the allowed paths, use write_file or "
-            "edit_file: they act on this computer's files, not the sandbox. Programs "
-            "outside the agent's own runtime may be refused. Creating virtual "
-            "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder and use the packages the agent's "
-            "Python already has or another tool; ask the user to install something "
-            "only when nothing available can do the job.")
+            "the sandbox temp folder; everything else is read-only to them, including "
+            "the system Python and the home folder. To create or change a file elsewhere "
+            "in the allowed paths, use write_file or edit_file: they act on this "
+            "computer's files, not the sandbox. To install packages, make a virtual "
+            f"environment inside {workspace} (for example `python -m venv .venv`) and "
+            "install into it, rather than into the system or the user's folders. Programs "
+            "outside the agent's own runtime may be refused; use what is available or another "
+            "tool, and ask the user to install something only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
@@ -20508,6 +20709,9 @@ def _workspace_note(trajectory, *, probe_backend: bool = True) -> str:
         extra = f" (and {len(locations) - 3} more)" if len(locations) > 3 else ""
         return (f"Files written to: {shown}{extra} -- the sandbox workspace, "
                 f"not {PROJECT_ROOT}.")
+    shell_root = Path(_shell_workspace_root).resolve() if _shell_workspace_root is not None else None
+    if shell_root is not None and shell_root == Path(PROJECT_ROOT).resolve():
+        return ""  # shell commands worked in the project itself: nothing was moved
     if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
         return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
                 f"with a relative path is there, not under {PROJECT_ROOT}.")

@@ -269,6 +269,18 @@ browser_headless=1
 # If neither is available, shell and code execution are refused.
 sandbox_backend=auto
 sandbox_runtime_version=0.0.73
+# Where sandboxed shell commands run and may write. `project` (the default) is the
+# project folder, so a build can write next to its sources; the repository's .git
+# stays read-only to them. When the project folder is the home folder, a folder
+# above it or a drive root, commands use artifacts/ instead. `artifacts` always
+# starts them in artifacts/, the project folder only after a file you named there
+# was written.
+# shell_workspace=project
+# Variables that look like secrets (names with TOKEN, SECRET, PASSWORD, API_KEY,
+# CREDENTIALS, ...) are removed from the environment of sandboxed commands, so
+# code the model runs cannot read a token set in your shell. Name any a task
+# really needs inside the sandbox here.
+# sandbox_pass_env=GITHUB_TOKEN
 # sandbox_allowed_domains=api.example.com
 # `open` lets sandboxed commands reach anything this computer can: the internet,
 # its own services (mail, databases, dev servers on localhost) and the local

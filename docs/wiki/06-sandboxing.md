@@ -99,6 +99,21 @@ sandbox_allowed_domains=registry.npmjs.org
 Packages installed in the container are Linux builds in your project folder, so
 run `npm install` again on Windows before you run the project yourself.
 
+## Where commands work
+
+Sandboxed shell commands start in the project folder and may write there
+(`shell_workspace=project`, the default), so a build can write its output next
+to its sources (`out/`, `dist/`, a `.venv`). The repository's `.git` stays
+read-only to them on every backend: srt denies writes to it, Docker mounts it
+read-only, and on Windows (whose runner grants one folder whole) the hooks and
+`.git/config` are saved before each command and put back after it. Use the git
+tools for repository changes.
+
+When the project folder is the home folder, a folder above it, the Agent8088
+data folder or a drive root, commands use `artifacts/` instead.
+`shell_workspace=artifacts` always starts them in `artifacts/`, and in the project
+folder only after a file you named there was written.
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run.
@@ -134,6 +149,16 @@ Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that
 daemon, so the fallback is refused with a diagnosis rather than returning a raw
 Docker error. Run Agent8088 on the Docker host or use native isolation there.
+
+## Secrets in the environment
+
+A sandboxed command does not inherit variables whose names look like secrets
+(`TOKEN`, `SECRET`, `PASSWORD`, `PASSPHRASE`, `CREDENTIALS`, `API_KEY`,
+`ACCESS_KEY` and other `*_KEY` names, `DATABASE_URL`), so code the model runs
+cannot read a token set in your shell. srt unsets them on macOS and Linux, the
+Windows runner drops them, and Docker containers never inherit the host
+environment. Name any variable a task really needs inside the sandbox with
+`sandbox_pass_env=GITHUB_TOKEN,NPM_TOKEN`.
 
 ## Network egress
 

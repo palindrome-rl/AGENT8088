@@ -83,6 +83,8 @@ def test_write_then_shell_sees_the_same_file_at_the_mapped_path(engine, ws, monk
 
 
 def test_default_writes_keep_the_shell_in_artifacts(engine, ws, monkeypatch):
+    # shell_workspace=artifacts: the shell starts in artifacts/ until a named path is written.
+    monkeypatch.setattr(engine, "SHELL_WORKSPACE", "artifacts")
     seen = {}
     monkeypatch.setattr(engine, "_resolve_sandbox_backend", lambda: "docker")
     monkeypatch.setattr(engine, "_run_in_sandbox_backend",
