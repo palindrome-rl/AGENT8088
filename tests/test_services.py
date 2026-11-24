@@ -229,6 +229,7 @@ def test_linux_service_settings_allow_the_bridge_and_hide_host_sockets(engine, t
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "data")
     monkeypatch.setattr(engine, "_secret_scan_roots", lambda workspace: [])
     monkeypatch.setattr(engine.os.path, "exists", lambda p: p in ("/var/run/docker.sock", "/run/user"))
+    monkeypatch.setattr(engine.os.path, "realpath", lambda p, **kwargs: p)
     data = json.loads(engine._write_service_settings(tmp_path).read_text(encoding="utf-8"))
     assert data["network"]["allowAllUnixSockets"] is True
     assert {"/var/run/docker.sock", "/run/user"} <= set(data["filesystem"]["denyRead"])

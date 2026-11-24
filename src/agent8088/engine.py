@@ -12613,7 +12613,9 @@ def _write_service_settings(cwd: Path) -> Path:
     data = _sandbox_settings_data(False, cwd)
     if sys.platform.startswith("linux"):
         data["network"]["allowAllUnixSockets"] = True
-        hidden = [path for path in _HOST_DAEMON_SOCKETS if os.path.exists(path)]
+        # The real paths: /var/run is a link to /run on most systems, and bubblewrap
+        # cannot place a mask on a path that goes through a link.
+        hidden = sorted({os.path.realpath(path) for path in _HOST_DAEMON_SOCKETS if os.path.exists(path)})
         data["filesystem"]["denyRead"] = list(dict.fromkeys([*data["filesystem"]["denyRead"], *hidden]))
         data["filesystem"]["denyWrite"] = list(dict.fromkeys([*data["filesystem"]["denyWrite"], *hidden]))
     path = _agent_data_dir() / f"srt-settings-service-{os.getpid()}.json"
