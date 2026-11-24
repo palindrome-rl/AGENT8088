@@ -206,4 +206,20 @@ instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
 
 ## Verifying it works
 
-Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state.
+
+The source checkout has attack tests (`tests/test_sandbox_attacks.py`): real
+commands that try to write outside the folder, read a key in the home folder or a
+`.env` in the project, reach hosts off the allowlist, private and metadata
+addresses, open a raw connection past the proxy, read a secret variable, and plant
+a git hook. They run on every backend the machine has and check the result on the
+host. They are opt-in:
+
+```bash
+AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+AGENT8088_ATTACK_BACKENDS=docker AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+```
+
+A test the backend cannot enforce is skipped with the reason (the Windows runner
+limits writes only), so a skip is the documented gap, not a pass. CI runs them on
+Linux (srt and Docker) and macOS (srt). The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).
