@@ -31,8 +31,9 @@ def test_native_is_ok(sandbox):
     assert engine._sandbox_model_note() == ""
 
 
-def test_docker_fallback_at_startup_is_degraded(sandbox):
+def test_docker_fallback_at_startup_is_degraded(sandbox, monkeypatch):
     engine, state = sandbox
+    monkeypatch.setattr(engine, "DOCKER_NETWORK_CONFIGURED", True)  # docker_network=none written down
     state["native_missing"] = ["sandbox-runtime"]
     engine.verify_sandbox_backend()
     entry = capabilities.get(capabilities.SANDBOX)

@@ -99,41 +99,92 @@ sandbox_allowed_domains=registry.npmjs.org
 Packages installed in the container are Linux builds in your project folder, so
 run `npm install` again on Windows before you run the project yourself.
 
+## Where commands work
+
+Sandboxed shell commands start in the project folder and may write there
+(`shell_workspace=project`, the default), so a build can write its output next
+to its sources (`out/`, `dist/`, a `.venv`). The repository's `.git` stays
+read-only to them on every backend: srt denies writes to it, Docker mounts it
+read-only, and on Windows (whose runner grants one folder whole) the hooks and
+`.git/config` are saved before each command and put back after it. Use the git
+tools for repository changes.
+
+When the project folder is the home folder, a folder above it, the Agent8088
+data folder or a drive root, commands use `artifacts/` instead.
+`shell_workspace=artifacts` always starts them in `artifacts/`, and in the project
+folder only after a file you named there was written.
+
 ## Docker fallback
 
-Used automatically under `auto` when native isolation is missing or cannot run:
+Used automatically under `auto` when native isolation is missing or cannot run.
 
-```ini
-docker_image=python:3.11-slim
-docker_network=none
-```
-
-`docker_network=none` is the safer default — no network from inside the
-container at all. `docker_network=allowlist` gives the container the same
-allowlist the native runtime enforces: it joins an internal Docker network
-whose only way out is a small proxy container (`agent8088-egress-proxy-*`,
-left running between sessions) that allows only `sandbox_allowed_domains`.
-If the proxy cannot start, the container gets no network.
+- **Image.** Commands run in Agent8088's sandbox image
+  (`ghcr.io/palindrome-rl/agent8088-sandbox`, built from
+  `docker/sandbox.Dockerfile`: Python, Node and git, on a base pinned by digest),
+  so `pip install`, `npm install` and `git clone` work in one container. When it
+  cannot be pulled, `python:3.11-slim` is used. `docker_image=` picks any other.
+- **Network.** Docker standing in for a missing native sandbox gets
+  `docker_network=allowlist`: the container joins an internal Docker network
+  whose only way out is a small proxy container (`agent8088-egress-proxy-*`)
+  that allows only `sandbox_allowed_domains` (the registry preset unless set).
+  The proxy also refuses any name that resolves to this computer, the local
+  network or a cloud metadata address, and connects to the address it checked.
+  If the proxy cannot start, the container gets no network. With
+  `sandbox_backend=docker` chosen on purpose, `docker_network=none` stays the
+  default: no network at all.
+- **Secrets.** Before each command, secret files in the folder are covered with
+  an empty file, including in `build/` and `dist/`, and a `.git/config` that
+  holds a token. Installed package trees (`node_modules`, `.venv`) are not
+  searched.
+- **Ownership.** On Linux the container runs as your user id, so the files it
+  writes are yours.
+- **Clean-up.** At the first command of a session, containers left by an
+  Agent8088 process that has ended, and proxies for an allowlist that is no
+  longer configured, are removed.
+- **Docker Desktop** is not started for the sandbox unless `docker_autostart=1` (the managed SearXNG still starts it unless `docker_autostart=0`).
+- **Many secret files.** A folder with four or more secret-looking files (a `certs/` or test-fixture folder) is covered with an empty folder as a whole, so its other files are hidden too. More than 200 masks in one project stops the command rather than running it unmasked.
+- **Pinned images.** The fallback and proxy images are pinned by digest.
 
 Docker's bind mounts are resolved by the Docker daemon. If Agent8088 itself is
 running in a container, its workspace path is normally not visible to that
 daemon, so the fallback is refused with a diagnosis rather than returning a raw
 Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
+## Secrets in the environment
+
+A sandboxed command does not inherit variables whose names look like secrets
+(`TOKEN`, `SECRET`, `PASSWORD`, `PASSPHRASE`, `CREDENTIALS`, `API_KEY`,
+`ACCESS_KEY` and other `*_KEY` names, `DATABASE_URL`), so code the model runs
+cannot read a token set in your shell. srt unsets them on macOS and Linux, the
+Windows runner drops them, and Docker containers never inherit the host
+environment. Name any variable a task really needs inside the sandbox with
+`sandbox_pass_env=GITHUB_TOKEN,NPM_TOKEN`.
+
 ## Network egress
 
-Sandboxed commands have no network unless you allow specific domains
+Sandboxed commands reach only the hosts in `sandbox_allowed_domains`
 (**macOS, Linux and Docker** -- the Windows native backend does not enforce this,
-see above):
+see above). With no `sandbox_allowed_domains` line the list is `default`: the
+common package registries, code hosts and docs sites (PyPI, npm, GitHub,
+crates.io, Go proxy, Maven Central, RubyGems, conda, Hugging Face, ...), so
+`npm install` / `pip install` / `git clone` work out of the box. Add your own
+hosts after it, or close the network with `none`:
 
 ```ini
-sandbox_allowed_domains=api.example.com,pypi.org
+sandbox_allowed_domains=default,api.example.com
+sandbox_allowed_domains=none
 ```
 
-`default` in the list adds the common package registries, code hosts and docs
-sites (PyPI, npm, GitHub, crates.io, Go proxy, Maven Central, RubyGems, conda,
-Hugging Face, ...), so `sandbox_allowed_domains=default` is enough for most
-`npm install` / `pip install` / `git clone` tasks.
+When a command is refused a host, the model is told which host it was and that
+retrying will not help, and the refusal is written to the audit log. In an
+interactive session you are also asked once whether to allow that host for the
+rest of the session; a host you decline is not asked about again, and
+`sandbox_ask_hosts=0` turns the question off. Nothing is written to `config.txt`.
+
+Package caches (pip, uv, npm, yarn, pnpm, cargo, Go) go to `sandbox-cache` in the
+Agent8088 data folder, which sandboxed commands may write and which is kept
+between commands. On macOS, commands may also listen on local ports, so a dev
+server or test runner can start inside the sandbox.
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP
@@ -206,4 +257,20 @@ instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
 
 ## Verifying it works
 
-Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state.
+
+The source checkout has attack tests (`tests/test_sandbox_attacks.py`): real
+commands that try to write outside the folder, read a key in the home folder or a
+`.env` in the project, reach hosts off the allowlist, private and metadata
+addresses, open a raw connection past the proxy, read a secret variable, and plant
+a git hook. They run on every backend the machine has and check the result on the
+host. They are opt-in:
+
+```bash
+AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+AGENT8088_ATTACK_BACKENDS=docker AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+```
+
+A test the backend cannot enforce is skipped with the reason (the Windows runner
+limits writes only), so a skip is the documented gap, not a pass. CI runs them on
+Linux (srt and Docker) and macOS (srt). The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).

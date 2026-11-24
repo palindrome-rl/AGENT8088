@@ -11,9 +11,13 @@ import pytest
 from agent8088 import capabilities, egress_proxy
 
 
-def test_network_closed_unless_configured(engine):
-    assert engine._sandbox_allowed_domains({}) == []
+def test_no_setting_means_the_registry_preset_and_none_closes_it(engine, monkeypatch):
+    assert engine._sandbox_allowed_domains({}) == list(engine._DEFAULT_SANDBOX_ALLOWED_DOMAINS)
+    assert engine._sandbox_allowed_domains({"sandbox_allowed_domains": "none"}) == []
     assert engine.DOCKER_NETWORK == "none"
+    # docker_network=none written in config.txt: no network. (With no line, Docker
+    # standing in for native gets the allowlist: test_docker_sandbox_fixes.py.)
+    monkeypatch.setattr(engine, "DOCKER_NETWORK_CONFIGURED", True)
     assert engine._docker_egress_args() == ("none", [])
 
 
@@ -41,8 +45,13 @@ def test_proxy_host_matching():
 
 
 @pytest.fixture
-def proxy():
-    """The proxy's handler behind a localhost listener; returns (port, patterns)."""
+def proxy(monkeypatch):
+    """The proxy's handler behind a localhost listener; returns (port, patterns).
+
+    The upstream servers here are on localhost, which the proxy refuses for real
+    use; these tests check the forwarding, so that address check lets them through."""
+    monkeypatch.setattr(egress_proxy, "public_address",
+                        lambda host, port: (socket.AF_INET, (socket.gethostbyname(host), port)))
     patterns = ["127.0.0.1"]
     server = socket.create_server(("127.0.0.1", 0))
 
@@ -138,6 +147,9 @@ class _FakeDocker:
 
 @pytest.fixture
 def allowlist_mode(engine, monkeypatch):
+    # These tests fake `docker` itself, so the real proxy start-up runs against the fake.
+    monkeypatch.setattr(engine, "_start_docker_egress",
+                        getattr(engine, "_unguarded_start_docker_egress", engine._start_docker_egress))
     monkeypatch.setattr(engine, "DOCKER_NETWORK", "allowlist")
     monkeypatch.setattr(engine, "SANDBOX_ALLOWED_DOMAINS", ["pypi.org", "registry.npmjs.org"])
     return engine
@@ -172,6 +184,7 @@ def test_docker_egress_failure_fails_closed(allowlist_mode, monkeypatch):
 
 
 def test_docker_network_none_and_custom_values(engine, monkeypatch):
+    monkeypatch.setattr(engine, "DOCKER_NETWORK_CONFIGURED", True)
     monkeypatch.setattr(engine, "DOCKER_NETWORK", "none")
     assert engine._docker_egress_args() == ("none", [])
     monkeypatch.setattr(engine, "DOCKER_NETWORK", "bridge")

@@ -62,6 +62,13 @@ python bench/run.py --profile <profile> --tier 1 --out tier1-runs
 python bench/report.py tier1-runs/results.jsonl --tier 1 --baseline <last tier 1 summary.json>
 ```
 
+When the release changes the sandbox (engine.py's sandbox code, `egress_proxy.py`, the pinned runtime or the
+sandbox image), also run the attack tests on a Windows machine, since CI covers only Linux and macOS:
+
+```bash
+AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+```
+
 Put the result and its "runs to read" list in the release PR. A failed bar is the
 release owner's call, not a silent go: say which rule failed and whether the cause
 is the harness, the model, the environment or infra.
