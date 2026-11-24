@@ -1300,10 +1300,43 @@ _permission_floor_readonly = False
 # never what the caller was already allowed to look at.
 _floor_parent_mode = "readonly"
 _sandbox_readonly = False
-# Where sandboxed shell commands run. artifacts/ unless a file the user named
-# was written elsewhere in the project this turn: then the project root, so the
-# shell sees that file at the same mapped path (never wider than the project).
+# Where sandboxed shell commands run and may write. shell_workspace=project (the
+# default) starts them in the project folder, so a build that writes next to its
+# own sources (out/, dist/, a venv) works in place; the repository's .git stays
+# read-only to them on every backend. shell_workspace=artifacts keeps the older
+# behaviour: artifacts/ unless a file the user named was written elsewhere in the
+# project this turn, then the project root. Either way never wider than the project,
+# and never a folder that holds the user's home (see _project_shell_root).
+SHELL_WORKSPACE = str(APP_CONFIG.get("shell_workspace", "project")).strip().lower() or "project"
 _shell_workspace_root = None
+
+
+def _project_shell_root():
+    """The project folder when shell commands may write there from the start, else None.
+
+    Not when the setting says artifacts, inside a disposable container (which has
+    its own rules), or when the project folder is too wide to hand to a shell: the
+    home folder, a folder above it, or the root of a drive. There the shell keeps
+    artifacts/, as before."""
+    if SHELL_WORKSPACE != "project" or DISPOSABLE_CONTAINER:
+        return None
+    try:
+        root = Path(PROJECT_ROOT).resolve()
+        artifacts = Path(ARTIFACTS_ROOT).resolve()
+        home = Path.home().resolve()
+        # reset_turn_counters also runs while this module is still loading,
+        # before the data-folder helper below exists.
+        data_dir = globals().get("_agent_data_dir")
+        data = data_dir().resolve() if data_dir else home
+    except (OSError, RuntimeError):
+        return None
+    if artifacts == root or not root.is_dir() or root == Path(root.anchor):
+        return None
+    if root == home or root in home.parents or root == data or root in data.parents:
+        return None
+    if not _path_is_allowed(root):
+        return None
+    return root
 _last_audit_share = 0.0     # verification's share of the last completed turn's tokens
 
 
@@ -1397,7 +1430,7 @@ def reset_turn_counters() -> None:
     global _turn_writes, _plan_tool_ran, _turn_blocker_counts, _pending_blocker_note
     global _failure_streak, _diagnostic_shown, _shell_workspace_root, _declined_plan_reply
     _turn_writes = 0
-    _shell_workspace_root = None
+    _shell_workspace_root = _project_shell_root()
     _turn_chunked.clear()
     _chunk_snapshots.clear()
     _pending_chunk_audits.clear()
@@ -5321,6 +5354,11 @@ def _ground_execute_shell_description(specs: dict) -> None:
     if cwd is None:
         where = (f"none: the configured {SHELL_CWD} {_dir_problem(SHELL_CWD)}, so "
                  f"commands cannot run until the user sets shell_cwd")
+    elif not spec.get("host") and _project_shell_root() is not None:
+        # Commands start in the project folder and may write there, so a build
+        # can write its output next to its sources.
+        where = (f"{PROJECT_ROOT} (the project folder; commands may write here, except in .git. "
+                 f"A file the file tools save under a bare name is in {ARTIFACTS_ROOT})")
     elif not spec.get("host"):
         # The sandbox moves every command into the artifacts workspace, so
         # naming the shell folder here was one folder off from what `pwd` prints.
@@ -11486,6 +11524,79 @@ def _existing_secret_files(roots: list) -> list:
     return found
 
 
+def _protected_repo_paths(workspace) -> list:
+    """The repository metadata inside a writable shell folder: `.git` (a folder, or
+    the file a linked worktree has instead). Shell commands may not change it --
+    git runs its hooks and reads its config on this computer, outside any sandbox."""
+    try:
+        candidate = Path(workspace).resolve() / ".git"
+    except (OSError, RuntimeError, TypeError):
+        return []
+    return [candidate] if candidate.exists() else []
+
+
+# The Windows runner grants one folder and cannot deny part of it, so a command
+# working in the project could write .git. What git would run or obey on this
+# computer -- the hooks and the config -- is saved before the command and put
+# back after it; any other change to .git is reported, not undone.
+_GIT_GUARD_MAX_FILES = 200
+_GIT_GUARD_MAX_BYTES = 1024 * 1024
+
+
+def _git_guard_snapshot(workspace) -> dict | None:
+    """{relative path: bytes} of .git/config and every file under .git/hooks, or None."""
+    git_dir = Path(workspace) / ".git"
+    if not git_dir.is_dir():
+        return None
+    saved = {}
+    candidates = [git_dir / "config"]
+    hooks = git_dir / "hooks"
+    if hooks.is_dir():
+        candidates += sorted(path for path in hooks.rglob("*") if path.is_file())
+    for path in candidates[:_GIT_GUARD_MAX_FILES]:
+        try:
+            if path.is_file() and path.stat().st_size <= _GIT_GUARD_MAX_BYTES:
+                saved[path.relative_to(git_dir).as_posix()] = path.read_bytes()
+        except OSError:
+            continue
+    return saved
+
+
+def _git_guard_restore(workspace, saved: dict | None) -> str:
+    """Put back hooks and config a shell command changed; a note for the model, or ""."""
+    if saved is None:
+        return ""
+    git_dir = Path(workspace) / ".git"
+    changed = []
+    hooks = git_dir / "hooks"
+    now = [git_dir / "config"] + (sorted(p for p in hooks.rglob("*") if p.is_file())
+                                  if hooks.is_dir() else [])
+    for path in now:
+        relative = path.relative_to(git_dir).as_posix()
+        try:
+            if relative not in saved:
+                if path.exists():
+                    path.unlink()
+                    changed.append(relative)
+            elif path.read_bytes() != saved[relative]:
+                path.write_bytes(saved[relative])
+                changed.append(relative)
+        except OSError:
+            changed.append(relative + " (could not be put back)")
+    for relative, data in saved.items():
+        path = git_dir / relative
+        if not path.exists():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                changed.append(relative)
+            except OSError:
+                changed.append(relative + " (could not be put back)")
+    if not changed:
+        return ""
+    _audit("sandbox_git_guard", workspace=str(workspace), restored=changed[:20])
+    return ("\n[sandbox] The command changed the repository's git settings, which shell commands may not do "
+            f"(.git/{', .git/'.join(changed[:5])}); they were put back. Use the git tools for repository changes.")
 # Package managers keep their caches under the home folder, which the sandbox
 # cannot write, so `pip install` and `npm install` failed on the cache before they
 # reached the network. Each one is pointed at its own folder under the agent's
@@ -11527,8 +11638,15 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
     allow_write = [str(sandbox_tmp), str(_sandbox_cache_dir())]
+    protected = []
     if not readonly:
         allow_write.append(str(ARTIFACTS_ROOT))
+        # The shell's own folder: the project once commands work there. Its
+        # repository metadata stays read-only, as it was when only artifacts/
+        # was writable: hooks and config are run by git on this computer.
+        if workspace is not None:
+            allow_write.append(str(Path(workspace).resolve()))
+            protected = [str(path) for path in _protected_repo_paths(workspace)]
     elif workspace is not None:
         allow_write.append(str(workspace.resolve()))
     return {
@@ -11544,7 +11662,7 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
             "denyRead": deny_paths,
             "allowRead": [],
             "allowWrite": list(dict.fromkeys(allow_write)),
-            "denyWrite": deny_paths + [str(path) for path in BLOCKED_PATHS],
+            "denyWrite": list(dict.fromkeys(deny_paths + [str(path) for path in BLOCKED_PATHS] + protected)),
         },
         "enableWeakerNestedSandbox": False,
         "enableWeakerNetworkIsolation": False,
@@ -12119,7 +12237,10 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         wrapped = _native_sandbox_shell_argv(command, cwd=None if readonly else cwd)
         full_argv = argv + ["--workspace", str(cwd), "--temp", str(sandbox_tmp),
                             "--mode", mode, "--"] + wrapped
-        return _exec_process(full_argv, timeout=timeout)
+        guarded = None if readonly else _git_guard_snapshot(cwd)
+        result = _exec_process(full_argv, timeout=timeout)
+        note = _git_guard_restore(cwd, guarded)
+        return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
     # Exported, not a prefix: `VAR=x a && b` sets VAR for `a` only.
     exports = {"TMPDIR": str(sandbox_tmp), **_sandbox_cache_env()}
@@ -12274,6 +12395,10 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
         "--mount", (f"type=bind,src={workspace},dst=/workspace"
                     + (",readonly" if readonly else "")),
     ]
+    if not readonly:
+        # The project's repository metadata stays read-only inside a writable mount.
+        for protected in _protected_repo_paths(workspace_path):
+            argv.extend(["--mount", f"type=bind,src={protected},dst=/workspace/.git,readonly"])
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
@@ -20452,6 +20577,9 @@ def _workspace_note(trajectory, *, probe_backend: bool = True) -> str:
         extra = f" (and {len(locations) - 3} more)" if len(locations) > 3 else ""
         return (f"Files written to: {shown}{extra} -- the sandbox workspace, "
                 f"not {PROJECT_ROOT}.")
+    shell_root = Path(_shell_workspace_root).resolve() if _shell_workspace_root is not None else None
+    if shell_root is not None and shell_root == Path(PROJECT_ROOT).resolve():
+        return ""  # shell commands worked in the project itself: nothing was moved
     if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
         return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
                 f"with a relative path is there, not under {PROJECT_ROOT}.")

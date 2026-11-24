@@ -155,6 +155,7 @@ not per call.
 |---|---|---|
 | `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
+| `shell_workspace` | `project` | Where sandboxed shell commands start and may write: the project folder (its `.git` stays read-only), or `artifacts`. A project folder that is the home folder, above it or a drive root always uses `artifacts/`. |
 | `sandbox_allowed_domains` | `default` | Domains reachable from inside the sandbox; `default` is the common package registries and code hosts, `none` closes the network. |
 | `sandbox_ask_hosts` | `1` | In an interactive session, ask once whether to allow a host a sandboxed command was refused, for the session. |
 | `sandbox_network` | (empty) | Explicitly setting `open` removes network filtering for Docker commands. In `auto` mode this prefers Docker on Linux/macOS; an explicit `native` backend remains native. Linux uses host networking; macOS uses bridge networking, where host services need `host.docker.internal`, not `localhost`. This can expose reachable services and allow project data to leave the sandbox; enable only for trusted work. Filesystem protections still apply. |
