@@ -196,3 +196,19 @@ def test_git_hooks_cannot_be_planted(box):
     (box.project / ".git" / "config").write_text("[core]\n", encoding="utf-8")
     out = box.run("write", _host_path_for(box, hooks / "post-checkout"))
     assert not (hooks / "post-checkout").exists(), out
+
+
+def test_a_symlink_out_of_the_folder_does_not_carry_a_write(box):
+    link = box.project / "artifacts" / "escape"
+    try:
+        if sys.platform == "win32":
+            # A directory junction: what any Windows user can make without a privilege.
+            import subprocess
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(box.outside)], check=True,
+                           capture_output=True)
+        else:
+            os.symlink(box.outside, link, target_is_directory=True)
+    except (OSError, NotImplementedError, subprocess.CalledProcessError if sys.platform == "win32" else OSError) as exc:
+        pytest.skip(f"a link cannot be made here: {exc}")
+    out = box.run("write", _host_path_for(box, link / "pwned.txt"))
+    assert not (box.outside / "pwned.txt").exists(), out
