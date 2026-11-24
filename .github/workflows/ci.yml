@@ -126,6 +126,10 @@ jobs:
               'profile agent8088-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' \
               '  include if exists <local/agent8088-bwrap>' '}' | sudo tee /etc/apparmor.d/agent8088-bwrap >/dev/null
             sudo apparmor_parser -r /etc/apparmor.d/agent8088-bwrap
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 || true
+            sudo sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+            bwrap --unshare-all --dev-bind / / true && echo 'bwrap with a network namespace works' || echo 'bwrap with a network namespace fails'
           else
             brew install ripgrep
           fi
