@@ -276,6 +276,11 @@ sandbox_runtime_version=0.0.73
 # starts them in artifacts/, the project folder only after a file you named there
 # was written.
 # shell_workspace=project
+# Variables that look like secrets (names with TOKEN, SECRET, PASSWORD, API_KEY,
+# CREDENTIALS, ...) are removed from the environment of sandboxed commands, so
+# code the model runs cannot read a token set in your shell. Name any a task
+# really needs inside the sandbox here.
+# sandbox_pass_env=GITHUB_TOKEN
 # Hosts sandboxed commands may reach. With no line here they get `default`: the
 # common package registries and code hosts (PyPI, npm, GitHub, crates.io, ...), so
 # installs and clones work. Add your own after it, or set `none` to close the network.

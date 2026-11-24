@@ -135,6 +135,16 @@ running in a container, its workspace path is normally not visible to that
 daemon, so the fallback is refused with a diagnosis rather than returning a raw
 Docker error. Run Agent8088 on the Docker host or use native isolation there.
 
+## Secrets in the environment
+
+A sandboxed command does not inherit variables whose names look like secrets
+(`TOKEN`, `SECRET`, `PASSWORD`, `PASSPHRASE`, `CREDENTIALS`, `API_KEY`,
+`ACCESS_KEY` and other `*_KEY` names, `DATABASE_URL`), so code the model runs
+cannot read a token set in your shell. srt unsets them on macOS and Linux, the
+Windows runner drops them, and Docker containers never inherit the host
+environment. Name any variable a task really needs inside the sandbox with
+`sandbox_pass_env=GITHUB_TOKEN,NPM_TOKEN`.
+
 ## Network egress
 
 Sandboxed commands reach only the hosts in `sandbox_allowed_domains`
