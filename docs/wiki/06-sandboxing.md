@@ -162,18 +162,29 @@ environment. Name any variable a task really needs inside the sandbox with
 
 ## Network egress
 
-Sandboxed commands have no network unless you allow specific domains
+Sandboxed commands reach only the hosts in `sandbox_allowed_domains`
 (**macOS, Linux and Docker** -- the Windows native backend does not enforce this,
-see above):
+see above). With no `sandbox_allowed_domains` line the list is `default`: the
+common package registries, code hosts and docs sites (PyPI, npm, GitHub,
+crates.io, Go proxy, Maven Central, RubyGems, conda, Hugging Face, ...), so
+`npm install` / `pip install` / `git clone` work out of the box. Add your own
+hosts after it, or close the network with `none`:
 
 ```ini
-sandbox_allowed_domains=api.example.com,pypi.org
+sandbox_allowed_domains=default,api.example.com
+sandbox_allowed_domains=none
 ```
 
-`default` in the list adds the common package registries, code hosts and docs
-sites (PyPI, npm, GitHub, crates.io, Go proxy, Maven Central, RubyGems, conda,
-Hugging Face, ...), so `sandbox_allowed_domains=default` is enough for most
-`npm install` / `pip install` / `git clone` tasks.
+When a command is refused a host, the model is told which host it was and that
+retrying will not help, and the refusal is written to the audit log. In an
+interactive session you are also asked once whether to allow that host for the
+rest of the session; a host you decline is not asked about again, and
+`sandbox_ask_hosts=0` turns the question off. Nothing is written to `config.txt`.
+
+Package caches (pip, uv, npm, yarn, pnpm, cargo, Go) go to `sandbox-cache` in the
+Agent8088 data folder, which sandboxed commands may write and which is kept
+between commands. On macOS, commands may also listen on local ports, so a dev
+server or test runner can start inside the sandbox.
 
 This is separate from the SSRF allowlist: `sandbox_allowed_domains` governs what
 a *sandboxed command* may reach; `ssrf_allow_hosts` governs what the *HTTP
@@ -246,4 +257,20 @@ instead (in `readonly`, `git_status`/`git_diff`/`git_log` ask first).
 
 ## Verifying it works
 
-Run `/sandbox` in the REPL to check the selected backend and verification state. The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).
+Run `/sandbox` in the REPL to check the selected backend and verification state.
+
+The source checkout has attack tests (`tests/test_sandbox_attacks.py`): real
+commands that try to write outside the folder, read a key in the home folder or a
+`.env` in the project, reach hosts off the allowlist, private and metadata
+addresses, open a raw connection past the proxy, read a secret variable, and plant
+a git hook. They run on every backend the machine has and check the result on the
+host. They are opt-in:
+
+```bash
+AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+AGENT8088_ATTACK_BACKENDS=docker AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
+```
+
+A test the backend cannot enforce is skipped with the reason (the Windows runner
+limits writes only), so a skip is the documented gap, not a pass. CI runs them on
+Linux (srt and Docker) and macOS (srt). The source checkout also includes `scripts/verify_features.py`; checks that execute shell commands require a working sandbox. See [Testing & Verification](12-testing-and-verification.md).

@@ -11,8 +11,9 @@ import pytest
 from agent8088 import capabilities, egress_proxy
 
 
-def test_network_closed_unless_configured(engine, monkeypatch):
-    assert engine._sandbox_allowed_domains({}) == []
+def test_no_setting_means_the_registry_preset_and_none_closes_it(engine, monkeypatch):
+    assert engine._sandbox_allowed_domains({}) == list(engine._DEFAULT_SANDBOX_ALLOWED_DOMAINS)
+    assert engine._sandbox_allowed_domains({"sandbox_allowed_domains": "none"}) == []
     assert engine.DOCKER_NETWORK == "none"
     # docker_network=none written in config.txt: no network. (With no line, Docker
     # standing in for native gets the allowlist: test_docker_sandbox_fixes.py.)

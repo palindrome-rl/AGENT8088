@@ -1129,10 +1129,11 @@ def _sandbox_runtime_version(config: dict) -> str:
 
 
 SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
-# Hosts a typical coding task installs from or reads docs on. The sandbox
-# network stays closed unless config.txt sets sandbox_allowed_domains; the word
-# `default` there expands to this list, so `sandbox_allowed_domains=default`
-# lets `npm install`, `pip install` and `git clone` work inside the sandbox.
+# Hosts a typical coding task installs from or reads docs on. The word `default`
+# in sandbox_allowed_domains expands to this list, and it is what a config with no
+# sandbox_allowed_domains line gets, so `npm install`, `pip install` and
+# `git clone` work inside the sandbox out of the box. `sandbox_allowed_domains=none`
+# (or an empty value) closes the network.
 _DEFAULT_SANDBOX_ALLOWED_DOMAINS = (
     "pypi.org", "files.pythonhosted.org", "bootstrap.pypa.io",
     "registry.npmjs.org", "registry.yarnpkg.com", "nodejs.org",
@@ -1146,7 +1147,9 @@ _DEFAULT_SANDBOX_ALLOWED_DOMAINS = (
 
 def _sandbox_allowed_domains(config: dict) -> list:
     domains = []
-    for value in str(config.get("sandbox_allowed_domains") or "").split(","):
+    configured = config.get("sandbox_allowed_domains")
+    configured = "default" if configured is None else configured
+    for value in str(configured or "").split(","):
         value = value.strip()
         if value.lower() == "default":
             domains.extend(_DEFAULT_SANDBOX_ALLOWED_DOMAINS)
@@ -1156,6 +1159,32 @@ def _sandbox_allowed_domains(config: dict) -> list:
 
 
 SANDBOX_ALLOWED_DOMAINS = _sandbox_allowed_domains(APP_CONFIG)
+# A host a sandboxed command was refused is named to the model and logged, and in
+# an interactive session the user is asked once whether to allow it. A host the
+# user allows is added for this session only (config.txt is never rewritten); a
+# host the user declines is not asked about again.
+SANDBOX_ASK_HOSTS = str(APP_CONFIG.get("sandbox_ask_hosts", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+_session_allowed_hosts: list = []
+_hosts_asked: set = set()
+
+
+def _effective_allowed_domains() -> list:
+    """The configured allowlist plus the hosts the user allowed this session."""
+    return list(dict.fromkeys([*SANDBOX_ALLOWED_DOMAINS, *_session_allowed_hosts]))
+
+
+def _host_is_allowed(host: str, domains: list) -> bool:
+    """Whether `host` matches an allowlist entry: exact, or `*.x` for a subdomain of x."""
+    host = (host or "").strip().lower().rstrip(".")
+    for entry in domains:
+        entry = str(entry).strip().lower().split(":", 1)[0] if not str(entry).startswith("[") else str(entry)
+        if entry.startswith("*."):
+            if host.endswith(entry[1:]):
+                return True
+        elif host == entry:
+            return True
+    return False
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
@@ -2480,6 +2509,18 @@ def grant_escalation(change_type: str = "", target: str = ""):
     (e.g. a CAD turn's plan.md write and its generator write, escalated
     together), and each grant is spent independently by check_permission."""
     global _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    if change_type == "sandbox_host" or change_type.startswith("sandbox_host:"):
+        # The hosts the user allowed join the sandbox allowlist for this session: only those the
+        # question named (in its change type), whatever else the target lists.
+        named = {h.strip().lower() for h in change_type.partition(":")[2].split(",") if h.strip()}
+        for host in str(target or "").split(","):
+            host = host.strip().lower()
+            if (host and host in named and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host)
+                    and host not in _session_allowed_hosts):
+                _session_allowed_hosts.append(host)
+        _audit("sandbox_host_allowed", hosts=list(_session_allowed_hosts))
+        _pending_approval_key = ""
+        return
     if change_type == "git_remote_write":
         # Bound to the approved target, so a retry aimed elsewhere re-asks.
         _remote_git_grant = target or True
@@ -7281,7 +7322,7 @@ def _timeout_note(result: str) -> str:
 def _sandbox_network_note(result: str, source: str) -> str:
     """The note to append when sandboxed code keeps hitting the closed network.
 
-    The sandbox reaches only the hosts in sandbox_allowed_domains (none unless
+    The sandbox reaches only the hosts in sandbox_allowed_domains (the registry preset unless
     config.txt sets it), and nothing in a failed fetch says so. Counted like every other config blocker. The Windows sandbox filters no
     network at all, so a failure there is not the sandbox and gets no note.
     """
@@ -11247,7 +11288,12 @@ def _native_sandbox_argv():
         return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = _which_executable("node")
+    # The installer downloads its own Node into the data folder when the
+    # system has none (or one too old for the runtime) and puts it on PATH only
+    # for the install itself. Looking at PATH alone, a new terminal found no
+    # Node, so the sandbox the installer had just verified was unavailable.
+    managed = _agent_data_dir() / "node" / "bin" / "node"
+    node = str(managed) if managed.is_file() and os.access(managed, os.X_OK) else _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
     executable = _which_executable("srt")
@@ -11600,6 +11646,39 @@ def _git_guard_restore(workspace, saved: dict | None) -> str:
     _audit("sandbox_git_guard", workspace=str(workspace), restored=changed[:20])
     return ("\n[sandbox] The command changed the repository's git settings, which shell commands may not do "
             f"(.git/{', .git/'.join(changed[:5])}); they were put back. Use the git tools for repository changes.")
+# Package managers keep their caches under the home folder, which the sandbox
+# cannot write, so `pip install` and `npm install` failed on the cache before they
+# reached the network. Each one is pointed at its own folder under the agent's
+# data folder instead, which survives between commands so a second install is fast.
+_SANDBOX_CACHE_VARS = (
+    ("PIP_CACHE_DIR", "pip"), ("UV_CACHE_DIR", "uv"), ("npm_config_cache", "npm"),
+    ("YARN_CACHE_FOLDER", "yarn"), ("npm_config_store_dir", "pnpm"), ("CARGO_HOME", "cargo"),
+    ("GOMODCACHE", "go-mod"), ("GOCACHE", "go-build"), ("XDG_CACHE_HOME", "xdg"),
+)
+
+
+def _sandbox_cache_dir() -> Path:
+    path = (_agent_data_dir() / "sandbox-cache").resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sandbox_cache_env() -> dict:
+    """{variable: folder} sending each package manager's cache into the sandbox cache."""
+    root = _sandbox_cache_dir()
+    return {name: str(root / folder) for name, folder in _SANDBOX_CACHE_VARS}
+
+
+def _HOME_CREDENTIAL_FILES(home: Path) -> list:
+    return [home / ".git-credentials", home / ".config" / "git" / "credentials", home / ".pypirc",
+            home / ".cargo" / "credentials.toml", home / ".cargo" / "credentials", home / ".gem" / "credentials",
+            home / ".config" / "hub", home / ".terraform.d" / "credentials.tfrc.json", home / ".m2" / "settings.xml",
+            home / ".config" / "pip" / "pip.conf", home / ".pip" / "pip.conf", home / ".yarnrc.yml",
+            home / ".config" / "op", home / ".password-store", home / ".local" / "share" / "keyrings",
+            home / ".config" / "rclone" / "rclone.conf", home / ".s3cfg", home / ".boto",
+            home / ".config" / "doctl", home / ".config" / "heroku", home / ".netlify",
+            home / ".vercel", home / ".config" / "configstore", home / ".huggingface" / "token",
+            home / ".cache" / "huggingface" / "token"]
 
 
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
@@ -11610,6 +11689,9 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
+        # Tokens other tools keep in plain files. With the package registries and code
+        # hosts reachable by default, a token read here could push or publish.
+        *_HOME_CREDENTIAL_FILES(home),
     ]
     roots = _secret_scan_roots(workspace)
     if sys.platform.startswith("linux"):
@@ -11619,7 +11701,7 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
     deny_paths = list(dict.fromkeys(str(path.expanduser().resolve()) for path in denied))
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
-    allow_write = [str(sandbox_tmp)]
+    allow_write = [str(sandbox_tmp), str(_sandbox_cache_dir())]
     protected = []
     if not readonly:
         allow_write.append(str(ARTIFACTS_ROOT))
@@ -11633,10 +11715,12 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         allow_write.append(str(workspace.resolve()))
     return {
         "network": {
-            "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
+            "allowedDomains": _effective_allowed_domains(),
             "deniedDomains": [],
             "strictAllowlist": True,
-            "allowLocalBinding": False,
+            # macOS: a dev server or test runner inside the sandbox may listen on
+            # a local port. Linux commands run in their own network namespace.
+            "allowLocalBinding": sys.platform == "darwin",
         },
         "filesystem": {
             "denyRead": deny_paths,
@@ -12234,8 +12318,11 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         note = _git_guard_restore(cwd, guarded)
         return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
-    command = (f"cd {shlex.quote(str(cwd))} && "
-               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+    # Exported, not a prefix: `VAR=x a && b` sets VAR for `a` only.
+    exports = {"TMPDIR": str(sandbox_tmp), **_sandbox_cache_env()}
+    command = (f"cd {shlex.quote(str(cwd))} && export "
+               + " ".join(f"{name}={shlex.quote(value)}" for name, value in exports.items())
+               + f" && {command}")
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
@@ -12954,6 +13041,61 @@ def _shell_missing_file_note(result: str, command: str, workspace: Path) -> str:
     return "".join(f"\n{note}" for note in notes)
 
 
+# What a client prints when the sandbox's proxy refused its connection. A server's
+# own 403 is not this: each pattern names the proxy or the tunnel.
+_PROXY_REFUSED_RE = re.compile(
+    r"Connection blocked by network allowlist"
+    r"|Tunnel connection failed: 403"
+    r"|CONNECT tunnel failed, response 403"
+    r"|tunneling socket could not be established, statusCode=403"
+    r"|Received HTTP code 403 from proxy after CONNECT",
+    re.IGNORECASE)
+_URL_HOST_RE = re.compile(r"\b(?:https?|git|wss?)://(?:[^@/\s'\"]*@)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+
+def _refused_hosts(result: str, command: str) -> list:
+    """Hosts a sandboxed command was refused by the network allowlist, or []."""
+    if not _PROXY_REFUSED_RE.search(result or ""):
+        return []
+    allowed = _effective_allowed_domains()
+    hosts = [host.lower() for host in _URL_HOST_RE.findall(f"{command}\n{result}")]
+    return [host for host in dict.fromkeys(hosts) if not _host_is_allowed(host, allowed)][:5]
+
+
+def _refused_host_result(result: str, command: str, interactive: bool) -> str:
+    """Name a refused host to the model, log it, and ask the user about it once.
+
+    Returns the result to give the model: unchanged when nothing was refused,
+    with a note when a host was, or an escalation request the first time a host
+    is refused in an interactive session (the model retries once it is allowed)."""
+    hosts = _refused_hosts(result, command)
+    if not hosts:
+        return result
+    _audit("sandbox_host_refused", hosts=hosts, command=str(command)[:200])
+    new = [host for host in hosts if host not in _hosts_asked]
+    if new and interactive and SANDBOX_ASK_HOSTS:
+        _hosts_asked.update(new)
+        return request_escalation(
+            # The hosts are part of the change type, so "allow for the session" in any front end
+            # remembers these hosts only, never every host that comes later.
+            "full-auto", new, "sandbox_host:" + ",".join(new),
+            f"A sandboxed command tried to reach {', '.join(new)}, which is not on the sandbox's network "
+            f"allowlist (sandbox_allowed_domains in {_config_file()}). Allow it for this session?")
+    shown = ", ".join(hosts)
+    return (f"{result}\n[sandbox] The command could not reach {shown}: it is not on the sandbox's network "
+            f"allowlist. Running it again will not help. Use a host on the list (the package registries and "
+            f"code hosts are), or tell the user this task needs {shown}: they can add it to "
+            f"sandbox_allowed_domains in {_config_file()}.")
+
+
+def _interactive_session() -> bool:
+    """A person is at the terminal who can answer an approval prompt."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def _run_sandbox_command(command: str, timeout: int = 25,
                          python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
@@ -12995,6 +13137,8 @@ def _run_sandbox_command(command: str, timeout: int = 25,
             workspace if temporary is None else workspace, command)
         if temporary is None:
             result += _shell_missing_file_note(result, command, workspace)
+        if not (backend == "native" and sys.platform == "win32"):  # Windows filters no network
+            result = _refused_host_result(result, command, _interactive_session() and temporary is None)
     finally:
         if temporary:
             cleanup_note = _cleanup_audit_workspace(temporary)
