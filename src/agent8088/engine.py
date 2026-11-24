@@ -11229,7 +11229,12 @@ def _native_sandbox_argv():
         return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = _which_executable("node")
+    # The installer downloads its own Node into the data folder when the
+    # system has none (or one too old for the runtime) and puts it on PATH only
+    # for the install itself. Looking at PATH alone, a new terminal found no
+    # Node, so the sandbox the installer had just verified was unavailable.
+    managed = _agent_data_dir() / "node" / "bin" / "node"
+    node = str(managed) if managed.is_file() and os.access(managed, os.X_OK) else _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
     executable = _which_executable("srt")

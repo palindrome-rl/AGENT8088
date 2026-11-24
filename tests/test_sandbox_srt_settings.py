@@ -109,3 +109,21 @@ def test_no_question_when_asking_is_off_or_nobody_is_there(engine, data, monkeyp
 def test_a_bad_host_name_is_never_allowed(engine, data):
     engine.grant_escalation("sandbox_host", "*,ok.example.com, ,evil host")
     assert engine._session_allowed_hosts == ["ok.example.com"]
+
+
+def test_the_node_the_installer_downloaded_is_found_without_path(engine, data, monkeypatch):
+    # A machine with no system Node gets one under the data folder, on PATH only while
+    # the installer runs; a later terminal must still find it.
+    root, _ = data
+    monkeypatch.setattr(engine.sys, "platform", "linux")
+    monkeypatch.delenv("AGENT8088_SRT", raising=False)
+    monkeypatch.setattr(engine, "_which_executable", lambda name: None)
+    cli = root / "runtime" / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("", encoding="utf-8")
+    assert engine._native_sandbox_argv() is None
+    node = root / "node" / "bin" / "node"
+    node.parent.mkdir(parents=True)
+    node.write_text("", encoding="utf-8")
+    node.chmod(0o755)
+    assert engine._native_sandbox_argv() == [str(node), str(cli)]
