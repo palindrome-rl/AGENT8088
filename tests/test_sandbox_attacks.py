@@ -212,3 +212,52 @@ def test_a_symlink_out_of_the_folder_does_not_carry_a_write(box):
         pytest.skip(f"a link cannot be made here: {exc}")
     out = box.run("write", _host_path_for(box, link / "pwned.txt"))
     assert not (box.outside / "pwned.txt").exists(), out
+
+
+def test_a_service_cannot_be_reached_from_the_network(box):
+    if not hasattr(box.engine, "_exec_service"):
+        pytest.skip("this build has no services yet")
+    if box.backend == "native" and sys.platform in ("win32", "darwin"):
+        pytest.skip("the service binds its own address on this backend (documented)")
+    import socket
+    from agent8088 import services
+    registry = services.Registry(box.project / "services.json", box.project / "logs")
+    box.engine._services_registry = registry
+    python = "python" if box.backend == "docker" else f'"{sys.executable}"'
+    try:
+        out = box.engine._exec_service("service_start", {
+            "name": "web", "command": f"{python} -m http.server {{port}} --bind 0.0.0.0"})
+        service = registry.get("web")
+        assert service is not None and "answering" in out, out
+        try:
+            lan = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            pytest.skip("no local network address to try")
+        if lan.startswith("127."):
+            pytest.skip("no local network address to try")
+        with pytest.raises(OSError):
+            socket.create_connection((lan, service.handle.host_port), timeout=3).close()
+    finally:
+        registry.stop_all()
+
+
+def test_a_service_cannot_reach_hosts_off_the_allowlist(box, monkeypatch):
+    if not hasattr(box.engine, "_exec_service"):
+        pytest.skip("this build has no services yet")
+    if box.windows_native:
+        pytest.skip("the Windows runner does not filter the network (documented)")
+    from agent8088 import services
+    registry = services.Registry(box.project / "services.json", box.project / "logs")
+    box.engine._services_registry = registry
+    monkeypatch.setattr(box.engine, "SANDBOX_ALLOWED_DOMAINS", ["pypi.org"])
+    python = "python" if box.backend == "docker" else f'"{sys.executable}"'
+    try:
+        box.engine._exec_service("service_start", {"name": "probe", "command":
+                                 f"{python} probe.py url https://example.com/ && {python} -m http.server {{port}}"})
+        import time
+        time.sleep(2)
+        service = registry.get("probe")
+        log = services.tail(service.log_path) if service else ""
+        assert "STATUS" not in log, log
+    finally:
+        registry.stop_all()
