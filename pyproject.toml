@@ -119,6 +119,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "browser_integration: slow end-to-end tests that launch a real headless browser and call a real LLM provider",
+    "sandbox_attack: real commands that try to get out of the sandbox (opt-in, AGENT8088_ATTACK_TESTS=1)",
 ]
 
 [tool.hatch.build.targets.wheel]

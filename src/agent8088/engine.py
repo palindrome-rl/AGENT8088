@@ -1129,10 +1129,11 @@ def _sandbox_runtime_version(config: dict) -> str:
 
 
 SANDBOX_RUNTIME_VERSION = _sandbox_runtime_version(APP_CONFIG)
-# Hosts a typical coding task installs from or reads docs on. The sandbox
-# network stays closed unless config.txt sets sandbox_allowed_domains; the word
-# `default` there expands to this list, so `sandbox_allowed_domains=default`
-# lets `npm install`, `pip install` and `git clone` work inside the sandbox.
+# Hosts a typical coding task installs from or reads docs on. The word `default`
+# in sandbox_allowed_domains expands to this list, and it is what a config with no
+# sandbox_allowed_domains line gets, so `npm install`, `pip install` and
+# `git clone` work inside the sandbox out of the box. `sandbox_allowed_domains=none`
+# (or an empty value) closes the network.
 _DEFAULT_SANDBOX_ALLOWED_DOMAINS = (
     "pypi.org", "files.pythonhosted.org", "bootstrap.pypa.io",
     "registry.npmjs.org", "registry.yarnpkg.com", "nodejs.org",
@@ -1146,7 +1147,9 @@ _DEFAULT_SANDBOX_ALLOWED_DOMAINS = (
 
 def _sandbox_allowed_domains(config: dict) -> list:
     domains = []
-    for value in str(config.get("sandbox_allowed_domains") or "").split(","):
+    configured = config.get("sandbox_allowed_domains")
+    configured = "default" if configured is None else configured
+    for value in str(configured or "").split(","):
         value = value.strip()
         if value.lower() == "default":
             domains.extend(_DEFAULT_SANDBOX_ALLOWED_DOMAINS)
@@ -1156,6 +1159,32 @@ def _sandbox_allowed_domains(config: dict) -> list:
 
 
 SANDBOX_ALLOWED_DOMAINS = _sandbox_allowed_domains(APP_CONFIG)
+# A host a sandboxed command was refused is named to the model and logged, and in
+# an interactive session the user is asked once whether to allow it. A host the
+# user allows is added for this session only (config.txt is never rewritten); a
+# host the user declines is not asked about again.
+SANDBOX_ASK_HOSTS = str(APP_CONFIG.get("sandbox_ask_hosts", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+_session_allowed_hosts: list = []
+_hosts_asked: set = set()
+
+
+def _effective_allowed_domains() -> list:
+    """The configured allowlist plus the hosts the user allowed this session."""
+    return list(dict.fromkeys([*SANDBOX_ALLOWED_DOMAINS, *_session_allowed_hosts]))
+
+
+def _host_is_allowed(host: str, domains: list) -> bool:
+    """Whether `host` matches an allowlist entry: exact, or `*.x` for a subdomain of x."""
+    host = (host or "").strip().lower().rstrip(".")
+    for entry in domains:
+        entry = str(entry).strip().lower().split(":", 1)[0] if not str(entry).startswith("[") else str(entry)
+        if entry.startswith("*."):
+            if host.endswith(entry[1:]):
+                return True
+        elif host == entry:
+            return True
+    return False
 
 # Tool templates interpolate from APP_CONFIG, so any default that a tool URL or
 # command references must exist there too. Without this, a missing config key left
@@ -1414,6 +1443,8 @@ def reset_turn_counters() -> None:
     _pending_blocker_note = ""
     _failure_streak = 0
     _diagnostic_shown = False
+    if "_sandbox_denials" in globals():  # also runs while the module loads
+        _sandbox_denials.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2481,6 +2512,18 @@ def grant_escalation(change_type: str = "", target: str = ""):
     (e.g. a CAD turn's plan.md write and its generator write, escalated
     together), and each grant is spent independently by check_permission."""
     global _local_fallback_grant, _remote_git_grant, _pending_approval_key
+    if change_type == "sandbox_host" or change_type.startswith("sandbox_host:"):
+        # The hosts the user allowed join the sandbox allowlist for this session: only those the
+        # question named (in its change type), whatever else the target lists.
+        named = {h.strip().lower() for h in change_type.partition(":")[2].split(",") if h.strip()}
+        for host in str(target or "").split(","):
+            host = host.strip().lower()
+            if (host and host in named and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host)
+                    and host not in _session_allowed_hosts):
+                _session_allowed_hosts.append(host)
+        _audit("sandbox_host_allowed", hosts=list(_session_allowed_hosts))
+        _pending_approval_key = ""
+        return
     if change_type == "git_remote_write":
         # Bound to the approved target, so a retry aimed elsewhere re-asks.
         _remote_git_grant = target or True
@@ -7282,7 +7325,7 @@ def _timeout_note(result: str) -> str:
 def _sandbox_network_note(result: str, source: str) -> str:
     """The note to append when sandboxed code keeps hitting the closed network.
 
-    The sandbox reaches only the hosts in sandbox_allowed_domains (none unless
+    The sandbox reaches only the hosts in sandbox_allowed_domains (the registry preset unless
     config.txt sets it), and nothing in a failed fetch says so. Counted like every other config blocker. The Windows sandbox filters no
     network at all, so a failure there is not the sandbox and gets no note.
     """
@@ -11004,12 +11047,24 @@ def _exec_browser(args: dict) -> str:
 # ---------------------------------------------------------------------------
 # Sandboxed execution — native OS isolation, with Docker as a fallback
 # ---------------------------------------------------------------------------
-DOCKER_IMAGE = APP_CONFIG.get("docker_image", "python:3.11-slim")
+# The image sandboxed commands run in: Agent8088's own (docker/sandbox.Dockerfile:
+# Python, Node and git), published with each release. Until it can be pulled --
+# no network, a registry that refuses it -- the plain Python image is used, as
+# before. docker_image in config.txt picks any other image, with no fallback.
+_SANDBOX_IMAGE = "ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0"
+# Pinned by digest: a tag can be moved to other content, a digest cannot.
+_SANDBOX_IMAGE_FALLBACK = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
+DOCKER_IMAGE_CONFIGURED = bool(str(APP_CONFIG.get("docker_image", "")).strip())
+DOCKER_IMAGE = str(APP_CONFIG.get("docker_image", "")).strip() or _SANDBOX_IMAGE
 GIT_DOCKER_IMAGE = "alpine/git:v2.47.2"
-# docker_network=none (the default) gives the container no network.
-# `allowlist` puts it on an --internal network whose only way out is a proxy
-# container enforcing sandbox_allowed_domains, the list the native runtime
-# enforces. Any other value is passed to `docker run --network` unfiltered.
+# docker_network=none gives the container no network. `allowlist` puts it on an
+# --internal network whose only way out is a proxy container enforcing
+# sandbox_allowed_domains, the list the native runtime enforces. Any other value
+# is passed to `docker run --network` unfiltered. With no docker_network line,
+# Docker chosen automatically (the native sandbox is missing) gets `allowlist`
+# with the registry preset, so installs work the way they do natively; Docker
+# chosen with sandbox_backend=docker keeps `none`.
+DOCKER_NETWORK_CONFIGURED = bool(str(APP_CONFIG.get("docker_network", "")).strip())
 DOCKER_NETWORK = APP_CONFIG.get("docker_network", "none").strip() or "none"
 # sandbox_network=open lets sandboxed commands reach anything this computer can:
 # the internet, its own services (IMAP, databases, dev servers) and the LAN.
@@ -11027,7 +11082,7 @@ def _open_docker_network() -> str:
 
 if SANDBOX_NETWORK_OPEN:
     DOCKER_NETWORK = _open_docker_network()
-_EGRESS_PROXY_IMAGE = "python:3.11-slim"
+_EGRESS_PROXY_IMAGE = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
@@ -11196,7 +11251,11 @@ def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
         "import base64, os, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
-        "env = dict(os.environ)\n"
+        "import re\n"
+        f"secret = re.compile({_SECRET_ENV_RE.pattern!r}, re.IGNORECASE)\n"
+        f"keep = {sorted(SANDBOX_PASS_ENV)!r}\n"
+        "env = {k: v for k, v in os.environ.items() if not secret.search(k) or k.upper() in keep\n"
+        "       or k.upper().startswith('AGENT8088_')}\n"
         "key = next((k for k in env if k.lower() == 'path'), 'PATH')\n"
         "env[key] = os.pathsep.join(p for p in env.get(key, '').split(os.pathsep) if not\n"
         "    p.strip().strip('\"').rstrip('\\\\/').lower().replace('/', '\\\\').endswith('\\\\git\\\\usr\\\\bin'))\n"
@@ -11232,7 +11291,12 @@ def _native_sandbox_argv():
         return [node, str(runner)]
     cli = (_agent_data_dir() / "runtime" / "node_modules"
            / "@anthropic-ai" / "sandbox-runtime" / "dist" / "cli.js")
-    node = _which_executable("node")
+    # The installer downloads its own Node into the data folder when the
+    # system has none (or one too old for the runtime) and puts it on PATH only
+    # for the install itself. Looking at PATH alone, a new terminal found no
+    # Node, so the sandbox the installer had just verified was unavailable.
+    managed = _agent_data_dir() / "node" / "bin" / "node"
+    node = str(managed) if managed.is_file() and os.access(managed, os.X_OK) else _which_executable("node")
     if node and cli.exists():
         return [node, str(cli)]
     executable = _which_executable("srt")
@@ -11272,7 +11336,7 @@ def _docker_available() -> bool:
 # Docker Desktop is installed but not running: the sandbox fallback and the
 # managed SearXNG then fail although nothing is wrong (feature suggestion:
 # self-launch Docker; issue sheet row 33). Linux needs root to start the daemon,
-# so it is left to the operator there. docker_autostart=0 turns this off.
+# so it is left to the operator there. Off by default; docker_autostart=1 turns it on.
 _DOCKER_DESKTOP_APPS = {
     "win32": [Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
               / "Docker" / "Docker" / "Docker Desktop.exe"],
@@ -11281,11 +11345,17 @@ _DOCKER_DESKTOP_APPS = {
 _docker_start_lock = threading.Lock()
 
 
-def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep) -> bool:
-    """Make sure the Docker daemon answers, launching Docker Desktop if needed."""
+def _start_docker_desktop(wait_seconds: int = 90, sleep=time.sleep, purpose: str = "sandbox") -> bool:
+    """Make sure the Docker daemon answers, launching Docker Desktop if needed.
+
+    For the sandbox fallback this is off unless docker_autostart=1: a sandbox the user
+    did not set up should not start a desktop application. For the managed SearXNG
+    that the user set up with /search setup it stays on unless docker_autostart=0, as
+    before, so web search comes back after a restart."""
     if _docker_available():
         return True
-    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", "1")
+    default = "1" if purpose == "searxng" else "0"
+    setting = os.environ.get("AGENT8088_DOCKER_AUTOSTART") or APP_CONFIG.get("docker_autostart", default)
     if str(setting).strip() == "0" or not _which_executable("docker"):
         return False
     app = next((p for p in _DOCKER_DESKTOP_APPS.get(sys.platform, []) if p.exists()), None)
@@ -11421,7 +11491,7 @@ def sandbox_status() -> dict:
         "network": _sandbox_network_summary(resolved) if resolved == "docker" else network,
         "network_enforced": (None if resolved == "unavailable" else
                              not unenforced and (resolved != "docker" or
-                                                 DOCKER_NETWORK in ("allowlist", "none"))),
+                                                 _docker_network_mode() in ("allowlist", "none"))),
         "host_processes_shared": unenforced,
         "runtime_version": SANDBOX_RUNTIME_VERSION,
         "verification": verification,
@@ -11440,6 +11510,28 @@ def set_sandbox_backend(backend: str) -> dict:
     status = sandbox_status()
     _report_sandbox(status)
     return status
+
+
+# Secret environment variables. A sandboxed command inherits the environment
+# Agent8088 was started in, so a token set in the user's shell (GITHUB_TOKEN,
+# AWS_SECRET_ACCESS_KEY, OPENAI_API_KEY) was readable by any code the model ran.
+# They are removed from that environment; sandbox_pass_env names any the task
+# really needs inside the sandbox. The Windows bridge below carries the same rule.
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY)(?:_|$)"
+    r"|(?:API|ACCESS|PRIVATE|SECRET|SIGNING|ENCRYPTION|MASTER|CLIENT|SERVICE)_KEY(?:_|$)"
+    r"|_KEY$|^(?:PGPASSWORD|NPM_TOKEN|NODE_AUTH_TOKEN|HF_TOKEN|DATABASE_URL)$",
+    re.IGNORECASE)
+SANDBOX_PASS_ENV = frozenset(
+    name.strip().upper() for name in str(APP_CONFIG.get("sandbox_pass_env", "")).split(",") if name.strip())
+
+
+def _secret_env_names(environ=None) -> list:
+    """Names (never values) of the variables kept out of sandboxed commands."""
+    environ = os.environ if environ is None else environ
+    return sorted(name for name in environ
+                  if _SECRET_ENV_RE.search(name) and name.upper() not in SANDBOX_PASS_ENV
+                  and not name.upper().startswith("AGENT8088_"))
 
 
 # Secret files inside the folders a sandboxed command can reach.
@@ -11581,6 +11673,39 @@ def _git_guard_restore(workspace, saved: dict | None) -> str:
     _audit("sandbox_git_guard", workspace=str(workspace), restored=changed[:20])
     return ("\n[sandbox] The command changed the repository's git settings, which shell commands may not do "
             f"(.git/{', .git/'.join(changed[:5])}); they were put back. Use the git tools for repository changes.")
+# Package managers keep their caches under the home folder, which the sandbox
+# cannot write, so `pip install` and `npm install` failed on the cache before they
+# reached the network. Each one is pointed at its own folder under the agent's
+# data folder instead, which survives between commands so a second install is fast.
+_SANDBOX_CACHE_VARS = (
+    ("PIP_CACHE_DIR", "pip"), ("UV_CACHE_DIR", "uv"), ("npm_config_cache", "npm"),
+    ("YARN_CACHE_FOLDER", "yarn"), ("npm_config_store_dir", "pnpm"), ("CARGO_HOME", "cargo"),
+    ("GOMODCACHE", "go-mod"), ("GOCACHE", "go-build"), ("XDG_CACHE_HOME", "xdg"),
+)
+
+
+def _sandbox_cache_dir() -> Path:
+    path = (_agent_data_dir() / "sandbox-cache").resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sandbox_cache_env() -> dict:
+    """{variable: folder} sending each package manager's cache into the sandbox cache."""
+    root = _sandbox_cache_dir()
+    return {name: str(root / folder) for name, folder in _SANDBOX_CACHE_VARS}
+
+
+def _HOME_CREDENTIAL_FILES(home: Path) -> list:
+    return [home / ".git-credentials", home / ".config" / "git" / "credentials", home / ".pypirc",
+            home / ".cargo" / "credentials.toml", home / ".cargo" / "credentials", home / ".gem" / "credentials",
+            home / ".config" / "hub", home / ".terraform.d" / "credentials.tfrc.json", home / ".m2" / "settings.xml",
+            home / ".config" / "pip" / "pip.conf", home / ".pip" / "pip.conf", home / ".yarnrc.yml",
+            home / ".config" / "op", home / ".password-store", home / ".local" / "share" / "keyrings",
+            home / ".config" / "rclone" / "rclone.conf", home / ".s3cfg", home / ".boto",
+            home / ".config" / "doctl", home / ".config" / "heroku", home / ".netlify",
+            home / ".vercel", home / ".config" / "configstore", home / ".huggingface" / "token",
+            home / ".cache" / "huggingface" / "token"]
 
 
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
@@ -11591,6 +11716,9 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
+        # Tokens other tools keep in plain files. With the package registries and code
+        # hosts reachable by default, a token read here could push or publish.
+        *_HOME_CREDENTIAL_FILES(home),
     ]
     roots = _secret_scan_roots(workspace)
     if sys.platform.startswith("linux"):
@@ -11600,7 +11728,7 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
     deny_paths = list(dict.fromkeys(str(path.expanduser().resolve()) for path in denied))
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     sandbox_tmp.mkdir(parents=True, exist_ok=True)
-    allow_write = [str(sandbox_tmp)]
+    allow_write = [str(sandbox_tmp), str(_sandbox_cache_dir())]
     protected = []
     if not readonly:
         allow_write.append(str(ARTIFACTS_ROOT))
@@ -11614,10 +11742,12 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         allow_write.append(str(workspace.resolve()))
     return {
         "network": {
-            "allowedDomains": SANDBOX_ALLOWED_DOMAINS,
+            "allowedDomains": _effective_allowed_domains(),
             "deniedDomains": [],
             "strictAllowlist": True,
-            "allowLocalBinding": False,
+            # macOS: a dev server or test runner inside the sandbox may listen on
+            # a local port. Linux commands run in their own network namespace.
+            "allowLocalBinding": sys.platform == "darwin",
         },
         "filesystem": {
             "denyRead": deny_paths,
@@ -11628,6 +11758,9 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         "enableWeakerNestedSandbox": False,
         "enableWeakerNetworkIsolation": False,
         "allowAppleEvents": False,
+        # srt unsets each of these in the sandboxed command (mode deny).
+        **({"credentials": {"envVars": [{"name": name, "mode": "deny"} for name in secret_env]}}
+           if (secret_env := _secret_env_names()) else {}),
     }
 
 
@@ -11924,7 +12057,8 @@ def _docker_sandbox_ready(workspace: Path, image: str = "") -> bool:
     key = str(workspace)
     if key in _docker_workspace_verified:
         return _docker_workspace_verified[key]
-    selected_image = image or DOCKER_IMAGE
+    # The probe never pulls (it runs at start-up): it tries what is already here.
+    selected_image = image or _sandbox_image_present()
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image) or not _docker_image_present(selected_image):
         return False
     try:
@@ -12001,11 +12135,12 @@ def verify_sandbox_backend() -> dict:
 
 def _docker_network_closed() -> bool:
     """True when Docker sandbox containers get no network at all."""
-    if DOCKER_NETWORK == "none":
+    mode = _docker_network_mode()
+    if mode == "none":
         return True
-    if DOCKER_NETWORK != "allowlist":
+    if mode != "allowlist":
         return False
-    return not SANDBOX_ALLOWED_DOMAINS or ("none", []) in _docker_egress.values()
+    return not _docker_allowed_domains() or ("none", []) in _docker_egress.values()
 
 
 def _sandbox_network_summary(backend: str) -> str:
@@ -12013,10 +12148,12 @@ def _sandbox_network_summary(backend: str) -> str:
     if backend == "native" and sys.platform == "win32":
         # The DSH Windows backend confines writes only; it has no network policy.
         return "not restricted (the Windows sandbox limits file writes only)"
-    if backend == "docker" and DOCKER_NETWORK not in ("allowlist", "none"):
-        return f"Docker network {DOCKER_NETWORK!r} (not filtered)"
+    if backend == "docker" and _docker_network_mode() not in ("allowlist", "none"):
+        return f"Docker network {_docker_network_mode()!r} (not filtered)"
     if backend == "docker" and _docker_network_closed():
         return "blocked"
+    if backend == "docker":
+        return ", ".join(_docker_allowed_domains()) or "blocked"
     return ", ".join(SANDBOX_ALLOWED_DOMAINS) or "blocked"
 
 
@@ -12032,10 +12169,10 @@ def _sandbox_docker_note() -> str:
     where = f"/workspace here is {ARTIFACTS_ROOT} on the host and the only folder visible"
     if _docker_network_closed():
         net = "no network, so pip/npm installs and downloads fail here"
-    elif DOCKER_NETWORK == "allowlist":
+    elif _docker_network_mode() == "allowlist":
         net = "network limited to sandbox_allowed_domains"
     else:
-        net = f"Docker network {DOCKER_NETWORK!r}"
+        net = f"Docker network {_docker_network_mode()!r}"
     return f"[note: this ran in the Docker sandbox — {where}; {net}]"
 
 
@@ -12168,6 +12305,11 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     argv = _native_sandbox_argv()
     if not argv:
         return "Native sandbox runtime is unavailable."
+    secret_env = [name for name in _secret_env_names() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)]
+    if sys.platform != "win32" and secret_env:
+        # srt unsets them too (credentials in its settings); this keeps them out
+        # if a runtime ever ignored that section.
+        command = f"unset {' '.join(secret_env)}; {command}"
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     if sys.platform == "win32":
@@ -12204,8 +12346,11 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
         note = "".join(_git_guard_restore(repo, saved) for repo, saved in guarded)
         return result + note if note and isinstance(result, str) else result
     settings = _write_sandbox_settings(readonly, cwd)
-    command = (f"cd {shlex.quote(str(cwd))} && "
-               f"TMPDIR={shlex.quote(str(sandbox_tmp))} {command}")
+    # Exported, not a prefix: `VAR=x a && b` sets VAR for `a` only.
+    exports = {"TMPDIR": str(sandbox_tmp), **_sandbox_cache_env()}
+    command = (f"cd {shlex.quote(str(cwd))} && export "
+               + " ".join(f"{name}={shlex.quote(value)}" for name, value in exports.items())
+               + f" && {command}")
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
@@ -12318,10 +12463,94 @@ def _running_in_container() -> bool:
     return os.path.exists("/.dockerenv")
 
 
+_GIT_CONFIG_CREDENTIAL_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@|extraheader\s*=|\btoken\s*=", re.IGNORECASE)
+
+
+def _git_config_has_credentials(path: Path) -> bool:
+    """A repository config with a password in a remote URL or an auth header."""
+    try:
+        return path.is_file() and bool(_GIT_CONFIG_CREDENTIAL_RE.search(
+            path.read_text(encoding="utf-8", errors="replace")[:200000]))
+    except OSError:
+        return False
+
+
+_docker_stale_cleaned = False
+# Masking: a folder with at least this many secret-looking files is covered whole,
+# and at most this many mounts are added (each is one argument on the command line).
+_MASK_FOLDER_AT = 4
+_MASK_MAX_MOUNTS = 200
+
+
+def _other_agent8088_running(psutil) -> bool:
+    """Another Agent8088 process (a CLI, the web UI, a gateway) is running now."""
+    me = os.getpid()
+    try:
+        ancestors = {proc.pid for proc in psutil.Process(me).parents()}
+    except Exception:  # noqa: BLE001 -- unknown parents: assume nothing extra
+        ancestors = set()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            pid, cmdline = proc.info["pid"], proc.info["cmdline"] or []
+        except Exception:  # noqa: BLE001
+            continue
+        if pid == me or pid in ancestors:
+            continue
+        head = [re.split(r"[\\/]", str(part))[-1].lower().removesuffix(".exe") for part in cmdline[:2]]
+        if "agent8088" in head or any(str(part).startswith("agent8088.") for part in cmdline[:4]):
+            return True
+    return False
+
+
+def _clean_stale_docker_sandbox() -> None:
+    """Once per process, remove what earlier sessions left behind.
+
+    Run containers whose Agent8088 process has ended (a crash or a kill skips
+    --rm's cleanup). Egress proxies and networks for an allowlist that is no
+    longer the configured one, but only when no other Agent8088 process is
+    running: another session with its own config may be using one right now.
+    Never anything that is not Agent8088's."""
+    global _docker_stale_cleaned
+    if _docker_stale_cleaned:
+        return
+    _docker_stale_cleaned = True
+
+    def docker(*args):
+        try:
+            return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a dependency
+        psutil = None
+    listed = docker("ps", "-a", "--filter", "name=^agent8088-", "--format", "{{.Names}}")
+    current = _docker_egress_key(_docker_allowed_domains())
+    proxies_free = psutil is not None and not _other_agent8088_running(psutil)
+    removed = []
+    for name in (listed.stdout.split() if listed and listed.returncode == 0 else []):
+        run = re.fullmatch(r"agent8088-(\d+)-[0-9a-f]{12}", name)
+        proxy = re.fullmatch(r"agent8088-egress-proxy-([0-9a-f]{10})", name)
+        if run and psutil is not None and int(run.group(1)) != os.getpid() \
+                and not psutil.pid_exists(int(run.group(1))):
+            removed.append(name)
+        elif proxy and proxy.group(1) != current and proxies_free:
+            removed.append(name)
+    if removed:
+        docker("rm", "-f", *removed)
+    networks = docker("network", "ls", "--filter", "name=^agent8088-egress-", "--format", "{{.Name}}")
+    for name in (networks.stdout.split() if networks and networks.returncode == 0 and proxies_free else []):
+        if re.fullmatch(r"agent8088-egress-[0-9a-f]{10}", name) and not name.endswith(current):
+            docker("network", "rm", name)  # refused while in use, which is fine
+    if removed:
+        _log.info("removed stale Docker sandbox containers: %s", ", ".join(removed))
+
+
 def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
                          image: str = "", workspace: Path | None = None,
                          readonly: bool = False) -> str:
-    selected_image = image or DOCKER_IMAGE
+    selected_image = image or _sandbox_image()
     if not _DOCKER_IMAGE_RE.fullmatch(selected_image):
         return f"Error: invalid container image name: {selected_image}"
     if _docker_sandbox_broken:
@@ -12365,25 +12594,48 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     empty = _agent_data_dir() / "sandbox-empty"
     empty.parent.mkdir(parents=True, exist_ok=True)
     empty.touch(mode=0o600, exist_ok=True)
-    skipped_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist"}
-    sensitive_mounts = 0
+    # Rebuilt on every command, so a secret written since the last one is masked
+    # too. Installed package trees are not searched: they hold the packages' own
+    # test keys and certificates, not the user's. build/ and dist/ are, since a
+    # build can copy a .env into them, and so is a .git/config holding a token.
+    package_dirs = {".venv", "venv", "node_modules", "__pycache__"}
+    empty_dir = _agent_data_dir() / "sandbox-empty-dir"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    masks = []   # (path, is a folder)
     for root, dirs, files in os.walk(workspace_path):
-        dirs[:] = [name for name in dirs if name not in skipped_dirs]
-        for filename in files:
-            path = Path(root) / filename
-            if not _is_sensitive_path(str(path)):
-                continue
-            sensitive_mounts += 1
-            if sensitive_mounts > 128:
-                return "Error: too many sensitive workspace files to mask safely."
-            relative = path.relative_to(workspace_path).as_posix()
-            destination = f"/workspace/{relative}"
-            argv.extend([
-                "--mount", f"type=bind,src={empty},dst={destination},readonly",
-            ])
+        if ".git" in dirs:
+            dirs.remove(".git")
+            git_config = Path(root) / ".git" / "config"
+            if _git_config_has_credentials(git_config):
+                files = [*files, str(Path(".git") / "config")]
+        dirs[:] = [name for name in dirs if name not in package_dirs]
+        hits = [Path(root) / name for name in files
+                if _is_sensitive_path(str(Path(root) / name)) or (Path(root) / name).parts[-2:] == (".git", "config")]
+        if not hits:
+            continue
+        # A folder of keys or certificates (test fixtures, a certs/ folder) is covered
+        # with an empty folder as a whole: one mount instead of one per file, so a
+        # project with many of them is still masked and can still run.
+        if len(hits) >= _MASK_FOLDER_AT and Path(root) != workspace_path:
+            masks.append((Path(root), True))
+            dirs[:] = []
+        else:
+            masks.extend((path, False) for path in hits)
+    if len(masks) > _MASK_MAX_MOUNTS:
+        return (f"Error: more than {_MASK_MAX_MOUNTS} secret files or folders to mask in {workspace_path}, so the "
+                "Docker sandbox cannot cover them all safely. Nothing was run.")
+    for path, folder in masks:
+        relative = path.relative_to(workspace_path).as_posix()
+        source = empty_dir if folder else empty
+        argv.extend(["--mount", f"type=bind,src={source},dst=/workspace/{relative},readonly"])
+    if sys.platform.startswith("linux") and hasattr(os, "getuid"):
+        # Files the command writes belong to the user, not root. Docker Desktop
+        # (macOS, Windows) maps ownership itself.
+        argv.extend(["--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"])
     if git_image:
         argv.extend(["--entrypoint", "/bin/sh"])
     argv.extend(["-w", "/workspace", selected_image, *container_command])
+    _clean_stale_docker_sandbox()
     result = _exec_process(argv, timeout=timeout)
     if "timed out" in result:
         try:
@@ -12402,13 +12654,66 @@ def _exec_docker_command(command: str, timeout: int, python_code: bool = False,
     return result
 
 
+def _docker_network_mode() -> str:
+    """The network a sandbox container gets: docker_network, or `allowlist` when
+    Docker stands in for a missing native sandbox and nothing was configured."""
+    if DOCKER_NETWORK_CONFIGURED or SANDBOX_NETWORK_OPEN or DOCKER_NETWORK != "none":
+        return DOCKER_NETWORK
+    if SANDBOX_BACKEND == "docker":
+        return DOCKER_NETWORK  # chosen on purpose: keep its default, no network
+    return "allowlist"
+
+
+def _docker_allowed_domains() -> list:
+    """The hosts the Docker proxy allows: sandbox_allowed_domains when it is set,
+    the registry preset when no line sets it (as the native sandbox gets)."""
+    if "sandbox_allowed_domains" in APP_CONFIG:
+        return list(SANDBOX_ALLOWED_DOMAINS)
+    return list(dict.fromkeys([*SANDBOX_ALLOWED_DOMAINS, *_DEFAULT_SANDBOX_ALLOWED_DOMAINS]))
+
+
+def _docker_egress_key(domains) -> str:
+    return hashlib.sha256(",".join(sorted(domains)).encode()).hexdigest()[:10]
+
+
+_sandbox_image_chosen = ""
+
+
+def _sandbox_image() -> str:
+    """The image for sandbox containers: Agent8088's own, or the plain Python
+    image when that cannot be pulled. A configured docker_image is used as is."""
+    global _sandbox_image_chosen
+    if DOCKER_IMAGE_CONFIGURED or DOCKER_IMAGE != _SANDBOX_IMAGE:
+        return DOCKER_IMAGE
+    if not _sandbox_image_chosen:
+        problem = _ensure_docker_image(_SANDBOX_IMAGE)
+        if problem:
+            _log.warning("Sandbox image %s is unavailable (%s); using %s", _SANDBOX_IMAGE,
+                         str(problem)[:200], _SANDBOX_IMAGE_FALLBACK)
+            _sandbox_image_chosen = _SANDBOX_IMAGE_FALLBACK
+        else:
+            _sandbox_image_chosen = _SANDBOX_IMAGE
+    return _sandbox_image_chosen
+
+
+def _sandbox_image_present() -> str:
+    """The sandbox image to probe without pulling anything."""
+    if DOCKER_IMAGE_CONFIGURED or DOCKER_IMAGE != _SANDBOX_IMAGE:
+        return DOCKER_IMAGE
+    if _sandbox_image_chosen:
+        return _sandbox_image_chosen
+    return _SANDBOX_IMAGE if _docker_image_present(_SANDBOX_IMAGE) else _SANDBOX_IMAGE_FALLBACK
+
+
 def _docker_egress_args() -> tuple:
     """The --network value and proxy environment for a sandbox container."""
-    if DOCKER_NETWORK != "allowlist":
-        return DOCKER_NETWORK, []
-    if not SANDBOX_ALLOWED_DOMAINS:
+    mode = _docker_network_mode()
+    if mode != "allowlist":
+        return mode, []
+    domains = _docker_allowed_domains()
+    if not domains:
         return "none", []
-    key = hashlib.sha256(",".join(sorted(SANDBOX_ALLOWED_DOMAINS)).encode()).hexdigest()[:10]
+    key = _docker_egress_key(domains)
     if key not in _docker_egress:
         _docker_egress[key] = _start_docker_egress(key)
     return _docker_egress[key]
@@ -12443,7 +12748,7 @@ def _start_docker_egress(key: str) -> tuple:
                 "--memory", "128m", "--cpus", "0.5", "--pids-limit", "128",
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--entrypoint", "python", _EGRESS_PROXY_IMAGE, "-u", "-B", "-c", source,
-                str(_EGRESS_PROXY_PORT), *SANDBOX_ALLOWED_DOMAINS)
+                str(_EGRESS_PROXY_PORT), *_docker_allowed_domains())
             if started.returncode != 0:
                 raise RuntimeError(started.stderr.strip() or "proxy did not start")
         joined = docker("network", "connect", network, proxy)
@@ -12589,6 +12894,44 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    explained = _sandbox_denial_hint(result, workspace, command)
+    return explained + _repeated_denial_note(command)
+
+
+# How many times each command was refused by the sandbox this turn. A model that
+# runs the same refused command again rarely does anything else differently, so
+# the second refusal says plainly that it will keep failing.
+_sandbox_denials: dict = {}
+
+
+def _repeated_denial_note(command: str) -> str:
+    key = " ".join(str(command or "").split())[:300]
+    if not key:
+        return ""
+    _sandbox_denials[key] = _sandbox_denials.get(key, 0) + 1
+    count = _sandbox_denials[key]
+    if count < 2:
+        return ""
+    return (f"\n[sandbox] This exact command has now been refused {count} times this turn, for the same reason. "
+            "It will be refused again: do not run it again. Change the approach (another folder, another tool), "
+            "or say in your answer what the task needs that the sandbox does not allow.")
+
+
+def _denied_secret_path(result: str) -> str:
+    """A protected credential path named in a refusal, or ""."""
+    for match in re.finditer(r"""['"]?((?:[A-Za-z]:)?[\\/~][^\s'":]*|\.env[^\s'":]*)['"]?""", result or ""):
+        path = match.group(1)
+        if _is_sensitive_path(path):
+            return path
+    return ""
+
+
+def _sandbox_denial_hint(result: str, workspace: Path, command: str = "") -> str:
+    """The refusal with the sentence that explains it."""
+    if secret := _denied_secret_path(result):
+        return (f"{result}\n[sandbox] {secret} holds credentials, which sandboxed commands may not read or "
+                "write. This is deliberate: do not look for another way to reach it. If the task needs a "
+                "credential, say so in your answer and the user will provide what is needed.")
     if (sys.platform == "win32" and "spawn EPERM" in (result or "")
             and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
         return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
@@ -12602,14 +12945,14 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only to them. To create "
-            "or change a file elsewhere in the allowed paths, use write_file or "
-            "edit_file: they act on this computer's files, not the sandbox. Programs "
-            "outside the agent's own runtime may be refused. Creating virtual "
-            "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder and use the packages the agent's "
-            "Python already has or another tool; ask the user to install something "
-            "only when nothing available can do the job.")
+            "the sandbox temp folder; everything else is read-only to them, including "
+            "the system Python and the home folder. To create or change a file elsewhere "
+            "in the allowed paths, use write_file or edit_file: they act on this "
+            "computer's files, not the sandbox. To install packages, make a virtual "
+            f"environment inside {workspace} (for example `python -m venv .venv`) and "
+            "install into it, rather than into the system or the user's folders. Programs "
+            "outside the agent's own runtime may be refused; use what is available or another "
+            "tool, and ask the user to install something only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
@@ -12730,6 +13073,61 @@ def _shell_missing_file_note(result: str, command: str, workspace: Path) -> str:
     return "".join(f"\n{note}" for note in notes)
 
 
+# What a client prints when the sandbox's proxy refused its connection. A server's
+# own 403 is not this: each pattern names the proxy or the tunnel.
+_PROXY_REFUSED_RE = re.compile(
+    r"Connection blocked by network allowlist"
+    r"|Tunnel connection failed: 403"
+    r"|CONNECT tunnel failed, response 403"
+    r"|tunneling socket could not be established, statusCode=403"
+    r"|Received HTTP code 403 from proxy after CONNECT",
+    re.IGNORECASE)
+_URL_HOST_RE = re.compile(r"\b(?:https?|git|wss?)://(?:[^@/\s'\"]*@)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+
+def _refused_hosts(result: str, command: str) -> list:
+    """Hosts a sandboxed command was refused by the network allowlist, or []."""
+    if not _PROXY_REFUSED_RE.search(result or ""):
+        return []
+    allowed = _effective_allowed_domains()
+    hosts = [host.lower() for host in _URL_HOST_RE.findall(f"{command}\n{result}")]
+    return [host for host in dict.fromkeys(hosts) if not _host_is_allowed(host, allowed)][:5]
+
+
+def _refused_host_result(result: str, command: str, interactive: bool) -> str:
+    """Name a refused host to the model, log it, and ask the user about it once.
+
+    Returns the result to give the model: unchanged when nothing was refused,
+    with a note when a host was, or an escalation request the first time a host
+    is refused in an interactive session (the model retries once it is allowed)."""
+    hosts = _refused_hosts(result, command)
+    if not hosts:
+        return result
+    _audit("sandbox_host_refused", hosts=hosts, command=str(command)[:200])
+    new = [host for host in hosts if host not in _hosts_asked]
+    if new and interactive and SANDBOX_ASK_HOSTS:
+        _hosts_asked.update(new)
+        return request_escalation(
+            # The hosts are part of the change type, so "allow for the session" in any front end
+            # remembers these hosts only, never every host that comes later.
+            "full-auto", new, "sandbox_host:" + ",".join(new),
+            f"A sandboxed command tried to reach {', '.join(new)}, which is not on the sandbox's network "
+            f"allowlist (sandbox_allowed_domains in {_config_file()}). Allow it for this session?")
+    shown = ", ".join(hosts)
+    return (f"{result}\n[sandbox] The command could not reach {shown}: it is not on the sandbox's network "
+            f"allowlist. Running it again will not help. Use a host on the list (the package registries and "
+            f"code hosts are), or tell the user this task needs {shown}: they can add it to "
+            f"sandbox_allowed_domains in {_config_file()}.")
+
+
+def _interactive_session() -> bool:
+    """A person is at the terminal who can answer an approval prompt."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def _run_sandbox_command(command: str, timeout: int = 25,
                          python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
@@ -12771,6 +13169,8 @@ def _run_sandbox_command(command: str, timeout: int = 25,
             workspace if temporary is None else workspace, command)
         if temporary is None:
             result += _shell_missing_file_note(result, command, workspace)
+        if not (backend == "native" and sys.platform == "win32"):  # Windows filters no network
+            result = _refused_host_result(result, command, _interactive_session() and temporary is None)
     finally:
         if temporary:
             cleanup_note = _cleanup_audit_workspace(temporary)
@@ -13237,7 +13637,7 @@ def _exec_docker(args: dict) -> str:
     if not code:
         return ("Error: sandboxed execution requires 'code'. Pass the Python "
                 "source as code=\"...\" (newlines escaped as \\n).")
-    image = str(args.get("image") or DOCKER_IMAGE)
+    image = str(args.get("image") or _sandbox_image())
     timeout = min(max(1, int(args.get("timeout") or 60)), MAX_TOOL_TIMEOUT_SECONDS)
     return _exec_sandbox_command(code, timeout=timeout, python_code=True, image=image)
 
@@ -17897,7 +18297,7 @@ def _revive_managed_searxng(wait=None) -> bool:
     """
     from agent8088 import searxng_provision
     url = urllib.parse.urlparse(str(_search_config().get("search_base_url") or ""))
-    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop():
+    if url.hostname not in ("127.0.0.1", "localhost") or not _start_docker_desktop(purpose="searxng"):
         return False
     if not searxng_provision.status().get("running") and not searxng_provision.resume():
         return False

@@ -12,6 +12,7 @@ Domains match exactly; `*.example.com` matches its subdomains (not the apex);
 an optional `:port` suffix limits an entry to that port. Stdlib only: it is run
 with `python -c` on the stock python image, not imported by Agent8088.
 """
+import ipaddress
 import socket
 import sys
 import threading
@@ -19,6 +20,37 @@ from urllib.parse import urlsplit
 
 IDLE_SECONDS = 300
 MAX_HEAD_BYTES = 65536
+# Names that lead back to the computer or the cloud host whatever the allowlist
+# says: Docker's own aliases for the host, and the instance metadata services.
+HOST_NAMES = frozenset((
+    "localhost", "host.docker.internal", "gateway.docker.internal", "host-gateway",
+    "kubernetes.docker.internal", "metadata.google.internal", "metadata", "instance-data",
+))
+
+
+def public_address(host: str, port: int):
+    """The first public address `host` resolves to, or None.
+
+    An allowed name can still resolve to the computer, the local network or a
+    metadata service (a wildcard entry, a hostile DNS answer), so the proxy
+    checks the address it is about to connect to, and connects to that address
+    -- not to the name again, which a second lookup could answer differently."""
+    if host.lower().rstrip(".") in HOST_NAMES:
+        return None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for family, _, _, _, sockaddr in infos:
+        try:
+            address = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        except ValueError:
+            continue
+        if getattr(address, "ipv4_mapped", None):
+            address = address.ipv4_mapped
+        if address.is_global and not address.is_multicast:
+            return family, sockaddr
+    return None
 
 
 def host_allowed(host: str, port: int, patterns) -> bool:
@@ -106,8 +138,16 @@ def handle(conn, patterns) -> None:
             _reply(conn, "403 Forbidden", f"Agent8088 sandbox: {host} is not in "
                    "sandbox_allowed_domains.\n")
             return
+        target_address = public_address(host, port)
+        if target_address is None:
+            _reply(conn, "403 Forbidden", f"Agent8088 sandbox: {host} is this computer, the local "
+                   "network or a metadata service, which sandboxed commands may not reach.\n")
+            return
         try:
-            upstream = socket.create_connection((host, port), timeout=30)
+            family, sockaddr = target_address
+            upstream = socket.socket(family, socket.SOCK_STREAM)
+            upstream.settimeout(30)
+            upstream.connect(sockaddr)
         except OSError as exc:
             _reply(conn, "502 Bad Gateway", f"Agent8088 sandbox proxy could not reach "
                    f"{host}:{port}: {exc}\n")

@@ -1,0 +1,76 @@
+name: Installer end to end
+
+# The real installers on throwaway machines, for the branch under test, then the installed sandbox checked
+# (scripts/installer_e2e_check.py). They download a lot and take a while, so they run when the installers, the
+# Docker sandbox image or proxy change, and by hand (Actions > Installer end to end > Run workflow) after other
+# sandbox changes, before a staging promotion.
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - install.ps1
+      - src/agent8088/egress_proxy.py
+      - docker/**
+      - scripts/installer_e2e_check.py
+      - .github/workflows/installer-e2e.yml
+  push:
+    branches: [development]
+    paths:
+      - install.sh
+      - install.ps1
+      - src/agent8088/egress_proxy.py
+      - docker/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: Install (${{ matrix.os }})
+    # The installers clone the branch from this repository, so a PR from a fork cannot be installed this way.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      AGENT8088_BRANCH: ${{ github.head_ref || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash install.sh --skip-libreoffice --skip-setup 2>&1 | tee "$RUNNER_TEMP/install.log"
+      - name: Run install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install.ps1 -SkipLibreOffice -SkipMem0 -SkipTerminalCheck *>&1 | Tee-Object "$env:RUNNER_TEMP/install.log"
+      - name: On Ubuntu, a blocked native sandbox is explained
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            grep -q "restricts unprivileged user namespaces" "$RUNNER_TEMP/install.log"
+          fi
+      - name: Check the installed sandbox
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            py="$LOCALAPPDATA/agent8088/agent8088/venv/Scripts/python.exe"
+          else
+            py="$HOME/.agent8088/agent8088/venv/bin/python"
+          fi
+          "$py" -m agent8088.cli --version
+          "$py" scripts/installer_e2e_check.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: install-log-${{ matrix.os }}
+          path: ${{ runner.temp }}/install.log
