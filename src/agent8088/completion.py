@@ -281,6 +281,30 @@ _INPUT_CUE = re.compile(
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`'\"(])|\n+")
 
 
+# A sentence that opens with a condition: its main clause, after the first comma, is only asked for under it.
+_OPENING_CONDITION = re.compile(
+    r"^\W*(?:(?:and|also|then|finally)\s+)?(?:if|unless|in\s+case|only\s+if|provided\s+that)\b", re.IGNORECASE)
+# A verb offered as a choice rather than asked for: "optionally write", "you may also save", "feel free to create".
+_OFFERED_AS_CHOICE = re.compile(
+    r"\b(?:optionally|optional|(?:you\s+)?(?:may|might|can|could)(?:\s+also)?|feel\s+free\s+to|"
+    r"if\s+(?:needed|necessary|helpful|useful|you\s+(?:want|like|wish)))\s*(?:also\s+)?(?:to\s+)?$", re.IGNORECASE)
+
+
+def _is_optional_file(sentence: str, path_start: int, cue_start: int) -> bool:
+    """The file is named in a clause that only asks for it under a condition, or offers it as a choice.
+
+    A file the request makes optional cannot be called missing: whether it was due depends on something the check
+    cannot see (did the conversation become long?). Only two shapes count, so a condition elsewhere in the sentence
+    does not hide a required file: the sentence opens with the condition and the file is in what follows it, or the
+    verb that names the file is itself offered as a choice. A time clause ("When done, ...") is neither.
+    """
+    if _OPENING_CONDITION.match(sentence):
+        comma = sentence.find(",")
+        if comma < 0 or path_start > comma:
+            return True
+    return bool(_OFFERED_AS_CHOICE.search(sentence[max(0, cue_start - 40):cue_start]))
+
+
 def named_output_paths(request: str) -> list[str]:
     """Paths the request asks to be created, in the order they are named.
 
@@ -292,9 +316,12 @@ def named_output_paths(request: str) -> list[str]:
     for sentence in _SENTENCE_SPLIT.split(_prose(request)):
         for match in _PATH_TOKEN.finditer(sentence):
             before = sentence[:match.start()]
-            output = [m.end() for m in _OUTPUT_CUE.finditer(before)]
+            cues = list(_OUTPUT_CUE.finditer(before))
+            output = [m.end() for m in cues]
             inputs = [m.end() for m in _INPUT_CUE.finditer(before)]
             if not output or (inputs and max(inputs) > max(output)):
+                continue
+            if _is_optional_file(sentence, match.start(), cues[-1].start()):
                 continue
             path = match.group(1).rstrip(".")
             if path not in found:
