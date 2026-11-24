@@ -269,6 +269,11 @@ browser_headless=1
 # If neither is available, shell and code execution are refused.
 sandbox_backend=auto
 sandbox_runtime_version=0.0.73
+# Variables that look like secrets (names with TOKEN, SECRET, PASSWORD, API_KEY,
+# CREDENTIALS, ...) are removed from the environment of sandboxed commands, so
+# code the model runs cannot read a token set in your shell. Name any a task
+# really needs inside the sandbox here.
+# sandbox_pass_env=GITHUB_TOKEN
 # sandbox_allowed_domains=api.example.com
 # `open` lets sandboxed commands reach anything this computer can: the internet,
 # its own services (mail, databases, dev servers on localhost) and the local
