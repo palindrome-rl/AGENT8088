@@ -88,10 +88,10 @@ def test_the_user_is_asked_once_per_host_and_an_allowed_host_joins_the_session(e
     command = "curl https://api.example.com/v1"
     refused = "curl: (56) CONNECT tunnel failed, response 403"
     first = engine._refused_host_result(refused, command, interactive=True)
-    assert first.startswith("ESCALATION_REQUEST\x1f") and "\x1fsandbox_host\x1fapi.example.com\x1f" in first
+    assert first.startswith("ESCALATION_REQUEST\x1f") and "\x1fsandbox_host:api.example.com\x1fapi.example.com\x1f" in first
     again = engine._refused_host_result(refused, command, interactive=True)
     assert not again.startswith("ESCALATION_REQUEST") and "could not reach api.example.com" in again
-    engine.grant_escalation("sandbox_host", "api.example.com")
+    engine.grant_escalation("sandbox_host:api.example.com", "api.example.com")
     assert "api.example.com" in engine._effective_allowed_domains()
     assert "api.example.com" in engine._sandbox_settings_data(False, data[0])["network"]["allowedDomains"]
     assert engine._refused_host_result(refused, command, interactive=True) == refused
@@ -107,8 +107,37 @@ def test_no_question_when_asking_is_off_or_nobody_is_there(engine, data, monkeyp
 
 
 def test_a_bad_host_name_is_never_allowed(engine, data):
-    engine.grant_escalation("sandbox_host", "*,ok.example.com, ,evil host")
+    engine.grant_escalation("sandbox_host:ok.example.com,*,evil host", "*,ok.example.com, ,evil host")
     assert engine._session_allowed_hosts == ["ok.example.com"]
+
+
+def test_a_session_approval_covers_only_the_hosts_it_named(engine, data):
+    # A front end that remembers "allow for the session" by change type re-grants that
+    # type later with whatever the new request lists; only the named host may come in.
+    engine.grant_escalation("sandbox_host:api.example.com", "api.example.com")
+    engine.grant_escalation("sandbox_host:api.example.com", "evil.example.net,api.example.com")
+    engine.grant_escalation("sandbox_host", "evil.example.net")
+    assert engine._session_allowed_hosts == ["api.example.com"]
+
+
+def test_two_hosts_are_two_different_questions(engine, data, monkeypatch):
+    monkeypatch.setattr(engine, "SANDBOX_ALLOWED_DOMAINS", [])
+    monkeypatch.setattr(engine, "SANDBOX_ASK_HOSTS", True)
+    refused = "curl: (56) CONNECT tunnel failed, response 403"
+    first = engine._refused_host_result(refused, "curl https://a.example.com", interactive=True)
+    second = engine._refused_host_result(refused, "curl https://b.example.com", interactive=True)
+    assert first.split("\x1f")[2] == "sandbox_host:a.example.com"
+    assert second.split("\x1f")[2] == "sandbox_host:b.example.com"
+
+
+@pytest.mark.parametrize("relative", [".git-credentials", ".pypirc", ".cargo/credentials.toml",
+                                      ".config/git/credentials", ".gem/credentials"])
+def test_home_credential_files_are_hidden(engine, data, monkeypatch, tmp_path, relative):
+    home = tmp_path / "home"
+    monkeypatch.setattr(engine.Path, "home", classmethod(lambda cls: home))
+    settings = engine._sandbox_settings_data(False, data[0])
+    hidden = str((home / relative).resolve())
+    assert hidden in settings["filesystem"]["denyRead"] and hidden in settings["filesystem"]["denyWrite"]
 
 
 def test_the_node_the_installer_downloaded_is_found_without_path(engine, data, monkeypatch):

@@ -2507,11 +2507,14 @@ def grant_escalation(change_type: str = "", target: str = ""):
     (e.g. a CAD turn's plan.md write and its generator write, escalated
     together), and each grant is spent independently by check_permission."""
     global _local_fallback_grant, _remote_git_grant, _pending_approval_key
-    if change_type == "sandbox_host":
-        # The hosts the user allowed join the sandbox allowlist for this session.
+    if change_type == "sandbox_host" or change_type.startswith("sandbox_host:"):
+        # The hosts the user allowed join the sandbox allowlist for this session: only those the
+        # question named (in its change type), whatever else the target lists.
+        named = {h.strip().lower() for h in change_type.partition(":")[2].split(",") if h.strip()}
         for host in str(target or "").split(","):
             host = host.strip().lower()
-            if host and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host) and host not in _session_allowed_hosts:
+            if (host and host in named and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host)
+                    and host not in _session_allowed_hosts):
                 _session_allowed_hosts.append(host)
         _audit("sandbox_host_allowed", hosts=list(_session_allowed_hosts))
         _pending_approval_key = ""
@@ -11620,6 +11623,18 @@ def _sandbox_cache_env() -> dict:
     return {name: str(root / folder) for name, folder in _SANDBOX_CACHE_VARS}
 
 
+def _HOME_CREDENTIAL_FILES(home: Path) -> list:
+    return [home / ".git-credentials", home / ".config" / "git" / "credentials", home / ".pypirc",
+            home / ".cargo" / "credentials.toml", home / ".cargo" / "credentials", home / ".gem" / "credentials",
+            home / ".config" / "hub", home / ".terraform.d" / "credentials.tfrc.json", home / ".m2" / "settings.xml",
+            home / ".config" / "pip" / "pip.conf", home / ".pip" / "pip.conf", home / ".yarnrc.yml",
+            home / ".config" / "op", home / ".password-store", home / ".local" / "share" / "keyrings",
+            home / ".config" / "rclone" / "rclone.conf", home / ".s3cfg", home / ".boto",
+            home / ".config" / "doctl", home / ".config" / "heroku", home / ".netlify",
+            home / ".vercel", home / ".config" / "configstore", home / ".huggingface" / "token",
+            home / ".cache" / "huggingface" / "token"]
+
+
 def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
     home = Path.home()
     denied = [
@@ -11628,6 +11643,9 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
+        # Tokens other tools keep in plain files. With the package registries and code
+        # hosts reachable by default, a token read here could push or publish.
+        *_HOME_CREDENTIAL_FILES(home),
     ]
     roots = _secret_scan_roots(workspace)
     if sys.platform.startswith("linux"):
@@ -12802,7 +12820,9 @@ def _refused_host_result(result: str, command: str, interactive: bool) -> str:
     if new and interactive and SANDBOX_ASK_HOSTS:
         _hosts_asked.update(new)
         return request_escalation(
-            "full-auto", new, "sandbox_host",
+            # The hosts are part of the change type, so "allow for the session" in any front end
+            # remembers these hosts only, never every host that comes later.
+            "full-auto", new, "sandbox_host:" + ",".join(new),
             f"A sandboxed command tried to reach {', '.join(new)}, which is not on the sandbox's network "
             f"allowlist (sandbox_allowed_domains in {_config_file()}). Allow it for this session?")
     shown = ", ".join(hosts)
