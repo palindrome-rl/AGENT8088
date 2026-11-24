@@ -21,8 +21,11 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
+engine.verify_sandbox_backend()  # runs one harmless command, so a native sandbox that cannot start is known now
 backend = engine._resolve_sandbox_backend()
 status = engine.sandbox_status()
+if engine._native_sandbox_failure:
+    print("native sandbox:", engine._native_sandbox_failure[:300])
 print("sandbox:", {k: status.get(k) for k in ("resolved", "network", "network_enforced", "verification")})
 check("a sandbox backend is available", backend in ("native", "docker"), backend)
 if backend not in ("native", "docker"):

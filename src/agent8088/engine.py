@@ -12213,7 +12213,7 @@ def _other_agent8088_running(psutil) -> bool:
             continue
         if pid == me or pid in ancestors:
             continue
-        head = [Path(str(part)).stem.lower() for part in cmdline[:2]]
+        head = [re.split(r"[\\/]", str(part))[-1].lower().removesuffix(".exe") for part in cmdline[:2]]
         if "agent8088" in head or any(str(part).startswith("agent8088.") for part in cmdline[:4]):
             return True
     return False
