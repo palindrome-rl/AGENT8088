@@ -1411,6 +1411,8 @@ def reset_turn_counters() -> None:
     _pending_blocker_note = ""
     _failure_streak = 0
     _diagnostic_shown = False
+    if "_sandbox_denials" in globals():  # also runs while the module loads
+        _sandbox_denials.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -11193,7 +11195,11 @@ def _native_sandbox_shell_argv(command: str, cwd=None) -> list:
         "import base64, os, subprocess, sys\n"
         "command = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "cwd = base64.b64decode(sys.argv[2]).decode('utf-8') if len(sys.argv) > 2 else None\n"
-        "env = dict(os.environ)\n"
+        "import re\n"
+        f"secret = re.compile({_SECRET_ENV_RE.pattern!r}, re.IGNORECASE)\n"
+        f"keep = {sorted(SANDBOX_PASS_ENV)!r}\n"
+        "env = {k: v for k, v in os.environ.items() if not secret.search(k) or k.upper() in keep\n"
+        "       or k.upper().startswith('AGENT8088_')}\n"
         "key = next((k for k in env if k.lower() == 'path'), 'PATH')\n"
         "env[key] = os.pathsep.join(p for p in env.get(key, '').split(os.pathsep) if not\n"
         "    p.strip().strip('\"').rstrip('\\\\/').lower().replace('/', '\\\\').endswith('\\\\git\\\\usr\\\\bin'))\n"
@@ -11439,6 +11445,28 @@ def set_sandbox_backend(backend: str) -> dict:
     return status
 
 
+# Secret environment variables. A sandboxed command inherits the environment
+# Agent8088 was started in, so a token set in the user's shell (GITHUB_TOKEN,
+# AWS_SECRET_ACCESS_KEY, OPENAI_API_KEY) was readable by any code the model ran.
+# They are removed from that environment; sandbox_pass_env names any the task
+# really needs inside the sandbox. The Windows bridge below carries the same rule.
+_SECRET_ENV_RE = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY)(?:_|$)"
+    r"|(?:API|ACCESS|PRIVATE|SECRET|SIGNING|ENCRYPTION|MASTER|CLIENT|SERVICE)_KEY(?:_|$)"
+    r"|_KEY$|^(?:PGPASSWORD|NPM_TOKEN|NODE_AUTH_TOKEN|HF_TOKEN|DATABASE_URL)$",
+    re.IGNORECASE)
+SANDBOX_PASS_ENV = frozenset(
+    name.strip().upper() for name in str(APP_CONFIG.get("sandbox_pass_env", "")).split(",") if name.strip())
+
+
+def _secret_env_names(environ=None) -> list:
+    """Names (never values) of the variables kept out of sandboxed commands."""
+    environ = os.environ if environ is None else environ
+    return sorted(name for name in environ
+                  if _SECRET_ENV_RE.search(name) and name.upper() not in SANDBOX_PASS_ENV
+                  and not name.upper().startswith("AGENT8088_"))
+
+
 # Secret files inside the folders a sandboxed command can reach.
 _SECRET_FILE_GLOBS = (".env*", "*.pem", "*.key", "*.p12", "*_KEY*", "*_SECRET*",
                       "*_TOKEN*", "*_PASSWORD*")
@@ -11601,6 +11629,9 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         "enableWeakerNestedSandbox": False,
         "enableWeakerNetworkIsolation": False,
         "allowAppleEvents": False,
+        # srt unsets each of these in the sandboxed command (mode deny).
+        **({"credentials": {"envVars": [{"name": name, "mode": "deny"} for name in secret_env]}}
+           if (secret_env := _secret_env_names()) else {}),
     }
 
 
@@ -12141,6 +12172,11 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     argv = _native_sandbox_argv()
     if not argv:
         return "Native sandbox runtime is unavailable."
+    secret_env = [name for name in _secret_env_names() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)]
+    if sys.platform != "win32" and secret_env:
+        # srt unsets them too (credentials in its settings); this keeps them out
+        # if a runtime ever ignored that section.
+        command = f"unset {' '.join(secret_env)}; {command}"
     cwd = (cwd or ARTIFACTS_ROOT).resolve()
     sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
     if sys.platform == "win32":
@@ -12557,6 +12593,44 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     """
     if not _SANDBOX_DENIED_RE.search(result or "") or "[sandbox]" in result:
         return result
+    explained = _sandbox_denial_hint(result, workspace, command)
+    return explained + _repeated_denial_note(command)
+
+
+# How many times each command was refused by the sandbox this turn. A model that
+# runs the same refused command again rarely does anything else differently, so
+# the second refusal says plainly that it will keep failing.
+_sandbox_denials: dict = {}
+
+
+def _repeated_denial_note(command: str) -> str:
+    key = " ".join(str(command or "").split())[:300]
+    if not key:
+        return ""
+    _sandbox_denials[key] = _sandbox_denials.get(key, 0) + 1
+    count = _sandbox_denials[key]
+    if count < 2:
+        return ""
+    return (f"\n[sandbox] This exact command has now been refused {count} times this turn, for the same reason. "
+            "It will be refused again: do not run it again. Change the approach (another folder, another tool), "
+            "or say in your answer what the task needs that the sandbox does not allow.")
+
+
+def _denied_secret_path(result: str) -> str:
+    """A protected credential path named in a refusal, or ""."""
+    for match in re.finditer(r"""['"]?((?:[A-Za-z]:)?[\\/~][^\s'":]*|\.env[^\s'":]*)['"]?""", result or ""):
+        path = match.group(1)
+        if _is_sensitive_path(path):
+            return path
+    return ""
+
+
+def _sandbox_denial_hint(result: str, workspace: Path, command: str = "") -> str:
+    """The refusal with the sentence that explains it."""
+    if secret := _denied_secret_path(result):
+        return (f"{result}\n[sandbox] {secret} holds credentials, which sandboxed commands may not read or "
+                "write. This is deliberate: do not look for another way to reach it. If the task needs a "
+                "credential, say so in your answer and the user will provide what is needed.")
     if (sys.platform == "win32" and "spawn EPERM" in (result or "")
             and _native_piped_spawn_blocked is True and _resolve_sandbox_backend() == "native"):
         return (f"{result}\n[sandbox] `spawn EPERM` here means the Windows sandbox does not let a program start "
@@ -12570,14 +12644,14 @@ def _explain_sandbox_denial(result: str, workspace: Path, command: str = "") -> 
     if hint := _git_tools_hint(command):
         return f"{result}\n[sandbox] git cannot change a repository from the sandboxed shell. {hint}"
     return (f"{result}\n[sandbox] Shell commands may write only to {workspace} and "
-            "the sandbox temp folder; everything else is read-only to them. To create "
-            "or change a file elsewhere in the allowed paths, use write_file or "
-            "edit_file: they act on this computer's files, not the sandbox. Programs "
-            "outside the agent's own runtime may be refused. Creating virtual "
-            "environments or installing packages from the shell will not work "
-            "here: keep outputs under that folder and use the packages the agent's "
-            "Python already has or another tool; ask the user to install something "
-            "only when nothing available can do the job.")
+            "the sandbox temp folder; everything else is read-only to them, including "
+            "the system Python and the home folder. To create or change a file elsewhere "
+            "in the allowed paths, use write_file or edit_file: they act on this "
+            "computer's files, not the sandbox. To install packages, make a virtual "
+            f"environment inside {workspace} (for example `python -m venv .venv`) and "
+            "install into it, rather than into the system or the user's folders. Programs "
+            "outside the agent's own runtime may be refused; use what is available or another "
+            "tool, and ask the user to install something only when nothing available can do the job.")
 
 
 def _exec_sandbox_command(command: str, timeout: int = 25,
