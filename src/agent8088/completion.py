@@ -926,6 +926,73 @@ def _property_part(item: str) -> bool:
     return not names and not _PART_BUILD_VERB.search(item) and not _ACTION_PART.match(item)
 
 
+# The words a part spends on the act of making a file, and on what kind of file it is. They are met by the file being
+# there, so they cannot be looked for inside it: the code of "a file that prints ..." never says "create" or "file".
+_MAKE_ACT_STEMS = frozenset(_stem(w) for w in (
+    "create", "make", "write", "generate", "produce", "save", "file", "files", "script"))
+
+# The words of a part that asks to run what was made and look at how it went. None of them names a result, so a
+# command that ran the file meets the part; a part that names one ("lists twelve customers") is not made of these.
+_RUN_CHECK_STEMS = frozenset(_stem(w) for w in (
+    "execute", "start", "launch", "test", "tests", "try", "call", "invoke", "rerun", "check", "checks", "verify",
+    "confirm", "ensure", "output", "result", "results", "work", "works", "working", "correct", "correctly",
+    "expected", "right", "successfully", "succeeds", "passes",
+    "script", "program", "code", "application", "module", "tool", "file", "files"))
+_THE_THING_MADE = re.compile(
+    r"\b(?:it|them|its|this|that|(?:the|this|that)\s+(?:script|program|code|file|files|app|application|module|tool|"
+    r"result|results|output))\b", re.IGNORECASE)
+# A command that only looks at a file, or prints its name, did not run it.
+_LOOKS_ONLY = re.compile(
+    r"^\s*(?:cat|type|more|less|head|tail|ls|dir|echo|grep|rg|findstr|sed|awk|wc|stat|file|get-content|gc|"
+    r"select-string|sls|write-output|write-host)\b", re.IGNORECASE)
+
+
+def _written_basenames(written: Iterable[str], roots: list[Path]) -> list[str]:
+    """Lower-cased names of the files this run wrote that are there and not empty (no folder to look in: all of them)."""
+    names = []
+    for raw in written:
+        if roots and not any(_nonempty_file(c) for c in _candidates(raw, roots)):
+            continue
+        name = PurePath(str(raw)).name.lower()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _made_file_named(item: str, written_names: list[str]) -> bool:
+    """The part asks for a file by name ("Create a file x.py that ...") and the run wrote it and left it not empty."""
+    return any(PurePath(p).name.lower() in written_names for p in named_output_paths(item))
+
+
+def _met_by_running_what_was_made(item: str, words: set[str], ran: Iterable[str], written_names: list[str]) -> bool:
+    """A part that asks to run what the run made ("run it to check the output"), met by a command that ran one of
+    the files it wrote.
+
+    A part that is only about running and looking ("execute it and verify the result") has no word a command line
+    could hold, so words were looked for there and never found. It counts when it points at what was made ("it",
+    "the script", or a written file by name), every key word is one of running and looking, and a command that ran a
+    written file finished without a failure. A part that names a result, or any other thing, is left to the word
+    check: running the file does not show it.
+    """
+    if not written_names or not _ACTION_PART.match(item):
+        return False
+    stems = {_root(w) for w in words}
+    own_names = {_root(_stem(w)) for name in written_names for w in re.findall(r"[a-z0-9_]{4,}", name)}
+    allowed = {_root(s) for s in _RUN_CHECK_STEMS} | own_names
+    if not stems <= allowed:
+        return False
+    if not (_THE_THING_MADE.search(item) or any(name in item.lower() for name in written_names)):
+        return False
+    for command in ran or ():
+        text = str(command)
+        if _LOOKS_ONLY.match(text):
+            continue
+        if any(re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])", text, re.IGNORECASE)
+               for name in written_names):
+            return True
+    return False
+
+
 def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str],
                          evidence: str | None = None, ran: Iterable[str] = (),
                          roots: Iterable[Path] = ()) -> list[str]:
@@ -954,7 +1021,9 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
     to another folder is not the thing the request asked for.
     """
     roots = [Path(r) for r in roots or ()]
+    written = list(written)
     names = " ".join(PurePath(w).name for w in written)
+    written_names = _written_basenames(written, roots)
     if evidence is None:
         haystack = _keywords(reply or "") | _keywords(names)
         open_items = []
@@ -977,12 +1046,16 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
         acts = bool(_ACTION_PART.match(item) or _ACTION_WORD.search(item))
         if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
             continue
+        if _met_by_running_what_was_made(item, words, ran, written_names):
+            continue
+        # The file the part asks for is there: the words that only restate making a file are met by it.
+        made = {_root(w) for w in _MAKE_ACT_STEMS} if _made_file_named(item, written_names) else set()
         if _COMMUNICATION.match(item) or _property_part(item):
             found = sum(1 for w in words if w in reply_words or (" " + _root(w)) in in_files)
         elif _ACTION_PART.match(item):
             found = sum(1 for w in words if (" " + _root(w)) in in_files or (" " + _root(w)) in in_commands)
         else:
-            found = sum(1 for w in words if (" " + _root(w)) in in_files)
+            found = sum(1 for w in words if _root(w) in made or (" " + _root(w)) in in_files)
         if found * 2 < len(words):
             open_items.append(item)
     return open_items
