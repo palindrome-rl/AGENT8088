@@ -4,6 +4,18 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (four-level verdict)
+
+### Improved
+
+- A run that changed files ends with one verdict in four levels, from the controller's own evidence: NOT VERIFIED (a
+  check failed or the work is unfinished, now also when a written file still does not parse), COULD NOT VERIFY (an
+  environment limit stopped the check and nothing passed), VERIFIED (a test passed after the last change and no part
+  waits for a recheck) and PARTLY VERIFIED (anything else, with what is missing). NOT VERIFIED stays above the reply;
+  the others lead the end-of-run notes as a `Verdict:` line. What the reply claims never raises the level.
+- The auditor must cite its evidence for a `fail` (the command and the output line, or the file and line), and is
+  told a `fail` the caller cannot reproduce is thrown away.
+
 ## v1.3 branch maintenance - 2026-11-26 (checks after every write)
 
 ### Added

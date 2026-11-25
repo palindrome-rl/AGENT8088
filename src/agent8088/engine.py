@@ -22753,6 +22753,50 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
     return list(dict.fromkeys(reasons))
 
 
+VERDICT_LEVELS = ("VERIFIED", "PARTLY VERIFIED", "NOT VERIFIED", "COULD NOT VERIFY")
+
+
+def _verdict(trajectory, reply: str = "") -> tuple[str, str]:
+    """(level, why) for a finished run, from the controller's own evidence only; ("", "") when nothing changed and
+    nothing is wrong.
+
+    NOT VERIFIED      a check failed or the run shows the work unfinished (_not_verified_reasons, which the saved
+                      runs are judged by, plus a written file that still does not parse)
+    COULD NOT VERIFY  nothing failed and nothing passed, because the machine or the sandbox stopped a check
+    VERIFIED          a test run passed after the last change and no part of the request waits for a recheck
+    PARTLY VERIFIED   anything else that changed files; `why` says what is missing
+    What the reply claims never raises the level."""
+    if trajectory is None:
+        return "", ""
+    reasons = list(_not_verified_reasons(trajectory, reply))
+    problems = trajectory.write_problems()
+    if problems:
+        names = sorted({Path(str(p)).name for p in problems})
+        reasons.append("a written file does not parse or points at missing files (" + ", ".join(names[:3]) + ")")
+    if reasons:
+        return "NOT VERIFIED", "; ".join(reasons[:4])
+    if not trajectory.mutation_count():
+        return "", ""
+    level = trajectory.assurance()
+    rechecks = trajectory.recheck_subgoals()
+    limit = trajectory.environment_note() or trajectory.backend_note()
+    if level not in ("tested", "exercised") and limit:
+        return "COULD NOT VERIFY", limit
+    if level == "tested" and not rechecks:
+        return "VERIFIED", ("a test run passed after the last change"
+                            + (", and every part of the request is settled" if trajectory.subgoals() else ""))
+    missing = []
+    if rechecks:
+        missing.append(f"{len(rechecks)} part(s) of the request were checked before the last change and not since")
+    if level == "exercised":
+        missing.append("it ran without an error, but no test run passed after the last change")
+    elif level == "inspected":
+        missing.append("the changed files were read back, but nothing was run after the last change")
+    elif level in ("unchecked", ""):
+        missing.append("nothing was run or tested after the last change")
+    return "PARTLY VERIFIED", "; ".join(missing)
+
+
 _ASSURANCE_LINES = {
     "tested": ("Verification: tested. A test run passed after the last change (the run's own tests; this does not "
                "check the result against what was asked)."),
@@ -22830,6 +22874,11 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
     model_reply = answer
     # First: the copy-back changes which files are missing, and the notes and the headline below report that.
     mirror_note = "" if read_only else _mirror_redirected_writes(trajectory)
+    if NOT_VERIFIED_HEADLINE and trajectory is not None:
+        level, why = _verdict(trajectory, model_reply)
+        if level and level != "NOT VERIFIED":
+            # The other three levels lead the notes; the reply stays the first thing a reader sees.
+            notes.append(f"Verdict: {level} ({why}).")
     assurance_line = _ASSURANCE_LINES.get(trajectory.assurance()) if trajectory is not None else None
     if assurance_line:
         notes.append(assurance_line)
@@ -22870,10 +22919,12 @@ def _with_task_notes(answer: str, trajectory, *, read_only: bool = False) -> str
         notes.append(location_note)
     for note in notes:
         answer += f"\n\n{note}"
-    reasons = _not_verified_reasons(trajectory, model_reply) if NOT_VERIFIED_HEADLINE else []
-    if reasons and not answer.startswith("NOT VERIFIED:"):
-        answer = ("NOT VERIFIED: " + "; ".join(reasons[:4])
-                  + ". Details are in the notes at the end.\n\n" + answer)
+    if not NOT_VERIFIED_HEADLINE or answer.startswith("NOT VERIFIED:"):
+        return answer
+    level, why = _verdict(trajectory, model_reply)
+    if level == "NOT VERIFIED":
+        # The one level that goes above the reply: something is wrong, and a reader must see it first.
+        return f"NOT VERIFIED: {why}. Details are in the notes at the end.\n\n" + answer
     return answer
 _REPEAT_OBSERVATIONS = frozenset({
     "cli_anything_status", "cli_anything_list", "cli_anything_search",
