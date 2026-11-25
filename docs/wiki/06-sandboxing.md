@@ -240,8 +240,13 @@ scripts) can start their child processes. Dev servers run as
   runner, and the first one after Windows starts takes a few seconds while WSL
   starts. Work under `/mnt` goes through WSL's file share, so a large
   `npm install` is slower than on Linux.
-- **Windows-only tools** (.NET, MSBuild, PowerShell scripts) cannot run there. For
-  those, `/sandbox native` switches back to the Windows runner.
+- **Windows programs run in the Windows sandbox.** A command that starts one (a
+  `.exe`, `.bat`, `.cmd` or `.ps1`, or `cmd`, `powershell`, `pwsh`, `dotnet`,
+  `msbuild`, `nuget` and other Windows-only tools) cannot run in the distro, so it
+  goes to the Windows ACL runner instead: its shell is cmd, writes are confined to
+  the project, and the network is not filtered, which the result says. `/mnt/<drive>`
+  paths in such a command are turned back into Windows paths. Without the Windows
+  runner installed the command is refused with the reason. Everything else stays in WSL.
 - **Off and removal.** `sandbox_wsl=0` (or `AGENT8088_SANDBOX_WSL=0` for the
   installer) skips it; `/sandbox native` or `/sandbox docker` stops using it
   without removing it. `agent8088 --uninstall` unregisters the distro.
