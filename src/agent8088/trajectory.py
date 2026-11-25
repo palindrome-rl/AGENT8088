@@ -14,6 +14,8 @@ from agent8088.completion import SUBGOAL_PREFIX
 
 VERSION = 2
 MAX_OPERATIONS = 12
+# How many times a request may be asked to look at what it built (once per state of the work).
+MAX_LOOK_ASKS = 2
 MAX_TEXT = 240
 MAX_EVIDENCE = 6
 
@@ -983,6 +985,9 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
+        "look_seen_at": None,
+        "look_asked_at": None,
+        "look_asks": 0,
         "message_count": 0,
     }
 
@@ -1050,6 +1055,8 @@ class TrajectoryState:
             self.data["smoke_asked"] = []
             self.data["backend_check"] = {}
             self.data["grounding_asked"] = False
+            self.data["look_asked_at"] = None
+            self.data["look_asks"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -1488,6 +1495,21 @@ class TrajectoryState:
         return (int(self.data.get("mutation_count") or 0),
                 int(self.data.get("passed_checks") or 0),
                 sum(1 for step in self.subgoals() if step.get("status") == "done"))
+
+    def note_looked(self) -> None:
+        """A render of the work was shown to the model (or, for a text-only model, its evidence was) at the current state of the work."""
+        self.data["look_seen_at"] = self.mutation_count()
+
+    def ask_to_look(self) -> bool:
+        """Whether to ask the model, now, to look at what it built: once per state of the work, never when it already looked at
+        this state, and at most MAX_LOOK_ASKS times a request."""
+        state = self.mutation_count()
+        if (not state or self.data.get("look_seen_at") == state or self.data.get("look_asked_at") == state
+                or int(self.data.get("look_asks") or 0) >= MAX_LOOK_ASKS):
+            return False
+        self.data["look_asked_at"] = state
+        self.data["look_asks"] = int(self.data.get("look_asks") or 0) + 1
+        return True
 
     def smoke_unchecked(self, paths: list[str]) -> list[str]:
         """Deliverables not yet smoke-tested at the current state of the work."""

@@ -723,6 +723,9 @@ if TASK_STATE_DELIVERY not in ("system", "history"):
 TASK_STATE_REFRESH_TURNS = max(1, _config_int("task_state_refresh_turns", 5))
 TASK_STATE_MAX_NOTES = max(1, _config_int("task_state_max_notes", 40))
 COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds", 20))
+# When a run built a page or image and the request is about how it looks, one nudge (per state of the work, at most twice a request)
+# to render it and look before the final answer, if nothing in the run has. It never blocks: the answer is accepted either way.
+COMPLETION_VISUAL_LOOK = str(APP_CONFIG.get("completion_visual_look", "1")).strip().lower() in ("1", "true", "yes", "on")
 # After the first control, the page check clicks this many more visible controls (within
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
@@ -20705,6 +20708,9 @@ def _exec_screenshot(name: str, ref: str, args: dict) -> str:
         lines.append(f"Drawn content: the render looks blank ({ink:.1%} of the image differs from the background).")
     else:
         lines.append(f"Drawn content: {ink:.0%} of the image differs from the background.")
+    layout = render_check.layout_note(render.layout)
+    if layout:
+        lines.append(f"Layout notes: {layout}.")
     if render.animating:
         lines.append("Compared with the previous render: skipped, the page is still changing on screen "
                      "(animation or a timer), so a pixel difference would not mean anything.")
@@ -20723,7 +20729,7 @@ def _exec_screenshot(name: str, ref: str, args: dict) -> str:
     evidence = {"file": str(target), "png": str(png), "width": shot_w, "height": shot_h,
                 "viewport": [width, height], "ink": round(ink, 4), "diff": None if diff is None else round(diff, 4),
                 "animating": render.animating, "page_errors": render.page_errors[:5],
-                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5]}
+                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5], "layout": layout}
     return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message, "evidence": evidence})
 
 
@@ -22515,6 +22521,20 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     return reasons
 
 
+def _visual_look_step(trajectory, written: list, request: str):
+    """Ask once to look at a page or image this run built, when the request is about how it looks and nothing has looked at it."""
+    if not COMPLETION_VISUAL_LOOK or not completion_checks.wants_visual_result(request):
+        return None
+    roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
+    targets = app_check.deliverable_targets(
+        written, roots, reference_pages=getattr(trajectory, "data", {}).get("reference_paths", []))
+    if not any(t.suffix.lower() in render_check.PAGE_SUFFIXES | {".svg"} for t in targets):
+        return None
+    if not trajectory.ask_to_look():
+        return None
+    return completion_checks.Nudge("look", completion_checks.VISUAL_LOOK_ASK)
+
+
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
                            deliverables_due: bool = False, can_search: bool = False):
     """The first completion check a text reply fails, or None to accept it.
@@ -22599,6 +22619,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                 "Ask the user only for what only they can do; if you are blocked, "
                 "say exactly what is missing."),
             unmet="the reply hands the work back to the user instead of doing it")
+    if nudge is None and depth == 0:
+        nudge = _visual_look_step(trajectory, written, request)
     if nudge is None:
         return None
     if budget.spend(mark, nudge.unmet):
@@ -24335,6 +24357,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     if pruned and trace is not None:
                         trace.append({"turn": turn, "type": "images_pruned", "removed": pruned,
                                       "kept": keep})
+                if result_message is not None and trajectory is not None:
+                    trajectory.note_looked()
                 if on_result:
                     on_result(name, "[image not attached: text-only model]" if withheld
                               else "[image attached]")
