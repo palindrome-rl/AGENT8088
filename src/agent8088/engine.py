@@ -711,6 +711,17 @@ REQUIREMENT_EVIDENCE = str(APP_CONFIG.get("requirement_evidence", "1")).strip().
 COMPLETION_SMOKE_TEST = str(APP_CONFIG.get("completion_smoke_test", "report")).strip().lower()
 if COMPLETION_SMOKE_TEST not in ("off", "report", "enforce"):
     COMPLETION_SMOKE_TEST = "report"
+# How the controller's task state (checklist, verification pending, changed files with no tests, unresolved tools) reaches the
+# model. `system` puts it at the end of the system prompt on every turn, which changes that prompt every turn: a server that
+# caches prompts can only reuse a request that starts with the whole previous request, so it then re-reads the entire
+# conversation every turn. `history` says it once, when it changes, at the end of the newest tool result (and again every
+# task_state_refresh_turns turns while something is still open), so earlier messages and the system prompt never change.
+# At most task_state_max_notes notes per run. The one-shot nudges and the completion checks are not affected.
+TASK_STATE_DELIVERY = str(APP_CONFIG.get("task_state_delivery", "system")).strip().lower()
+if TASK_STATE_DELIVERY not in ("system", "history"):
+    TASK_STATE_DELIVERY = "system"
+TASK_STATE_REFRESH_TURNS = max(1, _config_int("task_state_refresh_turns", 5))
+TASK_STATE_MAX_NOTES = max(1, _config_int("task_state_max_notes", 40))
 COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds", 20))
 # After the first control, the page check clicks this many more visible controls (within
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
@@ -20547,6 +20558,66 @@ def _harness_turn(text: str) -> dict:
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
+_TASK_STATE_MARK = f"\n{_HARNESS_PREFIX}Task state"
+
+
+class _TaskStateNotes:
+    """Tells the model the task state once, when it changes, instead of in the system prompt on every turn.
+
+    The note is added to the end of the newest tool result *before* that result is first sent, and the message is not touched
+    again, so every earlier message stays exactly as the server saw it. A note is added when the state changed, when no note
+    is left in the conversation (the first one, or after a compaction dropped them), and every `refresh` turns while
+    something is still open. Never to a message the person wrote, and never beyond `limit` notes."""
+
+    def __init__(self, refresh: int | None = None, limit: int | None = None):
+        self.refresh = TASK_STATE_REFRESH_TURNS if refresh is None else max(1, int(refresh))
+        self.limit = TASK_STATE_MAX_NOTES if limit is None else max(1, int(limit))
+        self.signature = None
+        self.sent = 0
+        self.turns_since = 0
+
+    @staticmethod
+    def _present(messages) -> bool:
+        """A note is in the conversation since the person's latest message. An earlier request's notes do not count: the
+        new request starts with a full note again."""
+        for message in reversed(messages):
+            if message.get("role") == "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and _TASK_STATE_MARK in content:
+                return True
+            if message.get("role") == "user" and not _message_text(message).startswith(_LOOP_PREFIXES):
+                return False
+        return False
+
+    def deliver(self, messages: list, trajectory) -> bool:
+        """Add the note to the last message when it is due. Returns whether one was added."""
+        if trajectory is None or not messages:
+            return False
+        self.turns_since += 1
+        signature = trajectory.state_signature()
+        present = self._present(messages)
+        changed = signature != self.signature
+        refresh_due = (present and not changed and trajectory.has_open_attention()
+                       and self.turns_since >= self.refresh)
+        if not (changed or refresh_due or not present) or self.sent >= self.limit:
+            return False
+        last = messages[-1]
+        content = last.get("content")
+        # Only the loop's own messages (a tool result or a harness turn) that have not been sent yet. A person's message, a
+        # message with images, or one that already carries a note is left alone and the note waits for the next round.
+        if (last.get("role") != "user" or not isinstance(content, str)
+                or not content.startswith(_LOOP_PREFIXES) or _TASK_STATE_MARK in content):
+            return False
+        note = trajectory.state_note(full=not present)
+        if not note:
+            return False
+        last["content"] = f"{content}\n{_HARNESS_PREFIX}{note}"
+        self.signature, self.turns_since = signature, 0
+        self.sent += 1
+        return True
+
+
 _screenshot_counts: dict = {}   # resolved file -> renders so far (file names only, never shown as a count)
 _screenshot_last: dict = {}     # resolved file -> its previous render, for the difference
 
@@ -22919,6 +22990,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     post_check_held = 0       # quiet turns that brought new evidence and were not counted against the allowance
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     edit_check = _new_edit_check_reminder()
+    state_notes = _TaskStateNotes()   # used only when task_state_delivery=history
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     answer_asked = False  # the last-stretch "answer now" ask was sent
@@ -23005,7 +23077,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
-            round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
+            if TASK_STATE_DELIVERY != "history":
+                # In history mode the system prompt is left exactly as it is: the state travels in the conversation.
+                round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -23176,6 +23250,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                               "tokens_after": _estimate_tokens(
                                   _estimate_context_chars(messages, round_system_prompt or "")
                                   + len(json.dumps(round_tools_def or [], default=str)))})
+        if trajectory is not None and TASK_STATE_DELIVERY == "history":
+            # After any compaction above, so a summary that dropped the earlier notes is followed by a fresh full one.
+            if state_notes.deliver(messages, trajectory) and trace is not None:
+                trace.append({"turn": turn, "type": "task_state_note", "notes": state_notes.sent})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
         output_profile, profile_line = _active_output_profile(
