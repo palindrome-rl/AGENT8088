@@ -175,3 +175,45 @@ def test_the_checks_result_is_evidence_like_a_command(engine, check, result, sta
 def test_it_is_a_shell_tool(engine):
     spec = engine.TOOL_SPECS["run_with_service"]
     assert spec["mode"] == "shell" and "{service}" in spec["command"] and "{check}" in spec["command"]
+
+
+def test_a_url_whose_port_is_not_a_number_is_refused_not_a_crash(engine):
+    assert engine._ssrf_check("http://127.0.0.1:{port}/health").startswith("Blocked: the URL's port is not a number")
+    assert engine._ssrf_check("http://example.com:abc/").startswith("Blocked: the URL's port is not a number")
+
+
+@pytest.mark.parametrize("url, tool, own", [
+    ("http://127.0.0.1:{port}/health", "run_with_service", True),
+    ("http://localhost:{port}/", "run_with_service", True),
+    ("http://127.0.0.1:{port}/health", "execute_shell", False),
+    ("http://127.0.0.1:8080/", "run_with_service", False),
+    ("http://10.0.0.1:{port}/", "run_with_service", False),
+    ("file://127.0.0.1:{port}/", "run_with_service", False),
+])
+def test_only_its_own_server_is_reachable_on_loopback(engine, url, tool, own):
+    assert engine._own_service_url(url, tool) is own
+
+
+def test_a_running_service_of_this_session_is_reachable_from_a_shell_command(engine, tmp_path, monkeypatch):
+    from agent8088 import services
+    registry = services.Registry(tmp_path / "s.json", tmp_path / "logs", pid=1)
+    registry.services["web"] = services.Service("web", "x", "main", 5555, "native", Path("l"),
+                                                services.Handle(stop=lambda: None, alive=lambda: True, host_port=5555))
+    monkeypatch.setattr(engine, "_services_registry", registry)
+    assert engine._own_service_url("http://127.0.0.1:5555/api", "execute_shell")
+    assert not engine._own_service_url("http://127.0.0.1:5556/api", "execute_shell")
+
+
+def test_the_check_command_reaches_the_tool_and_is_not_crashed_or_refused(engine, monkeypatch):
+    ran = {}
+    monkeypatch.setattr(engine, "_exec_run_with_service", lambda args: ran.setdefault("args", args) and "ran")
+    out = engine.run_tool("run_with_service", {"service": "python server.py {port}",
+                                               "check": "curl -fsS http://127.0.0.1:{port}/health"})
+    assert ran and out == "ran"
+
+
+def test_other_loopback_urls_in_the_check_stay_refused(engine, monkeypatch):
+    monkeypatch.setattr(engine, "_exec_run_with_service", lambda args: pytest.fail("must not run"))
+    out = engine.run_tool("run_with_service", {"service": "python server.py {port}",
+                                               "check": "curl -fsS http://127.0.0.1:6379/"})
+    assert out.startswith("Blocked")

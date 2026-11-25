@@ -7267,6 +7267,26 @@ RUN_WITH_SERVICE_READY_SECONDS = 45
 RUN_WITH_SERVICE_CHECK_SECONDS = 120
 
 
+def _own_service_url(url: str, tool: str) -> bool:
+    """A loopback URL a shell command may fetch although the SSRF rules refuse loopback: run_with_service's own
+    server (its `{port}`, filled in only when it runs), or a service this session runs (service_start). Anything
+    else on this computer stays refused."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or host not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    if tool == "run_with_service" and parts.netloc.endswith(":{port}"):
+        return True
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port is not None and _services_registry is not None and port in _services().host_ports()
+
+
 def _exec_run_with_service(args: dict) -> str:
     """run_with_service: the server and its check in one sandboxed command (the wrapper above)."""
     service = str(args.get("service") or "").strip()
@@ -15624,6 +15644,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             return ("Blocked: shell web clients require an explicit http:// or https:// "
                     "URL so the egress and SSRF policies can verify the destination.")
         for url in web_urls or ():
+            if _own_service_url(url, name):
+                continue
             blocked = _egress_check(url) or _ssrf_check(url)
             if blocked:
                 _audit("tool_call", tool=name, mode=mode, decision="denied",
@@ -18294,8 +18316,13 @@ def _ssrf_check(url: str):
         return "Blocked: malformed URL host."
     if not host:
         return "Blocked: URL has no host."
+    try:
+        port = parts.port
+    except ValueError:
+        # `http://127.0.0.1:{port}/` and other ports that are not a number: refused with a reason, not a crash.
+        return f"Blocked: the URL's port is not a number ({url[:120]})."
     # Explicitly allowlisted internal host (match on host and on host:port).
-    if _ssrf_host_allowlisted(host, parts.port):
+    if _ssrf_host_allowlisted(host, port):
         return None
     try:
         infos = socket.getaddrinfo(host, None)
