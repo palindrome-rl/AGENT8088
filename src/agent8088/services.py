@@ -84,6 +84,24 @@ def listening(port: int, timeout: float = 0.5) -> bool:
         return False
 
 
+def held_open(port: int, seconds: float = 1.5) -> bool:
+    """Something answers on `port` behind whatever listens there: a connection stays open (or sends data) instead
+    of being closed at once, which is what a relay or bridge does when the service behind it is not there yet."""
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=seconds)
+    except OSError:
+        return False
+    try:
+        sock.settimeout(seconds)
+        return sock.recv(1) != b""
+    except socket.timeout:
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
 def tail(path: Path, lines: int = 40) -> str:
     try:
         with open(path, "rb") as handle:
