@@ -57,6 +57,14 @@ task-state note names the play test as the next step. The browser-qa skill teach
 that makes such a build easy to drive: a read-only `window.__test.state()`, an optional `?seed=N`
 for the random parts, and for timed games `step(ms)`, none of which changes normal play.
 
+When changed work has no passing test since the change and a test suite sits above
+the changed files (pytest, unittest or `npm test`), the end-of-run check runs that
+suite itself in the sandbox (auto QA, `auto_qa_seconds`, once per state of the
+work) before asking the model to. A pass marks the change tested with no turn
+spent; a failure sends the model back with the command and the end of the output;
+no suite, or a result that says nothing either way, keeps the usual ask. It is
+skipped in the last stretch of the clock; `auto_qa=0` turns it off.
+
 The last three lead the end-of-run notes as one line, for example
 `Verdict: PARTLY VERIFIED (it ran without an error, but no test run passed after
 the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
