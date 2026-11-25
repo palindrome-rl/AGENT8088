@@ -51,7 +51,7 @@ the controller's own evidence only (what the reply claims never raises it):
 | PARTLY VERIFIED | Anything else that changed files: it ran without an error but no test passed, it was only read back, or a part was settled before the last change. The note says what is missing. |
 
 The last three lead the end-of-run notes as one line, for example
-`Verdict: PARTLY VERIFIED (it ran without an error, but no test run passed after
+`Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
 the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
 turns the headline and the verdict line off.
 

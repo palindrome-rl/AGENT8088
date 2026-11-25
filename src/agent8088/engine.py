@@ -22789,7 +22789,8 @@ def _verdict(trajectory, reply: str = "") -> tuple[str, str]:
     if rechecks:
         missing.append(f"{len(rechecks)} part(s) of the request were checked before the last change and not since")
     if level == "exercised":
-        missing.append("it ran without an error, but no test run passed after the last change")
+        # Worded apart from the "Verification: exercised" note, which already says no test run passed.
+        missing.append("it ran without an error, but nothing tested it after the last change")
     elif level == "inspected":
         missing.append("the changed files were read back, but nothing was run after the last change")
     elif level in ("unchecked", ""):
