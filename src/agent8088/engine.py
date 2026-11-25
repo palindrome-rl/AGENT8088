@@ -26,7 +26,7 @@ from agent8088 import (app_check, backend_check, cli_anything, completion as com
                        documents, efficiency, local_models,
                        memory, patching, providers, render_check, routing, secret_scan, testing_support,
                        tool_output,
-                       trajectory, web_search)
+                       trajectory, web_search, wsl_sandbox, npm_windows)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -2446,7 +2446,7 @@ def check_permission(mode: str, command: str = "", path_zone: str = "default",
     # _exec_sandbox_command; host execution never enters this exception.
     if (_permission_floor_readonly and _sandbox_readonly and not host
             and mode in ("shell", "docker")
-            and _resolve_sandbox_backend() in ("native", "docker")):
+            and _resolve_sandbox_backend() in ("native", "docker", "wsl")):
         return True
     if _plan_execution_grant and PERMISSION_MODE == "plan-only" and mode in ("write_text", "shell", "docker", "cron", "browser", "search"):
         return True  # temporary grant for approved plan steps — only in plan-only mode
@@ -5354,9 +5354,15 @@ def _ground_execute_shell_description(specs: dict) -> None:
     spec = specs.get("execute_shell")
     if not spec:
         return
-    shell_kind = "PowerShell/cmd.exe" if sys.platform == "win32" else "a POSIX shell (bash/sh)"
-    check_cmd = "where <name>" if sys.platform == "win32" else "command -v <name>"
-    if DISPOSABLE_CONTAINER:
+    wsl = not spec.get("host") and _wsl_shell_expected()
+    shell_kind = ("PowerShell/cmd.exe" if sys.platform == "win32" and not wsl else
+                  "bash in Agent8088's WSL sandbox (Alpine Linux). This computer's drives are under /mnt there "
+                  "(E:\\ is /mnt/e) and Windows paths in a command are rewritten to those; Windows programs "
+                  "(.exe, cmd, PowerShell) cannot run in it" if wsl else "a POSIX shell (bash/sh)")
+    check_cmd = "where <name>" if sys.platform == "win32" and not wsl else "command -v <name>"
+    if wsl:
+        python_hint = "If you need Python, use `python3` (or `python`); `pip install` installs for the user. "
+    elif DISPOSABLE_CONTAINER:
         # In a task container the graders use the system interpreter, and
         # sys.executable is agent8088's private venv: advertising it sent
         # `pip install` there, where nothing else can import the packages.
@@ -5398,7 +5404,19 @@ def _ground_execute_shell_description(specs: dict) -> None:
     if previous and base.endswith(previous):
         base = base[:-len(previous)]
     spec["description"] = base + suffix
-    _SHELL_GROUNDING.update(cwd=cwd, suffix=suffix)
+    _SHELL_GROUNDING.update(cwd=cwd, suffix=suffix, wsl=wsl)
+
+
+def _wsl_shell_expected() -> bool:
+    """Commands will run in the WSL sandbox, judged without starting anything (no wsl.exe, no `docker info`).
+
+    The first description is built while this module is still loading, before the sandbox settings exist; it says
+    the Windows shell then, and the refresh before the first turn corrects it."""
+    usable = globals().get("_wsl_sandbox_usable")
+    if usable is None or "SANDBOX_NETWORK_OPEN" not in globals():
+        return False
+    return (SANDBOX_BACKEND in ("auto", "wsl") and not (SANDBOX_BACKEND == "auto" and SANDBOX_NETWORK_OPEN)
+            and usable())
 
 
 def refresh_shell_grounding() -> bool:
@@ -5408,7 +5426,8 @@ def refresh_shell_grounding() -> bool:
     and rewriting the tool list every turn would defeat the provider's prompt
     cache. True when the description changed."""
     global TOOLS_DEF, SYSTEM_PROMPT
-    if "execute_shell" not in TOOL_SPECS or _choose_shell_cwd() == _SHELL_GROUNDING["cwd"]:
+    if "execute_shell" not in TOOL_SPECS or (_choose_shell_cwd() == _SHELL_GROUNDING["cwd"]
+                                             and _wsl_shell_expected() == _SHELL_GROUNDING.get("wsl", False)):
         return False
     _ground_execute_shell_description(TOOL_SPECS)
     TOOLS_DEF = build_tools_def(TOOL_SPECS)
@@ -6322,6 +6341,12 @@ def _from_container_path(raw_path: str) -> str:
     check below, so `/workspace/../../etc/passwd` is refused exactly as before.
     """
     text = str(raw_path or "").replace("\\", "/")
+    if sys.platform == "win32" and text.startswith("/mnt/"):
+        # The WSL sandbox's spelling of a Windows path (/mnt/e/x is E:\\x). Drive-relative on Windows otherwise,
+        # it would name \\mnt\\e\\x on the current drive, which nothing means.
+        windows = wsl_sandbox.to_windows(text)
+        if windows:
+            return windows
     if text != _CONTAINER_WORKSPACE and not text.startswith(_CONTAINER_WORKSPACE + "/"):
         return str(raw_path or "")
     relative = text[len(_CONTAINER_WORKSPACE):].lstrip("/")
@@ -7097,7 +7122,7 @@ def _tool_error_code(result: str) -> str | None:
     return match.group(1) if match else "error"
 
 
-def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
+def _exec_process(command, timeout: int = 25, shell: bool = False, extra_env: dict | None = None) -> str:
     cwd = _shell_cwd()
     if cwd is None:
         raise WorkingDirectoryMissing(2, "Working directory does not exist", str(SHELL_CWD))
@@ -7110,7 +7135,7 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "cwd": str(cwd),
-        "env": _non_interactive_env(),
+        "env": {**_non_interactive_env(), **(extra_env or {})},
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -7304,7 +7329,7 @@ def _exec_run_with_service(args: dict) -> str:
     if not service or not check:
         return "Error: run_with_service needs a service command and a check command."
     backend = _resolve_sandbox_backend()
-    if backend not in ("native", "docker"):
+    if backend not in ("native", "docker", "wsl"):
         return _sandbox_required_error()
     from agent8088 import services
     port = services.free_port()
@@ -7329,7 +7354,7 @@ def _exec_run_with_service(args: dict) -> str:
         created.append(wrapper)
         settings.write_text(json.dumps(spec), encoding="utf-8")
         created.append(settings)
-        python = "python3" if backend == "docker" else f'"{sys.executable}"'
+        python = "python3" if backend in ("docker", "wsl") else f'"{sys.executable}"'
         command = f"{python} {wrapper.name} {settings.name}"
         result = _run_sandbox_command(command, RUN_WITH_SERVICE_READY_SECONDS + check_timeout + 30)
     finally:
@@ -11341,7 +11366,18 @@ _EGRESS_PROXY_IMAGE = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2e
 _EGRESS_PROXY_PORT = 3128
 _docker_egress = {}  # allowlist key -> (--network value, extra docker run args)
 _DOCKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
-_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker"))
+_SANDBOX_BACKENDS = frozenset(("auto", "native", "docker", "wsl"))
+# Windows: sandboxed commands run under srt in Agent8088's own WSL distro (wsl_sandbox.py) once
+# `--sandbox-setup` has set it up. sandbox_wsl=0 keeps the Windows ACL runner and Docker only;
+# wsl_distro names another distro set up the same way (tests use agent8088-sandbox-test).
+SANDBOX_WSL = str(os.environ.get("AGENT8088_SANDBOX_WSL") or APP_CONFIG.get("sandbox_wsl", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+WSL_DISTRO = (str(os.environ.get("AGENT8088_WSL_DISTRO") or APP_CONFIG.get("wsl_distro", "")).strip()
+              or wsl_sandbox.DISTRO)
+_wsl_sandbox_broken = False
+_wsl_sandbox_verified = None
+_wsl_sandbox_failure = ""
+_WSL_SANDBOX_PROBE_TIMEOUT = 60   # the distro's first start after Windows boots takes a while
 # Native availability has two stages: binaries on PATH, then one real no-op
 # execution. A restricted account, locked-down kernel, or container can pass the
 # first check but fail the second for the whole process lifetime.
@@ -11647,8 +11683,42 @@ def _docker_usable() -> bool:
     return not _docker_sandbox_broken and _docker_available()
 
 
+def _wsl_state_path() -> Path:
+    return _agent_data_dir() / "wsl-sandbox.json"
+
+
+def _wsl_sandbox_installed() -> bool:
+    """`--sandbox-setup` finished setting up this distro for this runtime version (a local file: no wsl.exe call).
+
+    Read wherever the backend is resolved, so it must stay cheap; whether the distro really starts is settled by
+    _wsl_sandbox_ready, once."""
+    if sys.platform != "win32" or not SANDBOX_WSL:
+        return False
+    try:
+        state = json.loads(_wsl_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (isinstance(state, dict) and state.get("distro") == WSL_DISTRO
+            and state.get("setup") == wsl_sandbox.SETUP_VERSION
+            and state.get("runtime") == SANDBOX_RUNTIME_VERSION
+            and wsl_sandbox.wsl_executable() is not None)
+
+
+def _wsl_sandbox_usable() -> bool:
+    return not _wsl_sandbox_broken and _wsl_sandbox_installed()
+
+
 def _resolve_sandbox_backend() -> str:
     requested = SANDBOX_BACKEND if SANDBOX_BACKEND in _SANDBOX_BACKENDS else "auto"
+    if requested == "wsl":
+        if _wsl_sandbox_usable():
+            return "wsl"
+        if _wsl_sandbox_installed() and _docker_usable():   # set up, then failed to start: as native does
+            return "docker"
+        return "unavailable"
+    # sandbox_network=open asks for an unfiltered network, which srt in WSL cannot give.
+    if requested == "auto" and not SANDBOX_NETWORK_OPEN and _wsl_sandbox_usable():
+        return "wsl"
     native_available = not _native_sandbox_missing_requirements()
     if requested == "native":
         if native_available and _native_sandbox_broken:
@@ -11690,6 +11760,7 @@ def sandbox_status() -> dict:
     detail = {
         "native": "OS-native isolation via sandbox-runtime",
         "docker": "Docker fallback with capped resources",
+        "wsl": f"sandbox-runtime in Agent8088's WSL distro {WSL_DISTRO}",
         "unavailable": "native runtime and Docker are unavailable",
     }[resolved]
     missing = _native_sandbox_missing_requirements()
@@ -11717,6 +11788,12 @@ def sandbox_status() -> dict:
         # its failure is the more interesting half of the answer.
         if _native_sandbox_broken:
             detail += " (native failed verification)"
+        elif _wsl_sandbox_broken:
+            detail += " (the WSL sandbox failed verification)"
+    elif resolved == "wsl":
+        verification = ("failed" if _wsl_sandbox_broken else "verified" if _wsl_sandbox_verified
+                        else "unverified")
+        failure = _wsl_sandbox_failure
     else:
         if _native_sandbox_broken:
             verification = "failed"
@@ -11727,10 +11804,12 @@ def sandbox_status() -> dict:
         else:
             verification = "unverified"
         failure = _native_sandbox_failure
-    if resolved in ("native", "docker") and verification == "unverified":
+    if resolved == "native" and sys.platform == "win32" and _wsl_sandbox_broken:
+        detail += " (the WSL sandbox failed verification)"
+    if resolved in ("native", "docker", "wsl") and verification == "unverified":
         detail += " (candidate; not yet verified by a sandboxed command)"
-    if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure):
-        failure = _native_sandbox_failure or _docker_sandbox_failure
+    if resolved == "unavailable" and (_native_sandbox_failure or _docker_sandbox_failure or _wsl_sandbox_failure):
+        failure = _wsl_sandbox_failure or _native_sandbox_failure or _docker_sandbox_failure
     unenforced = resolved == "native" and not _native_enforces_network()
     if unenforced:
         network = NETWORK_NOT_ENFORCED
@@ -11758,7 +11837,7 @@ def set_sandbox_backend(backend: str) -> dict:
     global SANDBOX_BACKEND
     backend = str(backend or "").strip().lower()
     if backend not in _SANDBOX_BACKENDS:
-        raise ValueError("Sandbox must be auto, native, or docker.")
+        raise ValueError("Sandbox must be auto, native, docker, or wsl.")
     update_simple_config(CONFIG_PATH, {"sandbox_backend": backend})
     APP_CONFIG["sandbox_backend"] = backend
     SANDBOX_BACKEND = backend
@@ -11963,11 +12042,18 @@ def _HOME_CREDENTIAL_FILES(home: Path) -> list:
             home / ".cache" / "huggingface" / "token"]
 
 
-def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None) -> dict:
+def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None,
+                           linux_runtime: bool | None = None) -> dict:
+    """srt settings in this computer's own paths. `linux_runtime` is for srt running on Linux (here or in WSL),
+    where secret files are listed one by one: bubblewrap takes no glob patterns."""
+    if linux_runtime is None:
+        linux_runtime = sys.platform.startswith("linux")
     home = Path.home()
     denied = [
         CONFIG_PATH, _agent_data_dir() / "srt-settings.json",
         _agent_data_dir() / "srt-settings-readonly.json",
+        _agent_data_dir() / "srt-settings-wsl.json", _agent_data_dir() / "srt-settings-wsl-readonly.json",
+        _agent_data_dir() / "wsl-commands",
         home / ".ssh", home / ".aws", home / ".gnupg", home / ".kube",
         home / ".azure", home / ".config" / "gcloud", home / ".config" / "gh",
         home / ".docker" / "config.json", home / ".npmrc", home / ".netrc",
@@ -11976,7 +12062,7 @@ def _sandbox_settings_data(readonly: bool = False, workspace: Path | None = None
         *_HOME_CREDENTIAL_FILES(home),
     ]
     roots = _secret_scan_roots(workspace)
-    if sys.platform.startswith("linux"):
+    if linux_runtime:
         denied += _existing_secret_files(roots)
     else:
         denied += [root / "**" / pattern for root in roots for pattern in _SECRET_FILE_GLOBS]
@@ -12374,6 +12460,18 @@ def verify_sandbox_backend() -> dict:
         status = sandbox_status()
         _report_sandbox(status)
         return status
+    if _resolve_sandbox_backend() == "wsl":
+        # On failure the latch takes WSL out, and the checks below settle what Windows uses instead.
+        if _wsl_sandbox_ready(ARTIFACTS_ROOT):
+            status = sandbox_status()
+            _report_sandbox(status)
+            return status
+        if requested == "wsl":
+            _start_docker_desktop()
+            _docker_sandbox_ready(ARTIFACTS_ROOT)
+            status = sandbox_status()
+            _report_sandbox(status)
+            return status
     if requested != "docker" and not _native_sandbox_missing_requirements():
         if _native_sandbox_ready(ARTIFACTS_ROOT):
             _probe_piped_child_spawn(ARTIFACTS_ROOT)
@@ -12454,7 +12552,7 @@ def _report_sandbox(status: dict | None = None) -> None:
                 impact=("sandboxed commands can reach any host and see the host's "
                         f"processes{applied}"),
                 fix="sandbox_backend=docker for network isolation")
-        elif status.get("network_enforced") and resolved == "native":
+        elif status.get("network_enforced") and resolved in ("native", "wsl"):
             capabilities.report(capabilities.SANDBOX_NETWORK, active="enforced",
                                 preferred="enforced", state=capabilities.OK)
         else:
@@ -12468,7 +12566,15 @@ def _report_sandbox(status: dict | None = None) -> None:
                 impact=SANDBOX_CHILDREN_IMPACT, fix=SANDBOX_CHILDREN_FIX)
         else:
             capabilities.clear(capabilities.SANDBOX_CHILDREN)
-        if resolved == "native":
+        if resolved == "wsl":
+            capabilities.report(capabilities.SANDBOX, active="wsl", preferred="wsl", state=capabilities.OK)
+        elif resolved == "native" and sys.platform == "win32" and _wsl_sandbox_broken:
+            capabilities.report(
+                capabilities.SANDBOX, active="native", preferred="wsl", state=capabilities.DEGRADED,
+                reason="the WSL sandbox failed to start", impact=(
+                    "commands run under the Windows ACL runner: file writes are limited, the network is not"),
+                fix="agent8088 --sandbox-setup (sets the WSL sandbox up again)")
+        elif resolved == "native":
             capabilities.report(capabilities.SANDBOX, active="native", preferred="native",
                                 state=capabilities.OK)
         elif resolved == "docker":
@@ -12615,6 +12721,246 @@ def _exec_native_sandbox(command: str, timeout: int, cwd: Path | None = None,
     return _exec_process(
         argv + ["--settings", str(settings), "-c", command], timeout=timeout
     )
+
+
+# wsl.exe or the distro failing before the command ran: nothing executed, so another backend may run it.
+_WSL_SANDBOX_PREFLIGHT_ERRORS = (
+    "WSL sandbox is unavailable",
+    "There is no distribution with the supplied name",
+    "WSL_E_DISTRO_NOT_FOUND",
+    "Wsl/Service/",
+    "Wsl/CallMsi/",
+    "The Windows Subsystem for Linux is not installed",
+    "The Windows Subsystem for Linux has not been enabled",
+    "HCS_E_",
+    "agent8088-wsl: no runner",
+) + tuple(marker for marker in _NATIVE_SANDBOX_PREFLIGHT_ERRORS if marker.startswith(("bwrap:", "apply-seccomp:")))
+
+
+def _wsl_sandbox_unusable(result: str) -> bool:
+    return any(marker in (result or "") for marker in _WSL_SANDBOX_PREFLIGHT_ERRORS)
+
+
+def _mark_wsl_sandbox_broken(result: str, quiet: bool = False) -> None:
+    global _wsl_sandbox_broken, _wsl_sandbox_verified, _wsl_sandbox_failure
+    first_failure = not _wsl_sandbox_broken
+    _wsl_sandbox_broken = True
+    _wsl_sandbox_verified = False
+    _wsl_sandbox_failure = (result or "The WSL sandbox probe failed.").strip()
+    if first_failure and not quiet:
+        _log.warning("the WSL sandbox could not start. Reason: %s", _wsl_sandbox_failure[:200])
+    if first_failure:
+        _report_sandbox()
+        refresh_shell_grounding()
+
+
+def _wsl_settings_data(readonly: bool, workspace: Path, service: bool = False) -> dict:
+    """The srt settings for a command in the WSL distro: this computer's settings with every path as /mnt/...
+
+    A path the distro cannot see (a network share) is dropped from the allow lists and kept nowhere else: a deny
+    rule for a path that is not mounted protects nothing and cannot be expressed. WSL's own sockets are hidden too:
+    /run/WSL holds the interop socket, the way a Linux command could start a Windows program."""
+    data = _sandbox_settings_data(readonly, workspace, linux_runtime=True)
+    fs = data["filesystem"]
+    # srt skips a read rule for a path that does not exist, and a write rule outside every writable folder (it is
+    # read-only there anyway), but it finds that out over WSL's file share at about 0.2 s a path: two dozen such
+    # paths made every command take five seconds. The same checks are instant here.
+    writable = [Path(path) for path in fs["allowWrite"]]
+
+    def inside_writable(path: Path) -> bool:
+        return any(path == root or root in path.parents for root in writable)
+    fs["denyRead"] = [path for path in fs["denyRead"] if os.path.lexists(path)]
+    fs["denyWrite"] = [path for path in fs["denyWrite"] if inside_writable(Path(path))]
+    for key in ("denyRead", "allowRead", "allowWrite", "denyWrite"):
+        fs[key] = list(dict.fromkeys(p for p in (wsl_sandbox.to_linux(path) for path in fs[key]) if p))
+    # /run/WSL holds the interop socket; /mnt/wslg and /tmp/.X11-unix are WSLg's display and sound sockets.
+    for hidden in ("/run/WSL", "/mnt/wslg", "/tmp/.X11-unix"):
+        fs["denyRead"].append(hidden)
+        fs["denyWrite"].append(hidden)
+    data["network"]["allowLocalBinding"] = False
+    if service:
+        data["network"]["allowAllUnixSockets"] = True
+        fs["allowWrite"].append(wsl_sandbox.SERVICE_DIR)
+    return data
+
+
+def _write_wsl_settings(readonly: bool, workspace: Path, service: bool = False) -> Path:
+    name = ("srt-settings-wsl-readonly.json" if readonly else
+            f"srt-settings-wsl-service-{os.getpid()}.json" if service else "srt-settings-wsl.json")
+    path = _agent_data_dir() / name
+    _write_private_text(path, json.dumps(_wsl_settings_data(readonly, workspace, service), indent=2) + "\n")
+    return path
+
+
+def _wsl_sandbox_command(command: str, cwd: Path, readonly: bool, service: bool = False):
+    """(wsl.exe argv, environment, settings file, command file) for one command, or an error string."""
+    wsl = wsl_sandbox.wsl_executable()
+    if not wsl:
+        return "WSL sandbox is unavailable: wsl.exe was not found."
+    cwd = Path(cwd).resolve()
+    linux_cwd = wsl_sandbox.to_linux(cwd)
+    if linux_cwd is None:
+        return (f"Error: the WSL sandbox cannot reach {cwd}: it is not on a drive letter. Nothing was run. "
+                "Work in a folder on a local drive.")
+    sandbox_tmp = (_agent_data_dir() / "sandbox-tmp").resolve()
+    home = sandbox_tmp / "wsl-home"
+    home.mkdir(parents=True, exist_ok=True)
+    settings = _write_wsl_settings(readonly, cwd, service)
+    linux_home = wsl_sandbox.to_linux(home)
+    # The distro's own Python is read-only here, so `pip install` installs for the user (in HOME, which is
+    # writable): the externally-managed marker would otherwise refuse it outright.
+    exports = {"HOME": linux_home, "TMPDIR": wsl_sandbox.to_linux(sandbox_tmp),
+               "PATH": f"{linux_home}/.local/bin:/usr/local/bin:/usr/bin:/bin", "PIP_BREAK_SYSTEM_PACKAGES": "1",
+               **{name: wsl_sandbox.to_linux(value) for name, value in _sandbox_cache_env().items()}}
+    full = (f"cd {shlex.quote(linux_cwd)} && export "
+            + " ".join(f"{name}={shlex.quote(value)}" for name, value in exports.items() if value)
+            + f" && {wsl_sandbox.command_to_linux(command)}")
+    command_file = _agent_data_dir() / "wsl-commands" / f"{os.getpid()}-{uuid.uuid4().hex[:12]}.sh"
+    return wsl, full, settings, command_file
+
+
+def _exec_wsl_sandbox(command: str, timeout: int, cwd: Path | None = None, readonly: bool = False,
+                      service: str = "") -> str:
+    """Run one shell command under srt in Agent8088's WSL distro. `service` names a service being started."""
+    prepared = _wsl_sandbox_command(command, cwd or ARTIFACTS_ROOT, readonly, service=bool(service))
+    if isinstance(prepared, str):
+        return prepared
+    wsl, full, settings, command_file = prepared
+    env = wsl_sandbox.command_env(full, wsl_sandbox.to_linux(settings), timeout=0 if service else timeout,
+                                  command_file=command_file, service=service)
+    argv = wsl_sandbox.command_argv(wsl, WSL_DISTRO)
+    if service and _spawn_service is not None:
+        return _spawn_service(argv, env)   # a long command for a service stays in its file until it stops
+    try:
+        # The runner's own `timeout` ends the command inside the distro; this one is for wsl.exe itself.
+        return _exec_process(argv, timeout=timeout + 15, extra_env=env)
+    finally:
+        command_file.unlink(missing_ok=True)
+
+
+def _wsl_python_command(code: str) -> str:
+    """A Python snippet run by the distro's python3 (the Windows interpreter is not there)."""
+    import base64
+
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    return ("python3 -c \"import base64;exec(compile(base64.b64decode("
+            f"'{encoded}').decode('utf-8'),'<sandbox>','exec'))\"")
+
+
+def _wsl_npm_projects(workspace: Path, since: float) -> list[Path]:
+    """Project folders under `workspace` whose node_modules an npm command just changed (at most three)."""
+    found = []
+    workspace = Path(workspace)
+    for depth in range(4):
+        pattern = "/".join(["*"] * depth + ["package.json"])
+        for manifest in workspace.glob(pattern):
+            folder = manifest.parent
+            if "node_modules" in folder.relative_to(workspace).parts:
+                continue
+            modules = folder / "node_modules"
+            try:
+                if modules.is_dir() and modules.stat().st_mtime >= since - 2:
+                    found.append(folder)
+            except OSError:
+                continue
+            if len(found) == 3:
+                return found
+    return found
+
+
+def _wsl_windows_node_modules(workspace: Path, since: float) -> str:
+    """After npm installed packages in the WSL sandbox: make each changed node_modules usable on Windows too
+    (npm_windows.py). Returns notes for the model, or ""."""
+    notes = []
+    cpu = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine().lower(), "x64")
+    for project in _wsl_npm_projects(workspace, since):
+        modules = project / "node_modules"
+        needs_windows_install = bool(npm_windows.linux_only(modules)) or any(
+            any(name in (npm_windows._manifest(folder).get("scripts") or {}) for name in npm_windows._INSTALL_SCRIPTS)
+            for folder in npm_windows.packages(modules).values())
+        if not needs_windows_install:
+            result = npm_windows.Result(shims=npm_windows.write_shims(modules),
+                                        native=npm_windows.native_addons(modules))
+            notes.append(result.note())
+            continue
+        temporary = (_agent_data_dir() / "sandbox-tmp" / f"npm-windows-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        try:
+            temporary.mkdir(parents=True)
+            for name in ("package.json", "package-lock.json", "npm-shrinkwrap.json"):
+                if (project / name).is_file():
+                    shutil.copy2(project / name, temporary / name)
+            # The same sandbox, no install scripts: only files are fetched, for Windows.
+            out = _exec_wsl_sandbox(f"npm install --os=win32 --cpu={cpu} --ignore-scripts --no-audit --no-fund "
+                                    "--loglevel=error", 300, cwd=temporary)
+            if not (temporary / "node_modules").is_dir():
+                notes.append(f"[note: npm ran in the WSL sandbox, on Linux, and the Windows builds of this project's "
+                             f"packages could not be added ({str(out).strip()[-160:]}). Tell the user to run "
+                             f"`npm install` in {project} on Windows before running the project there.]")
+                continue
+            notes.append(npm_windows.merge_windows_tree(modules, temporary / "node_modules").note())
+        except OSError as exc:
+            notes.append(f"[note: node_modules in {project} was installed on Linux (the WSL sandbox) and could not be "
+                         f"made ready for Windows: {exc}. Tell the user to run `npm install` there on Windows.]")
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+    return "\n".join(note for note in notes if note)
+
+
+def _wsl_sandbox_ready(cwd: Path, readonly: bool = False, quiet: bool = False) -> bool:
+    """Run one real command in the distro before trusting the setup marker."""
+    global _wsl_sandbox_verified
+    if _wsl_sandbox_broken:
+        return False
+    if _wsl_sandbox_verified is not None:
+        return bool(_wsl_sandbox_verified)
+    try:
+        cwd = Path(cwd).resolve()
+        cwd.mkdir(parents=True, exist_ok=True)
+        prepared = _wsl_sandbox_command("echo agent8088-wsl-ok", cwd, readonly)
+    except OSError as exc:
+        _mark_wsl_sandbox_broken(f"WSL sandbox probe could not prepare: {exc}", quiet)
+        return False
+    if isinstance(prepared, str):
+        _mark_wsl_sandbox_broken(prepared, quiet)
+        return False
+    wsl, full, settings, _ = prepared
+    env = {**_non_interactive_env(), **wsl_sandbox.command_env(full, wsl_sandbox.to_linux(settings), timeout=30)}
+    try:
+        result = subprocess.run(wsl_sandbox.command_argv(wsl, WSL_DISTRO), env=env, capture_output=True,
+                                stdin=subprocess.DEVNULL, timeout=_WSL_SANDBOX_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _mark_wsl_sandbox_broken(f"WSL sandbox probe timed out after {_WSL_SANDBOX_PROBE_TIMEOUT}s.", quiet)
+        return False
+    except OSError as exc:
+        _mark_wsl_sandbox_broken(f"WSL sandbox probe could not start: {exc}", quiet)
+        return False
+    output = wsl_sandbox._decode(result.stdout) + wsl_sandbox._decode(result.stderr)
+    if result.returncode or "agent8088-wsl-ok" not in output:
+        _mark_wsl_sandbox_broken(output.strip() or f"WSL sandbox probe exited {result.returncode}.", quiet)
+        return False
+    _wsl_sandbox_verified = True
+    return True
+
+
+def install_wsl_sandbox(log=None) -> str:
+    """Import and set up Agent8088's WSL distro (Windows). Returns a one-line outcome."""
+    global _wsl_sandbox_broken, _wsl_sandbox_verified, _wsl_sandbox_failure
+    if sys.platform != "win32":
+        return "The WSL sandbox is for Windows only."
+    if not SANDBOX_WSL:
+        return "The WSL sandbox is off (sandbox_wsl=0)."
+    say = log or (lambda message: print(message, flush=True))
+    error = wsl_sandbox.provision(WSL_DISTRO, _agent_data_dir() / "wsl" / WSL_DISTRO, SANDBOX_RUNTIME_VERSION,
+                                  log=say)
+    if error:
+        return f"WSL sandbox not set up: {error}"
+    _write_private_text(_wsl_state_path(), json.dumps({
+        "distro": WSL_DISTRO, "setup": wsl_sandbox.SETUP_VERSION, "runtime": SANDBOX_RUNTIME_VERSION,
+        "alpine": wsl_sandbox.ALPINE_VERSION}) + "\n")
+    _wsl_sandbox_broken, _wsl_sandbox_verified, _wsl_sandbox_failure = False, None, ""
+    if not _wsl_sandbox_ready(ARTIFACTS_ROOT, quiet=True):
+        return f"WSL sandbox set up but could not be verified. Reason: {_wsl_sandbox_failure[:200]}"
+    return f"WSL sandbox set up and verified (distro {WSL_DISTRO})."
 
 
 def _exec_sandbox_argv(argv: list, timeout: int = 25) -> str:
@@ -12878,9 +13224,11 @@ def _write_service_settings(cwd: Path) -> Path:
     return path
 
 
-def _service_popen(argv: list, log_path: Path):
+def _service_popen(argv: list, log_path: Path, extra_env: dict | None = None):
     log = open(log_path, "ab")
     kwargs = {"stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    if extra_env:
+        kwargs["env"] = {**_non_interactive_env(), **extra_env}
     if sys.platform == "win32":
         kwargs["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -13055,7 +13403,13 @@ def _service_launcher(backend: str, cwd: Path, name: str):
         windows_native = backend == "native" and sys.platform == "win32"
         linux_native = backend == "native" and sys.platform.startswith("linux")
         socket_path = None
-        if windows_native:
+        wsl_name = ""
+        if backend == "wsl":
+            # The bridge's other end, inside the service's network namespace, on a socket in the distro's /tmp.
+            wsl_name = wsl_sandbox.service_name(f"{os.getpid()}-{re.sub(r'[^a-z0-9-]', '-', name.lower())[:40]}-{port}")
+            command = (f"export PORT={port} && (socat UNIX-LISTEN:{wsl_sandbox.service_socket(wsl_name)},fork,"
+                       f"mode=600 TCP:127.0.0.1:{port} 2>/dev/null &) && {command}")
+        elif windows_native:
             command = f'set "PORT={port}" && {command}'
         elif linux_native:
             socket_dir = (_agent_data_dir() / "sandbox-tmp" / "services").resolve()
@@ -13081,7 +13435,7 @@ def _service_launcher(backend: str, cwd: Path, name: str):
         guarded = ([(git.parent, _git_guard_snapshot(git.parent)) for git in _protected_repo_paths(cwd)
                     if git.is_dir()] if windows_native else [])
 
-        def spawn(argv):
+        def spawn(argv, env=None):
             if backend == "docker":
                 # The container's name, to stop it and to reach it from the relay.
                 spawned["container"] = argv[argv.index("--name") + 1]
@@ -13096,7 +13450,7 @@ def _service_launcher(backend: str, cwd: Path, name: str):
                         argv = [*argv[:at], own, *argv[at + 1:]]
                         spawned["own_network"] = own
                 spawned["network"] = argv[at]
-            spawned["proc"] = _service_popen(argv, log_path)
+            spawned["proc"] = _service_popen(argv, log_path, env) if env else _service_popen(argv, log_path)
             return spawned["proc"]
 
         # The same readiness step a command goes through: it prepares the sandbox's
@@ -13105,10 +13459,19 @@ def _service_launcher(backend: str, cwd: Path, name: str):
             raise RuntimeError(f"the native sandbox is not ready: {_native_sandbox_failure[:200]}")
         if backend == "docker" and not _docker_sandbox_ready(cwd):
             raise RuntimeError("the Docker sandbox is not ready")
+        wsl = wsl_sandbox.wsl_executable() if backend == "wsl" else None
+        if backend == "wsl":
+            if not _wsl_sandbox_ready(cwd):
+                raise RuntimeError(f"the WSL sandbox is not ready: {_wsl_sandbox_failure[:200]}")
+            subprocess.run(wsl_sandbox.prepare_services_argv(wsl, WSL_DISTRO), capture_output=True, timeout=60)
         previous, _spawn_service = _spawn_service, spawn
         try:
             if backend == "docker":
                 _exec_docker_command(command, 3600, workspace=cwd)
+            elif backend == "wsl":
+                started = _exec_wsl_sandbox(command, 3600, cwd=cwd, service=wsl_name)
+                if isinstance(started, str):
+                    raise RuntimeError(started)
             else:
                 _exec_native_sandbox(command, 3600, cwd=cwd)
         finally:
@@ -13139,6 +13502,30 @@ def _service_launcher(backend: str, cwd: Path, name: str):
             closers.append(bridge.close)
             ready = bridge.ready
             note = "bridged out of the sandbox's network through a unix socket"
+        elif backend == "wsl":
+            host_port = services.free_port()
+            bridge_log = open(log_path.with_suffix(log_path.suffix + ".bridge"), "ab")
+            try:
+                bridge_proc = subprocess.Popen(
+                    wsl_sandbox.bridge_argv(wsl, WSL_DISTRO, host_port, wsl_name), stdout=bridge_log,
+                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            finally:
+                bridge_log.close()
+
+            def close_wsl():
+                # Stopping wsl.exe does not reliably stop what it started in the distro: the stopper ends the
+                # service's runner (srt's sandbox dies with it) and the bridge.
+                try:
+                    subprocess.run(wsl_sandbox.stop_argv(wsl, WSL_DISTRO, wsl_name), capture_output=True,
+                                   timeout=60)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if bridge_proc.poll() is None:
+                    _kill_process_tree(bridge_proc.pid)
+            closers.append(close_wsl)
+            ready = lambda: services.held_open(host_port)   # the bridge listens before the service does
+            note = "bridged out of the WSL sandbox's network through a unix socket"
 
         def stop():
             for close in closers:
@@ -13195,7 +13582,7 @@ def _exec_service(name: str, args: dict) -> str:
                 f"Error: no service named {args.get('name')!r} is running. service_status lists them.")
     # service_start
     backend = _resolve_sandbox_backend()
-    if backend not in ("native", "docker"):
+    if backend not in ("native", "docker", "wsl"):
         return _sandbox_required_error()
     cwd = Path(_shell_workspace_root or ARTIFACTS_ROOT).resolve()
     port = args.get("port")
@@ -13865,6 +14252,26 @@ def _run_sandbox_command(command: str, timeout: int = 25,
 
 def _run_in_sandbox_backend(backend: str, command: str, timeout: int,
                             python_code: bool, image: str, workspace: Path) -> str:
+    if backend == "wsl":
+        result = None
+        if _wsl_sandbox_ready(workspace, readonly=_sandbox_readonly):
+            local_command = _wsl_python_command(command) if python_code else command
+            started = time.time()
+            result = _exec_wsl_sandbox(local_command, timeout, workspace, readonly=_sandbox_readonly)
+            if not _wsl_sandbox_unusable(result):
+                if (not python_code and not _sandbox_readonly and isinstance(result, str)
+                        and npm_windows.is_npm_install(command)
+                        and "Command exited with status" not in result and "timed out after" not in result):
+                    note = _wsl_windows_node_modules(workspace, started)
+                    if note:
+                        result = f"{result}\n{note}"
+                return result
+            _mark_wsl_sandbox_broken(result)
+        # Nothing ran: the next backend in line runs it, as a native failure falls back to Docker.
+        fallback = _resolve_sandbox_backend()
+        if fallback in ("wsl", "unavailable"):
+            return _sandbox_required_error()
+        return _run_in_sandbox_backend(fallback, command, timeout, python_code, image, workspace)
     if backend == "native":
         if not _native_sandbox_ready(workspace, readonly=_sandbox_readonly):
             return (_exec_docker_command(command, timeout, python_code, image,
@@ -13975,6 +14382,18 @@ def _native_sandbox_node_toolchain(*, require_npm=True) -> tuple[str | None, str
 
 
 def install_native_sandbox() -> str:
+    """`--sandbox-setup`: the native runtime, and on Windows with WSL also Agent8088's own WSL distro."""
+    native = _install_native_runtime()
+    if sys.platform == "win32" and SANDBOX_WSL and wsl_sandbox.wsl_executable():
+        return f"{native}\n{install_wsl_sandbox()}"
+    return native
+
+
+def wsl_sandbox_verified() -> bool:
+    return _wsl_sandbox_verified is True
+
+
+def _install_native_runtime() -> str:
     node, npm, version = _native_sandbox_node_toolchain()
     if (not node or not npm) and sys.platform == "win32":
         found = f" (found {version})" if version else ""
@@ -21698,7 +22117,7 @@ def _workspace_note(trajectory, *, probe_backend: bool = True) -> str:
     shell_root = Path(_shell_workspace_root).resolve() if _shell_workspace_root is not None else None
     if shell_root is not None and shell_root == Path(PROJECT_ROOT).resolve():
         return ""  # shell commands worked in the project itself: nothing was moved
-    if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker"}:
+    if probe_backend and trajectory.mutation_count() and _resolve_sandbox_backend() in {"native", "docker", "wsl"}:
         return (f"Work ran in the sandbox workspace {ARTIFACTS_ROOT}. Anything created "
                 f"with a relative path is there, not under {PROJECT_ROOT}.")
     return ""

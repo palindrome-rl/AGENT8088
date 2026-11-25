@@ -153,7 +153,9 @@ not per call.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `sandbox_backend` | `auto` | `auto` → native, then Docker. `native` or `docker` can force one backend; there is no unsandboxed fallback. |
+| `sandbox_backend` | `auto` | `auto` → on Windows the WSL sandbox once set up, then native, then Docker. `native`, `docker` or `wsl` can force one backend; there is no unsandboxed fallback. |
+| `sandbox_wsl` | `1` | Windows: `0` skips the WSL sandbox (setup does not create its distro and `auto` never picks it). `AGENT8088_SANDBOX_WSL=0` does the same for one run or for the installer. |
+| `wsl_distro` | `agent8088-sandbox` | The WSL distro the WSL sandbox uses. Only a distro named `agent8088-sandbox` or `agent8088-sandbox-<name>` is ever removed. |
 | `sandbox_runtime_version` | pinned | Version of the native runtime to install. |
 | `shell_workspace` | `project` | Where sandboxed shell commands start and may write: the project folder (its `.git` stays read-only), or `artifacts`. A project folder that is the home folder, above it or a drive root always uses `artifacts/`. |
 | `sandbox_pass_env` | (empty) | Secret-looking variables a sandboxed command may still see; all others with such names are removed. |

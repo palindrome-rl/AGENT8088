@@ -287,7 +287,8 @@ $TExtract     = 300 * $TimeoutScale   # PortableGit self-extractor
 # short no-op probe to verify the sandbox actually starts - not a large download,
 # but npm registry round-trips and the probe both count as network/process calls
 # nothing here should be allowed to hang forever.
-$TSandboxSetup = 180 * $TimeoutScale
+# Includes the WSL sandbox distro on Windows with WSL 2: an Alpine download and its packages.
+$TSandboxSetup = 480 * $TimeoutScale
 
 # One-line activity display for quiet installation stages. The external tools
 # still own their real progress output where they have one (notably git clone);
