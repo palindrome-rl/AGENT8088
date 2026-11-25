@@ -267,7 +267,14 @@ browser_headless=1
 # --- sandbox ---
 # auto uses free native OS isolation first, then Docker when available.
 # If neither is available, shell and code execution are refused.
+# On Windows, auto prefers `wsl` once `agent8088 --sandbox-setup` has set up
+# Agent8088's own WSL distro: commands run in bash under the same runtime as on
+# Linux, with the network allowlist enforced and no limit on child processes.
+# `native` is the Windows ACL runner (file writes only).
 sandbox_backend=auto
+# Windows only: set to 0 to skip the WSL sandbox (setup does not create the distro,
+# and auto never picks it).
+# sandbox_wsl=1
 sandbox_runtime_version=0.0.73
 # Where sandboxed shell commands run and may write. `project` (the default) is the
 # project folder, so a build can write next to its sources; the repository's .git

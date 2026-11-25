@@ -36,14 +36,14 @@ status = engine.sandbox_status()
 if engine._native_sandbox_failure:
     print("native sandbox:", engine._native_sandbox_failure[:300])
 print("sandbox:", {k: status.get(k) for k in ("resolved", "network", "network_enforced", "verification")})
-check("a sandbox backend is available", backend in ("native", "docker"), backend)
-if backend not in ("native", "docker"):
+check("a sandbox backend is available", backend in ("native", "docker", "wsl"), backend)
+if backend not in ("native", "docker", "wsl"):
     sys.exit(1)
 windows_native = backend == "native" and sys.platform == "win32"
 
 engine.reset_turn_counters()
 print("project:", engine.PROJECT_ROOT, "| shell folder:", engine._shell_workspace_root)
-python = "python" if backend == "docker" else f'"{sys.executable}"'
+python = "python" if backend == "docker" else "python3" if backend == "wsl" else f'"{sys.executable}"'
 os.environ["E2E_SERVICE_TOKEN"] = "e2e-secret-value"
 
 
@@ -65,6 +65,14 @@ else:
 if hasattr(engine, "_secret_env_names"):
     out = run(f"{python} -c \"import os; print('token=[' + os.environ.get('E2E_SERVICE_TOKEN', '') + ']')\"")
     check("a secret variable is not inherited", "e2e-secret-value" not in out, out.strip()[-120:])
+
+if backend == "wsl":
+    # The WSL sandbox's own promises: interop is off, so no Windows program starts, and Node can start a child
+    # with piped output (what the Windows runner refuses with spawn EPERM).
+    out = run("/mnt/c/Windows/System32/cmd.exe /c echo INTEROP-RAN; echo done")
+    check("a Windows program cannot be started from the WSL sandbox", "INTEROP-RAN" not in out, out.strip()[-200:])
+    out = run("node -e \"require('child_process').execFileSync(process.execPath, ['-e', '0']); console.log('SPAWNED')\"")
+    check("Node can start a child process in the WSL sandbox", "SPAWNED" in out, out.strip()[-200:])
 
 if windows_native:
     print("[skip] network checks: the Windows runner does not filter the network")
