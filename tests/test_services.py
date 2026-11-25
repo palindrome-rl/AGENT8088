@@ -241,3 +241,67 @@ def test_a_normal_command_never_gets_unix_sockets(engine, tmp_path, monkeypatch)
     monkeypatch.setattr(engine, "_agent_data_dir", lambda: tmp_path / "data")
     monkeypatch.setattr(engine, "_secret_scan_roots", lambda workspace: [])
     assert "allowAllUnixSockets" not in engine._sandbox_settings_data(False, tmp_path)["network"]
+
+
+def test_held_open_tells_a_relay_with_nothing_behind_it_from_a_service():
+    # What a relay does when the service behind it is not up: accept, then close at once.
+    closer = socket.create_server(("127.0.0.1", 0))
+
+    def accept_and_close():
+        while True:
+            try:
+                conn, _ = closer.accept()
+                conn.close()
+            except OSError:
+                return
+    threading.Thread(target=accept_and_close, daemon=True).start()
+    holder = socket.create_server(("127.0.0.1", 0))
+    held = []
+
+    def accept_and_hold():
+        while True:
+            try:
+                conn, _ = holder.accept()
+                held.append(conn)
+            except OSError:
+                return
+    threading.Thread(target=accept_and_hold, daemon=True).start()
+    try:
+        assert services.listening(closer.getsockname()[1])            # listening alone is not enough
+        assert not services.held_open(closer.getsockname()[1], seconds=0.5)
+        assert services.held_open(holder.getsockname()[1], seconds=0.5)
+    finally:
+        closer.close()
+        holder.close()
+
+
+def test_a_docker_service_gets_a_forwarder_so_a_loopback_bind_works(engine, tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(engine, "_docker_sandbox_ready", lambda cwd: True)
+
+    def fake_docker(command, timeout, workspace=None):
+        seen["command"] = command
+        return engine._spawn_service(["docker", "run", "--name", "agent8088-1-abc", "--network", "net1", "img"])
+    monkeypatch.setattr(engine, "_exec_docker_command", fake_docker)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    monkeypatch.setattr(engine, "_service_popen", lambda argv, log: proc)
+    relay = {}
+    monkeypatch.setattr(engine, "_start_docker_relay",
+                        lambda container, network, port, host_port: relay.update(
+                            container=container, network=network, port=port) or "agent8088-1-abc-relay")
+    monkeypatch.setattr(engine, "_remove_containers", lambda names: None)
+    handle = engine._service_launcher("docker", tmp_path, "web")("serve {port}", 5557, tmp_path / "l.log")
+    try:
+        assert "python3 -c" in seen["command"] and seen["command"].endswith("serve 5557")
+        import re
+        forward = int(re.search(r"' (\d+) 5557 >/dev/null", seen["command"]).group(1))
+        assert relay == {"container": "agent8088-1-abc", "network": "net1", "port": forward} and forward != 5557
+        assert handle.ready is not None and handle.containers == ["agent8088-1-abc", "agent8088-1-abc-relay"]
+    finally:
+        handle.stop()
+
+
+def test_the_forwarder_code_compiles():
+    import ast
+    import agent8088.engine as engine_module
+    ast.parse(engine_module._IN_CONTAINER_FORWARDER)
