@@ -141,6 +141,34 @@ answers on its port; `service_status`, `service_logs` and `service_stop` manage 
   next one stops what it left running.
 - `services=0` turns the tools off.
 
+`run_with_service` is the one-command form: it starts the server, waits until its
+port answers (45 s at most), runs one check command (120 s by default, 280 s at
+most), then stops the server and everything it started. The check runs in the
+same sandboxed command as the server, so it reaches the server on every backend,
+including where a service cannot be reached from this computer. A check that
+hangs is ended with everything it started. Its exit status and output count as
+evidence the way a shell command's do: a test runner's result, or a failing exit.
+
+## Testing a service in a browser
+
+`browser_test` runs the model's own steps in headless Chromium on this computer
+against a running service (the address `service_start` gave): open a path,
+click, type, choose, wait, and check what the page shows (`expect_text`,
+`expect_visible`, `expect_count`, ...). It stops at the first failing step and
+says what the page showed instead, reports page and console errors, and saves a
+screenshot of the last state.
+
+- It reaches only a service this session started and still runs, at
+  `http://127.0.0.1:<port>/`. Any other address is refused before the browser
+  starts, and inside the test every request to another origin is refused too.
+- A test whose `expect_*` steps all pass counts as a passing check, like a test
+  run; a failing step counts as a failing check. A test with no `expect_*` step
+  settles nothing.
+- It is a `browser` tool: in `readonly` and plan mode it asks first.
+
+On Docker, a service is reached through a relay container and a small forwarder
+inside its own container, so a service that binds `127.0.0.1` works too.
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run.
