@@ -1304,6 +1304,25 @@ class Nudge:
     unmet: str = ""  # what to tell the user if the budget runs out before this is met
 
 
+# Words that say the request is about how the result looks. Used only together with a page or image the run wrote.
+_VISUAL_WORDS = re.compile(
+    r"\b(?:visual(?:ly)?|aesthetic\w*|polish(?:ed)?|graphics?|artwork|pixel[- ]?art|animat\w+|illustrat\w+|layout|user interface|"
+    r"ui|ux|responsive|styled|styling|palette|colou?rs?|colou?rful|sprites?|beautiful|attractive|stunning|landing page|mock-?up|"
+    r"looks?\s+(?:good|great|nice|professional|polished|beautiful))\b", re.IGNORECASE)
+
+
+def wants_visual_result(request: str) -> bool:
+    """The request is about how the result looks, not only what it does."""
+    return bool(_VISUAL_WORDS.search(request or ""))
+
+
+VISUAL_LOOK_ASK = (
+    "What you built is meant to be seen, and nothing in this run has looked at it yet. Render it with screenshot_page (a page that "
+    "needs input to reach a state can be driven with browser_test), say plainly what looks wrong or weak (layout, text that is hard "
+    "to read, missing or overlapping parts, anything the request asked to be visible), and fix it. If it already looks right, say so in "
+    "one line, then give your final answer.")
+
+
 def continue_text(problem: str, ask: str) -> str:
     """Every completion nudge reads as an instruction to carry on, never to stop."""
     return f"{problem} {ask}".strip()

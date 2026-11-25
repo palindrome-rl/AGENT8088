@@ -14,6 +14,8 @@ from agent8088.completion import SUBGOAL_PREFIX
 
 VERSION = 2
 MAX_OPERATIONS = 12
+# How many times a request may be asked to look at what it built (once per state of the work).
+MAX_LOOK_ASKS = 2
 MAX_TEXT = 240
 MAX_EVIDENCE = 6
 
@@ -983,6 +985,9 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
+        "look_seen_at": None,
+        "look_asked_at": None,
+        "look_asks": 0,
         "message_count": 0,
     }
 
@@ -1050,6 +1055,8 @@ class TrajectoryState:
             self.data["smoke_asked"] = []
             self.data["backend_check"] = {}
             self.data["grounding_asked"] = False
+            self.data["look_asked_at"] = None
+            self.data["look_asks"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -1488,6 +1495,21 @@ class TrajectoryState:
         return (int(self.data.get("mutation_count") or 0),
                 int(self.data.get("passed_checks") or 0),
                 sum(1 for step in self.subgoals() if step.get("status") == "done"))
+
+    def note_looked(self) -> None:
+        """A render of the work was shown to the model (or, for a text-only model, its evidence was) at the current state of the work."""
+        self.data["look_seen_at"] = self.mutation_count()
+
+    def ask_to_look(self) -> bool:
+        """Whether to ask the model, now, to look at what it built: once per state of the work, never when it already looked at
+        this state, and at most MAX_LOOK_ASKS times a request."""
+        state = self.mutation_count()
+        if (not state or self.data.get("look_seen_at") == state or self.data.get("look_asked_at") == state
+                or int(self.data.get("look_asks") or 0) >= MAX_LOOK_ASKS):
+            return False
+        self.data["look_asked_at"] = state
+        self.data["look_asks"] = int(self.data.get("look_asks") or 0) + 1
+        return True
 
     def smoke_unchecked(self, paths: list[str]) -> list[str]:
         """Deliverables not yet smoke-tested at the current state of the work."""
@@ -1938,6 +1960,48 @@ class TrajectoryState:
             if operation.get("verdict") in {"passed", "failed"}:
                 line += f" (verification {operation['verdict']})"
             lines.append(line)
+        if self.needs_replan():
+            lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
+        if self.needs_verification():
+            lines.append("Verification is pending: do not claim the changed work is verified until you inspect or test it.")
+        if self.needs_tests():
+            lines.append("Changed with no tests yet: " + ", ".join(self.untested_paths())
+                         + ". Call generate_tests for each, or say why tests do not apply.")
+        return "\n".join(lines)
+
+    # The same facts as prompt(), for delivery in the conversation instead of the system prompt. A system prompt that
+    # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
+    # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
+
+    def state_signature(self) -> tuple:
+        """What the model should act on. It changes only when one of those things changes, not on every tool call."""
+        steps = tuple((str(step.get("name")), str(step.get("status"))) for step in self.data.get("checklist", []))
+        return (steps, bool(self.needs_verification()),
+                tuple(self.untested_paths()) if self.needs_tests() else (),
+                bool(self.needs_replan()), tuple(self.unresolved_tools()))
+
+    def has_open_attention(self) -> bool:
+        """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
+        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools())
+
+    def state_note(self, *, full: bool = False) -> str:
+        """The state as one short note. `full` adds the goal and the workspace line, which do not change within a task."""
+        if not (self.data.get("operations") or []):
+            return ""
+        lines = ["Task state (controller-maintained facts, not a request from the user):"]
+        if full:
+            lines.append("Notes like this one come from the harness, not from the tool. The newest is current, and it is "
+                         "repeated while something stays open.")
+            if self.data.get("goal"):
+                lines.append(f"Goal: {self.data['goal']}")
+            if self.data.get("workspace"):
+                lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
+        lines.append("Checklist: " + "; ".join(
+            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
+        ))
+        unresolved = self.unresolved_tools()
+        if unresolved:
+            lines.append("Unresolved tool work: " + ", ".join(unresolved) + ".")
         if self.needs_replan():
             lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
         if self.needs_verification():

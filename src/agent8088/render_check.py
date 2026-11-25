@@ -51,6 +51,7 @@ class Render:
     console_errors: list = field(default_factory=list)
     blocked: list = field(default_factory=list)
     animating: bool = False
+    layout: dict = field(default_factory=dict)
 
 
 # --- well-formedness -----------------------------------------------------------------------------------
@@ -143,6 +144,60 @@ def diff_share(path_a, path_b) -> float:
     return sum(1 for p, q in pairs if _differs(p, q)) / total
 
 
+# --- small layout notes --------------------------------------------------------------------------------
+
+# Run in the page after the screenshot. Three plain facts about the window, nothing about taste: whether the page is larger than the
+# window, text that is hard to read against its background (WCAG contrast under 3:1, skipped where the background is an image or
+# a gradient), and text under 10 px. Only the text of the page itself is seen: text drawn on a canvas is not.
+LAYOUT_PROBE = r"""() => {
+  const de = document.documentElement;
+  const out = {scrollW: de.scrollWidth, scrollH: de.scrollHeight, vw: window.innerWidth, vh: window.innerHeight, low: [], lowCount: 0, tiny: 0};
+  const parse = c => { const m = (c || '').match(/rgba?\(([^)]+)\)/); if (!m) return null; const p = m[1].split(',').map(parseFloat);
+                       return {r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1}; };
+  const lin = v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const lum = c => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+  const bgOf = el => { for (let e = el; e; e = e.parentElement) { const s = getComputedStyle(e);
+                         if (s.backgroundImage && s.backgroundImage !== 'none') return null;
+                         const c = parse(s.backgroundColor); if (c && c.a > 0.5) return c; }
+                       return {r: 255, g: 255, b: 255, a: 1}; };
+  const walker = document.createTreeWalker(document.body || de, NodeFilter.SHOW_TEXT);
+  let seen = 0;
+  while (walker.nextNode() && seen < 600) {
+    const n = walker.currentNode, t = (n.nodeValue || '').trim(), el = n.parentElement;
+    if (t.length < 2 || !el || /^(SCRIPT|STYLE|NOSCRIPT)$/.test(el.tagName)) continue;
+    const s = getComputedStyle(el), r = el.getBoundingClientRect();
+    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity) === 0 || r.width < 1 || r.height < 1) continue;
+    seen++;
+    if (parseFloat(s.fontSize) < 10) out.tiny++;
+    const fg = parse(s.color), bg = bgOf(el);
+    if (!fg || !bg) continue;
+    const l1 = lum(fg), l2 = lum(bg), ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    if (ratio < 3) { out.lowCount++; if (out.low.length < 3) out.low.push({t: t.slice(0, 24), r: Math.round(ratio * 10) / 10}); }
+  }
+  return out;
+}"""
+
+
+def layout_note(layout) -> str:
+    """The probe's findings as one short sentence, or "" when there is nothing to say."""
+    if not isinstance(layout, dict) or not layout:
+        return ""
+    parts = []
+    width, height = int(layout.get("vw") or 0), int(layout.get("vh") or 0)
+    scroll_w, scroll_h = int(layout.get("scrollW") or 0), int(layout.get("scrollH") or 0)
+    if width and height and (scroll_w > width + 2 or scroll_h > height + 2):
+        parts.append(f"the page is larger than the window ({scroll_w} x {scroll_h} in {width} x {height}), so it scrolls")
+    count = int(layout.get("lowCount") or 0)
+    if count:
+        example = (layout.get("low") or [{}])[0]
+        sample = f' (for example "{example.get("t", "")}" at {example.get("r", "")}:1)' if example.get("t") else ""
+        parts.append(f"{count} text item{'s' if count != 1 else ''} hard to read against the background{sample}")
+    tiny = int(layout.get("tiny") or 0)
+    if tiny:
+        parts.append(f"{tiny} text item{'s' if tiny != 1 else ''} under 10 px")
+    return "; ".join(parts)
+
+
 # --- the browser ---------------------------------------------------------------------------------------
 
 def _wrapper_html(relative: str) -> str:
@@ -205,6 +260,11 @@ def _worker(root: Path, relative: str, as_image: bool, out_png: Path, width: int
                     out["animating"] = diff_share(out_png, second) > ANIMATION_SHARE
                 finally:
                     second.unlink(missing_ok=True)
+                if not as_image:
+                    try:
+                        out["layout"] = tab.evaluate(LAYOUT_PROBE)
+                    except Exception:  # noqa: BLE001 -- notes are optional; a page that blocks the probe just has none
+                        out["layout"] = {}
             finally:
                 browser.close()
     except Exception as exc:  # noqa: BLE001 -- reported as an unavailable render
@@ -247,4 +307,4 @@ def render_file(path: Path, out_png: Path, *, width: int, height: int, wait_ms: 
                       page_errors=out.get("page_errors", []), console_errors=out.get("console_errors", []),
                       blocked=out.get("blocked", []))
     return Render("ok", png=out_png, page_errors=out["page_errors"], console_errors=out["console_errors"],
-                  blocked=out["blocked"], animating=bool(out.get("animating")))
+                  blocked=out["blocked"], animating=bool(out.get("animating")), layout=out.get("layout") or {})

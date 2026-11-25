@@ -4,6 +4,34 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-25 (looking at what was built)
+
+### Added
+
+- `screenshot_page` adds a short "Layout notes" line for a page when something is off: the page is larger than the window,
+  text that is hard to read against its background, or text under 10 px. Nothing is said when nothing is off.
+- When a run built a page or image and the request is about how it looks, the final check asks once to render it and look,
+  if nothing in the run has (`completion_visual_look`, on by default). It is last in the order, never blocks, and never marks
+  a run as not completed.
+
+## v1.3 branch maintenance - 2026-11-25
+
+### Added
+
+- `task_state_delivery=history` (default `system`, unchanged) sends the harness's task state to the model once, when it
+  changes, at the end of the newest tool result, instead of rewriting the end of the system prompt on every turn. The
+  system prompt and all earlier messages then stay exactly as the server saw them, so a server that caches prompts can
+  reuse the whole previous request. `task_state_refresh_turns` and `task_state_max_notes` bound how often it repeats.
+
+## v1.3 branch maintenance - 2026-11-25 (post-check window)
+
+### Improved
+
+- A run is no longer ended while it is still gathering new evidence after a passing check. Reading a file or range for the
+  first time, or taking a new screenshot or page check, is held and not counted against `max_post_check_rounds`. The budget is
+  bounded by `post_check_ceiling_turns` (default 15 quiet turns), nothing is held once the wrap-up nudge was sent, a write
+  starts over, and `post_check_new_evidence=0` restores the old count.
+
 ## v1.3 branch maintenance - 2026-11-20
 
 ### Added

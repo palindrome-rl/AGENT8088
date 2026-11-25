@@ -673,6 +673,13 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
+# A quiet turn that brings new evidence (a successful call that is not a change and has not been made before in the run:
+# a first read of a file or range, a new screenshot or page check) is not idle, so it does not use up the allowance above.
+# Those held turns have a budget of POST_CHECK_CEILING minus the allowance and its two turns of grace, so a run is still
+# stopped after at most POST_CHECK_CEILING quiet turns. Once the wrap-up nudge has been sent nothing is held. 0 = off.
+POST_CHECK_NEW_EVIDENCE = str(APP_CONFIG.get("post_check_new_evidence", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+POST_CHECK_CEILING = max(MAX_POST_CHECK_ROUNDS + 2, _config_int("post_check_ceiling_turns", 15))
 # Whole-file rewrites of one path in a run: a corrective note from REWRITE_NUDGE_AFTER,
 # a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
 MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
@@ -704,7 +711,21 @@ REQUIREMENT_EVIDENCE = str(APP_CONFIG.get("requirement_evidence", "1")).strip().
 COMPLETION_SMOKE_TEST = str(APP_CONFIG.get("completion_smoke_test", "report")).strip().lower()
 if COMPLETION_SMOKE_TEST not in ("off", "report", "enforce"):
     COMPLETION_SMOKE_TEST = "report"
+# How the controller's task state (checklist, verification pending, changed files with no tests, unresolved tools) reaches the
+# model. `system` puts it at the end of the system prompt on every turn, which changes that prompt every turn: a server that
+# caches prompts can only reuse a request that starts with the whole previous request, so it then re-reads the entire
+# conversation every turn. `history` says it once, when it changes, at the end of the newest tool result (and again every
+# task_state_refresh_turns turns while something is still open), so earlier messages and the system prompt never change.
+# At most task_state_max_notes notes per run. The one-shot nudges and the completion checks are not affected.
+TASK_STATE_DELIVERY = str(APP_CONFIG.get("task_state_delivery", "system")).strip().lower()
+if TASK_STATE_DELIVERY not in ("system", "history"):
+    TASK_STATE_DELIVERY = "system"
+TASK_STATE_REFRESH_TURNS = max(1, _config_int("task_state_refresh_turns", 5))
+TASK_STATE_MAX_NOTES = max(1, _config_int("task_state_max_notes", 40))
 COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds", 20))
+# When a run built a page or image and the request is about how it looks, one nudge (per state of the work, at most twice a request)
+# to render it and look before the final answer, if nothing in the run has. It never blocks: the answer is accepted either way.
+COMPLETION_VISUAL_LOOK = str(APP_CONFIG.get("completion_visual_look", "1")).strip().lower() in ("1", "true", "yes", "on")
 # After the first control, the page check clicks this many more visible controls (within
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
@@ -20540,6 +20561,66 @@ def _harness_turn(text: str) -> dict:
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
+_TASK_STATE_MARK = f"\n{_HARNESS_PREFIX}Task state"
+
+
+class _TaskStateNotes:
+    """Tells the model the task state once, when it changes, instead of in the system prompt on every turn.
+
+    The note is added to the end of the newest tool result *before* that result is first sent, and the message is not touched
+    again, so every earlier message stays exactly as the server saw it. A note is added when the state changed, when no note
+    is left in the conversation (the first one, or after a compaction dropped them), and every `refresh` turns while
+    something is still open. Never to a message the person wrote, and never beyond `limit` notes."""
+
+    def __init__(self, refresh: int | None = None, limit: int | None = None):
+        self.refresh = TASK_STATE_REFRESH_TURNS if refresh is None else max(1, int(refresh))
+        self.limit = TASK_STATE_MAX_NOTES if limit is None else max(1, int(limit))
+        self.signature = None
+        self.sent = 0
+        self.turns_since = 0
+
+    @staticmethod
+    def _present(messages) -> bool:
+        """A note is in the conversation since the person's latest message. An earlier request's notes do not count: the
+        new request starts with a full note again."""
+        for message in reversed(messages):
+            if message.get("role") == "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and _TASK_STATE_MARK in content:
+                return True
+            if message.get("role") == "user" and not _message_text(message).startswith(_LOOP_PREFIXES):
+                return False
+        return False
+
+    def deliver(self, messages: list, trajectory) -> bool:
+        """Add the note to the last message when it is due. Returns whether one was added."""
+        if trajectory is None or not messages:
+            return False
+        self.turns_since += 1
+        signature = trajectory.state_signature()
+        present = self._present(messages)
+        changed = signature != self.signature
+        refresh_due = (present and not changed and trajectory.has_open_attention()
+                       and self.turns_since >= self.refresh)
+        if not (changed or refresh_due or not present) or self.sent >= self.limit:
+            return False
+        last = messages[-1]
+        content = last.get("content")
+        # Only the loop's own messages (a tool result or a harness turn) that have not been sent yet. A person's message, a
+        # message with images, or one that already carries a note is left alone and the note waits for the next round.
+        if (last.get("role") != "user" or not isinstance(content, str)
+                or not content.startswith(_LOOP_PREFIXES) or _TASK_STATE_MARK in content):
+            return False
+        note = trajectory.state_note(full=not present)
+        if not note:
+            return False
+        last["content"] = f"{content}\n{_HARNESS_PREFIX}{note}"
+        self.signature, self.turns_since = signature, 0
+        self.sent += 1
+        return True
+
+
 _screenshot_counts: dict = {}   # resolved file -> renders so far (file names only, never shown as a count)
 _screenshot_last: dict = {}     # resolved file -> its previous render, for the difference
 
@@ -20627,6 +20708,9 @@ def _exec_screenshot(name: str, ref: str, args: dict) -> str:
         lines.append(f"Drawn content: the render looks blank ({ink:.1%} of the image differs from the background).")
     else:
         lines.append(f"Drawn content: {ink:.0%} of the image differs from the background.")
+    layout = render_check.layout_note(render.layout)
+    if layout:
+        lines.append(f"Layout notes: {layout}.")
     if render.animating:
         lines.append("Compared with the previous render: skipped, the page is still changing on screen "
                      "(animation or a timer), so a pixel difference would not mean anything.")
@@ -20645,7 +20729,7 @@ def _exec_screenshot(name: str, ref: str, args: dict) -> str:
     evidence = {"file": str(target), "png": str(png), "width": shot_w, "height": shot_h,
                 "viewport": [width, height], "ink": round(ink, 4), "diff": None if diff is None else round(diff, 4),
                 "animating": render.animating, "page_errors": render.page_errors[:5],
-                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5]}
+                "console_errors": render.console_errors[:5], "blocked": render.blocked[:5], "layout": layout}
     return _IMAGE_MARKER_PREFIX + _json.dumps({"message": message, "evidence": evidence})
 
 
@@ -22437,6 +22521,20 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     return reasons
 
 
+def _visual_look_step(trajectory, written: list, request: str):
+    """Ask once to look at a page or image this run built, when the request is about how it looks and nothing has looked at it."""
+    if not COMPLETION_VISUAL_LOOK or not completion_checks.wants_visual_result(request):
+        return None
+    roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
+    targets = app_check.deliverable_targets(
+        written, roots, reference_pages=getattr(trajectory, "data", {}).get("reference_paths", []))
+    if not any(t.suffix.lower() in render_check.PAGE_SUFFIXES | {".svg"} for t in targets):
+        return None
+    if not trajectory.ask_to_look():
+        return None
+    return completion_checks.Nudge("look", completion_checks.VISUAL_LOOK_ASK)
+
+
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
                            deliverables_due: bool = False, can_search: bool = False):
     """The first completion check a text reply fails, or None to accept it.
@@ -22521,6 +22619,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
                 "Ask the user only for what only they can do; if you are blocked, "
                 "say exactly what is missing."),
             unmet="the reply hands the work back to the user instead of doing it")
+    if nudge is None and depth == 0:
+        nudge = _visual_look_step(trajectory, written, request)
     if nudge is None:
         return None
     if budget.spend(mark, nudge.unmet):
@@ -22909,8 +23009,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     approved_reply_pushed = False
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    post_check_held = 0       # quiet turns that brought new evidence and were not counted against the allowance
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     edit_check = _new_edit_check_reminder()
+    state_notes = _TaskStateNotes()   # used only when task_state_delivery=history
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
     time_nudges = 0  # TIME_LEFT_NUDGE_AT thresholds already announced
     answer_asked = False  # the last-stretch "answer now" ask was sent
@@ -22997,7 +23099,9 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
-            round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
+            if TASK_STATE_DELIVERY != "history":
+                # In history mode the system prompt is left exactly as it is: the state travels in the conversation.
+                round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
         # Resource ceiling. Checked before the model call so an exhausted budget
@@ -23168,6 +23272,10 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                               "tokens_after": _estimate_tokens(
                                   _estimate_context_chars(messages, round_system_prompt or "")
                                   + len(json.dumps(round_tools_def or [], default=str)))})
+        if trajectory is not None and TASK_STATE_DELIVERY == "history":
+            # After any compaction above, so a summary that dropped the earlier notes is followed by a fresh full one.
+            if state_notes.deliver(messages, trajectory) and trace is not None:
+                trace.append({"turn": turn, "type": "task_state_note", "notes": state_notes.sent})
         # A3.1: after a cut-off, a small adaptive cap (room for one real tool call,
         # never below the floor); any normal finish resets to the full limit.
         output_profile, profile_line = _active_output_profile(
@@ -23823,12 +23931,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # Not a finishing check: the approach failed and the model is
                 # back to working, so the cap must not cut that short.
                 post_check_rounds, post_check_told = None, False
+                post_check_held = 0
                 continue
             if gates_open and _pending_chunk_audits and depth == 0:
                 chunk_note = _flush_chunk_audits(depth)
                 if chunk_note:
                     messages.append(_harness_turn(chunk_note))
                     post_check_rounds = 0
+                    post_check_held = 0
                     continue
             reply_declined = False  # the user saw this reply as a plan and kept planning
             if (approved_reply_awaiting_work and not approved_reply_pushed and depth == 0
@@ -23896,6 +24006,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                                       "kind": nudge.kind,
                                       "spent": completion_budget.spent})
                     post_check_rounds = 0
+                    post_check_held = 0
                     continue
             if not gates_open:
                 # The cap told the model to answer, so no completion check ran. Say
@@ -23930,6 +24041,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_new_evidence = False  # a call this round succeeded, was new to the run, and was not a wait
         round_repeated = False  # a call this round only repeated an earlier one (answered from the earlier result)
         round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
@@ -24245,6 +24357,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     if pruned and trace is not None:
                         trace.append({"turn": turn, "type": "images_pruned", "removed": pruned,
                                       "kept": keep})
+                if result_message is not None and trajectory is not None:
+                    trajectory.note_looked()
                 if on_result:
                     on_result(name, "[image not attached: text-only model]" if withheld
                               else "[image attached]")
@@ -24326,6 +24440,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 round_productive = True
             if not no_progress and sig not in seen_signatures:
                 round_fresh = True
+                if not _plan_step_failed(result) and not _is_wait_command(name, args):
+                    round_new_evidence = True
             seen_signatures.add(sig)
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
@@ -24495,6 +24611,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 and trajectory.data.get("verification") == "verified"
                 and not round_changed):
             post_check_rounds = 0
+            post_check_held = 0
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
@@ -24502,6 +24619,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # A check found something and the model fixed it: real work,
                 # never cut off. The count starts over.
                 post_check_rounds, post_check_told = 0, False
+                post_check_held = 0
+            elif (POST_CHECK_NEW_EVIDENCE and round_new_evidence and not post_check_told
+                  and post_check_held < POST_CHECK_CEILING - (MAX_POST_CHECK_ROUNDS + 2)):
+                # Looking at something new is how a check is done, not looping: held, not counted.
+                post_check_held += 1
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "post_check_held", "quiet": post_check_rounds,
+                                  "held": post_check_held})
             else:
                 post_check_rounds += 1
                 if post_check_rounds >= MAX_POST_CHECK_ROUNDS + 2:
