@@ -16163,6 +16163,47 @@ def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> boo
     return False
 
 
+_PROGRAM_RUN_RE = re.compile(
+    r"^\s*(?:(?:python3?|py|node|ruby|php|perl|bash|sh)(?:\.exe)?\s+(?:-[\w-]+\s+)*([\w./\\:-]+\.(?:py|js|mjs|cjs|rb|php|pl|sh))"
+    r"|((?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test|start|compile)|make(?:\s+[\w-]+)?|cargo\s+(?:build|test|run)"
+    r"|go\s+(?:build|test|run)|mvn\s+\S+|gradle\w*\s+\S+|dotnet\s+(?:build|test|run)|cmake\s+--build))\b",
+    re.IGNORECASE)
+
+
+_BUILD_ENTRY_RE = re.compile(
+    r"^(?:build|compile|bundle|make|setup|test|tests|run[_-]?tests|check|ci)(?:[_.-][\w.-]*)?\.(?:py|js|mjs|cjs|sh|rb|pl|php)$",
+    re.IGNORECASE)
+
+
+def _runs_project_program(name: str, args: dict, result: str, trajectory) -> bool:
+    """Whether a shell call ran the project's own build, test or script cleanly after a change.
+
+    In a real run the model fixed a typo in a source file a build reads, ran `python build.py`, which succeeded and
+    wrote its output -- and that output counted as new unchecked work, so the completion check asked twice for
+    evidence the build had just given and the model's answer was lost. A program the project already had (not one
+    this run wrote or changed) that exits cleanly, run after the change, is the check of that change. Only the
+    command's first program counts, and only a run with no error and no failure line."""
+    if name != "execute_shell" or not trajectory.needs_verification():
+        return False
+    text = str(result or "")
+    if text.startswith("Error:") or _EXIT_STATUS_RE.search(text) or re.search(
+            r"Traceback \(most recent call last\)|\b(?:error|failed|failure)\b", _unwrap_untrusted(text),
+            re.IGNORECASE):
+        return False
+    command = str(args.get("command") or "")
+    match = _PROGRAM_RUN_RE.match(command)
+    if not match:
+        return False
+    script = match.group(1)
+    if script:
+        # Only the project's build or test entry point (build.py, compile.sh, run_tests.py, ...): some other script
+        # may have nothing to do with the change, and a changed code file is checked by running it.
+        name_only = Path(script.replace("\\", "/")).name
+        written = {Path(str(p)).name for p in trajectory.written_paths()}
+        return name_only not in written and bool(_BUILD_ENTRY_RE.match(name_only))
+    return True
+
+
 DIAGNOSE_AFTER_FAILURES = 3
 _DIAGNOSTIC_LISTING_MAX = 20
 _failure_streak = 0
@@ -21782,6 +21823,13 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+# The engine's own words when the model gave no answer at all, and the note on a held answer it falls back to.
+# Neither is the model's account of its work, so neither is read for what "the reply" says.
+NO_ANSWER_TEXT = "I wasn't able to produce an answer to that."
+NO_FINAL_REPLY_NOTE = ("(This was the model's last answer. It was sent back for more checks and gave no further "
+                       "answer.)")
+
+
 def _not_verified_reasons(trajectory, reply: str = "") -> list:
     """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones.
 
@@ -21791,6 +21839,9 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
     if trajectory is None:
         return []
     reasons = []
+    reply = "" if str(reply or "").strip() == NO_ANSWER_TEXT else str(reply or "").replace(NO_FINAL_REPLY_NOTE, "")
+    if not reply.strip() and trajectory.mutation_count():
+        reasons.append("the model gave no final answer")
     if reply and completion_checks.reports_part_not_done(reply):
         reasons.append("the reply says part of the request was not done")
     if reply and completion_checks.reports_failed_check(reply):
@@ -23007,9 +23058,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             if not answer:
                 # Stripping removed everything (the message was ONLY a tool-call
                 # attempt or pure reasoning) — never fall back to the raw markup.
+                # The model's own answer that a completion check sent back is the
+                # best account of the work it did; the notes say what was not
+                # settled after it (and a change after it makes it stale).
+                held = (trajectory.use_held_reply()
+                        if trajectory is not None and depth == 0 and not unknown else "")
                 answer = (f"I tried to use a tool that isn't available. "
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
-                          if unknown else "I wasn't able to produce an answer to that.")
+                          if unknown else
+                          f"{held}\n\n{NO_FINAL_REPLY_NOTE}" if held else NO_ANSWER_TEXT)
 
             if (tool_failed and not diagnostic_seen
                     and _claims_environment_unavailable(answer)):
@@ -23408,6 +23465,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                     trajectory.note_ran_ok()
+                elif mutated and _runs_project_program(name, args, result, trajectory):
+                    # The project's own build or script ran cleanly after the
+                    # change: what it wrote is its output, and the run is the
+                    # check of the change (exercised, not tested).
+                    mutated = False
+                    trajectory.note_project_program_ran(str(args.get("command") or ""), result)
                 check_app_path = ""
                 if name == "check_app" and args.get("path"):
                     try:

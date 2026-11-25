@@ -139,6 +139,27 @@ def _text(value) -> str:
 # A request to build a web app or page, and the files that count as its entry point.
 _WEB_APP_REQUEST = re.compile(r"\b(web[\s-]?app(lication)?s?|web[\s-]?sites?|web[\s-]?pages?|html page|browser game|front-?end|web-based)\b", re.I)
 _BUILD_VERB = re.compile(r"\b(create|build|make|develop|write|implement|generate|design)\b", re.I)
+
+
+def _asks_to_build_web_app(goal: str) -> bool:
+    """The request asks to build a web app or page: a build verb with the web thing as what it makes.
+
+    Both words anywhere in the request was not enough: "compare our prices with four competitor websites ... write a
+    short brief" names websites to read and asks to write a brief, and a run that delivered the spreadsheet, brief and
+    script was marked "no runnable app was produced". The verb now has to come first in the same sentence, at most a
+    few words before the web thing ("build a small web app", "make me a landing page", "create an HTML page"), with no
+    "from", "on", "of" and the like between them ("a script that checks prices on competitor websites")."""
+    for sentence in re.split(r"(?<=[.!?;:])\s+|\n+", goal):
+        for verb in _BUILD_VERB.finditer(sentence):
+            between = sentence[verb.end():verb.end() + 60]
+            web = _WEB_APP_REQUEST.search(between)
+            if not web:
+                continue
+            lead = between[:web.start()]
+            if len(lead.split()) <= 5 and not re.search(
+                    r"\b(?:from|on|of|at|across|with|against|for|in|using|via|about|that|which)\b", lead, re.I):
+                return True
+    return False
 # Folders that hold pages the run saved for itself (downloaded docs, scraped results), not pages it built.
 _REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
                              "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
@@ -1607,6 +1628,18 @@ class TrajectoryState:
         # previously passing page check is later superseded.
         self.data["inspected_by_page_check"] = None
 
+    def note_project_program_ran(self, command: str, result: str) -> None:
+        """The project's own build, test or script ran cleanly after the change: the change was exercised.
+
+        Not "tested" (nothing says the result is right), but no longer unchecked, so the completion check stops asking
+        for evidence the run has already given."""
+        self.note_ran_ok()
+        if self.data.get("verification") == "pending":
+            self.data["verification"] = "inspected"
+            self._set_step("Verify changed work", "inspected")
+        self.data.setdefault("evidence", []).append({"tool": "execute_shell", "result": _text(result)[:300]})
+        del self.data["evidence"][:-MAX_EVIDENCE]
+
     def status_lines(self) -> list[tuple[str, str]]:
         """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
 
@@ -1674,7 +1707,7 @@ class TrajectoryState:
     def wants_web_app(self) -> bool:
         """The request is to build a web app or page (judged from the start of the request, which is all that is kept)."""
         goal = str(self.data.get("goal") or "")
-        return bool(_WEB_APP_REQUEST.search(goal) and _BUILD_VERB.search(goal))
+        return _asks_to_build_web_app(goal)
 
     def has_app_entry(self) -> bool:
         """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
