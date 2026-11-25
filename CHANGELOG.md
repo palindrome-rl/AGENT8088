@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-25
+
+### Added
+
+- `task_state_delivery=history` (default `system`, unchanged) sends the harness's task state to the model once, when it
+  changes, at the end of the newest tool result, instead of rewriting the end of the system prompt on every turn. The
+  system prompt and all earlier messages then stay exactly as the server saw them, so a server that caches prompts can
+  reuse the whole previous request. `task_state_refresh_turns` and `task_state_max_notes` bound how often it repeats.
+
 ## v1.3 branch maintenance - 2026-11-20
 
 ### Added
