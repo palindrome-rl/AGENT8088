@@ -673,6 +673,13 @@ MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
 # answer; at this + 2 the best answer so far is returned. A write resets the
 # count, so a fix found by a check is never cut off. 0 disables the cap.
 MAX_POST_CHECK_ROUNDS = max(0, _config_int("max_post_check_rounds", 5))
+# A quiet turn that brings new evidence (a successful call that is not a change and has not been made before in the run:
+# a first read of a file or range, a new screenshot or page check) is not idle, so it does not use up the allowance above.
+# Those held turns have a budget of POST_CHECK_CEILING minus the allowance and its two turns of grace, so a run is still
+# stopped after at most POST_CHECK_CEILING quiet turns. Once the wrap-up nudge has been sent nothing is held. 0 = off.
+POST_CHECK_NEW_EVIDENCE = str(APP_CONFIG.get("post_check_new_evidence", "1")).strip().lower() in (
+    "1", "true", "yes", "on")
+POST_CHECK_CEILING = max(MAX_POST_CHECK_ROUNDS + 2, _config_int("post_check_ceiling_turns", 15))
 # Whole-file rewrites of one path in a run: a corrective note from REWRITE_NUDGE_AFTER,
 # a refusal past MAX_FILE_REWRITES (0 disables). Edits and append chunks never count.
 MAX_FILE_REWRITES = max(0, _config_int("max_file_rewrites", 10))
@@ -22931,6 +22938,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     approved_reply_pushed = False
     post_check_rounds = None  # tool rounds since the last finishing nudge; None = none sent
     post_check_told = False   # POST_CHECK_CAP_NUDGE sent; the next text reply is final
+    post_check_held = 0       # quiet turns that brought new evidence and were not counted against the allowance
     rewrite_counts: dict = {}  # path -> whole-file overwrites this run
     edit_check = _new_edit_check_reminder()
     last_text_answer = ""     # the reply a finishing nudge sent back, for the backstop
@@ -23845,12 +23853,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # Not a finishing check: the approach failed and the model is
                 # back to working, so the cap must not cut that short.
                 post_check_rounds, post_check_told = None, False
+                post_check_held = 0
                 continue
             if gates_open and _pending_chunk_audits and depth == 0:
                 chunk_note = _flush_chunk_audits(depth)
                 if chunk_note:
                     messages.append(_harness_turn(chunk_note))
                     post_check_rounds = 0
+                    post_check_held = 0
                     continue
             reply_declined = False  # the user saw this reply as a plan and kept planning
             if (approved_reply_awaiting_work and not approved_reply_pushed and depth == 0
@@ -23918,6 +23928,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                                       "kind": nudge.kind,
                                       "spent": completion_budget.spent})
                     post_check_rounds = 0
+                    post_check_held = 0
                     continue
             if not gates_open:
                 # The cap told the model to answer, so no completion check ran. Say
@@ -23952,6 +23963,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         round_changed = False  # a call this round changed state: resets the post-check cap
         malformed_round = False  # a call was malformed (bad/missing arguments) and corrected
         round_fresh = False  # did this round do something the run had not done?
+        round_new_evidence = False  # a call this round succeeded, was new to the run, and was not a wait
         round_repeated = False  # a call this round only repeated an earlier one (answered from the earlier result)
         round_productive = False  # any new successful call, or an intentional wait
         turn_tools = [] if trace is not None else None
@@ -24350,6 +24362,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 round_productive = True
             if not no_progress and sig not in seen_signatures:
                 round_fresh = True
+                if not _plan_step_failed(result) and not _is_wait_command(name, args):
+                    round_new_evidence = True
             seen_signatures.add(sig)
             tool_outputs.append(result)
             if name == "web_search" and not result.startswith("ESCALATION_REQUEST\x1f"):
@@ -24519,6 +24533,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 and trajectory.data.get("verification") == "verified"
                 and not round_changed):
             post_check_rounds = 0
+            post_check_held = 0
 
         # Nothing new ran this round (model is looping): nudge once, then give up.
         if executed and post_check_rounds is not None and MAX_POST_CHECK_ROUNDS:
@@ -24526,6 +24541,14 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # A check found something and the model fixed it: real work,
                 # never cut off. The count starts over.
                 post_check_rounds, post_check_told = 0, False
+                post_check_held = 0
+            elif (POST_CHECK_NEW_EVIDENCE and round_new_evidence and not post_check_told
+                  and post_check_held < POST_CHECK_CEILING - (MAX_POST_CHECK_ROUNDS + 2)):
+                # Looking at something new is how a check is done, not looping: held, not counted.
+                post_check_held += 1
+                if trace is not None:
+                    trace.append({"turn": turn, "type": "post_check_held", "quiet": post_check_rounds,
+                                  "held": post_check_held})
             else:
                 post_check_rounds += 1
                 if post_check_rounds >= MAX_POST_CHECK_ROUNDS + 2:
