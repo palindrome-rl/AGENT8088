@@ -13,6 +13,15 @@ All notable changes to Agent8088 are recorded here. The format follows
   system prompt and all earlier messages then stay exactly as the server saw them, so a server that caches prompts can
   reuse the whole previous request. `task_state_refresh_turns` and `task_state_max_notes` bound how often it repeats.
 
+## v1.3 branch maintenance - 2026-11-25 (post-check window)
+
+### Improved
+
+- A run is no longer ended while it is still gathering new evidence after a passing check. Reading a file or range for the
+  first time, or taking a new screenshot or page check, is held and not counted against `max_post_check_rounds`. The budget is
+  bounded by `post_check_ceiling_turns` (default 15 quiet turns), nothing is held once the wrap-up nudge was sent, a write
+  starts over, and `post_check_new_evidence=0` restores the old count.
+
 ## v1.3 branch maintenance - 2026-11-20
 
 ### Added
