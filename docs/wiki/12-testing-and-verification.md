@@ -66,7 +66,7 @@ no suite, or a result that says nothing either way, keeps the usual ask. It is
 skipped in the last stretch of the clock; `auto_qa=0` turns it off.
 
 The last three lead the end-of-run notes as one line, for example
-`Verdict: PARTLY VERIFIED (it ran without an error, but no test run passed after
+`Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
 the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
 turns the headline and the verdict line off.
 
