@@ -26,7 +26,7 @@ from agent8088 import (app_check, backend_check, cli_anything, completion as com
                        documents, efficiency, local_models,
                        memory, patching, providers, render_check, routing, secret_scan, testing_support,
                        tool_output,
-                       trajectory, web_search, wsl_sandbox, npm_windows)
+                       trajectory, web_search, wsl_sandbox, npm_windows, write_checks)
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -22559,6 +22559,38 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     return reasons
 
 
+_WRITE_CHECK_TOOLS = frozenset(("write_file", "edit_file"))
+
+
+def _write_check_node() -> str | None:
+    """The Node used for `node --check`: Agent8088's own on Windows, else the one on PATH."""
+    if sys.platform == "win32":
+        node, _, _ = _native_sandbox_node_toolchain(require_npm=False)
+        if node:
+            return node
+    return _which_executable("node")
+
+
+def _write_check_note(name: str, args: dict, mutated: bool, trajectory) -> str:
+    """After a write landed: a parse of the file that runs nothing, kept in the ledger, and one line for the result.
+
+    Not for an append (a file written in parts is incomplete until its last part) or a write that did not land."""
+    if name not in _WRITE_CHECK_TOOLS or not mutated or str(args.get("mode") or "").lower() == "append":
+        return ""
+    filename = str(args.get("filename") or "")
+    if not filename or trajectory is None:
+        return ""
+    try:
+        target = resolve_write_path(filename).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return ""
+    if not target.is_file():
+        return ""
+    problem = write_checks.check_file(target, _write_check_node())
+    trajectory.note_write_problem(str(target), problem)
+    return f"\n[check: {target.name}: {problem}. Fix it before going on.]" if problem else ""
+
+
 def _visual_look_step(trajectory, written: list, request: str):
     """Ask once to look at a page or image this run built, when the request is about how it looks and nothing has looked at it."""
     if eval_mode() or not COMPLETION_VISUAL_LOOK or not completion_checks.wants_visual_result(request):
@@ -24369,6 +24401,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 )
                 if name == "check_app":
                     trajectory.settle_check_app(result, path=check_app_path)
+                if isinstance(result, str) and not result.startswith(_IMAGE_MARKER_PREFIX):
+                    result += _write_check_note(name, args, mutated, trajectory)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):

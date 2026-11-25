@@ -2011,6 +2011,17 @@ class TrajectoryState:
     # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
     # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
 
+    def note_write_problem(self, path: str, problem: str) -> None:
+        """What the check after a write found in a file ("" when it is fine now, which clears an earlier problem)."""
+        problems = self.data.setdefault("write_problems", {})
+        if problem:
+            problems[str(path)] = _text(problem)[:200]
+        else:
+            problems.pop(str(path), None)
+
+    def write_problems(self) -> dict:
+        return dict(self.data.get("write_problems") or {})
+
     def _ledger_lines(self) -> list[str]:
         """The checklist as the model reads it: the general steps on one line, then each part of the request with its
         status and, once settled, what settled it, then the next step."""
@@ -2031,6 +2042,10 @@ class TrajectoryState:
             following = self.open_subgoals() or self.recheck_subgoals()
             if following:
                 lines.append(f"Next: {following[0]}")
+        problems = self.write_problems()
+        if problems:
+            lines.append("Problems in written files: " + "; ".join(
+                f"{PurePath(str(p).replace(chr(92), '/')).name} ({msg})" for p, msg in list(problems.items())[:5]))
         return lines
 
     def state_signature(self) -> tuple:
@@ -2038,11 +2053,13 @@ class TrajectoryState:
         steps = tuple((str(step.get("name")), str(step.get("status"))) for step in self.data.get("checklist", []))
         return (steps, bool(self.needs_verification()),
                 tuple(self.untested_paths()) if self.needs_tests() else (),
-                bool(self.needs_replan()), tuple(self.unresolved_tools()))
+                bool(self.needs_replan()), tuple(self.unresolved_tools()),
+                tuple(sorted(self.write_problems().items())))
 
     def has_open_attention(self) -> bool:
         """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
-        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools())
+        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools()
+                    or self.write_problems())
 
     def state_note(self, *, full: bool = False) -> str:
         """The state as one short note. `full` adds the goal and the workspace line, which do not change within a task."""
