@@ -7946,6 +7946,45 @@ def _runs_a_test_runner(command: str) -> bool:
                for part in segments)
 
 
+def _browser_test_target_error(url: str) -> str:
+    """Why browser_test may not open `url`, or "". It reaches only a service this session started and still runs:
+    http on 127.0.0.1 (or localhost) at that service's host port."""
+    parts = urllib.parse.urlsplit(url or "")
+    if not url:
+        return "Error: browser_test needs the url of a running service (service_start gives it)."
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if parts.scheme != "http" or host not in ("127.0.0.1", "localhost") or port is None:
+        return (f"Error: browser_test tests a service this session started, at http://127.0.0.1:<port>/; {url} is "
+                "not one. Start the app with service_start first. For a page from files use check_app, and for a "
+                "site on the internet browse_page.")
+    running = _services().host_ports() if _services_registry is not None else set()
+    if port not in running:
+        return (f"Error: nothing this session started answers on port {port}. Start the app with service_start "
+                "and use the address it gives; service_status lists the running ones.")
+    return ""
+
+
+def _exec_browser_test(args: dict) -> str:
+    """Run the model's steps against one of this session's services (browser_test.py)."""
+    from agent8088 import browser_test
+    try:
+        steps = browser_test.parse_steps(args.get("steps"))
+    except ValueError as exc:
+        return f"Error: {exc}"
+    executable = _playwright_chromium_executable()
+    if not executable:
+        return ("browser test could not run: no Chromium for Playwright is installed here. "
+                "The user can install it with `python -m playwright install chromium`.")
+    shots = (_agent_data_dir() / "screenshots").resolve()
+    report = browser_test.run(str(args.get("url") or ""), steps, executable=executable, screenshot_dir=shots)
+    # What the page shows is data from the app, not instructions.
+    return _wrap_untrusted(report.text(), "browser test")
+
+
 def _evidence_status(name: str, args: dict, result: str, status: str, source: str) -> str:
     """Only a real test runner's output can say a check passed or failed.
 
@@ -7965,6 +8004,20 @@ def _evidence_status(name: str, args: dict, result: str, status: str, source: st
     if status == "failed" and name in ("execute_shell", "run_with_service") and "exit status" in source:
         return status
     return "unknown"
+
+
+def _browser_test_status(name: str, result: str, status: str) -> str:
+    """A browser test the model wrote and ran reports its own verdict, like a test run: passed when every step ran
+    and at least one expectation was met, failed when a step failed. A test with no expect_* step only shows that the
+    steps ran, so it settles nothing."""
+    if name != "browser_test":
+        return status
+    text = _unwrap_untrusted(str(result or "")).strip()
+    if text.startswith("browser test FAILED"):
+        return "failed"
+    if text.startswith("browser test PASSED") and "No expect_* step" not in text.split("\n", 1)[0]:
+        return "passed"
+    return status if status not in ("passed", "failed") else "unknown"
 
 
 def _check_app_status(name: str, result: str, status: str) -> str:
@@ -12790,6 +12843,30 @@ def _service_popen(argv: list, log_path: Path):
         log.close()
 
 
+_IN_CONTAINER_FORWARDER = (
+    "import socket,sys,threading\n"
+    "lp,tp=int(sys.argv[1]),int(sys.argv[2])\n"
+    "srv=socket.create_server(('0.0.0.0',lp))\n"
+    "def pipe(a,b):\n"
+    "  try:\n"
+    "    while True:\n"
+    "      d=a.recv(65536)\n"
+    "      if not d: break\n"
+    "      b.sendall(d)\n"
+    "  except OSError: pass\n"
+    "  finally:\n"
+    "    for s in (a,b):\n"
+    "      try: s.shutdown(socket.SHUT_RDWR)\n"
+    "      except OSError: pass\n"
+    "while True:\n"
+    "  c,_=srv.accept()\n"
+    "  try: u=socket.create_connection(('127.0.0.1',tp),timeout=10)\n"
+    "  except OSError:\n"
+    "    c.close(); continue\n"
+    "  threading.Thread(target=pipe,args=(c,u),daemon=True).start()\n"
+    "  threading.Thread(target=pipe,args=(u,c),daemon=True).start()\n")
+
+
 _RELAY_CODE = r"""
 import socket, sys, threading
 target, port = sys.argv[1], int(sys.argv[2])
@@ -12940,6 +13017,13 @@ def _service_launcher(backend: str, cwd: Path, name: str):
             # Inside the service's own network namespace: the bridge's other end.
             command = (f"export PORT={port} && (socat UNIX-LISTEN:{shlex.quote(str(socket_path))},fork,mode=600 "
                        f"TCP:127.0.0.1:{port} 2>/dev/null &) && {command}")
+        elif backend == "docker":
+            # The relay reaches the container on its network address, but a service told to bind 127.0.0.1 listens
+            # on the container's own loopback. A small forwarder inside the container, from every interface to that
+            # loopback port, makes either bind work; the relay talks to the forwarder.
+            forward_port = services.free_port()
+            command = (f"export PORT={port} && (python3 -c {shlex.quote(_IN_CONTAINER_FORWARDER)} {forward_port} "
+                       f"{port} >/dev/null 2>&1 &) && {command}")
         else:
             command = f"export PORT={port} && {command}"
         spawned = {}
@@ -12994,7 +13078,9 @@ def _service_launcher(backend: str, cwd: Path, name: str):
                     host_port = port
             else:
                 try:
-                    containers.append(_start_docker_relay(spawned["container"], spawned["network"], port, host_port))
+                    containers.append(_start_docker_relay(spawned["container"], spawned["network"], forward_port,
+                                                          host_port))
+                    ready = lambda: services.held_open(host_port)  # the relay listens before the service does
                 except Exception as exc:  # noqa: BLE001
                     note = f"not reachable from this computer: {str(exc)[:160]}"
             note = note or "published on 127.0.0.1 through a relay container"
@@ -15574,6 +15660,13 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
                     f"smaller file or raise max_write_bytes in config.txt.")
     elif mode == "cron":
         command = str(args.get("action") or "list").strip().lower()
+    elif mode == "browser" and name == "browser_test":
+        command = str(args.get("url") or "").strip()
+        blocked = _browser_test_target_error(command)
+        if blocked:
+            _audit("tool_call", tool=name, mode=mode, decision="denied", detail=command[:200],
+                   reason="not_a_session_service")
+            return blocked
     elif mode == "browser":
         command = str(args.get("url") or "").strip()
         if not command:
@@ -15782,6 +15875,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
     if mode == "docker":
         result = _exec_docker(args)
         return result + _sandbox_network_note(result, str(args.get("code") or ""))
+
+    if mode == "browser" and name == "browser_test":
+        return _exec_browser_test(args)
 
     if mode == "browser":
         return _exec_browser(args)
@@ -16319,6 +16415,47 @@ def _runs_changed_program(name: str, args: dict, result: str, trajectory) -> boo
         if stem and re.search(rf"(?<![\w.-]){re.escape(stem)}(?![\w.-])", command):
             return True
     return False
+
+
+_PROGRAM_RUN_RE = re.compile(
+    r"^\s*(?:(?:python3?|py|node|ruby|php|perl|bash|sh)(?:\.exe)?\s+(?:-[\w-]+\s+)*([\w./\\:-]+\.(?:py|js|mjs|cjs|rb|php|pl|sh))"
+    r"|((?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|test|start|compile)|make(?:\s+[\w-]+)?|cargo\s+(?:build|test|run)"
+    r"|go\s+(?:build|test|run)|mvn\s+\S+|gradle\w*\s+\S+|dotnet\s+(?:build|test|run)|cmake\s+--build))\b",
+    re.IGNORECASE)
+
+
+_BUILD_ENTRY_RE = re.compile(
+    r"^(?:build|compile|bundle|make|setup|test|tests|run[_-]?tests|check|ci)(?:[_.-][\w.-]*)?\.(?:py|js|mjs|cjs|sh|rb|pl|php)$",
+    re.IGNORECASE)
+
+
+def _runs_project_program(name: str, args: dict, result: str, trajectory) -> bool:
+    """Whether a shell call ran the project's own build, test or script cleanly after a change.
+
+    In a real run the model fixed a typo in a source file a build reads, ran `python build.py`, which succeeded and
+    wrote its output -- and that output counted as new unchecked work, so the completion check asked twice for
+    evidence the build had just given and the model's answer was lost. A program the project already had (not one
+    this run wrote or changed) that exits cleanly, run after the change, is the check of that change. Only the
+    command's first program counts, and only a run with no error and no failure line."""
+    if name != "execute_shell" or not trajectory.needs_verification():
+        return False
+    text = str(result or "")
+    if text.startswith("Error:") or _EXIT_STATUS_RE.search(text) or re.search(
+            r"Traceback \(most recent call last\)|\b(?:error|failed|failure)\b", _unwrap_untrusted(text),
+            re.IGNORECASE):
+        return False
+    command = str(args.get("command") or "")
+    match = _PROGRAM_RUN_RE.match(command)
+    if not match:
+        return False
+    script = match.group(1)
+    if script:
+        # Only the project's build or test entry point (build.py, compile.sh, run_tests.py, ...): some other script
+        # may have nothing to do with the change, and a changed code file is checked by running it.
+        name_only = Path(script.replace("\\", "/")).name
+        written = {Path(str(p)).name for p in trajectory.written_paths()}
+        return name_only not in written and bool(_BUILD_ENTRY_RE.match(name_only))
+    return True
 
 
 DIAGNOSE_AFTER_FAILURES = 3
@@ -21945,6 +22082,13 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+# The engine's own words when the model gave no answer at all, and the note on a held answer it falls back to.
+# Neither is the model's account of its work, so neither is read for what "the reply" says.
+NO_ANSWER_TEXT = "I wasn't able to produce an answer to that."
+NO_FINAL_REPLY_NOTE = ("(This was the model's last answer. It was sent back for more checks and gave no further "
+                       "answer.)")
+
+
 def _not_verified_reasons(trajectory, reply: str = "") -> list:
     """Clear signs, seen by the run itself, that the work is unfinished or not working. Never the weak ones.
 
@@ -21954,6 +22098,9 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
     if trajectory is None:
         return []
     reasons = []
+    reply = "" if str(reply or "").strip() == NO_ANSWER_TEXT else str(reply or "").replace(NO_FINAL_REPLY_NOTE, "")
+    if not reply.strip() and trajectory.mutation_count():
+        reasons.append("the model gave no final answer")
     if reply and completion_checks.reports_part_not_done(reply):
         reasons.append("the reply says part of the request was not done")
     if reply and completion_checks.reports_failed_check(reply):
@@ -23170,9 +23317,15 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             if not answer:
                 # Stripping removed everything (the message was ONLY a tool-call
                 # attempt or pure reasoning) — never fall back to the raw markup.
+                # The model's own answer that a completion check sent back is the
+                # best account of the work it did; the notes say what was not
+                # settled after it (and a change after it makes it stale).
+                held = (trajectory.use_held_reply()
+                        if trajectory is not None and depth == 0 and not unknown else "")
                 answer = (f"I tried to use a tool that isn't available. "
                           f"Available tools: {', '.join(sorted(round_allowed_tools)) or 'none'}."
-                          if unknown else "I wasn't able to produce an answer to that.")
+                          if unknown else
+                          f"{held}\n\n{NO_FINAL_REPLY_NOTE}" if held else NO_ANSWER_TEXT)
 
             if (tool_failed and not diagnostic_seen
                     and _claims_environment_unavailable(answer)):
@@ -23559,6 +23712,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 # through to "no automated verification passed".
                 status = _evidence_status(name, args, result, verdict.status, verdict.source)
                 status = _check_app_status(name, result, status)
+                status = _browser_test_status(name, result, status)
                 audit_verdict = _take_audit_verdict()
                 if audit_verdict == "passed":
                     status = "passed"
@@ -23571,6 +23725,12 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     # a check; caches were already invalidated as for any run.
                     mutated = False
                     trajectory.note_ran_ok()
+                elif mutated and _runs_project_program(name, args, result, trajectory):
+                    # The project's own build or script ran cleanly after the
+                    # change: what it wrote is its output, and the run is the
+                    # check of the change (exercised, not tested).
+                    mutated = False
+                    trajectory.note_project_program_ran(str(args.get("command") or ""), result)
                 check_app_path = ""
                 if name == "check_app" and args.get("path"):
                     try:
