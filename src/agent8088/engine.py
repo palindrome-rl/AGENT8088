@@ -5629,10 +5629,9 @@ def render_tool_name_index(specs: dict) -> str:
     lines = [
         "",
         "## Tool index",
-        "All of these tools exist. Call a tool only after its schema is loaded and "
-        "permission allows it. When search_tools is available, use it "
-        "to load a family or capability; for one exact known name, call "
-        "describe_tool(tool_name). Then call the loaded tool using its schema.",
+        "All of these tools exist. Call one only once its schema is loaded and permission allows it: "
+        "load a family or capability with search_tools when available, or one known name with "
+        "describe_tool(tool_name), then call it by its schema.",
     ]
     labels = {"cli_anything": "CLI Anything", "general": "General"}
     for head, names in sorted(families.items()):
