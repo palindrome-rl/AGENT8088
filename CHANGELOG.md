@@ -4,6 +4,18 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (play tests and the test seam)
+
+### Improved
+
+- An interactive part of a request (a click, a key, a drag, a game) counts as checked only after a passing
+  `browser_test` since the last change; a unit test or a page load does not show an interaction works. Without one the
+  verdict stays PARTLY VERIFIED and the task-state note names the play test as the next step. Nothing is blocked or
+  reopened.
+- The browser-qa skill teaches a test seam for interactive builds: a read-only `window.__test.state()`, an optional
+  `?seed=N` for randomness and `step(ms)` for timed games, without changing normal play.
+- A part that names a file ("draw the board in game.html") is a file part even without a verb that writes it.
+
 ## v1.3 branch maintenance - 2026-11-26 (four-level verdict)
 
 ### Improved

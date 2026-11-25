@@ -93,7 +93,8 @@ def test_only_a_passing_check_clears_a_recheck(tmp_path):
     state.mark_subgoals([])   # the end-of-run word check alone does not settle stale evidence
     assert state.recheck_subgoals()
     _passing_test(state)
-    assert state.recheck_subgoals() == []
+    # A test run settles the run and test parts; an interactive part waits for a play test (browser_test).
+    assert state.recheck_subgoals() == ["Clicking Add puts a new row in the table"]
     item = next(i for i in state.subgoals() if i["name"].endswith("check it starts"))
     assert item["status"] == "done" and item["done_at"] == state.mutation_count()
     assert "passing check" in item["evidence"]
