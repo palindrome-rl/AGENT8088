@@ -5629,10 +5629,9 @@ def render_tool_name_index(specs: dict) -> str:
     lines = [
         "",
         "## Tool index",
-        "All of these tools exist. Call a tool only after its schema is loaded and "
-        "permission allows it. When search_tools is available, use it "
-        "to load a family or capability; for one exact known name, call "
-        "describe_tool(tool_name). Then call the loaded tool using its schema.",
+        "All of these tools exist. Call one only once its schema is loaded and permission allows it: "
+        "load a family or capability with search_tools when available, or one known name with "
+        "describe_tool(tool_name), then call it by its schema.",
     ]
     labels = {"cli_anything": "CLI Anything", "general": "General"}
     for head, names in sorted(families.items()):
@@ -7182,6 +7181,157 @@ def _exec_process(command, timeout: int = 25, shell: bool = False) -> str:
     return text or "Command completed."
 
 
+# Inside the sandbox, one command: start the server in the background, wait until its port answers, run the check,
+# then stop the server and everything it started. For where a service cannot be reached from this computer (no
+# bridge, no relay, a network the host cannot see), and for a quick "start it and curl it" that needs no service.
+_RUN_WITH_SERVICE_CODE = r"""
+import json, os, socket, subprocess, sys, time
+spec = json.load(open(sys.argv[1], encoding="utf-8"))
+port = spec["port"]
+env = dict(os.environ, PORT=str(port))
+posix = os.name != "nt"
+
+
+def stop(proc):
+    # End proc and everything it started.
+    if posix:
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            time.sleep(0.5)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    else:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+
+
+log = open(spec["log"], "wb")
+server = subprocess.Popen(spec["service"], shell=True, env=env, stdout=log, stderr=subprocess.STDOUT,
+                          stdin=subprocess.DEVNULL, start_new_session=posix)
+started = time.time()
+ready = False
+while time.time() - started < spec["ready"]:
+    if server.poll() is not None:
+        break
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        ready = True
+        break
+    except OSError:
+        time.sleep(0.3)
+waited = time.time() - started
+code = 0
+if ready:
+    print(f"[service started; it answered on port {port} after {waited:.1f} s]", flush=True)
+    # Its own process group, output to a file: a hung check is ended with everything it started (on Windows a
+    # timeout ends only the shell, and a program it started would keep the output pipe, and this run, open).
+    check_log = spec["log"] + ".check"
+    with open(check_log, "wb") as out_file:
+        check = subprocess.Popen(spec["check"], shell=True, env=env, stdout=out_file, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=posix,
+                                 creationflags=0 if posix else subprocess.CREATE_NEW_PROCESS_GROUP)
+        try:
+            code = check.wait(timeout=spec["check_timeout"])
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out, code = True, 124
+            stop(check)
+            try:
+                check.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+    with open(check_log, "rb") as handle:
+        out = handle.read()[-6000:].decode("utf-8", "replace")
+    os.remove(check_log)
+    print(f"[check: timed out after {spec['check_timeout']} s]" if timed_out else f"[check: exit {code}]", flush=True)
+    print(out, flush=True)
+elif server.poll() is not None:
+    print(f"[service exited with status {server.returncode} before it answered on port {port}]", flush=True)
+    code = 3
+else:
+    print(f"[service did not answer on port {port} within {spec['ready']} s]", flush=True)
+    code = 3
+if server.poll() is None:
+    stop(server)
+log.close()
+with open(spec["log"], "rb") as handle:
+    tail = handle.read()[-3000:].decode("utf-8", "replace").strip()
+if tail:
+    print("[service output, last lines]", flush=True)
+    print(tail, flush=True)
+sys.exit(code)
+"""
+RUN_WITH_SERVICE_READY_SECONDS = 45
+RUN_WITH_SERVICE_CHECK_SECONDS = 120
+
+
+def _own_service_url(url: str, tool: str) -> bool:
+    """A loopback URL a shell command may fetch although the SSRF rules refuse loopback: run_with_service's own
+    server (its `{port}`, filled in only when it runs), or a service this session runs (service_start). Anything
+    else on this computer stays refused."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or host not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    if tool == "run_with_service" and parts.netloc.endswith(":{port}"):
+        return True
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port is not None and _services_registry is not None and port in _services().host_ports()
+
+
+def _exec_run_with_service(args: dict) -> str:
+    """run_with_service: the server and its check in one sandboxed command (the wrapper above)."""
+    service = str(args.get("service") or "").strip()
+    check = str(args.get("check") or "").strip()
+    if not service or not check:
+        return "Error: run_with_service needs a service command and a check command."
+    backend = _resolve_sandbox_backend()
+    if backend not in ("native", "docker"):
+        return _sandbox_required_error()
+    from agent8088 import services
+    port = services.free_port()
+    service, check = service.replace("{port}", str(port)), check.replace("{port}", str(port))
+    log_name = f".agent8088-service-{os.getpid()}-{port}.log"
+    # The shell's folder, where the command runs and may write (sandbox temp is a different path per backend).
+    workspace = Path(_shell_workspace_root or ARTIFACTS_ROOT).resolve()
+    try:
+        check_timeout = max(5, min(int(args.get("timeout") or RUN_WITH_SERVICE_CHECK_SECONDS), 280))
+    except (TypeError, ValueError):
+        check_timeout = RUN_WITH_SERVICE_CHECK_SECONDS
+    spec = {"service": service, "check": check, "port": port, "log": log_name,
+            "ready": RUN_WITH_SERVICE_READY_SECONDS, "check_timeout": check_timeout}
+    # The wrapper and its settings go in two files in the shell's folder (a command line that carried them was too
+    # long for cmd.exe), named so nothing the project has is touched, and removed afterwards.
+    stem = f".agent8088-run-with-service-{os.getpid()}-{port}"
+    wrapper, settings = workspace / f"{stem}.py", workspace / f"{stem}.json"
+    created = []
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(_RUN_WITH_SERVICE_CODE, encoding="utf-8")
+        created.append(wrapper)
+        settings.write_text(json.dumps(spec), encoding="utf-8")
+        created.append(settings)
+        python = "python3" if backend == "docker" else f'"{sys.executable}"'
+        command = f"{python} {wrapper.name} {settings.name}"
+        result = _run_sandbox_command(command, RUN_WITH_SERVICE_READY_SECONDS + check_timeout + 30)
+    finally:
+        for path in [*created, workspace / log_name, workspace / f"{log_name}.check"]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    text = str(result)
+    # What the server and the check printed is data, not instructions.
+    return _wrap_untrusted(text, f"run_with_service: {_redact_secrets(check[:120])}")
+
+
 def _exec_shell_command(command: str, timeout: int = 25, image: str = "") -> str:
     return _exec_sandbox_command(command, timeout=timeout, image=image)
 
@@ -7848,7 +7998,9 @@ def _evidence_status(name: str, args: dict, result: str, status: str, source: st
         return status
     if name == "execute_shell" and _runs_a_test_runner(str((args or {}).get("command", ""))):
         return status
-    if status == "failed" and name == "execute_shell" and "exit status" in source:
+    if name == "run_with_service" and _runs_a_test_runner(str((args or {}).get("check", ""))):
+        return status
+    if status == "failed" and name in ("execute_shell", "run_with_service") and "exit status" in source:
         return status
     return "unknown"
 
@@ -15584,6 +15736,8 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             return ("Blocked: shell web clients require an explicit http:// or https:// "
                     "URL so the egress and SSRF policies can verify the destination.")
         for url in web_urls or ():
+            if _own_service_url(url, name):
+                continue
             blocked = _egress_check(url) or _ssrf_check(url)
             if blocked:
                 _audit("tool_call", tool=name, mode=mode, decision="denied",
@@ -16048,6 +16202,9 @@ def _run_tool(name: str, args: dict, allow_plan: bool = True, depth: int = 0) ->
             return str(_safe_calculate(expression))
         except (SyntaxError, TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
             return f"Error: invalid arithmetic expression: {exc}"
+
+    if mode == "shell" and name == "run_with_service":
+        return _exec_run_with_service(args)
 
     if mode == "shell" and name in _SERVICE_TOOLS:
         return _exec_service(name, args)
@@ -18295,8 +18452,13 @@ def _ssrf_check(url: str):
         return "Blocked: malformed URL host."
     if not host:
         return "Blocked: URL has no host."
+    try:
+        port = parts.port
+    except ValueError:
+        # `http://127.0.0.1:{port}/` and other ports that are not a number: refused with a reason, not a crash.
+        return f"Blocked: the URL's port is not a number ({url[:120]})."
     # Explicitly allowlisted internal host (match on host and on host:port).
-    if _ssrf_host_allowlisted(host, parts.port):
+    if _ssrf_host_allowlisted(host, port):
         return None
     try:
         infos = socket.getaddrinfo(host, None)
