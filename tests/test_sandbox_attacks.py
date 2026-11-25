@@ -2,8 +2,9 @@
 
 Each test runs a command through the real backend (srt on macOS and Linux, the Windows ACL runner, Docker) and checks
 the result on the host, not the command's own report. They are opt-in, because they need the backend installed and
-take minutes: set AGENT8088_ATTACK_TESTS=1, and pick backends with AGENT8088_ATTACK_BACKENDS=native,docker (default
-both). CI runs them in the "Sandbox attack tests" job; run them locally on Windows before a release, and after every
+take minutes: set AGENT8088_ATTACK_TESTS=1, and pick backends with AGENT8088_ATTACK_BACKENDS=native,docker,wsl (default
+native,docker). `wsl` runs on Windows in the distro AGENT8088_WSL_DISTRO names (agent8088-sandbox by default), once
+`agent8088 --sandbox-setup` has set it up. CI runs them in the "Sandbox attack tests" job; run them locally on Windows before a release, and after every
 bump of the pinned sandbox runtime or Docker image.
 
 A backend that does not enforce a boundary at all is skipped for that test with the reason (the Windows runner limits
@@ -51,6 +52,14 @@ def _native_available(engine):
     return not engine._native_sandbox_missing_requirements()
 
 
+def _wsl_ready(engine):
+    if sys.platform != "win32" or not hasattr(engine, "_exec_wsl_sandbox"):
+        return False
+    from agent8088 import wsl_sandbox
+    wsl = wsl_sandbox.wsl_executable()
+    return bool(wsl) and wsl_sandbox.is_ready(wsl, engine.WSL_DISTRO, engine.SANDBOX_RUNTIME_VERSION)
+
+
 @pytest.fixture
 def scratch():
     """A scratch folder with ordinary permissions. pytest's tmp_path (like mkdtemp) is made owner-only, and the
@@ -73,6 +82,8 @@ def box(request, engine, scratch, monkeypatch):
         pytest.skip("the native sandbox is not installed here")
     if backend == "docker" and not engine._docker_available():
         pytest.skip("Docker is not running here")
+    if backend == "wsl" and not _wsl_ready(engine):
+        pytest.skip("the WSL sandbox is not set up here")
     home = tmp_path / "home"
     (home / ".ssh").mkdir(parents=True)
     (home / ".ssh" / "id_ed25519").write_text(f"{MARK}-home-key\n", encoding="utf-8")
@@ -85,6 +96,10 @@ def box(request, engine, scratch, monkeypatch):
     monkeypatch.setattr(engine, "SANDBOX_BACKEND", backend)
     monkeypatch.setattr(engine, "_native_sandbox_broken", False)
     monkeypatch.setattr(engine, "_docker_sandbox_broken", False)
+    if backend == "wsl":
+        monkeypatch.setattr(engine, "_wsl_sandbox_installed", lambda: True)
+        monkeypatch.setattr(engine, "_wsl_sandbox_broken", False)
+        monkeypatch.setattr(engine, "_wsl_sandbox_verified", None)
     monkeypatch.setattr(engine, "PROJECT_ROOT", project)
     monkeypatch.setattr(engine, "ARTIFACTS_ROOT", project / "artifacts")
     monkeypatch.setattr(engine, "_shell_workspace_root", project)
@@ -92,8 +107,8 @@ def box(request, engine, scratch, monkeypatch):
     monkeypatch.setattr(engine.Path, "home", classmethod(lambda cls: home))
     monkeypatch.setenv("HOME", str(home))
     windows_native = backend == "native" and sys.platform == "win32"
-    python = "python" if backend == "docker" else f'"{sys.executable}"'
-    if backend == "native":
+    python = "python" if backend == "docker" else "python3" if backend == "wsl" else f'"{sys.executable}"'
+    if backend in ("native", "wsl"):
         # A native sandbox that cannot start falls back to Docker in real use; here that would test the
         # wrong backend, so the native run fails with the reason instead.
         monkeypatch.setattr(engine, "_docker_usable", lambda: False)
@@ -103,9 +118,12 @@ def box(request, engine, scratch, monkeypatch):
         out = str(engine._run_in_sandbox_backend(backend, f"{python} probe.py {parts}", 120, False, "", project))
         if backend == "native" and engine._native_sandbox_broken:
             pytest.fail(f"the native sandbox could not start here: {engine._native_sandbox_failure[:300]}")
+        if backend == "wsl" and engine._wsl_sandbox_broken:
+            pytest.fail(f"the WSL sandbox could not start here: {engine._wsl_sandbox_failure[:300]}")
         return out
     return type("Box", (), {"backend": backend, "home": home, "project": project, "outside": outside,
-                            "run": staticmethod(run), "windows_native": windows_native, "engine": engine})
+                            "run": staticmethod(run), "windows_native": windows_native, "engine": engine,
+                            "python": python})
 
 
 def _host_path_for(box, path: Path) -> str:
@@ -223,7 +241,7 @@ def test_a_service_cannot_be_reached_from_the_network(box):
     from agent8088 import services
     registry = services.Registry(box.project / "services.json", box.project / "logs")
     box.engine._services_registry = registry
-    python = "python" if box.backend == "docker" else f'"{sys.executable}"'
+    python = box.python
     try:
         out = box.engine._exec_service("service_start", {
             "name": "web", "command": f"{python} -m http.server {{port}} --bind 0.0.0.0"})
@@ -250,7 +268,7 @@ def test_a_service_cannot_reach_hosts_off_the_allowlist(box, monkeypatch):
     registry = services.Registry(box.project / "services.json", box.project / "logs")
     box.engine._services_registry = registry
     monkeypatch.setattr(box.engine, "SANDBOX_ALLOWED_DOMAINS", ["pypi.org"])
-    python = "python" if box.backend == "docker" else f'"{sys.executable}"'
+    python = box.python
     try:
         box.engine._exec_service("service_start", {"name": "probe", "command":
                                  f"{python} probe.py url https://example.com/ && {python} -m http.server {{port}}"})
@@ -261,3 +279,53 @@ def test_a_service_cannot_reach_hosts_off_the_allowlist(box, monkeypatch):
         assert "STATUS" not in log, log
     finally:
         registry.stop_all()
+
+
+def test_a_windows_program_cannot_be_started_from_wsl(box):
+    """WSL interop runs a Windows program with the user's full rights, outside every Linux boundary."""
+    if box.backend != "wsl":
+        pytest.skip("WSL interop exists only in the WSL backend")
+    target = box.outside / "interop.txt"
+    windows_target = str(target)
+    for program in ("/mnt/c/Windows/System32/cmd.exe", "/init"):
+        out = str(box.engine._run_in_sandbox_backend(
+            "wsl", f'{program} /c "echo {MARK}> {windows_target}"; echo done', 60, False, "", box.project))
+        assert not target.exists(), out
+        assert MARK not in out, out
+
+
+def test_node_can_start_a_child_with_piped_output_in_wsl(box):
+    """What the Windows runner blocks (spawn EPERM) and every Node build tool needs."""
+    if box.backend != "wsl":
+        pytest.skip("the WSL backend's own promise")
+    code = "require('child_process').execFileSync(process.execPath, ['-e', '0']); console.log('SPAWNED')"
+    out = str(box.engine._run_in_sandbox_backend("wsl", f'node -e "{code}"', 60, False, "", box.project))
+    assert "SPAWNED" in out, out
+
+
+def test_a_timed_out_command_does_not_keep_running_in_wsl(box):
+    if box.backend != "wsl":
+        pytest.skip("the WSL backend's own promise")
+    import time
+    marker = box.project / "artifacts" / "late.txt"
+    out = str(box.engine._run_in_sandbox_backend(
+        "wsl", f"sleep 20; echo late > {marker}", 5, False, "", box.project))
+    time.sleep(25)
+    assert not marker.exists(), out
+
+
+def test_a_stopped_service_leaves_nothing_running_in_wsl(box):
+    if box.backend != "wsl":
+        pytest.skip("the WSL backend's own promise")
+    import subprocess
+    from agent8088 import services, wsl_sandbox
+    registry = services.Registry(box.project / "services.json", box.project / "logs")
+    box.engine._services_registry = registry
+    out = box.engine._exec_service("service_start", {"name": "web", "command": "python3 -m http.server {port}"})
+    assert "answering" in out, out
+    registry.stop_all()
+    wsl = wsl_sandbox.wsl_executable()
+    left = subprocess.run([wsl, "-d", box.engine.WSL_DISTRO, "-u", "root", "--exec", "ps", "-o", "args"],
+                          capture_output=True, timeout=60)
+    text = wsl_sandbox._decode(left.stdout)
+    assert "http.server" not in text and "UNIX-CONNECT" not in text, text

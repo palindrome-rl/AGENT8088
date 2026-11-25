@@ -2773,7 +2773,7 @@ COMMAND_SPECS = (
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
-    ("sandbox", "/sandbox [auto|native|docker|setup]", "Show or configure command isolation", ()),
+    ("sandbox", "/sandbox [auto|native|docker|wsl|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, session and current-task status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
     ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
@@ -2853,8 +2853,8 @@ COMMAND_DETAILS = {
            "<command> [args] [--project] or /mcp add <name> http <url> [--project]; /mcp remove "
            "<name>; /mcp reload reconnects them.",
     "sandbox": "/sandbox shows the sandbox backend, whether it is verified, and its network "
-               "access; /sandbox auto|native|docker picks the backend; /sandbox setup installs "
-               "the native sandbox runtime.",
+               "access; /sandbox auto|native|docker|wsl picks the backend; /sandbox setup installs "
+               "the native sandbox runtime (and, on Windows, Agent8088's own WSL distro).",
     "status": "Shows the model, context use, tools, skills and session state, and the current task: goal, plan steps, changed files, verification level and latest check (read from what was recorded; no model call).",
     "doctor": "/doctor checks the model endpoint, auth and config, tools and skills; /doctor "
               "--fix also repairs a broken web-search install.",
@@ -8180,6 +8180,21 @@ def _remove_agent8088_searxng_container():
     return bool(result.get("ok"))
 
 
+def _remove_agent8088_wsl_distro(home):
+    """Unregister the WSL distro `--sandbox-setup` made, named in the install's wsl-sandbox.json. The distro's name
+    or "" when there was none. Only an Agent8088 sandbox distro is ever removed (wsl_sandbox.remove refuses others)."""
+    import json as json_module
+    from agent8088 import wsl_sandbox
+    try:
+        state = json_module.loads((Path(home) / "wsl-sandbox.json").read_text(encoding="utf-8"))
+        distro = str(state.get("distro") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not distro or wsl_sandbox.remove(distro) is not None:
+        return ""
+    return distro
+
+
 def _windows_owned_path_entries(home):
     """Every Windows user-PATH entry an agent8088 install can add.
 
@@ -8757,6 +8772,11 @@ def _run_windows_uninstall(home, workspace=False):
 
     if _remove_agent8088_searxng_container():
         _say("Removed the SearXNG Docker container.")
+
+    # Before the files go: a registered distro's disk is in use and cannot be deleted.
+    removed_distro = _remove_agent8088_wsl_distro(home)
+    if removed_distro:
+        _say(f"Removed the WSL sandbox distro {removed_distro}.")
 
     if not home.exists():
         _say(f"Install directory not found: {home}")
@@ -10323,7 +10343,7 @@ def main():
         return 0 if configure_model_profile() else 130
     if args.sandbox_setup:
         print(A.install_native_sandbox())
-        return 0 if A.native_sandbox_verified() else 1
+        return 0 if A.native_sandbox_verified() or A.wsl_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
     if args.libreoffice_setup:
