@@ -790,6 +790,37 @@ def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     return [i[:160] for i in items[:MAX_SUBGOALS]]
 
 
+# What a part of a request asks for, for the checklist. Order matters: a part that asks for tests is a test item even
+# when it names the file the tests go in, and one that asks for a click or a key is interactive even when it says run.
+_TEST_ITEM = re.compile(r"\b(?:unit[- ]?tests?|tests?|testing|pytest|jest|vitest|spec)\b", re.IGNORECASE)
+_INTERACTIVE_ITEM = re.compile(
+    r"\b(?:click(?:s|ed|ing)?|press(?:es|ed|ing)?|tap(?:s|ped|ping)?|drag(?:s|ged|ging)?|type(?:s|d)? into|"
+    r"keys?|keyboard|arrow|mouse|button|play(?:s|ed|ing|able)?|player|game)\b", re.IGNORECASE)
+_RUN_ITEM = re.compile(r"\b(?:run(?:s|ning)?|start(?:s|ed|ing)?|serve(?:s|d)?|launch(?:es|ed)?|install(?:s|ed)?|"
+                       r"execute(?:s|d)?|deploy(?:s|ed)?|boot(?:s|ed)?)\b", re.IGNORECASE)
+
+
+def item_kind(item: str) -> str:
+    """test | interactive | file | run | property: what kind of evidence can settle this part of a request.
+
+    file, run, test and interactive parts can be shown by a check (a file present, a command or test run that passed, a
+    played interaction); a property ("keep the layout tidy") only by the work itself."""
+    text = item or ""
+    if _TEST_ITEM.search(text):
+        return "test"
+    if _INTERACTIVE_ITEM.search(text):
+        return "interactive"
+    if named_output_paths(text):
+        return "file"
+    if _RUN_ITEM.search(text):
+        return "run"
+    return "property"
+
+
+# Kinds whose evidence is a run of the work: a later change makes it stale.
+RERUN_KINDS = frozenset(("run", "test", "interactive"))
+
+
 def _stem(word: str) -> str:
     for suffix in ("ing", "ed", "es", "s"):
         if word.endswith(suffix) and len(word) - len(suffix) >= 4:

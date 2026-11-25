@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
-from agent8088.completion import SUBGOAL_PREFIX
+from agent8088.completion import RERUN_KINDS, SUBGOAL_PREFIX, item_kind, named_output_paths
 
 VERSION = 2
 MAX_OPERATIONS = 12
@@ -1216,8 +1216,10 @@ class TrajectoryState:
                 self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
+                self._recheck_after_change()
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
+            self._settle_rechecks()
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
             # A passing test run after the last change verifies it, whether the work was still pending or had only been
@@ -1407,7 +1409,7 @@ class TrajectoryState:
         self.data["subgoals_built"] = True
         checklist = self.data.setdefault("checklist", [])
         for item in items:
-            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending"})
+            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending", "kind": item_kind(item)})
 
     def subgoals_built(self) -> bool:
         return bool(self.data.get("subgoals_built"))
@@ -1417,14 +1419,52 @@ class TrajectoryState:
                 if str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
 
     def open_subgoals(self) -> list[str]:
-        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") != "done"]
+        """Parts not yet addressed. A part whose evidence went stale (recheck) is not open: it was covered, and only a
+        passing check after the change settles it again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") not in ("done", "recheck")]
+
+    def recheck_subgoals(self) -> list[str]:
+        """Parts that were settled by a run of the work before it changed again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") == "recheck"]
 
     def mark_subgoals(self, still_open: list[str]) -> None:
-        """Everything not in `still_open` is done; what is in it stays pending."""
+        """Everything not in `still_open` is done; what is in it stays pending. A part waiting for a recheck keeps
+        waiting: the reply covering its words is not new evidence about the changed work."""
         keep = set(still_open)
         for step in self.subgoals():
             name = step["name"][len(SUBGOAL_PREFIX):]
-            step["status"] = "pending" if name in keep else "done"
+            if name in keep:
+                step["status"] = "pending"
+            elif step.get("status") not in ("done", "recheck"):
+                step["status"] = "done"
+                step["done_at"] = self.mutation_count()
+                step["evidence"] = self._item_evidence(name, step.get("kind", "property"))
+
+    def _item_evidence(self, item: str, kind: str) -> str:
+        """What settled a part, in a few words, from what the controller saw."""
+        if kind == "file":
+            written = {PurePath(str(p).replace("\\", "/")).name.lower() for p in self.data.get("written_paths") or []}
+            present = [PurePath(p).name for p in named_output_paths(item) if PurePath(p).name.lower() in written]
+            if present:
+                return "file present: " + ", ".join(present)
+        if kind in RERUN_KINDS and int(self.data.get("passed_checks") or 0):
+            return "a passing check"
+        return "covered by the work and the reply"
+
+    def _recheck_after_change(self) -> None:
+        """The work changed: a part settled by running the earlier work needs a new run."""
+        now = self.mutation_count()
+        for step in self.subgoals():
+            if (step.get("status") == "done" and step.get("kind") in RERUN_KINDS
+                    and int(step.get("done_at") or 0) < now):
+                step["status"] = "recheck"
+
+    def _settle_rechecks(self) -> None:
+        for step in self.subgoals():
+            if step.get("status") == "recheck":
+                step["status"] = "done"
+                step["done_at"] = self.mutation_count()
+                step["evidence"] = "a passing check after the last change"
 
     def unresolved_tools(self) -> list[str]:
         latest = {}
@@ -1952,9 +1992,7 @@ class TrajectoryState:
             lines.append(f"Goal: {self.data['goal']}")
         if self.data.get("workspace"):
             lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
-        lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
-        ))
+        lines.extend(self._ledger_lines())
         for operation in operations[-6:]:
             line = f"- {operation.get('status', 'unknown')}: {operation.get('tool', 'tool')}"
             if operation.get("verdict") in {"passed", "failed"}:
@@ -1972,6 +2010,28 @@ class TrajectoryState:
     # The same facts as prompt(), for delivery in the conversation instead of the system prompt. A system prompt that
     # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
     # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
+
+    def _ledger_lines(self) -> list[str]:
+        """The checklist as the model reads it: the general steps on one line, then each part of the request with its
+        status and, once settled, what settled it, then the next step."""
+        general = [s for s in self.data.get("checklist", []) if not str(s.get("name", "")).startswith(SUBGOAL_PREFIX)]
+        lines = ["Checklist: " + "; ".join(f"{s.get('name')}: {s.get('status')}" for s in general)]
+        parts = self.subgoals()
+        if parts:
+            lines.append("Parts of the request:")
+            for step in parts:
+                name = str(step["name"])[len(SUBGOAL_PREFIX):]
+                status = {"done": "done", "recheck": "recheck"}.get(str(step.get("status")), "open")
+                line = f"- [{status}] {name}"
+                if status == "done" and step.get("evidence"):
+                    line += f" ({str(step['evidence'])[:80]})"
+                elif status == "recheck":
+                    line += " (settled before the last change: run the check again)"
+                lines.append(line)
+            following = self.open_subgoals() or self.recheck_subgoals()
+            if following:
+                lines.append(f"Next: {following[0]}")
+        return lines
 
     def state_signature(self) -> tuple:
         """What the model should act on. It changes only when one of those things changes, not on every tool call."""
@@ -1996,9 +2056,7 @@ class TrajectoryState:
                 lines.append(f"Goal: {self.data['goal']}")
             if self.data.get("workspace"):
                 lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
-        lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
-        ))
+        lines.extend(self._ledger_lines())
         unresolved = self.unresolved_tools()
         if unresolved:
             lines.append("Unresolved tool work: " + ", ".join(unresolved) + ".")
