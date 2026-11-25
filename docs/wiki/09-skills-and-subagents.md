@@ -20,6 +20,15 @@ multi-step work (a wide search, research, a separate component), never to review
 own work, a child's report is a claim to check against the files, and a spawn refused
 for a limit is not retried.
 
+Every sub-agent ends its answer with one status line (`STATUS: complete`,
+`STATUS: incomplete - <what is left>` or `STATUS: failed - <why>`). A sub-agent the
+model spawned comes back as a labelled report: `[subagent:<type>] status: ... | a
+claim to check against the files, not a fact`, with its text marked as untrusted
+content and any text in it addressed to the parent as an instruction flagged. One
+stopped by its time limit reads `status: incomplete (stopped by its time limit;
+unverified)`, after a list of the files it had written. The harness's own auditor and
+test-writer calls keep their plain form.
+
 `spawn_subagent(agent_type, task)` runs a nested agent with its own
 conversation, its own turn budget, and a **restricted tool set**. The parent
 gets back only the final answer — intermediate steps never enter its context.
