@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-25 (looking at what was built)
+
+### Added
+
+- `screenshot_page` adds a short "Layout notes" line for a page when something is off: the page is larger than the window,
+  text that is hard to read against its background, or text under 10 px. Nothing is said when nothing is off.
+- When a run built a page or image and the request is about how it looks, the final check asks once to render it and look,
+  if nothing in the run has (`completion_visual_look`, on by default). It is last in the order, never blocks, and never marks
+  a run as not completed.
+
 ## v1.3 branch maintenance - 2026-11-20
 
 ### Added
