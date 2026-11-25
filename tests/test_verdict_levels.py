@@ -64,7 +64,7 @@ def test_ran_without_error_but_no_test_is_partly_verified(engine, state, tmp_pat
     state.note_ran_ok()
     state.mark_subgoals([])
     level, why = engine._verdict(state, "Done.")
-    assert level == "PARTLY VERIFIED" and "no test run passed" in why
+    assert level == "PARTLY VERIFIED" and "nothing tested it" in why
 
 
 def test_a_part_settled_before_the_last_change_is_partly_verified(engine, state, tmp_path):

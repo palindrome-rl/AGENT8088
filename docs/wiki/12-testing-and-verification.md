@@ -72,7 +72,7 @@ check passes, so the next attempt changes approach instead of trying another sma
 variation. A failure that changes after the edit counts as progress.
 
 The last three lead the end-of-run notes as one line, for example
-`Verdict: PARTLY VERIFIED (it ran without an error, but no test run passed after
+`Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
 the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
 turns the headline and the verdict line off.
 
