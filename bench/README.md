@@ -191,6 +191,7 @@ in the prompt, so a careful run can find it, and the grader checks only what the
 | `tile-flip-game` | sandbox | 15 min | a puzzle page: grid rules, a start pattern from the address, a move count, restart |
 | `three-in-row-game` | sandbox | 15 min | a two-player game page: turns, win and draw detection, a score kept across reloads |
 | `cart-page` | sandbox | 15 min | a shop page: a cart, a discount code at a threshold, money in cents, state kept across reloads |
+| `canvas-play-fix` | sandbox | 15 min | a canvas game run as a service and played in the browser: keys and a click on a drawn coin misbehave; find why and fix it |
 | `catalog-scrape` | sandbox | 15 min | a stdlib scraper over HTTP that follows next links; graded on a second shop it has not seen |
 | `invoice-totals` | sandbox | 15 min | trap: monthly totals from several exports where one invoice appears twice and some amounts use a comma; graded on exports it has not seen |
 | `discount-rounding` | sandbox | 15 min | trap: stacked discounts rounded half up after each one; the tests that come with it also pass with floats |
