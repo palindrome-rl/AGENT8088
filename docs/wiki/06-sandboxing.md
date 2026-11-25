@@ -141,6 +141,14 @@ answers on its port; `service_status`, `service_logs` and `service_stop` manage 
   next one stops what it left running.
 - `services=0` turns the tools off.
 
+`run_with_service` is the one-command form: it starts the server, waits until its
+port answers (45 s at most), runs one check command (120 s by default, 280 s at
+most), then stops the server and everything it started. The check runs in the
+same sandboxed command as the server, so it reaches the server on every backend,
+including where a service cannot be reached from this computer. A check that
+hangs is ended with everything it started. Its exit status and output count as
+evidence the way a shell command's do: a test runner's result, or a failing exit.
+
 ## Docker fallback
 
 Used automatically under `auto` when native isolation is missing or cannot run.

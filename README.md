@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/65%20built--in%20tools-execution%20grounded-10b981" alt="65 built-in tools">
+  <img src="https://img.shields.io/badge/66%20built--in%20tools-execution%20grounded-10b981" alt="66 built-in tools">
   <img src="https://img.shields.io/badge/verification--gated%20completion-optional%20audit%20%2B%20rollback-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
   <img src="https://img.shields.io/badge/40%20skill%20packages-extensible-6366f1" alt="40 skill packages">

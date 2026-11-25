@@ -52,6 +52,7 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `service_status` | `shell` | | no | List this session's services: address, whether it runs, for how long. |
 | `service_logs` | `shell` | `name`, `lines`* | no | The last lines a service printed. |
 | `service_stop` | `shell` | `name` | no | Stop a service and everything it started. |
+| `run_with_service` | `shell` | `service`, `check`, `timeout`* | no | Start a server, run one check against it once its port answers, and stop it, all in one sandboxed command; `{port}` is filled in in both. Returns the check's output and exit status and the server's last lines. |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |
