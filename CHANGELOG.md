@@ -33,6 +33,14 @@ All notable changes to Agent8088 are recorded here. The format follows
 - `spawn_subagent` says when to delegate (independent multi-step work only, never to review its own work), that a
   child's report is a claim to check, and not to retry a spawn refused for a limit.
 
+## v1.3 branch maintenance - 2026-11-26 (retry with change)
+
+### Improved
+
+- A check that fails the same way again after the model changed files (same command, same failure line, numbers
+  ignored) is called out once per repeat in the tool result and named in the task-state note until a check passes,
+  so the next attempt takes a different approach. A failure that changes after the edit counts as progress.
+
 ## v1.3 branch maintenance - 2026-11-26 (auto QA)
 
 ### Added
