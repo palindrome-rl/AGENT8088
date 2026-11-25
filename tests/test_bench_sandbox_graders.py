@@ -42,7 +42,7 @@ def _all_tasks_have_a_grader_test():
 # Long tasks are covered in test_bench_long_graders.py.
 LONG_TASKS = {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app"}
 # The game, page and scraper tasks are covered in test_bench_web_tasks.py.
-WEB_TASKS = {"tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape"}
+WEB_TASKS = {"tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix"}
 # Tasks whose graders need the task's services running; tested in test_bench_service_tasks.py.
 SERVICE_TASKS = {"price-watch", "expense-erp"}
 

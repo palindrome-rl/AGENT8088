@@ -166,6 +166,24 @@ screenshot of the last state.
   settles nothing.
 - It is a `browser` tool: in `readonly` and plan mode it asks first.
 
+For what a selector cannot reach, such as a canvas game or a drawing board, it
+also has the mouse and the keyboard, and it can look:
+
+- `click_at [x, y]` (relative to an element with `selector`), `hover`, `drag`
+  with `to`, `type`, `press` with `times`, `hold` a key for `ms`, `keydown` and
+  `keyup`, and `viewport [375, 740]` for a phone-sized screen.
+- `inspect` lists the visible buttons, fields, links and canvases with their
+  positions, sizes and a selector for each, to plan a test.
+- `screenshot` captures the window or one element (`grid` draws labelled
+  coordinates). Screenshots and `inspect` captures are attached to the result
+  as images (as many as the conversation keeps, the latest ones), and so is the
+  state a failing test stopped in. They are saved under
+  `artifacts/screenshots/browser-test/`.
+- `expect_js` checks a JavaScript expression in the page (a game's score, a
+  board's turn); `js` reads a value. `expect_changed` and `expect_unchanged`
+  compare an element's pixels with the last screenshot (or the page as first
+  loaded).
+
 On Docker, a service is reached through a relay container and a small forwarder
 inside its own container, so a service that binds `127.0.0.1` works too.
 

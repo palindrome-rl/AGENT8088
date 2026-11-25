@@ -1,0 +1,10 @@
+{
+  "id": "canvas-play-fix",
+  "title": "Play a small canvas game in the browser, find why the keys and the coin misbehave, fix it",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "fixture",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"]
+}
