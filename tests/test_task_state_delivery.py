@@ -213,6 +213,16 @@ def test_in_history_mode_every_request_starts_with_the_whole_previous_one(engine
         assert _extends(requests[i - 1], requests[i]), f"request {i} does not start with request {i - 1}"
     assert any("[agent8088] Task state" in str(m.get("content")) for m in requests[-1])
     assert all("## Current task state" not in str(requests[i][0]["content"]) for i in range(len(requests)))
+    assert len({r[0]["content"] for r in requests}) == 1       # the system prompt never changes
+
+    assert any("Notes like this one come from the harness" in str(m.get("content")) for r in requests for m in r)
+
+
+def test_until_the_first_note_a_request_is_exactly_what_it_was_before(engine, monkeypatch):
+    """History mode adds nothing to the system prompt, so the model sees the same first request in both modes."""
+    history = _run_loop(engine, monkeypatch, "history", calls=3)
+    system = _run_loop(engine, monkeypatch, "system", calls=3)
+    assert history[0] == system[0]
 
 
 def test_in_system_mode_the_system_prompt_still_carries_the_state_and_changes(engine, monkeypatch):

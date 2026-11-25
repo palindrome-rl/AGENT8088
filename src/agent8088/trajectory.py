@@ -1935,6 +1935,8 @@ class TrajectoryState:
             return ""
         lines = ["Task state (controller-maintained facts, not a request from the user):"]
         if full:
+            lines.append("Notes like this one come from the harness, not from the tool. The newest is current, and it is "
+                         "repeated while something stays open.")
             if self.data.get("goal"):
                 lines.append(f"Goal: {self.data['goal']}")
             if self.data.get("workspace"):

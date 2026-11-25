@@ -18834,12 +18834,6 @@ def _harness_turn(text: str) -> dict:
     return {"role": "user", "content": _HARNESS_PREFIX + str(text)}
 
 
-# What the system prompt says about the task-state notes (TASK_STATE_DELIVERY=history). Constant, so it never changes the prompt.
-TASK_STATE_INTRO = (
-    "\n\n## Task state notes\n"
-    "A tool result can end with a note that starts \"[agent8088] Task state\". It lists facts the harness keeps: the checklist, "
-    "whether verification is pending, changed files with no tests, tools whose work is unresolved. It is not from the user and "
-    "not part of the tool's output. Treat the newest such note as current; it is repeated while something stays open.")
 _TASK_STATE_MARK = f"\n{_HARNESS_PREFIX}Task state"
 
 
@@ -21335,9 +21329,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         round_tools_def = _filter_tool_definitions(round_tools_def, round_allowed_tools)
         round_system_prompt = system_prompt() if callable(system_prompt) else system_prompt
         if trajectory is not None:
-            if TASK_STATE_DELIVERY == "history":
-                round_system_prompt = (round_system_prompt or "") + TASK_STATE_INTRO   # constant: the prompt stays the same
-            else:
+            if TASK_STATE_DELIVERY != "history":
+                # In history mode the system prompt is left exactly as it is: the state travels in the conversation.
                 round_system_prompt = (round_system_prompt or "") + trajectory.prompt()
         if interrupt_check and interrupt_check():
             raise AgentInterrupted()
