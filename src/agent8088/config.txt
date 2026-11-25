@@ -72,6 +72,9 @@ max_turns=400
 # These bound ROUNDS. The separate wall-clock/token/cost ceilings bound what
 # those rounds may consume, and raising max_turns does not raise them:
 #   max_turn_seconds            wall clock for one whole turn (0 = off)
+#   headless_max_turn_seconds   the clock a run nobody watches gets when max_turn_seconds
+#                               is not set (--prompt-file, unattended jobs, task containers;
+#                               default 10800 = 3 hours, 0 = off). The REPL keeps no clock.
 #   plan_audit_timeout_seconds  wall clock for ONE auditor sub-run
 #   max_turn_tokens             tokens per turn (0 = off)
 #   max_turn_cost_usd           dollars per turn (0 = off)

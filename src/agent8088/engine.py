@@ -668,6 +668,11 @@ DEFAULT_MAX_TURNS = 400
 # max_turns bounds ROUNDS; these bound resources. A plan or subagent chain can
 # burn unbounded tokens and wall-clock inside a small number of rounds.
 MAX_TURN_SECONDS = _config_int("max_turn_seconds", 0)
+# A run nobody watches (--prompt-file, an unattended job, a task container) gets this clock when max_turn_seconds is
+# not set, so its time checks and answer stretch work; without one, long runs ended at an outer limit with no answer.
+# 0 turns the default off. The interactive REPL keeps no clock. HEADLESS_RUN is set by the CLI for --prompt-file.
+HEADLESS_MAX_TURN_SECONDS = max(0, _config_int("headless_max_turn_seconds", 10800))
+HEADLESS_RUN = False
 # Tool rounds allowed after a finishing nudge or successful verification of
 # changed work, with no state change before the model is told to
 # answer; at this + 2 the best answer so far is returned. A write resets the
@@ -20272,6 +20277,8 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
     if budget is None:
         max_seconds = (MAX_TURN_SECONDS or PLAN_MODE_TIMEOUT_SECONDS
                        if PERMISSION_MODE == "plan-only" else MAX_TURN_SECONDS)
+        if not max_seconds and not kwargs.get("depth") and (HEADLESS_RUN or UNATTENDED or DISPOSABLE_CONTAINER):
+            max_seconds = HEADLESS_MAX_TURN_SECONDS
         budget = _TurnBudget(
             max_seconds=max_seconds, max_tokens=MAX_TURN_TOKENS,
             max_cost=MAX_TURN_COST_USD,
@@ -22938,8 +22945,10 @@ def _budget_answer(reason: str, trajectory) -> str:
                                "more checks.")
     else:
         partial = _last_tool_output[:1000] if _last_tool_output else "(none)"
-        answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer. "
-                               f"Partial result so far:\n{partial}")
+        progress = trajectory.progress_summary() if trajectory is not None else ""
+        answer = _guard_answer(f"{reason}\n\nThe run stopped before the model gave a final answer."
+                               + (f"\n\n{progress}" if progress else "")
+                               + f"\n\nPartial result so far:\n{partial}")
     if trajectory is None:
         return answer
     try:
