@@ -14,6 +14,15 @@ All notable changes to Agent8088 are recorded here. The format follows
   if nothing in the run has (`completion_visual_look`, on by default). It is last in the order, never blocks, and never marks
   a run as not completed.
 
+## v1.3 branch maintenance - 2026-11-25
+
+### Added
+
+- `task_state_delivery=history` (default `system`, unchanged) sends the harness's task state to the model once, when it
+  changes, at the end of the newest tool result, instead of rewriting the end of the system prompt on every turn. The
+  system prompt and all earlier messages then stay exactly as the server saw them, so a server that caches prompts can
+  reuse the whole previous request. `task_state_refresh_turns` and `task_state_max_notes` bound how often it repeats.
+
 ## v1.3 branch maintenance - 2026-11-25 (post-check window)
 
 ### Improved

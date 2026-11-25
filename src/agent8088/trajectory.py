@@ -1968,3 +1968,45 @@ class TrajectoryState:
             lines.append("Changed with no tests yet: " + ", ".join(self.untested_paths())
                          + ". Call generate_tests for each, or say why tests do not apply.")
         return "\n".join(lines)
+
+    # The same facts as prompt(), for delivery in the conversation instead of the system prompt. A system prompt that
+    # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
+    # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
+
+    def state_signature(self) -> tuple:
+        """What the model should act on. It changes only when one of those things changes, not on every tool call."""
+        steps = tuple((str(step.get("name")), str(step.get("status"))) for step in self.data.get("checklist", []))
+        return (steps, bool(self.needs_verification()),
+                tuple(self.untested_paths()) if self.needs_tests() else (),
+                bool(self.needs_replan()), tuple(self.unresolved_tools()))
+
+    def has_open_attention(self) -> bool:
+        """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
+        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools())
+
+    def state_note(self, *, full: bool = False) -> str:
+        """The state as one short note. `full` adds the goal and the workspace line, which do not change within a task."""
+        if not (self.data.get("operations") or []):
+            return ""
+        lines = ["Task state (controller-maintained facts, not a request from the user):"]
+        if full:
+            lines.append("Notes like this one come from the harness, not from the tool. The newest is current, and it is "
+                         "repeated while something stays open.")
+            if self.data.get("goal"):
+                lines.append(f"Goal: {self.data['goal']}")
+            if self.data.get("workspace"):
+                lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
+        lines.append("Checklist: " + "; ".join(
+            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
+        ))
+        unresolved = self.unresolved_tools()
+        if unresolved:
+            lines.append("Unresolved tool work: " + ", ".join(unresolved) + ".")
+        if self.needs_replan():
+            lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
+        if self.needs_verification():
+            lines.append("Verification is pending: do not claim the changed work is verified until you inspect or test it.")
+        if self.needs_tests():
+            lines.append("Changed with no tests yet: " + ", ".join(self.untested_paths())
+                         + ". Call generate_tests for each, or say why tests do not apply.")
+        return "\n".join(lines)
