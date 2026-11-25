@@ -22792,7 +22792,8 @@ def _verdict(trajectory, reply: str = "") -> tuple[str, str]:
     if unplayed:
         missing.append(f"{len(unplayed)} interactive part(s) were not play-tested with browser_test")
     if level == "exercised":
-        missing.append("it ran without an error, but no test run passed after the last change")
+        # Worded apart from the "Verification: exercised" note, which already says no test run passed.
+        missing.append("it ran without an error, but nothing tested it after the last change")
     elif level == "inspected":
         missing.append("the changed files were read back, but nothing was run after the last change")
     elif level in ("unchecked", ""):
