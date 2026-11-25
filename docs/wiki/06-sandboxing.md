@@ -11,9 +11,10 @@ command can't reach your whole filesystem or network.
 
 | Value | Behaviour |
 |---|---|
-| `auto` *(default)* | Native runtime first, Docker if it is missing or fails its one-time probe, otherwise refuse execution |
-| `native` | Force the free OS-level sandbox (if it is installed but fails its probe, Docker is used when available, otherwise execution is refused) |
+| `auto` *(default)* | On Windows, the [WSL sandbox](#wsl-sandbox-windows) once setup has made it; then the native runtime; Docker if that is missing or fails its one-time probe; otherwise refuse execution |
+| `native` | Force the free OS-level sandbox (if it is installed but fails its probe, Docker is used when available, otherwise execution is refused). On Windows this is the ACL runner |
 | `docker` | Force the Docker fallback |
+| `wsl` | Windows: force the WSL sandbox (if it is set up but cannot start, Docker is used when available, otherwise execution is refused) |
 
 Check what's active:
 
@@ -33,7 +34,8 @@ agent8088 --sandbox-setup
 ```
 
 Installs the native sandbox runtime: Anthropic's sandbox runtime on macOS/Linux
-or the DSH Windows ACL runtime on Windows. No Docker daemon or container images
+or the DSH Windows ACL runtime on Windows. On Windows with WSL 2 it also sets up
+the [WSL sandbox](#wsl-sandbox-windows). No Docker daemon or container images
 are needed.
 
 **Prerequisites:**
@@ -68,8 +70,8 @@ says so.
 `sandbox_allowed_domains`, and a sandboxed command sees the host's process list.
 `/sandbox`, `/doctor` and the start-up notice say so ("network policy not
 enforced on this backend (write restriction only)"), and `/doctor` warns when
-`sandbox_allowed_domains` is set there. For network isolation on Windows use
-`sandbox_backend=docker`. Stopping processes by name is refused in every mode
+`sandbox_allowed_domains` is set there. For network isolation on Windows use the
+[WSL sandbox](#wsl-sandbox-windows) or `sandbox_backend=docker`. Stopping processes by name is refused in every mode
 for the same reason (see [permissions](03-permissions-and-security.md)).
 
 **The Windows native backend also blocks child processes with piped output.**
@@ -86,8 +88,10 @@ start-up notice show "sandbox child processes: limited", and a `spawn EPERM`
 result tells the model the real cause. macOS and Linux use different
 sandboxes and are not affected.
 
-To build projects that need these tools on Windows, run commands in Docker
-(needs Docker Desktop and an image that has both Python and Node):
+To build projects that need these tools on Windows, use the
+[WSL sandbox](#wsl-sandbox-windows) (`agent8088 --sandbox-setup` sets it up when
+WSL 2 is installed), or run commands in Docker (needs Docker Desktop and an image
+that has both Python and Node):
 
 ```ini
 sandbox_backend=docker
@@ -186,6 +190,66 @@ also has the mouse and the keyboard, and it can look:
 
 On Docker, a service is reached through a relay container and a small forwarder
 inside its own container, so a service that binds `127.0.0.1` works too.
+
+## WSL sandbox (Windows)
+
+On Windows with WSL 2, `agent8088 --sandbox-setup` also imports a small WSL
+distro of Agent8088's own, `agent8088-sandbox`, and from then on `auto` runs
+commands there under the same sandbox runtime as on Linux. That removes the
+Windows runner's limits: the network allowlist is enforced, a command cannot see
+the host's processes, and Node build tools (Vite, esbuild, Vitest, npm install
+scripts) can start their child processes. Dev servers run as
+[services](#services) and are reached on `127.0.0.1` as before.
+
+- **What setup does.** It downloads the Alpine Linux root filesystem (about 4 MB,
+  checked against a pinned SHA-256), imports it with `wsl --import` (no admin
+  rights), and installs bash, Node, npm, Python 3, pip, git, bubblewrap, socat,
+  ripgrep and the sandbox runtime: about 60 MB downloaded and 190 MB on disk,
+  in `<data folder>/wsl/agent8088-sandbox`. It takes under a minute on a fast
+  connection. Running setup again brings the distro up to date. Your own WSL
+  distros are never used or changed.
+- **The distro is for the sandbox only.** WSL interop is off in it, so a Linux
+  command cannot start a Windows program (`cmd.exe`, `powershell.exe`) the way it
+  can in an ordinary distro, and Windows' `PATH` is not added. Commands run as an
+  unprivileged user, `agent`. No Windows environment variable reaches a command
+  (WSL passes only the ones listed in `WSLENV`, which Agent8088 sets to its own),
+  so a token set in your shell never gets in.
+- **Paths.** Your drives are under `/mnt` (`E:\project` is `/mnt/e/project`).
+  Windows paths in a command are rewritten to those, and a `/mnt/...` path the
+  shell prints is accepted by the file tools. Folders on a network share
+  (`\\server\share`) cannot be reached from the sandbox.
+- **Files.** Commands may write the shell's folder (the project, or `artifacts/`),
+  the sandbox temp folder and the package caches; `.git` stays read-only. Your
+  home folder's credential files and the project's secret files are hidden, as on
+  Linux. WSL's interop and display sockets (`/run/WSL`, `/mnt/wslg`) are hidden too.
+- **Python and Node** are the distro's Linux builds: `python` and `python3` both
+  work, and `pip install` installs for the sandbox's own user. A virtual environment
+  made in the project is a Linux one.
+- **npm projects work on both systems.** After an `npm install` (or `ci`, `add`,
+  `update`) in the sandbox, Agent8088 installs the project once more for Windows, in a
+  temporary folder, in the same sandbox and with no install scripts, and from it adds
+  the Windows builds of packages that ship native code per platform (esbuild, and
+  rollup for Vite, swc, lightningcss, sharp), puts back the files an install script
+  replaced with a Linux binary, and writes Windows `.cmd` and `.ps1` shims in
+  `node_modules/.bin`. So `npm run build` works in the sandbox and on Windows from
+  the same `node_modules`. A package that compiles native code while it installs
+  (node-gyp, a `binding.gyp`) has no Windows build to add: the result names it, and
+  `npm install` on Windows is needed before the project runs there. yarn and pnpm
+  installs are not adjusted.
+- **Speed.** A command takes about a second longer to start than with the Windows
+  runner, and the first one after Windows starts takes a few seconds while WSL
+  starts. Work under `/mnt` goes through WSL's file share, so a large
+  `npm install` is slower than on Linux.
+- **Windows-only tools** (.NET, MSBuild, PowerShell scripts) cannot run there. For
+  those, `/sandbox native` switches back to the Windows runner.
+- **Off and removal.** `sandbox_wsl=0` (or `AGENT8088_SANDBOX_WSL=0` for the
+  installer) skips it; `/sandbox native` or `/sandbox docker` stops using it
+  without removing it. `agent8088 --uninstall` unregisters the distro.
+- **When it cannot start** (WSL turned off, the distro removed), the next backend
+  in line takes over for the session, and `/sandbox` says why.
+
+`wsl_distro` names another distro set up the same way; the tests use one called
+`agent8088-sandbox-test` so the real one is never touched.
 
 ## Docker fallback
 
@@ -343,6 +407,12 @@ host. They are opt-in:
 AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
 AGENT8088_ATTACK_BACKENDS=docker AGENT8088_ATTACK_TESTS=1 python -m pytest -q -rs tests/test_sandbox_attacks.py
 ```
+
+On Windows, `AGENT8088_ATTACK_BACKENDS=wsl` runs them in the WSL sandbox too, with
+four more that only it promises: a Windows program cannot be started from it, Node
+can start a child with piped output, a timed-out command stops inside the distro,
+and a stopped service leaves nothing running. They use the distro
+`AGENT8088_WSL_DISTRO` names (default `agent8088-sandbox`), set up beforehand.
 
 A test the backend cannot enforce is skipped with the reason (the Windows runner
 limits writes only), so a skip is the documented gap, not a pass. CI runs them on
