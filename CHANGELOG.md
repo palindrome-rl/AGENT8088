@@ -4,6 +4,14 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (retry with change)
+
+### Improved
+
+- A check that fails the same way again after the model changed files (same command, same failure line, numbers
+  ignored) is called out once per repeat in the tool result and named in the task-state note until a check passes,
+  so the next attempt takes a different approach. A failure that changes after the edit counts as progress.
+
 ## v1.3 branch maintenance - 2026-11-26 (auto QA)
 
 ### Added
