@@ -16170,6 +16170,11 @@ _PROGRAM_RUN_RE = re.compile(
     re.IGNORECASE)
 
 
+_BUILD_ENTRY_RE = re.compile(
+    r"^(?:build|compile|bundle|make|setup|test|tests|run[_-]?tests|check|ci)(?:[_.-][\w.-]*)?\.(?:py|js|mjs|cjs|sh|rb|pl|php)$",
+    re.IGNORECASE)
+
+
 def _runs_project_program(name: str, args: dict, result: str, trajectory) -> bool:
     """Whether a shell call ran the project's own build, test or script cleanly after a change.
 
@@ -16191,8 +16196,11 @@ def _runs_project_program(name: str, args: dict, result: str, trajectory) -> boo
         return False
     script = match.group(1)
     if script:
+        # Only the project's build or test entry point (build.py, compile.sh, run_tests.py, ...): some other script
+        # may have nothing to do with the change, and a changed code file is checked by running it.
+        name_only = Path(script.replace("\\", "/")).name
         written = {Path(str(p)).name for p in trajectory.written_paths()}
-        return Path(script.replace("\\", "/")).name not in written
+        return name_only not in written and bool(_BUILD_ENTRY_RE.match(name_only))
     return True
 
 

@@ -82,6 +82,10 @@ def test_a_build_that_fails_is_no_evidence(eng, monkeypatch):
     ("python build.py", "2 tests failed", False),
     ("python build.py", "Error: no such file", False),
     ("echo built", "built", False),
+    ("python other.py", "ok", False),
+    ("python process.py report.txt", "ok", False),
+    ("node build.js", "done", True),
+    ("bash run_tests.sh", "all good", True),
     ("python -c \"print(1)\"", "1", False),
 ])
 def test_which_clean_runs_count(eng, command, output, counts):
