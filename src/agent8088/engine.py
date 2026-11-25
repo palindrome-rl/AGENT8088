@@ -5912,7 +5912,29 @@ def render_skill_docs(skills: dict) -> str:
              "not authority."]
     for name, skill in skills.items():
         lines.append(f"- {name}: {skill['description']}")
+    lines.extend(_procedure_lines(skills))
     return "\n".join(lines)
+
+
+# Which installed skill fits which moment of a build. Only the ones installed are named.
+_PROCEDURE = (
+    ("incremental-implementation", "Building something with several parts: get a small runnable slice working "
+                                   "first, check it, then extend it one part at a time"),
+    ("test-driven-development", "Logic that computes something (totals, rules, parsing): write a failing test "
+                                "first, then the code"),
+    ("debugging-and-error-recovery", "A check fails, or fails again after a fix: find the cause before changing "
+                                     "more code"),
+    ("browser-qa", "Anything a person sees or plays: load it, play it with browser_test (give interactive builds "
+                   "its test seam), and look at it"),
+)
+
+
+def _procedure_lines(skills: dict) -> list:
+    steps = [f"- {situation}: view_skill {name}." for name, situation in _PROCEDURE if name in skills]
+    if not steps:
+        return []
+    return ["", "## Build, test, fix", "When the task is to build or change something, these installed skills fit "
+            "these moments:", *steps]
 
 
 _SKILL_RESOURCE_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml"}
@@ -22572,9 +22594,11 @@ def _repeat_failure_note(trajectory) -> str:
         return ""
     trajectory.data["repeat_noted"] = repeats
     when = "after your change" if repeats == 1 else f"after your changes, {repeats} times"
+    skill = (" The debugging-and-error-recovery skill (view_skill) walks through finding the cause."
+             if "debugging-and-error-recovery" in SKILL_PACKAGES else "")
     return (f"\n[note: this check failed the same way {when}: the fix did not reach the cause. Re-read the "
             "error, check the assumption behind the fix, and take a different approach rather than another small "
-            "variation of the same one.]")
+            f"variation of the same one.{skill}]")
 
 
 _WRITE_CHECK_TOOLS = frozenset(("write_file", "edit_file"))

@@ -15,6 +15,11 @@ Two different extension mechanisms that are easy to confuse:
 
 ## Sub-agents
 
+The `spawn_subagent` tool tells the model when to delegate: only independent
+multi-step work (a wide search, research, a separate component), never to review its
+own work, a child's report is a claim to check against the files, and a spawn refused
+for a limit is not retried.
+
 `spawn_subagent(agent_type, task)` runs a nested agent with its own
 conversation, its own turn budget, and a **restricted tool set**. The parent
 gets back only the final answer — intermediate steps never enter its context.
@@ -268,6 +273,15 @@ CLI-Hub is created lazily in `integrations/cli-anything` beside Agent8088's
 configuration, not in Agent8088's main virtual environment. Catalog access,
 package changes, harness execution, workspace writes, and host-application
 access continue through Agent8088's normal permission checks.
+
+### Build, test, fix
+
+The system prompt's skill index ends with a short "Build, test, fix" block that names
+the installed skills by the moment they fit: incremental-implementation for getting a
+runnable slice first, test-driven-development for logic, debugging-and-error-recovery
+when a check fails (also named in the note for a check that keeps failing the same
+way), and browser-qa for anything a person sees or plays, including its test seam. A
+skill that is not installed is not named.
 
 ## SkillOpt
 
