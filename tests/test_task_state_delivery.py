@@ -121,6 +121,16 @@ def test_a_note_is_added_again_after_compaction_dropped_the_notes(engine):
     assert "Goal: Fix it" in messages[-1]["content"]      # restated in full
 
 
+def test_a_new_request_in_the_same_conversation_starts_with_a_full_note(engine):
+    state = _state(("write_file", "done"))
+    notes, messages = _history(engine, state)
+    notes.deliver(messages, state)
+    messages += [{"role": "assistant", "content": "done"}, {"role": "user", "content": "now something else"},
+                 {"role": "assistant", "content": "x"}, _tool_result("new work")]
+    assert notes.deliver(messages, state)
+    assert "Goal: Fix it" in messages[-1]["content"]
+
+
 def test_a_message_the_person_wrote_is_never_changed(engine):
     state = _state(("write_file", "done"))
     notes = engine._TaskStateNotes()

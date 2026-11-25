@@ -18860,8 +18860,17 @@ class _TaskStateNotes:
 
     @staticmethod
     def _present(messages) -> bool:
-        return any(m.get("role") != "system" and isinstance(m.get("content"), str) and _TASK_STATE_MARK in m["content"]
-                   for m in messages)
+        """A note is in the conversation since the person's latest message. An earlier request's notes do not count: the
+        new request starts with a full note again."""
+        for message in reversed(messages):
+            if message.get("role") == "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and _TASK_STATE_MARK in content:
+                return True
+            if message.get("role") == "user" and not _message_text(message).startswith(_LOOP_PREFIXES):
+                return False
+        return False
 
     def deliver(self, messages: list, trajectory) -> bool:
         """Add the note to the last message when it is due. Returns whether one was added."""
