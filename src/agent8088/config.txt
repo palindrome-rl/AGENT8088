@@ -269,7 +269,31 @@ browser_headless=1
 # If neither is available, shell and code execution are refused.
 sandbox_backend=auto
 sandbox_runtime_version=0.0.73
-# sandbox_allowed_domains=api.example.com
+# Where sandboxed shell commands run and may write. `project` (the default) is the
+# project folder, so a build can write next to its sources; the repository's .git
+# stays read-only to them. When the project folder is the home folder, a folder
+# above it or a drive root, commands use artifacts/ instead. `artifacts` always
+# starts them in artifacts/, the project folder only after a file you named there
+# was written.
+# shell_workspace=project
+# Services: service_start runs a long-lived process the task needs (a dev server,
+# an API) in the sandbox and keeps it running, reachable from this computer on
+# 127.0.0.1 (on Docker and Linux only there; on Windows native and macOS a service
+# that binds 0.0.0.0 is reachable from the network). 0 turns the tools off.
+# services=1
+# Variables that look like secrets (names with TOKEN, SECRET, PASSWORD, API_KEY,
+# CREDENTIALS, ...) are removed from the environment of sandboxed commands, so
+# code the model runs cannot read a token set in your shell. Name any a task
+# really needs inside the sandbox here.
+# sandbox_pass_env=GITHUB_TOKEN
+# Hosts sandboxed commands may reach. With no line here they get `default`: the
+# common package registries and code hosts (PyPI, npm, GitHub, crates.io, ...), so
+# installs and clones work. Add your own after it, or set `none` to close the network.
+# sandbox_allowed_domains=default,api.example.com
+# When a command is refused a host, the model is told which one. In an interactive
+# session you are also asked once whether to allow it for the session; set 0 to
+# never ask.
+# sandbox_ask_hosts=1
 # `open` lets sandboxed commands reach anything this computer can: the internet,
 # its own services (mail, databases, dev servers on localhost) and the local
 # network. File-write limits still apply. In auto mode, Linux/macOS commands
@@ -278,9 +302,18 @@ sandbox_runtime_version=0.0.73
 # Off by default: a command steered by a malicious page or email could send
 # project files anywhere.
 # sandbox_network=open
-# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running,
-# for the sandbox fallback or the managed SearXNG. 0 turns this off.
-# docker_autostart=1
+# Launch Docker Desktop (Windows/macOS) when Docker is needed but not running.
+# For the sandbox fallback it is off unless this is 1; for the managed SearXNG you
+# set up with /search setup it is on unless this is 0.
+# docker_autostart=
+# The Docker fallback runs commands in Agent8088's sandbox image (Python, Node,
+# git), or python:3.11-slim when that cannot be pulled. Set an image to use it
+# instead. With no docker_network line, Docker used in place of a missing native
+# sandbox reaches only sandbox_allowed_domains (the registry preset by default),
+# through a proxy that also refuses this computer, the local network and cloud
+# metadata addresses; sandbox_backend=docker on its own keeps docker_network=none.
+# docker_image=ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0
+# docker_network=allowlist
 # Seconds allowed for pulling a missing container image. This is deliberately
 # separate from a tool's own timeout: the read-only git tools allow 20s, and a
 # first-run image pull inside that budget fails as an unexplained timeout.

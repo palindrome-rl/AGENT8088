@@ -48,6 +48,12 @@ names return HTTP 404. Describing a tool does not grant permission to execute it
 | `generate_tests` | `autotest` | `filename`, `focus`* | prompt | Write and run tests for a source file via a sub-agent that may not change the code under test; the file is hashed and restored if it was. |
 | `run_tests` | `shell` | `path`* | depends | Detect the project's test framework and run it. Prefer over `execute_shell`. |
 | `execute_shell` | `shell` | `command` | safe list only | Run a shell command; shipped timeout 60 seconds. Override with `tool_timeout.execute_shell` or a per-call `timeout`, bounded by `max_tool_timeout_seconds`. |
+| `service_start` | `shell` | `name`, `command`, `port`* | no | Start a long-running process (a dev server, an API) in the sandbox and keep it running; `{port}` becomes a free port. Returns its `http://127.0.0.1:<port>/` address once it answers. See [Sandboxing](06-sandboxing.md#services). |
+| `service_status` | `shell` | | no | List this session's services: address, whether it runs, for how long. |
+| `service_logs` | `shell` | `name`, `lines`* | no | The last lines a service printed. |
+| `service_stop` | `shell` | `name` | no | Stop a service and everything it started. |
+| `run_with_service` | `shell` | `service`, `check`, `timeout`* | no | Start a server, run one check against it once its port answers, and stop it, all in one sandboxed command; `{port}` is filled in in both. Returns the check's output and exit status and the server's last lines. |
+| `browser_test` | `browser` | `url`, `steps` | no | Run scripted steps (goto, click, fill, press, select, check, wait_for, reload, wait), mouse and key steps for canvases and games (click_at, hover, drag, type, hold, keydown, keyup, viewport), `inspect` and `screenshot` (attached to the result as images), and checks (expect_text, expect_no_text, expect_visible, expect_hidden, expect_count, expect_url, expect_js, expect_changed, expect_unchanged) in headless Chromium against a running service of this session. Stops at the first failing step. See [Sandboxing](06-sandboxing.md#testing-a-service-in-a-browser). |
 | `calculate` | `python_eval` | `expression` | ✅ | Evaluate a maths expression. |
 | `last_output` | `last_output` | `ref`*, `offset`*, `length`* | ✅ | Re-read the previous tool's output without re-running it; pass a truncation `ref` to read the elided part. |
 | `memory_forget` | `memory` | `query` | prompt | Delete one specific memory, but only when exactly one clearly matches; several matches are listed back instead. |

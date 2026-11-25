@@ -3237,7 +3237,7 @@ function Install-Native-Sandbox {
         if ($detail) { Write-Warn "Native sandbox details: $detail" }
         Write-StageWarning -Result $result -TimeoutSec $TSandboxSetup `
             -What "Native sandbox setup" `
-            -Consequence "Docker will be used for sandboxing if available" `
+            -Consequence "Docker will be used for sandboxing when Docker Desktop is running" `
             -Fix "agent8088 --sandbox-setup"
     }
 }
@@ -3550,7 +3550,8 @@ function Verify-Install {
     if ($script:SandboxInstalled) {
         Write-Host "  Sandbox:  native runtime installed"
     } else {
-        Write-Host "  Sandbox:  Docker is used when available"
+        Write-Host "  Sandbox:  Docker is used when Docker Desktop is running"
+        Write-Host "            (package registries only; Agent8088 does not start Docker Desktop itself)"
         Write-Host "            Native setup did not finish; retry (no admin needed):"
         Write-Host "            agent8088 --sandbox-setup"
     }

@@ -49,7 +49,7 @@ def test_autostart_can_be_turned_off(engine, desktop, monkeypatch):
 @pytest.fixture
 def searxng(engine, monkeypatch):
     calls = []
-    monkeypatch.setattr(engine, "_start_docker_desktop", lambda: True)
+    monkeypatch.setattr(engine, "_start_docker_desktop", lambda **kwargs: True)
     monkeypatch.setattr(searxng_provision, "status", lambda: {"running": False})
     monkeypatch.setattr(searxng_provision, "resume", lambda: calls.append("resume") or True)
     monkeypatch.setitem(engine.APP_CONFIG, "web_search_provider", "ddgs")
