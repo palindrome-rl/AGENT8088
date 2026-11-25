@@ -16,7 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 TASKS = ROOT / "bench" / "tasks"
 REFS = Path(__file__).resolve().parent / "bench_references"
-WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape")
+WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix")
 
 
 def _browser_env():
@@ -79,10 +79,38 @@ def test_an_empty_workspace_fails(task, tmp_path):
     assert report.get("passed") is not True
 
 
-@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page"])
+@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page", "canvas-play-fix"])
 def test_the_reference_page_passes(task, tmp_path, browser):
     report = _grade(task, _with_reference(task, tmp_path), tmp_path)
     assert report["passed"], report
+
+
+# ----------------------------------------------------------------- canvas-play-fix
+
+def test_canvas_play_fails_the_game_as_given(tmp_path, browser):
+    report = _grade("canvas-play-fix", _workspace("canvas-play-fix", tmp_path), tmp_path)
+    assert not report["passed"]
+    assert not report["checks"]["ArrowLeft moves the paddle left"]
+    assert not report["checks"]["a click on the coin scores"]
+
+
+@pytest.mark.parametrize("edit, check", [
+    (lambda s: s.replace("Math.max(0, game.paddle - 20)", "game.paddle - 20"), "the paddle stops at the left edge"),
+    # Offset only by the box, not the border: a click lands 2 px off, still on the coin; scaled clicks are not.
+    (lambda s: s.replace("(event.clientX - rect.left - board.clientLeft) * board.width / board.clientWidth",
+                         "event.clientX"), "a click on the coin scores"),
+    (lambda s: s.replace("game.coin += 1;", ""), "the coin moves after a score"),
+])
+def test_canvas_play_fails_a_partial_fix(tmp_path, browser, edit, check):
+    report = _grade("canvas-play-fix", _with_reference("canvas-play-fix", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"][check], report
+
+
+def test_canvas_play_fails_a_changed_server(tmp_path, browser):
+    workspace = _with_reference("canvas-play-fix", tmp_path)
+    (workspace / "server.py").write_text("print('no')\n", encoding="utf-8")
+    report = _grade("canvas-play-fix", workspace, tmp_path)
+    assert not report["passed"] and not report["checks"]["server.py unchanged"]
 
 
 # ----------------------------------------------------------------- tile-flip-game
