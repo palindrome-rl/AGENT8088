@@ -22563,6 +22563,20 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
     return reasons
 
 
+def _repeat_failure_note(trajectory) -> str:
+    """One line, once per repeat, when the latest check failed the same way after the model's change."""
+    if trajectory is None:
+        return ""
+    repeats = trajectory.repeated_failure()
+    if not repeats or trajectory.data.get("repeat_noted") == repeats:
+        return ""
+    trajectory.data["repeat_noted"] = repeats
+    when = "after your change" if repeats == 1 else f"after your changes, {repeats} times"
+    return (f"\n[note: this check failed the same way {when}: the fix did not reach the cause. Re-read the "
+            "error, check the assumption behind the fix, and take a different approach rather than another small "
+            "variation of the same one.]")
+
+
 _WRITE_CHECK_TOOLS = frozenset(("write_file", "edit_file"))
 
 
@@ -24507,6 +24521,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                     trajectory.settle_check_app(result, path=check_app_path)
                 if isinstance(result, str) and not result.startswith(_IMAGE_MARKER_PREFIX):
                     result += _write_check_note(name, args, mutated, trajectory)
+                    result += _repeat_failure_note(trajectory)
                 if on_trajectory_state:
                     on_trajectory_state()
             if isinstance(result, str) and result.startswith(_IMAGE_MARKER_PREFIX):

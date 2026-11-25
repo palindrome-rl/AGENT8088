@@ -992,6 +992,11 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
     }
 
 
+# The line that names what failed (a failing test, an exception, an assertion), not the summary or the exit status.
+_FAILURE_LINE = re.compile(r"\bFAILED\b|\bERROR\b|\w*(?:Error|Exception)\b|\bassert(?:ion)?\b|\bpanicked\b|\berror(?:\[|:)",
+                           re.IGNORECASE)
+
+
 class TrajectoryState:
     """Mutates one JSON-serializable session dictionary in place.
 
@@ -1177,6 +1182,7 @@ class TrajectoryState:
             self.data["failing_what"] = _text(display(_command_core(command) or operation["tool"]))[:100]
             self.data["failing_error"] = _error_line(display(result))
             self.data["failing_command"] = " ".join(command.split())
+            self._note_failure_repeat(command, display(result))
             # The written files this run started: a clean run of any of them later settles the failure.
             self.data["failing_files"] = ([] if _is_check_run(command) else
                                          [PurePath(str(f)).name for f in written_now or []
@@ -2031,6 +2037,28 @@ class TrajectoryState:
     # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
     # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
 
+    def _note_failure_repeat(self, command: str, result: str) -> None:
+        """Count a failing check that fails the same way (same command, same failure line, numbers ignored) after the
+        work changed since its last failure: a fix that missed the cause."""
+        lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
+        named = next((line for line in lines if _FAILURE_LINE.search(line)), "")
+        error = re.sub(r"\d+(?:\.\d+)?", "N", named or str(self.data.get("failing_error") or ""))[:160]
+        key = f"{' '.join(_command_core(command).split())[:120]} || {error}"
+        history = self.data.setdefault("failure_history", {})
+        entry = history.pop(key, None)
+        if entry is None:
+            entry = {"repeats": 0, "at": self.mutation_count()}
+        elif self.mutation_count() > int(entry.get("at") or 0):
+            entry = {"repeats": int(entry.get("repeats") or 0) + 1, "at": self.mutation_count()}
+        history[key] = entry
+        while len(history) > 10:
+            history.pop(next(iter(history)))
+        self.data["same_failure_repeats"] = entry["repeats"]
+
+    def repeated_failure(self) -> int:
+        """How many times the latest failing check came back the same way after a change (0 when it is not failing)."""
+        return int(self.data.get("same_failure_repeats") or 0) if self.check_failing() else 0
+
     def note_write_problem(self, path: str, problem: str) -> None:
         """What the check after a write found in a file ("" when it is fine now, which clears an earlier problem)."""
         problems = self.data.setdefault("write_problems", {})
@@ -2065,6 +2093,11 @@ class TrajectoryState:
             elif unplayed := self.unplayed_interactive():
                 lines.append(f'Next: play-test "{unplayed[0]}" with browser_test (inspect, act, then expect_js or '
                              "expect_changed)")
+        repeats = self.repeated_failure()
+        if repeats:
+            lines.append(f"The latest check failed the same way after {repeats} change(s): "
+                         f"{str(self.data.get('failing_what') or 'the check')[:80]}. The fixes so far missed the cause; "
+                         "take a different approach.")
         problems = self.write_problems()
         if problems:
             lines.append("Problems in written files: " + "; ".join(
@@ -2077,7 +2110,7 @@ class TrajectoryState:
         return (steps, bool(self.needs_verification()),
                 tuple(self.untested_paths()) if self.needs_tests() else (),
                 bool(self.needs_replan()), tuple(self.unresolved_tools()),
-                tuple(sorted(self.write_problems().items())))
+                tuple(sorted(self.write_problems().items())), self.repeated_failure())
 
     def has_open_attention(self) -> bool:
         """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
