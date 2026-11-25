@@ -24,6 +24,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 - `spawn_subagent` says when to delegate (independent multi-step work only, never to review its own work), that a
   child's report is a claim to check, and not to retry a spawn refused for a limit.
 
+## v1.3 branch maintenance - 2026-11-26 (auto QA)
+
+### Added
+
+- Auto QA: when changed work has no passing test since the change and a test suite sits above the changed files, the
+  end-of-run check runs it in the sandbox (`auto_qa_seconds`, default 120, once per state of the work) instead of only
+  asking the model to. A pass marks the change tested with no turn spent; a failure sends the model back with the
+  command and the end of the output. `auto_qa=0` turns it off.
+
 ## v1.3 branch maintenance - 2026-11-26 (play tests and the test seam)
 
 ### Improved
