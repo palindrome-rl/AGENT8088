@@ -182,6 +182,9 @@ def test_a_command_that_ran_and_failed_is_not_retried(engine, wsl, monkeypatch):
 def test_the_shell_description_says_bash_in_wsl(engine, wsl, monkeypatch):
     specs = {"execute_shell": {"description": "Run a command."}}
     monkeypatch.setattr(engine, "_SHELL_GROUNDING", {"cwd": None, "suffix": ""})
+    # The folder probe looks up programs; with sys.platform faked on Linux that would take Windows-only paths.
+    monkeypatch.setattr(engine, "_environment_probe", lambda cwd: "holds a project")
+    monkeypatch.setattr(engine, "_probe_interpreters", lambda: ([], []))
     engine._ground_execute_shell_description(specs)
     text = specs["execute_shell"]["description"]
     assert "bash in Agent8088's WSL sandbox" in text and "/mnt/e" in text and "python3" in text
