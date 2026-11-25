@@ -3607,6 +3607,37 @@ def _write_retry_cap(failed_cap: int, provider_limit: int, profile=None) -> int:
 
 
 _OUTPUT_PROFILE_SEEN: dict = {}
+# (model, cap, source) already warned about: a cap below the model profile's is logged once per session.
+_CAP_OVERRIDE_WARNED: set = set()
+
+
+def _cap_in_force(initial_cap: int, completion_limit: int, *, profile_set: bool, config_set: bool) -> tuple[int, str]:
+    """(the cap an ordinary call is given, where it comes from).
+
+    The lower of the first-call cap and the model's completion limit wins. Named so the trace and the log say the
+    number a reply is really cut at: six long runs were cut at 16,384 while the announced limit said 20,000,
+    because an explicit initial_completion_cap in config overrode the profile and nothing printed it."""
+    if initial_cap and (not completion_limit or initial_cap <= completion_limit):
+        if config_set:
+            return initial_cap, "initial_completion_cap in config"
+        return initial_cap, "model profile" if profile_set else "context window"
+    return completion_limit, "the model's completion limit"
+
+
+def _warn_cap_below_profile(model: str, cap: int, source: str, profile) -> None:
+    """Log once when the cap in force is below what the model profile allows, and why."""
+    if profile is None or not cap or cap >= profile.thinking_cap:
+        return
+    key = (model, cap, source)
+    if key in _CAP_OVERRIDE_WARNED:
+        return
+    _CAP_OVERRIDE_WARNED.add(key)
+    if source == "initial_completion_cap in config":
+        _log.warning("initial_completion_cap=%s in config overrides the model profile's %s-token cap for %s: "
+                     "replies longer than %s tokens are cut off", cap, profile.thinking_cap, model, cap)
+    else:
+        _log.warning("%s (%s tokens) is below the model profile's %s-token cap for %s: replies longer than %s "
+                     "tokens are cut off", source, cap, profile.thinking_cap, model, cap)
 
 
 # Whether the served model reasons before it answers decides the cap of an ordinary call: a model that does not
@@ -23281,17 +23312,25 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         output_profile, profile_line = _active_output_profile(
             loop_model or MODEL_NAME, loop_provider or ACTIVE_PROVIDER or DEFAULT_PROVIDER or "",
             loop_client or client)
-        if output_profile is not None and trace is not None and profile_traced != profile_line:
-            profile_traced = profile_line
+        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window, output_profile)
+        if output_profile is not None:
+            # The number a reply is really cut at, and why: the profile's own cap is not it when config or the
+            # model's completion limit is lower.
+            cap_now, cap_source = _cap_in_force(initial_cap, turn_completion_limit,
+                                                profile_set=True, config_set=_INITIAL_CAP_SET)
+            _warn_cap_below_profile(str(loop_model or MODEL_NAME), cap_now, cap_source, output_profile)
+            cap_line = f"{profile_line}; cap in force {cap_now} ({cap_source})"
+        if output_profile is not None and trace is not None and profile_traced != cap_line:
+            profile_traced = cap_line
             detected = _OUTPUT_PROFILE_SEEN.get(str(loop_model or MODEL_NAME), (None, ""))[0]
-            trace.append({"turn": turn, "type": "output_profile", "content": profile_line,
+            trace.append({"turn": turn, "type": "output_profile", "content": cap_line,
+                          "cap_in_force": cap_now, "cap_source": cap_source,
                           "thinking_cap": output_profile.thinking_cap,
                           "nonthinking_cap": output_profile.nonthinking_cap,
                           "calibrated": output_profile.calibrated,
                           "size_b": getattr(detected, "size_b", None), "active_b": getattr(detected, "active_b", None),
                           "thinking": getattr(detected, "thinking", None),
                           "thinking_source": getattr(detected, "thinking_source", "")})
-        initial_cap, min_tokens, thinking_off_cap = _output_cap_defaults(turn_context_window, output_profile)
         normal_cap = (min(turn_completion_limit, initial_cap)
                       if initial_cap else turn_completion_limit)
         # The median shrinking sized the cap from typical replies and cut the long ones; with a model profile it
