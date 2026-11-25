@@ -104,6 +104,8 @@ def copy_env(profile: dict, dest: Path) -> list:
 # original; the large ones are linked.
 COPIED = ("runtime",)
 LINKED = ("node", "playwright-browsers")
+# The WSL sandbox's setup record (Windows): which distro the shared install set up, so a run uses it too.
+COPIED_FILES = ("wsl-sandbox.json",)
 
 
 def _link_dir(source: Path, dest: Path) -> None:
@@ -140,6 +142,10 @@ def share_runtime(profile: dict, home: Path) -> list:
         else:
             _link_dir(source / name, home / name)
         shared.append(name)
+    for name in COPIED_FILES:
+        if (source / name).is_file() and not (home / name).exists():
+            shutil.copy2(source / name, home / name)
+            shared.append(name)
     return shared
 
 
