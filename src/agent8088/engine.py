@@ -22641,7 +22641,9 @@ def _missing_required_files(trajectory, reply: str, request: str) -> list:
         request, reply, trajectory.written_paths(), [PROJECT_ROOT, Path.cwd()],
         mirror_roots=mirrors,
         start_files=trajectory.start_files,
-        landed=trajectory.data.get("redirected_writes") or [])
+        landed=trajectory.data.get("redirected_writes") or [],
+        removed=completion_checks.removed_by_commands(
+            trajectory.ran_commands() if hasattr(trajectory, "ran_commands") else ()))
     return completion_checks.annotate_missing(missing, [PROJECT_ROOT, Path.cwd()], mirrors) if mirrors else missing
 
 

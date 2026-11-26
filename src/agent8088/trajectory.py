@@ -302,6 +302,9 @@ _FILE_COMMANDS = frozenset({
     "xcopy", "copy", "robocopy", "move", "del", "erase", "rmdir", "rd", "mkdir", "md", "ren", "rename", "dir",
     "type", "attrib", "tree", "cd", "chdir", "pushd", "popd", "echo", "cls", "set", "ls", "cp", "mv", "rm",
     "cat", "touch", "pwd", "mkdir", "chmod", "ln", "find", "stat", "where", "which",
+    # Reading a log or waiting on a job checks nothing, whatever the file is called. Seen in a run: a
+    # `sleep 60 && tail -1 build.log` that found no log stayed "the latest check failed" after the build itself passed.
+    "tail", "head", "wc", "sleep", "kill",
     "copy-item", "move-item", "remove-item", "get-childitem", "new-item", "set-location", "get-content"})
 def command_segments(command: str, *, split_or: bool = False) -> list[str]:
     """Split shell sequencing outside quotes, without splitting `2>&1`.
