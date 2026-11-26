@@ -201,7 +201,10 @@ _CHECK_COMMAND = re.compile(
 
 # The note the sandbox appends when a command tried to write where it may not. A check that ends with
 # it was stopped by the sandbox: it never ran to a result, so it did not fail.
-_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
+# The sandbox refused a write, so the command tested nothing. On Linux (the WSL and Docker sandboxes) a folder the
+# sandbox keeps read-only answers EROFS: seen as "mkdir: can't create directory 'mt_test/': Read-only file system" on
+# a scratch check in /tmp, which then ended a passing run "the latest check failed".
+_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only|Read-only file system|\[Errno 30\]")
 
 
 # Commands that move, list or remove files. A folder called `tests\` in their arguments does not make them a
