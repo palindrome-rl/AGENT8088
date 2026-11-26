@@ -19,6 +19,15 @@ All notable changes to Agent8088 are recorded here. The format follows
   counts as not verified.
 - A run on a task that cannot be done that says not verified is scored as nobody's fault.
 
+## v1.3 branch maintenance - 2026-11-26 (Windows programs from the WSL sandbox)
+
+### Improved
+
+- While the WSL sandbox is active, a command that starts a Windows program (`.exe`, `.bat`, `.cmd`, `.ps1`, `cmd`,
+  `powershell`, `dotnet`, `msbuild` and other Windows-only tools) runs in the Windows sandbox instead of failing in
+  bash, with `/mnt/<drive>` paths turned back into Windows paths and a note that says where it ran and that the
+  network is not filtered there. The model is told this in the shell's description.
+
 ## v1.3 branch maintenance - 2026-11-25 (the output cap in force)
 
 ### Improved

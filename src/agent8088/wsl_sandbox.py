@@ -223,6 +223,19 @@ def command_to_linux(command: str, normalize: Callable[[str], str] | None = long
     return _BARE_PATH_RE.sub(lambda m: _linux_spelling(m.group("drive"), m.group("rest"), normalize), command)
 
 
+_MNT_WORD_RE = re.compile(r"""(?<![\w/.-])/mnt/([a-z])(?=[/\s"'`;&|<>()]|$)([^\s"'`;&|<>()]*)""")
+_MNT_QUOTED_RE = re.compile(r"""(?P<q>["'])/mnt/(?P<drive>[a-z])(?P<rest>(?:/[^"'\n]*)?)(?P=q)""")
+
+
+def command_to_windows(command: str) -> str:
+    """Rewrite /mnt/<drive> paths in a command to Windows paths: the reverse of command_to_linux, for a command that
+    runs on Windows after all (a Windows program the WSL sandbox cannot start). /mnt/wslg and other paths that are
+    not a drive are left alone."""
+    command = _MNT_QUOTED_RE.sub(
+        lambda m: m.group("q") + to_windows(f"/mnt/{m.group('drive')}{m.group('rest')}") + m.group("q"), command)
+    return _MNT_WORD_RE.sub(lambda m: to_windows(f"/mnt/{m.group(1)}{m.group(2)}"), command)
+
+
 # ---- the distro --------------------------------------------------------------------------------------------------
 
 def wsl_executable() -> str | None:
