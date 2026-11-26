@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (temporary files in the WSL sandbox)
+
+### Fixed
+
+- Commands in the WSL sandbox get their temporary files in the distro's own `/tmp/agent8088-tmp`, not on the
+  Windows drive. Python's `TemporaryFile` deletes a file while it is still open, which a Windows drive does not
+  support, so every pytest run there crashed at teardown with `FileNotFoundError`. The runner makes the folder
+  (mode 700) before the sandbox starts, and the distro's setup version goes to 3.
+
 ## v1.3 branch maintenance - 2026-11-26 (verdict fixes from the second Tier 1 run)
 
 ### Fixed

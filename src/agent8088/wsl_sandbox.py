@@ -39,7 +39,7 @@ RUNNER = f"{RUNTIME_DIR}/run"
 # A marker file the setup writes last; a distro without it was imported but never finished setting up.
 SETUP_MARKER = f"{RUNTIME_DIR}/setup-version"
 # Bumped when the setup script changes, so an older distro is set up again.
-SETUP_VERSION = "2"
+SETUP_VERSION = "3"
 
 ALPINE_VERSION = "3.24.4"
 _ROOTFS = {
@@ -59,6 +59,9 @@ ENV_SERVICE = "AGENT8088_WSL_SERVICE"
 # Services: the sandboxed side listens on a unix socket here (the distro's own /tmp: drvfs has no unix sockets), and
 # a bridge outside srt but inside the distro listens on 127.0.0.1:<port>, which WSL forwards to Windows' 127.0.0.1.
 SERVICE_DIR = "/tmp/agent8088-services"
+# Temporary files for sandboxed commands, on the distro's own filesystem. A /mnt/<drive> folder cannot hold a file
+# deleted while still open, which is how Python's TemporaryFile works: pytest's output capture crashed there.
+TMP_DIR = "/tmp/agent8088-tmp"
 STOPPER = f"{RUNTIME_DIR}/stop"
 _SERVICE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,80}")
 _MAX_ENV_COMMAND = 24000   # Windows allows 32767 characters for one variable; leave room for base64 and the rest
@@ -91,6 +94,7 @@ limit="${{{ENV_TIMEOUT}:-0}}"
 service="${ENV_SERVICE}"
 unset {ENV_COMMAND} {ENV_COMMAND_FILE} {ENV_SETTINGS} {ENV_TIMEOUT} {ENV_SERVICE} WSL_INTEROP WSLENV
 cd /
+install -d -m 700 {TMP_DIR}
 if [ -n "$service" ]; then
   # A service: its pid, so `stop` can end it (srt's sandbox dies with it), and no time limit.
   echo $$ > {SERVICE_DIR}/"$service".pid
