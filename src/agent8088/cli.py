@@ -8947,7 +8947,7 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "AGENT8088-v1.3"
+UPDATE_BRANCH = "AGENT8088-v1.4"
 
 
 def _git(install_dir, *args):
@@ -8965,8 +8965,8 @@ def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
     The branch the install has checked out is the channel the user chose
-    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
-    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    (AGENT8088_BRANCH at install time), and development, staging-1.4 and
+    AGENT8088-v1.4 carry the same tree, so UPDATE_BRANCH alone would move every
     development or staging install to production on its first update. That
     branch is followed while the remote still has it.
 

@@ -191,7 +191,7 @@ Write-Output "files-after:" @(Get-ChildItem -LiteralPath (Join-Path $env:TEMP 'a
     assert out.read_text().strip() == "it works; with quotes"
 
 
-@pytest.mark.parametrize("branch", ["development", "staging-1.3"])
+@pytest.mark.parametrize("branch", ["development", "staging-1.4"])
 def test_terminal_relaunch_preserves_installer_parameters(tmp_path, branch):
     output = _run_powershell(
         f"""

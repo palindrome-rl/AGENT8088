@@ -4,6 +4,32 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-27
+
+v1.4 gathers the v1.3 branch maintenance work from 2026-11-20 to 2026-11-26, listed in full below. The release
+channel moves to `AGENT8088-v1.4` (staging `staging-1.4`). Existing v1.3 installs stay on `AGENT8088-v1.3` when they
+run `agent8088 --update`; reinstall to move to v1.4. Configuration and memory are preserved.
+
+### Added
+
+- A four-level verdict for every run that changed files (VERIFIED, PARTLY VERIFIED, NOT VERIFIED, COULD NOT VERIFY),
+  taken from the controller's own evidence.
+- Checks after every write, a checklist for multi-part requests from the first turn, play tests for interactive
+  parts, auto QA, retry with change, eval mode and a clock for headless runs.
+- Sub-agents end with a STATUS line and return a report to check; delegation rules and a build-test-fix procedure.
+- The Tier 1 smoke set (`bench/run.py --tier 1`) and its pass bar, run before a release.
+
+### Fixed
+
+- Weakened, skipped or deleted given tests, and code that hard-codes a given test's case, keep work from VERIFIED.
+- The WSL sandbox: Windows programs, pytest in the distro, and temporary files in the distro's own folder.
+- Stale or literal verdict signals that reported finished work NOT VERIFIED.
+
+### Changed
+
+- Version 1.4.0. The installers, `agent8088 --update` default, CI, the sandbox image tag
+  (`ghcr.io/palindrome-rl/agent8088-sandbox:1.4.0`) and the wiki sync follow `AGENT8088-v1.4`.
+
 ## v1.3 branch maintenance - 2026-11-26 (finished work reported NOT VERIFIED)
 
 ### Fixed

@@ -21,7 +21,7 @@ def test_new_defaults_and_public_channel(runtime):
     assert runtime._turn_policy(runtime.DEFAULT_MAX_TURNS).ceiling == 1200
     assert runtime.PLAN_MODE_TIMEOUT_SECONDS == 600
     assert runtime.MAX_TOOL_TIMEOUT_SECONDS == 1200
-    assert cli.UPDATE_BRANCH == "AGENT8088-v1.3"
+    assert cli.UPDATE_BRANCH == "AGENT8088-v1.4"
     template = Path(runtime.__file__).with_name("config.txt").read_text(encoding="utf-8")
     assert "\nmemory_engine=native\n" in template
     assert "\nmax_turns=400\n" in template
