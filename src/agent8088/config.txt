@@ -56,6 +56,13 @@ prompt_paths=~
 # it here, or at any time with `/maxturns <n>` in the REPL, which writes it back
 # to this file.
 max_turns=400
+# Run mode. `full` (the default) is the normal behaviour. `eval` is for runs judged
+# on what they leave on disk (measured experiments, comparisons): it leaves out the
+# steps that cannot change that (the last-stretch ask to stop and write the answer,
+# the optional look at a page, screenshots no test asked for) and keeps every check
+# that can lead to a fix. --eval, AGENT8088_RUN_MODE=eval or /eval on set it too;
+# each run's trace records its mode.
+# run_mode=full
 # How far progress may grow max_turns. 1 disables growth and restores a hard
 # fixed limit of exactly max_turns rounds.
 # dynamic_turns_ceiling_multiplier=3
@@ -65,6 +72,9 @@ max_turns=400
 # These bound ROUNDS. The separate wall-clock/token/cost ceilings bound what
 # those rounds may consume, and raising max_turns does not raise them:
 #   max_turn_seconds            wall clock for one whole turn (0 = off)
+#   headless_max_turn_seconds   the clock a run nobody watches gets when max_turn_seconds
+#                               is not set (--prompt-file, unattended jobs, task containers;
+#                               default 10800 = 3 hours, 0 = off). The REPL keeps no clock.
 #   plan_audit_timeout_seconds  wall clock for ONE auditor sub-run
 #   max_turn_tokens             tokens per turn (0 = off)
 #   max_turn_cost_usd           dollars per turn (0 = off)

@@ -4,6 +4,138 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (Tier 1 smoke set)
+
+### Added
+
+- Tier 1 grows from 7 tasks and 14 runs to 12 tasks and 26 runs (about four hours):
+  - `npm-esbuild-bundle`
+  - three honesty tasks: `broken-test-green`, `no-change-needed` and `impossible-request`
+  - one small visual task, `sales-bar-chart`
+- Each new task comes with reference solutions and ones that must fail.
+- The two trap tasks run three times each (`trials_by_task` in `bench/tiers.json`). `--trials` still overrides.
+- The report compares with a baseline only on the tasks the baseline has, and lists the tasks added since.
+- Each result records the four-level verdict (`verdict_level`), read from the whole answer. A COULD NOT VERIFY answer
+  counts as not verified.
+- A run on a task that cannot be done that says not verified is scored as nobody's fault.
+
+## v1.3 branch maintenance - 2026-11-26 (Windows programs from the WSL sandbox)
+
+### Improved
+
+- While the WSL sandbox is active, a command that starts a Windows program (`.exe`, `.bat`, `.cmd`, `.ps1`, `cmd`,
+  `powershell`, `dotnet`, `msbuild` and other Windows-only tools) runs in the Windows sandbox instead of failing in
+  bash, with `/mnt/<drive>` paths turned back into Windows paths and a note that says where it ran and that the
+  network is not filtered there. The model is told this in the shell's description.
+
+## v1.3 branch maintenance - 2026-11-25 (the output cap in force)
+
+### Improved
+
+- The output limits named in the trace and the log are the ones a reply is really cut at. The `output_profile` trace entry
+  adds `cap_in_force` and `cap_source` (the model profile, `initial_completion_cap` in config, or the model's completion
+  limit), and a cap below the model profile's is logged once as a warning that says which setting set it. Before, an
+  explicit `initial_completion_cap=16384` cut replies at 16,384 tokens while the announced limit said 20,000.
+
+## v1.3 branch maintenance - 2026-11-26 (sub-agent results as reports)
+
+### Improved
+
+- Every sub-agent ends with one STATUS line (complete, incomplete, failed). A sub-agent the model spawned comes back
+  as a labelled report: its status, a reminder that it is a claim to check against the files, its text marked as
+  untrusted content, and a flag on any text addressed to the parent as an instruction. One stopped by its time limit
+  reads "incomplete (stopped by its time limit; unverified)". Internal auditor and test-writer calls are unchanged.
+
+## v1.3 branch maintenance - 2026-11-26 (a clock for headless runs)
+
+### Improved
+
+- A run nobody watches (`--prompt-file`, an unattended job, a task container) gets `headless_max_turn_seconds`
+  (3 hours) when `max_turn_seconds` is not set, so its time checks and answer stretch work. An explicit
+  `max_turn_seconds` wins, `headless_max_turn_seconds=0` turns the default off, and the REPL keeps no clock.
+- When the clock stops a run before the model answered, the answer lists what is done (with its evidence), what is
+  not, the files changed and the latest check, from the controller's records.
+
+## v1.3 branch maintenance - 2026-11-26 (build-test-fix procedure and delegation rules)
+
+### Improved
+
+- The skill index in the system prompt ends with a short "Build, test, fix" block naming the installed skills by
+  situation (runnable slice first, test-first for logic, debugging when a check fails, browser-qa for what a person
+  sees or plays). The note for a check that keeps failing the same way points at the debugging skill.
+- `spawn_subagent` says when to delegate (independent multi-step work only, never to review its own work), that a
+  child's report is a claim to check, and not to retry a spawn refused for a limit.
+
+## v1.3 branch maintenance - 2026-11-26 (retry with change)
+
+### Improved
+
+- A check that fails the same way again after the model changed files (same command, same failure line, numbers
+  ignored) is called out once per repeat in the tool result and named in the task-state note until a check passes,
+  so the next attempt takes a different approach. A failure that changes after the edit counts as progress.
+
+## v1.3 branch maintenance - 2026-11-26 (auto QA)
+
+### Added
+
+- Auto QA: when changed work has no passing test since the change and a test suite sits above the changed files, the
+  end-of-run check runs it in the sandbox (`auto_qa_seconds`, default 120, once per state of the work) instead of only
+  asking the model to. A pass marks the change tested with no turn spent; a failure sends the model back with the
+  command and the end of the output. `auto_qa=0` turns it off.
+
+## v1.3 branch maintenance - 2026-11-26 (play tests and the test seam)
+
+### Improved
+
+- An interactive part of a request (a click, a key, a drag, a game) counts as checked only after a passing
+  `browser_test` since the last change; a unit test or a page load does not show an interaction works. Without one the
+  verdict stays PARTLY VERIFIED and the task-state note names the play test as the next step. Nothing is blocked or
+  reopened.
+- The browser-qa skill teaches a test seam for interactive builds: a read-only `window.__test.state()`, an optional
+  `?seed=N` for randomness and `step(ms)` for timed games, without changing normal play.
+- A part that names a file ("draw the board in game.html") is a file part even without a verb that writes it.
+
+## v1.3 branch maintenance - 2026-11-26 (four-level verdict)
+
+### Improved
+
+- A run that changed files ends with one verdict in four levels, from the controller's own evidence: NOT VERIFIED (a
+  check failed or the work is unfinished, now also when a written file still does not parse), COULD NOT VERIFY (an
+  environment limit stopped the check and nothing passed), VERIFIED (a test passed after the last change and no part
+  waits for a recheck) and PARTLY VERIFIED (anything else, with what is missing). NOT VERIFIED stays above the reply;
+  the others lead the end-of-run notes as a `Verdict:` line. What the reply claims never raises the level.
+- The auditor must cite its evidence for a `fail` (the command and the output line, or the file and line), and is
+  told a `fail` the caller cannot reproduce is thrown away.
+
+## v1.3 branch maintenance - 2026-11-26 (checks after every write)
+
+### Added
+
+- A file landed by `write_file` or `edit_file` is checked at once by a parse that runs nothing: Python and JSON are
+  parsed, JavaScript goes through `node --check`, and an HTML page's local `src`/`href` files must exist. A problem
+  is added to the tool result in one line and kept in the task-state note until the file is written cleanly, so a
+  broken file is found on the next turn instead of at the end of the run. Appends and files over 1 MB are not checked.
+
+## v1.3 branch maintenance - 2026-11-26 (checklist and ledger)
+
+### Improved
+
+- The parts of a multi-part request are on the checklist from the first turn, not only when the final answer is
+  checked. Each part records its kind (file, run, test, interactive or property), what settled it, and the state of
+  the work at that moment. A run, test or interactive part settled before a later change goes back to "recheck" until
+  a check passes again. The task-state note lists each part with its status and evidence and names the next step; it
+  is rebuilt from the controller's state, so it survives compaction.
+
+## v1.3 branch maintenance - 2026-11-26 (eval mode)
+
+### Added
+
+- Eval mode, for runs judged on what they leave on disk (measured experiments, comparisons): `run_mode=eval` in
+  config, `--eval`, `AGENT8088_RUN_MODE=eval`, or `/eval on` in the REPL. It leaves out the last-stretch ask to stop
+  and write the answer, the optional look at a page, and the last-state screenshot of a failing `browser_test`;
+  every check whose result can lead to a fix stays. `full` is the default and changes nothing. Each run's trace starts
+  with a `run_mode` entry, and `/status` shows the mode.
+
 ## v1.3 branch maintenance - 2026-11-25 (looking at what was built)
 
 ### Added

@@ -42,6 +42,10 @@ Reply with exactly one verdict line, followed by one or two sentences of evidenc
     VERDICT: fail — <what is actually true instead>
     VERDICT: unknown — <what you could not observe, and why>
 
+A `fail` must cite its evidence: the command you ran and the line of its output that shows the
+problem, or the file and line you read. The caller reproduces a `fail` before acting on it, so a
+`fail` it cannot reproduce from what you cite is thrown away.
+
 Choose `fail` over `unknown` when you have contrary evidence. Choose `unknown` over `pass`
 when you could not observe the effect at all. Never guess, and never soften a `fail` because
 the work looks close — a wrong file reported as correct is worse than an honest `unknown`.

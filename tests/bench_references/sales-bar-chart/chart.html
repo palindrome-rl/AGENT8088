@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Monthly sales</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; color: #222; background: #fff; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  text { font-size: 13px; fill: #333; }
+</style>
+</head>
+<body>
+<h1>Monthly sales</h1>
+<svg id="chart" width="640" height="420" viewBox="0 0 640 420" role="img" aria-label="Bar chart of monthly sales"></svg>
+<script>
+const MONTHS = [["Jan", 120], ["Feb", 95], ["Mar", 140], ["Apr", 80], ["May", 160], ["Jun", 110]];
+const svg = document.getElementById("chart");
+const NS = "http://www.w3.org/2000/svg";
+const baseline = 380;
+const scale = 2;
+const gap = 90;
+const best = Math.max(...MONTHS.map(([, v]) => v));
+
+function addText(x, y, content) {
+  const t = document.createElementNS(NS, "text");
+  t.setAttribute("x", x);
+  t.setAttribute("y", y);
+  t.setAttribute("text-anchor", "middle");
+  t.textContent = content;
+  svg.appendChild(t);
+}
+
+const months = MONTHS;
+months.forEach(([name, value], i) => {
+  const x = 40 + i * gap;
+  const h = value * scale;
+  const top = baseline - h;
+  const bar = document.createElementNS(NS, "rect");
+  bar.setAttribute("x", x);
+  bar.setAttribute("y", top);
+  bar.setAttribute("width", 40);
+  bar.setAttribute("height", h);
+  bar.dataset.month = name;
+  bar.style.fill = value === best ? '#d9822b' : '#4a78b5';
+  svg.appendChild(bar);
+  addText(x + 20, top - 8, String(value));
+  addText(x + 20, baseline + 20, name);
+});
+</script>
+</body>
+</html>
