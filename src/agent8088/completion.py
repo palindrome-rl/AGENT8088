@@ -160,11 +160,22 @@ _FAILURE_FIXED = re.compile(
     re.IGNORECASE)
 
 
+# "the failing test" or "the previously failing one" names the test the task was about, which the fix makes pass:
+# not a check of the model's that failed (seen marking a passing fix NOT VERIFIED). A sentence that says it still
+# fails keeps the phrase.
+_TASK_FAILING_TEST = re.compile(
+    r"\bthe\s+(?:(?:previously|originally|given|one)\s+)?failing\s+(?:tests?|checks?|ones?|cases?)\b",
+    re.IGNORECASE)
+_STILL = re.compile(r"\b(?:still|remains?|again)\b", re.IGNORECASE)
+
+
 def reports_failed_check(reply: str) -> str:
     """The sentence in which the reply says one of its own checks failed and it was not fixed, or ""."""
     text = _prose(reply).replace("**", "").replace("__", "")
     text = re.sub(r"\bif\s+(?:you|your|it|the)\b[^.\n]*", " ", text, flags=re.IGNORECASE)
     for sentence in _SENTENCE_SPLIT.split(text):
+        if not _STILL.search(sentence):
+            sentence = _TASK_FAILING_TEST.sub(" ", sentence)
         if (_OWN_CHECK_FAILED.search(sentence) and not _NO_FAILURE.search(sentence)
                 and not _FAILURE_FIXED.search(sentence)):
             return " ".join(sentence.split())
