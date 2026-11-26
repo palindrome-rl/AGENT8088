@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [development, staging-1.3, AGENT8088-v1.3]
+    branches: [development, staging-1.4, AGENT8088-v1.4]
   pull_request:
   workflow_dispatch:
 
@@ -34,7 +34,7 @@ jobs:
         run: bash scripts/check_installer_portability.sh
 
   # The full suite runs where code changes: pushes and PRs into development, and
-  # any PR into staging-1.3 or AGENT8088-v1.3 that is not a plain promotion
+  # any PR into staging-1.4 or AGENT8088-v1.4 that is not a plain promotion
   # (a hotfix). A promotion carries a tree that already passed this job on
   # development; the `promotion` job below checks that nothing else rides along.
   tests:
@@ -42,8 +42,8 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       || github.base_ref == 'development'
-      || !((github.base_ref == 'staging-1.3' && github.head_ref == 'development')
-           || (github.base_ref == 'AGENT8088-v1.3' && github.head_ref == 'staging-1.3'))
+      || !((github.base_ref == 'staging-1.4' && github.head_ref == 'development')
+           || (github.base_ref == 'AGENT8088-v1.4' && github.head_ref == 'staging-1.4'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -67,8 +67,8 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       || github.base_ref == 'development'
-      || !((github.base_ref == 'staging-1.3' && github.head_ref == 'development')
-           || (github.base_ref == 'AGENT8088-v1.3' && github.head_ref == 'staging-1.3'))
+      || !((github.base_ref == 'staging-1.4' && github.head_ref == 'development')
+           || (github.base_ref == 'AGENT8088-v1.4' && github.head_ref == 'staging-1.4'))
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -85,12 +85,72 @@ jobs:
           mkdir -p "$AGENT8088_HOME"
           uv run --extra dev python -m pytest -q -rfE tests/test_verdict_corpus.py
 
+  # Real commands that try to get out of the sandbox (tests/test_sandbox_attacks.py): srt with bubblewrap and the
+  # Docker fallback on Linux, srt with sandbox-exec on macOS. The Windows runner needs an administrator setup a hosted
+  # runner does not allow, so its run is part of the release checklist on a Windows machine.
+  sandbox-attacks:
+    name: Sandbox attack tests (${{ matrix.os }})
+    if: >-
+      github.event_name != 'pull_request'
+      || github.base_ref == 'development'
+      || !((github.base_ref == 'staging-1.4' && github.head_ref == 'development')
+           || (github.base_ref == 'AGENT8088-v1.4' && github.head_ref == 'staging-1.4'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backends: native,docker
+          - os: macos-latest
+            backends: native
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install the sandbox runtime (the version engine.py pins)
+        shell: bash
+        run: |
+          version=$(sed -n 's/^_SANDBOX_RUNTIME_DEFAULT = "\(.*\)"/\1/p' src/agent8088/engine.py)
+          npm install -g "@anthropic-ai/sandbox-runtime@${version}"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q bubblewrap socat ripgrep
+            # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. Ubuntu's way to let
+            # one program use them is a profile for it; this is the one install.sh suggests.
+            printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+              'profile agent8088-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' \
+              '  include if exists <local/agent8088-bwrap>' '}' | sudo tee /etc/apparmor.d/agent8088-bwrap >/dev/null
+            sudo apparmor_parser -r /etc/apparmor.d/agent8088-bwrap
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 || true
+            sudo sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+            bwrap --unshare-all --dev-bind / / true && echo 'bwrap with a network namespace works' || echo 'bwrap with a network namespace fails'
+          else
+            brew install ripgrep
+          fi
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Run the attack tests in a throwaway home
+        shell: bash
+        env:
+          AGENT8088_ATTACK_TESTS: "1"
+          AGENT8088_ATTACK_BACKENDS: ${{ matrix.backends }}
+        run: |
+          export AGENT8088_HOME="$RUNNER_TEMP/home/.agent8088" AGENT8088_ATTACK_ROOT="$RUNNER_TEMP/attack"
+          mkdir -p "$AGENT8088_HOME" "$AGENT8088_ATTACK_ROOT"
+          uv run --extra dev python -m pytest -q -rfEs tests/test_sandbox_attacks.py
+
   promotion:
     name: Promotion carries only the source tree
     if: >-
       github.event_name == 'pull_request'
-      && ((github.base_ref == 'staging-1.3' && github.head_ref == 'development')
-          || (github.base_ref == 'AGENT8088-v1.3' && github.head_ref == 'staging-1.3'))
+      && ((github.base_ref == 'staging-1.4' && github.head_ref == 'development')
+          || (github.base_ref == 'AGENT8088-v1.4' && github.head_ref == 'staging-1.4'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

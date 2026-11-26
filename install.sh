@@ -3,7 +3,7 @@
 # Agent8088 Installer — Linux, macOS, WSL2, Termux
 # ============================================================================
 # Usage:
-#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash
+#   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | bash
 #
 # Installs agent8088 as an isolated uv tool with a global `agent8088` command.
 # Handles: uv bootstrap, Python provisioning, git install, repo clone, venv,
@@ -35,7 +35,7 @@
 # a file to check (bash install.sh, sh install.sh). Piped, it is "bash"/"sh" or
 # the shell binary's own path (`curl | /bin/sh`), so only a first line that is a
 # "#!" line counts -- a binary never starts with one, and a piped download is LF.
-head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash   (use LF line endings)" >&2 && exit 1
+head -n 1 "$0" 2>/dev/null | grep -q "^#!.*$(printf '\r')" && printf '%s\n' "ERROR: this file has Windows (CRLF) line endings." "  Fix:  perl -pi -e 's/\r\$//' \"$0\"" "  Or:   curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | bash   (use LF line endings)" >&2 && exit 1
 
 # ----------------------------------------------------------------------------
 # Shell preflight -- must be the first executable code in this file
@@ -57,12 +57,12 @@ if [ -z "${BASH_VERSION:-}" ]; then
         # re-exec something whose first line is a bash shebang (this script).
         if [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!.*bash'; then exec bash "$0" "$@"; fi
         echo "This installer needs bash. Re-run it as:" >&2
-        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" >&2
+        echo "  curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | bash" >&2
         exit 1
     fi
     echo "ERROR: bash is required and was not found." >&2
     echo "  Alpine / busybox:  apk add bash" >&2
-    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | bash" >&2
+    echo "  Then:              curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | bash" >&2
     exit 1
 fi
 
@@ -179,13 +179,13 @@ fi
 # Configuration
 # ----------------------------------------------------------------------------
 REPO_URL="https://github.com/palindrome-rl/AGENT8088.git"
-REPO_BRANCH="${AGENT8088_BRANCH:-AGENT8088-v1.3}"
+REPO_BRANCH="${AGENT8088_BRANCH:-AGENT8088-v1.4}"
 AGENT8088_HOME="${AGENT8088_HOME:-$HOME/.agent8088}"
 INSTALL_DIR="$AGENT8088_HOME/agent8088"
 PYTHON_VERSION="3.11"
 PYTHON_FALLBACK_VERSIONS=("3.12" "3.10")
 NODE_VERSION="22.11.0"
-INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh"
+INSTALLER_URL="https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh"
 # Everything the heavy stages print goes here instead of /dev/null, so a failure
 # can show its last lines and the user has a file to attach to a bug report.
 INSTALL_LOG="$AGENT8088_HOME/install.log"
@@ -251,7 +251,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-setup) SKIP_SETUP=true; shift ;;
         --branch)
-            _require_option_value "$1" "${2:-}" "AGENT8088-v1.3"
+            _require_option_value "$1" "${2:-}" "AGENT8088-v1.4"
             BRANCH="$2"; shift 2 ;;
         --memory)
             _require_option_value "$1" "${2:-}" "native"
@@ -282,7 +282,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # The exact command to re-run, for every "re-run the installer" message.
-if [ "$BRANCH" = "AGENT8088-v1.3" ]; then
+if [ "$BRANCH" = "AGENT8088-v1.4" ]; then
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | bash"
 else
     INSTALL_CMD="curl -fsSL --proto '=https' --tlsv1.2 $INSTALLER_URL | AGENT8088_BRANCH=$BRANCH bash"
@@ -1078,7 +1078,7 @@ _check_branch_listed() {
         return 0
     fi
     log_error "Branch '$BRANCH' does not exist in $REPO_URL."
-    log_info "Use an existing branch: --branch AGENT8088-v1.3 (or AGENT8088_BRANCH=AGENT8088-v1.3)"
+    log_info "Use an existing branch: --branch AGENT8088-v1.4 (or AGENT8088_BRANCH=AGENT8088-v1.4)"
     log_info "List them: git ls-remote --heads $REPO_URL"
     exit 1
 }
@@ -1297,7 +1297,7 @@ detect_os() {
         CYGWIN*|MINGW*|MSYS*)
             OS="windows"; DISTRO="windows"
             log_error "Windows detected. Please use the PowerShell installer:"
-            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1 | iex\""
+            log_info "  powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.ps1 | iex\""
             exit 1
             ;;
         *)
@@ -2444,10 +2444,34 @@ install_native_sandbox() {
         log_success "Native sandbox runtime installed and verified"
     else
         [ -n "$_sandbox_setup" ] && log_warn "$_sandbox_setup"
-        log_warn "Native sandbox setup did not complete - Docker will be used automatically when available"
-        record_skip "Native sandbox runtime" "setup did not complete" \
-            "agent8088 --sandbox-setup   (Docker is used automatically meanwhile)"
+        log_warn "Native sandbox setup did not complete - Docker will be used automatically when it is running"
+        if userns_restricted; then
+            # Ubuntu 23.10+ restricts the unprivileged user namespaces bubblewrap needs, through
+            # AppArmor. On Ubuntu 24.04 srt started only with an AppArmor profile for bwrap AND both
+            # restriction switches off (either alone was not enough). These are system security
+            # settings, so the installer only explains them.
+            log_warn "This system restricts unprivileged user namespaces through AppArmor, which the native sandbox (bubblewrap) needs."
+            log_info "  To allow them (system security settings, your decision), as root:"
+            log_info "    printf '%s\\n' 'abi <abi/4.0>,' 'include <tunables/global>' 'profile agent8088-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' > /etc/apparmor.d/agent8088-bwrap"
+            log_info "    apparmor_parser -r /etc/apparmor.d/agent8088-bwrap"
+            log_info "    printf '%s\\n' kernel.apparmor_restrict_unprivileged_userns=0 kernel.apparmor_restrict_unprivileged_unconfined=0 > /etc/sysctl.d/60-agent8088-userns.conf"
+            log_info "    sysctl --system"
+            log_info "  then run: agent8088 --sandbox-setup"
+            record_skip "Native sandbox runtime" "unprivileged user namespaces are restricted by AppArmor" \
+                "add an AppArmor profile for bwrap and set kernel.apparmor_restrict_unprivileged_userns=0 and kernel.apparmor_restrict_unprivileged_unconfined=0 (commands in the install log), then agent8088 --sandbox-setup   (Docker is used meanwhile when running)"
+        else
+            record_skip "Native sandbox runtime" "setup did not complete" \
+                "agent8088 --sandbox-setup   (Docker is used automatically meanwhile when it is running)"
+        fi
     fi
+}
+
+# True when the kernel restricts unprivileged user namespaces through AppArmor
+# (Ubuntu 23.10 and later), which is what stops bubblewrap.
+userns_restricted() {
+    [ "$OS" = linux ] || return 1
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ] ||
+        [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_unconfined 2>/dev/null)" = "1" ]
 }
 
 # ----------------------------------------------------------------------------
@@ -2728,7 +2752,8 @@ verify_install() {
     if [ "$SANDBOX_INSTALLED" = true ]; then
         echo "  Sandbox:  native runtime installed"
     else
-        echo "  Sandbox:  Docker fallback is automatic when available"
+        echo "  Sandbox:  Docker fallback is automatic when Docker is running"
+        echo "            (package registries only; Agent8088 does not start Docker itself)"
         echo "            Native setup: agent8088 --sandbox-setup"
     fi
     echo "  Update: curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/$BRANCH/install.sh | AGENT8088_BRANCH=$BRANCH bash"

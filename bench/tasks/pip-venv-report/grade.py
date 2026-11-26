@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1]))  # bench/, for graderlib
+import graderlib  # noqa: E402
 
 
 def expected():
@@ -29,14 +31,8 @@ def expected():
 
 
 def venv_python(workspace: Path):
-    for candidate in (workspace / ".venv" / "Scripts" / "python.exe", workspace / ".venv" / "bin" / "python"):
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            # A venv made inside a Linux container leaves a symlink the host cannot open.
-            continue
-    return None
+    """The command that starts the venv's Python (see graderlib.venv_python_command), or None."""
+    return graderlib.venv_python_command(workspace)
 
 
 def grade(workspace: Path) -> dict:
@@ -46,7 +42,8 @@ def grade(workspace: Path) -> dict:
     checks["venv exists"] = python is not None
     has_tabulate = False
     if python:
-        probe = subprocess.run([str(python), "-c", "import tabulate"], capture_output=True, timeout=60, check=False)
+        probe = subprocess.run([*python, "-c", "import tabulate"], cwd=workspace, capture_output=True, timeout=60,
+                               check=False)
         has_tabulate = probe.returncode == 0
     checks["tabulate installed in the venv"] = has_tabulate
     checks["report.py exists"] = (workspace / "report.py").is_file()
@@ -58,7 +55,7 @@ def grade(workspace: Path) -> dict:
     if python and checks["report.py exists"]:
         previous = totals_path.read_bytes() if totals_path.is_file() else None
         totals_path.unlink(missing_ok=True)
-        done = subprocess.run([str(python), "report.py"], cwd=workspace, capture_output=True, text=True,
+        done = subprocess.run([*python, "report.py"], cwd=workspace, capture_output=True, text=True,
                               timeout=120, encoding="utf-8", errors="replace", check=False)
         output = done.stdout
         ran = done.returncode == 0

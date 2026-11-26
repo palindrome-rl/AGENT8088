@@ -6,5 +6,6 @@
   "fixture": "",
   "grader": "grade.py",
   "budget_sec": 900,
-  "needs": ["chromium for the grader"]
+  "needs": ["chromium for the grader"],
+  "grader_modules": ["playwright"]
 }

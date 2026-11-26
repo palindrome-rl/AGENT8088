@@ -2773,7 +2773,7 @@ COMMAND_SPECS = (
     ("model", "/model [provider[:model]|auto[:fast|:smart]|setup|auto setup]", "Show/switch providers, add one, or use the auto strength ladder", ()),
     ("models", "/models [provider|custom]", "Pick a provider/model or connect a custom endpoint", ()),
     ("mcp", "/mcp [reload|add|remove]", "List servers; add uses <name> stdio <command> [args] or http <url>", ()),
-    ("sandbox", "/sandbox [auto|native|docker|setup]", "Show or configure command isolation", ()),
+    ("sandbox", "/sandbox [auto|native|docker|wsl|setup]", "Show or configure command isolation", ()),
     ("status", "/status", "Show model, context, tool, skill, session and current-task status", ()),
     ("doctor", "/doctor [--fix]", "Check model endpoint reachability, auth/config, tools, and skills; --fix repairs a broken web-search install", ()),
     ("review", "/review [--from REF] [--to REF] [--commit SHA] [--mode native|delegated|auto] [--repo PATH]", "Review local Git changes and print findings with file, line and severity; read-only, a fix is a separate request", ()),
@@ -2781,6 +2781,7 @@ COMMAND_SPECS = (
     ("dump", "/dump", "Write a redacted diagnostic bundle to disk, for sharing in a bug report", ()),
     ("search", "/search [status|use|setup|stop]", "Inspect and configure web-search backends", ()),
     ("mode", "/mode [readonly|full-auto]", "Show or set the permission mode (edit is an alias for full-auto)", ()),
+    ("eval", "/eval [on|off]", "Show or switch eval mode: leave out steps that cannot change the result", ()),
     ("new", "/new <name>", "Create a named persistent session", ()),
     ("sessions", "/sessions", "List named sessions", ()),
     ("resume", "/resume [name]", "Load a named session; with no name, release a /hold", ()),
@@ -2853,8 +2854,8 @@ COMMAND_DETAILS = {
            "<command> [args] [--project] or /mcp add <name> http <url> [--project]; /mcp remove "
            "<name>; /mcp reload reconnects them.",
     "sandbox": "/sandbox shows the sandbox backend, whether it is verified, and its network "
-               "access; /sandbox auto|native|docker picks the backend; /sandbox setup installs "
-               "the native sandbox runtime.",
+               "access; /sandbox auto|native|docker|wsl picks the backend; /sandbox setup installs "
+               "the native sandbox runtime (and, on Windows, Agent8088's own WSL distro).",
     "status": "Shows the model, context use, tools, skills and session state, and the current task: goal, plan steps, changed files, verification level and latest check (read from what was recorded; no model call).",
     "doctor": "/doctor checks the model endpoint, auth and config, tools and skills; /doctor "
               "--fix also repairs a broken web-search install.",
@@ -2872,6 +2873,10 @@ COMMAND_DETAILS = {
               "/search use <searxng|ddgs|tavily|exa|auto> pins one; /search setup starts a "
               "local SearXNG in Docker and saves it; /search stop stops it; /search doctor "
               "checks the SearXNG setup.",
+    "eval": "/eval shows the run mode; /eval on switches this session to eval mode, which leaves out the steps "
+            "that cannot change what a run leaves on disk (the last-stretch ask to write the answer, the optional look "
+            "at a page, screenshots no test asked for); /eval off goes back to full. run_mode=eval in config.txt, "
+            "--eval or AGENT8088_RUN_MODE=eval set it from the start.",
     "mode": "/mode shows the permission mode; /mode readonly or /mode full-auto changes it "
             "(edit is an alias for full-auto). Plan mode is started with /plan, not /mode.",
     "new": "/new <name> creates a named session that is saved and can be resumed later.",
@@ -4345,6 +4350,7 @@ def cmd_status(_):
     t.add_row("Skills", f"{len(_active_skills())} active · {len(S.disabled_skills)} disabled")
     sandbox = A.sandbox_status()
     t.add_row("Sandbox", f"{sandbox['resolved']} ({sandbox['verification']}; {sandbox['requested']}) · network {sandbox['network']}")
+    t.add_row("Run mode", A.RUN_MODE)
     t.add_row("Web search", _search_status_value())
     for entry in capabilities.degraded():
         # The "Limited" rows: what is running on a fallback, and how to upgrade.
@@ -5585,6 +5591,21 @@ def cmd_dump(_rest):
                   f"[dim]({out_path.stat().st_size // 1024 or 1} KB)[/dim]")
     console.print("[dim]Reviewed for secrets before sharing — no API keys or tokens are included.[/dim]")
     return out_path
+
+
+def cmd_eval(rest):
+    action = rest.strip().lower()
+    if action in ("on", "eval"):
+        A.set_run_mode("eval")
+    elif action in ("off", "full"):
+        A.set_run_mode("full")
+    elif action:
+        console.print("[red]Use /eval on or /eval off.[/red]")
+        return
+    if A.eval_mode():
+        console.print("Run mode: [bold]eval[/bold] (steps that cannot change the result are left out)")
+    else:
+        console.print("Run mode: [bold]full[/bold]")
 
 
 def cmd_sandbox(rest):
@@ -7581,7 +7602,7 @@ COMMANDS = {
     "audit": cmd_audit, "fusion": cmd_fusion,
     "skills": cmd_skills, "cli-anything": cmd_cli_anything,
     "raw": cmd_raw, "vision": cmd_vision, "model": cmd_model, "models": cmd_models, "mcp": cmd_mcp, "config": cmd_config,
-    "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode,
+    "status": cmd_status, "doctor": cmd_doctor, "dump": cmd_dump, "sandbox": cmd_sandbox, "mode": cmd_mode, "eval": cmd_eval,
     "local": cmd_local,
     "search": cmd_search,
     "new": cmd_new, "sessions": cmd_sessions, "resume": cmd_resume, "reset": cmd_reset,
@@ -8180,6 +8201,21 @@ def _remove_agent8088_searxng_container():
     return bool(result.get("ok"))
 
 
+def _remove_agent8088_wsl_distro(home):
+    """Unregister the WSL distro `--sandbox-setup` made, named in the install's wsl-sandbox.json. The distro's name
+    or "" when there was none. Only an Agent8088 sandbox distro is ever removed (wsl_sandbox.remove refuses others)."""
+    import json as json_module
+    from agent8088 import wsl_sandbox
+    try:
+        state = json_module.loads((Path(home) / "wsl-sandbox.json").read_text(encoding="utf-8"))
+        distro = str(state.get("distro") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not distro or wsl_sandbox.remove(distro) is not None:
+        return ""
+    return distro
+
+
 def _windows_owned_path_entries(home):
     """Every Windows user-PATH entry an agent8088 install can add.
 
@@ -8758,6 +8794,11 @@ def _run_windows_uninstall(home, workspace=False):
     if _remove_agent8088_searxng_container():
         _say("Removed the SearXNG Docker container.")
 
+    # Before the files go: a registered distro's disk is in use and cannot be deleted.
+    removed_distro = _remove_agent8088_wsl_distro(home)
+    if removed_distro:
+        _say(f"Removed the WSL sandbox distro {removed_distro}.")
+
     if not home.exists():
         _say(f"Install directory not found: {home}")
         _remove_windows_launcher_dir(link_dir)
@@ -8906,7 +8947,7 @@ def _run_uninstall(workspace=False, assume_yes=False, dry_run=False):
 
 # The branch releases come from. Change this one line when that moves; the
 # resolver below copes with it having been renamed or retired in the meantime.
-UPDATE_BRANCH = "AGENT8088-v1.3"
+UPDATE_BRANCH = "AGENT8088-v1.4"
 
 
 def _git(install_dir, *args):
@@ -8924,8 +8965,8 @@ def _resolve_update_branch(install_dir):
     """Return (branch, note) — the branch --update should move the install to.
 
     The branch the install has checked out is the channel the user chose
-    (AGENT8088_BRANCH at install time), and development, staging-1.3 and
-    AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH alone would move every
+    (AGENT8088_BRANCH at install time), and development, staging-1.4 and
+    AGENT8088-v1.4 carry the same tree, so UPDATE_BRANCH alone would move every
     development or staging install to production on its first update. That
     branch is followed while the remote still has it.
 
@@ -10096,6 +10137,7 @@ def _run_prompt_file(path: str, resume: str = None) -> int:
     if not query:
         print("agent8088 --prompt-file: the file is empty", file=sys.stderr)
         return 2
+    A.HEADLESS_RUN = True   # nobody is watching: the run gets the headless clock when none is set
     A.PERMISSION_MODE = "full-auto"
     # Saved so --resume has something to load. cmd_resume names the session
     # itself; without it this run would claim a name and leave nothing to
@@ -10280,7 +10322,11 @@ def main():
                              "under a session name so --resume can continue it)")
     parser.add_argument("--resume", default=None, metavar="NAME",
                         help="with --prompt-file: load this saved session first and continue it")
+    parser.add_argument("--eval", action="store_true",
+                        help="eval mode: leave out the steps that cannot change what a run leaves on disk")
     args = parser.parse_args()
+    if args.eval:
+        A.set_run_mode("eval")
 
     # The transport flags are meaningless without --mcp-serve, and argparse happily
     # accepts them alone — which used to fall through to the REPL with no server and
@@ -10323,7 +10369,7 @@ def main():
         return 0 if configure_model_profile() else 130
     if args.sandbox_setup:
         print(A.install_native_sandbox())
-        return 0 if A.native_sandbox_verified() else 1
+        return 0 if A.native_sandbox_verified() or A.wsl_sandbox_verified() else 1
     if args.memory_setup:
         return run_memory_setup()
     if args.libreoffice_setup:

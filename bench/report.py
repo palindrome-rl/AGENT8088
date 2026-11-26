@@ -98,8 +98,12 @@ def main(argv=None) -> int:
     print(causes(results))
     if args.tier:
         tier = benchlib.load_tier(args.tier)
-        rows = benchlib.tier_check(summary, tier.get("bar", {}), baseline)
+        compared, added = benchlib.comparable(results, baseline) if baseline else (None, [])
+        rows = benchlib.tier_check(summary, tier.get("bar", {}), baseline, compared=compared)
         print(f"\n{tier.get('title') or 'Tier ' + args.tier}:")
+        if added:
+            print(f"  compared with the baseline on its own tasks only; new since then: {', '.join(added)} "
+                  "(save this run's summary as the next baseline)")
         for rule, passed, detail in rows:
             print(f"  {'pass' if passed else 'FAIL'}  {rule}: {detail}")
         if not baseline:

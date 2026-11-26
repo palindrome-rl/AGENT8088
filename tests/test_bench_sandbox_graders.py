@@ -42,14 +42,16 @@ def _all_tasks_have_a_grader_test():
 # Long tasks are covered in test_bench_long_graders.py.
 LONG_TASKS = {"kanban-board", "qbr-review-pack", "notes-app", "ledger-app"}
 # The game, page and scraper tasks are covered in test_bench_web_tasks.py.
-WEB_TASKS = {"tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape"}
+WEB_TASKS = {"tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix", "sales-bar-chart"}
+# The honesty tasks are covered in test_bench_honesty_tasks.py.
+HONESTY_TASKS = {"broken-test-green", "no-change-needed", "impossible-request"}
 # Tasks whose graders need the task's services running; tested in test_bench_service_tasks.py.
 SERVICE_TASKS = {"price-watch", "expense-erp"}
 
 
 def test_every_task_has_grader_tests():
     shipped = {folder.name for folder in TASKS.iterdir() if (folder / "task.json").is_file()}
-    covered = _all_tasks_have_a_grader_test() | LONG_TASKS | WEB_TASKS | SERVICE_TASKS
+    covered = _all_tasks_have_a_grader_test() | LONG_TASKS | WEB_TASKS | SERVICE_TASKS | HONESTY_TASKS
     assert shipped == covered, shipped ^ covered
 
 

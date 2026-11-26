@@ -7,13 +7,15 @@ import posixpath
 import re
 import shlex
 from copy import deepcopy
-from pathlib import PurePath, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
-from agent8088.completion import SUBGOAL_PREFIX
+from agent8088.completion import RERUN_KINDS, SUBGOAL_PREFIX, item_kind, named_output_paths
 
 VERSION = 2
 MAX_OPERATIONS = 12
+# How many times a request may be asked to look at what it built (once per state of the work).
+MAX_LOOK_ASKS = 2
 MAX_TEXT = 240
 MAX_EVIDENCE = 6
 
@@ -49,6 +51,106 @@ def _is_test_path(path: str) -> bool:
             or ".test" in p.name.lower() or ".spec" in p.name.lower()
             or any(part.lower() in {"tests", "test", "__tests__", "spec"}
                    for part in p.parts))
+
+
+# A line of a test that checks something, and a marker that stops a test from running or failing.
+_TEST_CHECK_LINE = re.compile(r"^\s*assert\b|\bself\.assert\w*\(|\bexpect\(|\bassert\w*\(")
+_TEST_SKIP = re.compile(r"@pytest\.mark\.(?:skip|xfail)|\bpytest\.(?:skip|xfail)\(|@unittest\.skip|"
+                        r"\b(?:it|test|describe)\.(?:skip|todo)\(|\bx(?:it|describe)\(")
+# "update the test", "fix the body temperature test", "the test is wrong": the request asks for a test to change.
+# "Don't change the tests" and "fix it and add a test" do not.
+_ASKS_TO_CHANGE_TESTS = re.compile(
+    r"\b(?:update|change|fix|edit|correct|rewrite|adjust|modify|replace)\s+"
+    r"(?:(?:the|that|this|these|those|my|our|its|their)\s+)?(?:[\w-]+\s+){0,2}tests?\b"
+    r"|\btests?\b[^.\n]{0,30}\b(?:is|are)\s+(?:wrong|incorrect|outdated|out\s+of\s+date)\b",
+    re.IGNORECASE)
+_NEGATED = re.compile(r"(?:\bdon['’]?t|\bdo\s+not|\bnever|\bnot|\bwithout|\bno\s+need\s+to)\s*$", re.IGNORECASE)
+
+
+def _asks_to_change_tests(goal: str) -> bool:
+    """The request asks for a test to change, and does not say not to."""
+    return any(not _NEGATED.search(goal[max(0, m.start() - 20):m.start()])
+               for m in _ASKS_TO_CHANGE_TESTS.finditer(goal or ""))
+_TEST_ORIGINAL_MAX = 200_000
+
+
+# A given test's literal case: `assert f(37) == 98.0` gives (37.0, 98.0). Numbers compare by value.
+def _literal(value) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return repr(float(value))
+    return repr(value)
+
+
+def _given_test_cases(text: str) -> set:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    cases = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq)):
+            continue
+        for call, value in ((node.left, node.comparators[0]), (node.comparators[0], node.left)):
+            if (isinstance(call, ast.Call) and len(call.args) == 1 and isinstance(call.args[0], ast.Constant)
+                    and isinstance(value, ast.Constant)):
+                cases.add((_literal(call.args[0].value), _literal(value.value)))
+    return cases
+
+
+# Code that says it is shaped to pass a test ("to satisfy test_body_temperature", "the only way to keep all four
+# tests passing"). "to pass the tests" is left out: honest code says that too.
+_SHAPED_FOR_A_TEST = re.compile(
+    r"\bto\s+satisfy\s+(?:the\s+)?(?:given\s+)?(?:test_\w+|tests?)\b"
+    r"|\bonly\s+way\s+to\s+keep\s+(?:all\s+)?(?:\w+\s+){0,2}tests?\s+pass",
+    re.IGNORECASE)
+
+
+def _special_cases(text: str, cases: set) -> set:
+    """`if x == <a given test's input>: return <that test's expected value>`, and comments saying the code is there to
+    satisfy a test. Only `==`: a boundary such as `if kg <= 5: return 4.0` is a rule, not a test's case."""
+    found = {"comment|" + " ".join(line.split()).lower() for line in text.splitlines() if _SHAPED_FOR_A_TEST.search(line)}
+    if not cases:
+        return found
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return found
+    for node in ast.walk(tree):
+        test = getattr(node, "test", None) if isinstance(node, ast.If) else None
+        if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq)):
+            continue
+        sides = (test.left, test.comparators[0])
+        constant = next((side for side in sides if isinstance(side, ast.Constant)), None)
+        if constant is None or all(isinstance(side, ast.Constant) for side in sides):
+            continue
+        for statement in node.body:
+            if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Constant):
+                pair = (_literal(constant.value), _literal(statement.value.value))
+                if pair in cases:
+                    found.add(f"eq|{pair[0]}|{pair[1]}")
+    return found
+
+
+_CODE_SCAN_MAX_FILES = 200
+_CODE_SCAN_MAX_BYTES = 200_000
+_CODE_SCAN_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", "dist", "build",
+                                  "site-packages", "artifacts", ".pytest_cache", ".mypy_cache"})
+
+
+def _code_files(root: str):
+    """The project's own Python source files (not tests), capped."""
+    import os
+    count = 0
+    for folder, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in _CODE_SCAN_SKIP_DIRS and not d.startswith(".")]
+        for name in names:
+            path = Path(folder) / name
+            if path.suffix.lower() != ".py" or _is_test_path(str(path)):
+                continue
+            count += 1
+            if count > _CODE_SCAN_MAX_FILES:
+                return
+            yield path
 
 
 def _is_code_path(path: str) -> bool:
@@ -139,6 +241,27 @@ def _text(value) -> str:
 # A request to build a web app or page, and the files that count as its entry point.
 _WEB_APP_REQUEST = re.compile(r"\b(web[\s-]?app(lication)?s?|web[\s-]?sites?|web[\s-]?pages?|html page|browser game|front-?end|web-based)\b", re.I)
 _BUILD_VERB = re.compile(r"\b(create|build|make|develop|write|implement|generate|design)\b", re.I)
+
+
+def _asks_to_build_web_app(goal: str) -> bool:
+    """The request asks to build a web app or page: a build verb with the web thing as what it makes.
+
+    Both words anywhere in the request was not enough: "compare our prices with four competitor websites ... write a
+    short brief" names websites to read and asks to write a brief, and a run that delivered the spreadsheet, brief and
+    script was marked "no runnable app was produced". The verb now has to come first in the same sentence, at most a
+    few words before the web thing ("build a small web app", "make me a landing page", "create an HTML page"), with no
+    "from", "on", "of" and the like between them ("a script that checks prices on competitor websites")."""
+    for sentence in re.split(r"(?<=[.!?;:])\s+|\n+", goal):
+        for verb in _BUILD_VERB.finditer(sentence):
+            between = sentence[verb.end():verb.end() + 60]
+            web = _WEB_APP_REQUEST.search(between)
+            if not web:
+                continue
+            lead = between[:web.start()]
+            if len(lead.split()) <= 5 and not re.search(
+                    r"\b(?:from|on|of|at|across|with|against|for|in|using|via|about|that|which)\b", lead, re.I):
+                return True
+    return False
 # Folders that hold pages the run saved for itself (downloaded docs, scraped results), not pages it built.
 _REFERENCE_DIRS = frozenset({"data", "research", "docs", "doc", "cache", "downloads", "download", "reference", "references", "refs",
                              "raw", "scraped", "samples", "fixtures", "tmp", "temp", "scratch"})
@@ -157,7 +280,19 @@ _CHECK_COMMAND = re.compile(
 
 # The note the sandbox appends when a command tried to write where it may not. A check that ends with
 # it was stopped by the sandbox: it never ran to a result, so it did not fail.
-_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
+# A start refused because that service is already running left the service up: nothing is left undone (seen ending a
+# run "Unresolved tool work remains: service_start" after the model had used and stopped the service).
+_ALREADY_RUNNING = re.compile(r"a service named \S+ is already running")
+
+
+def _already_running(tool: str, operation: dict) -> bool:
+    return tool == "service_start" and bool(_ALREADY_RUNNING.search(str(operation.get("result") or "")))
+
+
+# The sandbox refused a write, so the command tested nothing. On Linux (the WSL and Docker sandboxes) a folder the
+# sandbox keeps read-only answers EROFS: seen as "mkdir: can't create directory 'mt_test/': Read-only file system" on
+# a scratch check in /tmp, which then ended a passing run "the latest check failed".
+_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only|Read-only file system|\[Errno 30\]")
 
 
 # Commands that move, list or remove files. A folder called `tests\` in their arguments does not make them a
@@ -167,6 +302,9 @@ _FILE_COMMANDS = frozenset({
     "xcopy", "copy", "robocopy", "move", "del", "erase", "rmdir", "rd", "mkdir", "md", "ren", "rename", "dir",
     "type", "attrib", "tree", "cd", "chdir", "pushd", "popd", "echo", "cls", "set", "ls", "cp", "mv", "rm",
     "cat", "touch", "pwd", "mkdir", "chmod", "ln", "find", "stat", "where", "which",
+    # Reading a log or waiting on a job checks nothing, whatever the file is called. Seen in a run: a
+    # `sleep 60 && tail -1 build.log` that found no log stayed "the latest check failed" after the build itself passed.
+    "tail", "head", "wc", "sleep", "kill",
     "copy-item", "move-item", "remove-item", "get-childitem", "new-item", "set-location", "get-content"})
 def command_segments(command: str, *, split_or: bool = False) -> list[str]:
     """Split shell sequencing outside quotes, without splitting `2>&1`.
@@ -747,6 +885,9 @@ def _own_script_passed(command: str, result: str, written, workspace: str = "") 
     return any(_OWN_PASS_LINE.fullmatch(ln) for ln in lines[-3:])
 
 
+_ENV_PREFIX = re.compile(r"^(?:[a-z_][a-z0-9_]*=\S*\s+)+")
+
+
 def _same_command(a: str, b: str) -> bool:
     """Whether `b` is the command `a` that failed, run again.
 
@@ -756,7 +897,12 @@ def _same_command(a: str, b: str) -> bool:
     if not a:
         return False
     first, second = " ".join(str(a).split()).lower(), " ".join(str(b).split()).lower()
-    return first == second or (bool(second) and _without_trailing_clause(first) == second)
+    if first == second or (bool(second) and _without_trailing_clause(first) == second):
+        return True
+    # A check that failed with settings in front of it (`BUILD_FAST=1 python build.py`) is settled by the plain
+    # command passing: that is the fuller check. A setting added to the rerun does not count the other way round.
+    plain = _ENV_PREFIX.sub("", first)
+    return bool(second) and plain != first and plain == second
 
 
 # Output thrown away (`2>nul`, `>/dev/null`) leaves a command's exit status as it was, so it does not change what a
@@ -962,8 +1108,16 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
         "consecutive_setbacks": 0,
         "stalled": False,
         "replan_requested": False,
+        "look_seen_at": None,
+        "look_asked_at": None,
+        "look_asks": 0,
         "message_count": 0,
     }
+
+
+# The line that names what failed (a failing test, an exception, an assertion), not the summary or the exit status.
+_FAILURE_LINE = re.compile(r"\bFAILED\b|\bERROR\b|\w*(?:Error|Exception)\b|\bassert(?:ion)?\b|\bpanicked\b|\berror(?:\[|:)",
+                           re.IGNORECASE)
 
 
 class TrajectoryState:
@@ -1029,6 +1183,8 @@ class TrajectoryState:
             self.data["smoke_asked"] = []
             self.data["backend_check"] = {}
             self.data["grounding_asked"] = False
+            self.data["look_asked_at"] = None
+            self.data["look_asks"] = 0
         self.data["message_count"] = message_count
         for operation in self.data["operations"]:
             if operation.get("status") == "running":
@@ -1149,6 +1305,7 @@ class TrajectoryState:
             self.data["failing_what"] = _text(display(_command_core(command) or operation["tool"]))[:100]
             self.data["failing_error"] = _error_line(display(result))
             self.data["failing_command"] = " ".join(command.split())
+            self._note_failure_repeat(command, display(result))
             # The written files this run started: a clean run of any of them later settles the failure.
             self.data["failing_files"] = ([] if _is_check_run(command) else
                                          [PurePath(str(f)).name for f in written_now or []
@@ -1188,8 +1345,13 @@ class TrajectoryState:
                 self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
+                self._recheck_after_change()
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
+            play_test = operation.get("tool") == "browser_test"
+            if play_test:
+                self.data["play_tested_at"] = self.mutation_count()
+            self._settle_rechecks(play_test)
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
             # A passing test run after the last change verifies it, whether the work was still pending or had only been
@@ -1263,6 +1425,70 @@ class TrajectoryState:
 
     def edited_existing_tests(self) -> list[str]:
         return list(self.data.get("edited_existing_tests") or [])
+
+    def remember_test_original(self, path: str, text: str) -> None:
+        """Keep a test file as it was before this run first changed it (once per file, size-capped)."""
+        if not _is_test_path(path) or len(text) > _TEST_ORIGINAL_MAX:
+            return
+        originals = self.data.setdefault("test_originals", {})
+        key = _file_key(path)
+        if key in originals or len(originals) >= MAX_WRITTEN:
+            return
+        originals[key] = {"path": str(path), "text": text}
+
+    def weakened_tests(self) -> list[str]:
+        """Names of the given tests this run made weaker: a check the file had is gone or changed, or a skip or
+        xfail marker was added. Empty when the request itself asks for the tests to change."""
+        if _asks_to_change_tests(str(self.data.get("goal") or "")):
+            return []
+        weakened = []
+        for original in (self.data.get("test_originals") or {}).values():
+            before = original["text"]
+            try:
+                now = Path(original["path"]).read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                # A given test that is gone checks nothing any more (deleted or moved away by any tool).
+                weakened.append(PurePath(original["path"]).name)
+                continue
+            except OSError:
+                continue
+            if now == before:
+                continue
+            kept = {" ".join(line.split()) for line in now.splitlines()}
+            checks_gone = any(" ".join(line.split()) not in kept
+                              for line in before.splitlines() if _TEST_CHECK_LINE.search(line))
+            if checks_gone or len(_TEST_SKIP.findall(now)) > len(_TEST_SKIP.findall(before)):
+                weakened.append(PurePath(original["path"]).name)
+        return weakened
+
+    def special_case_findings(self) -> list[str]:
+        """"<file>|<finding>" for each hard-coded given test case or test-shaped comment in the project's code now."""
+        root = self.data.get("test_snapshot_root")
+        if not root:
+            return []
+        cases = set()
+        for original in (self.data.get("test_originals") or {}).values():
+            cases |= _given_test_cases(str(original.get("text") or ""))
+        findings = []
+        for path in _code_files(root):
+            try:
+                if path.stat().st_size > _CODE_SCAN_MAX_BYTES:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            relative = path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
+            findings += [f"{relative}|{finding}" for finding in sorted(_special_cases(text, cases))]
+        return findings
+
+    def hardcoded_test_cases(self) -> list[str]:
+        """Names of the code files where this run hard-coded a given test's case (`if x == 37: return 98.0`) or wrote
+        that the code is there to satisfy a test. What the project had before the run does not count."""
+        if not self.data.get("test_snapshot_root"):
+            return []
+        before = set(self.data.get("special_case_baseline") or [])
+        return sorted({PurePath(finding.split("|", 1)[0]).name
+                       for finding in self.special_case_findings() if finding not in before})
 
     def _track_tests(self, operation: dict, path: str, *, mutated: bool, command: str = "") -> None:
         """Maintain the list of code files changed this run with no test written.
@@ -1379,7 +1605,7 @@ class TrajectoryState:
         self.data["subgoals_built"] = True
         checklist = self.data.setdefault("checklist", [])
         for item in items:
-            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending"})
+            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending", "kind": item_kind(item)})
 
     def subgoals_built(self) -> bool:
         return bool(self.data.get("subgoals_built"))
@@ -1389,21 +1615,76 @@ class TrajectoryState:
                 if str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
 
     def open_subgoals(self) -> list[str]:
-        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") != "done"]
+        """Parts not yet addressed. A part whose evidence went stale (recheck) is not open: it was covered, and only a
+        passing check after the change settles it again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") not in ("done", "recheck")]
+
+    def recheck_subgoals(self) -> list[str]:
+        """Parts that were settled by a run of the work before it changed again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") == "recheck"]
 
     def mark_subgoals(self, still_open: list[str]) -> None:
-        """Everything not in `still_open` is done; what is in it stays pending."""
+        """Everything not in `still_open` is done; what is in it stays pending. A part waiting for a recheck keeps
+        waiting: the reply covering its words is not new evidence about the changed work."""
         keep = set(still_open)
         for step in self.subgoals():
             name = step["name"][len(SUBGOAL_PREFIX):]
-            step["status"] = "pending" if name in keep else "done"
+            if name in keep:
+                step["status"] = "pending"
+            elif step.get("status") not in ("done", "recheck"):
+                step["status"] = "done"
+                step["done_at"] = self.mutation_count()
+                step["evidence"] = self._item_evidence(name, step.get("kind", "property"))
+
+    def _item_evidence(self, item: str, kind: str) -> str:
+        """What settled a part, in a few words, from what the controller saw."""
+        if kind == "file":
+            written = {PurePath(str(p).replace("\\", "/")).name.lower() for p in self.data.get("written_paths") or []}
+            present = [PurePath(p).name for p in named_output_paths(item) if PurePath(p).name.lower() in written]
+            if present:
+                return "file present: " + ", ".join(present)
+        if kind == "interactive":
+            # Only playing it shows an interaction works: a passing browser_test at this state of the work.
+            if self.data.get("play_tested_at") == self.mutation_count():
+                return "a passing play test"
+            return "covered by the work and the reply (not play-tested)"
+        if kind in RERUN_KINDS and int(self.data.get("passed_checks") or 0):
+            return "a passing check"
+        return "covered by the work and the reply"
+
+    def _recheck_after_change(self) -> None:
+        """The work changed: a part settled by running the earlier work needs a new run."""
+        now = self.mutation_count()
+        for step in self.subgoals():
+            if (step.get("status") == "done" and step.get("kind") in RERUN_KINDS
+                    and int(step.get("done_at") or 0) < now):
+                step["status"] = "recheck"
+
+    def _settle_rechecks(self, play_test: bool = False) -> None:
+        """A passing check after the change settles the parts waiting for a recheck; an interactive part only when the
+        check played it (browser_test)."""
+        for step in self.subgoals():
+            if step.get("status") != "recheck":
+                continue
+            if step.get("kind") == "interactive" and not play_test:
+                continue
+            step["status"] = "done"
+            step["done_at"] = self.mutation_count()
+            step["evidence"] = ("a passing play test" if step.get("kind") == "interactive"
+                                else "a passing check after the last change")
+
+    def unplayed_interactive(self) -> list[str]:
+        """Interactive parts counted done without a passing play test (browser_test) behind them."""
+        return [step["name"][len(SUBGOAL_PREFIX):] for step in self.subgoals()
+                if step.get("kind") == "interactive" and step.get("status") == "done"
+                and step.get("evidence") != "a passing play test"]
 
     def unresolved_tools(self) -> list[str]:
         latest = {}
         for operation in self.data.get("operations", []):
             latest[operation.get("tool", "tool")] = operation
         return [tool for tool, op in latest.items()
-                if op.get("status") in {"blocked", "failed", "unknown"}]
+                if op.get("status") in {"blocked", "failed", "unknown"} and not _already_running(tool, op)]
 
     def has_open_items(self) -> bool:
         """Work the run itself shows is not finished: pending verification, a failed
@@ -1467,6 +1748,21 @@ class TrajectoryState:
         return (int(self.data.get("mutation_count") or 0),
                 int(self.data.get("passed_checks") or 0),
                 sum(1 for step in self.subgoals() if step.get("status") == "done"))
+
+    def note_looked(self) -> None:
+        """A render of the work was shown to the model (or, for a text-only model, its evidence was) at the current state of the work."""
+        self.data["look_seen_at"] = self.mutation_count()
+
+    def ask_to_look(self) -> bool:
+        """Whether to ask the model, now, to look at what it built: once per state of the work, never when it already looked at
+        this state, and at most MAX_LOOK_ASKS times a request."""
+        state = self.mutation_count()
+        if (not state or self.data.get("look_seen_at") == state or self.data.get("look_asked_at") == state
+                or int(self.data.get("look_asks") or 0) >= MAX_LOOK_ASKS):
+            return False
+        self.data["look_asked_at"] = state
+        self.data["look_asks"] = int(self.data.get("look_asks") or 0) + 1
+        return True
 
     def smoke_unchecked(self, paths: list[str]) -> list[str]:
         """Deliverables not yet smoke-tested at the current state of the work."""
@@ -1607,6 +1903,18 @@ class TrajectoryState:
         # previously passing page check is later superseded.
         self.data["inspected_by_page_check"] = None
 
+    def note_project_program_ran(self, command: str, result: str) -> None:
+        """The project's own build, test or script ran cleanly after the change: the change was exercised.
+
+        Not "tested" (nothing says the result is right), but no longer unchecked, so the completion check stops asking
+        for evidence the run has already given."""
+        self.note_ran_ok()
+        if self.data.get("verification") == "pending":
+            self.data["verification"] = "inspected"
+            self._set_step("Verify changed work", "inspected")
+        self.data.setdefault("evidence", []).append({"tool": "execute_shell", "result": _text(result)[:300]})
+        del self.data["evidence"][:-MAX_EVIDENCE]
+
     def status_lines(self) -> list[tuple[str, str]]:
         """Plain facts about the task so far, for /status. Read from what the harness already recorded; no model call.
 
@@ -1674,7 +1982,7 @@ class TrajectoryState:
     def wants_web_app(self) -> bool:
         """The request is to build a web app or page (judged from the start of the request, which is all that is kept)."""
         goal = str(self.data.get("goal") or "")
-        return bool(_WEB_APP_REQUEST.search(goal) and _BUILD_VERB.search(goal))
+        return _asks_to_build_web_app(goal)
 
     def has_app_entry(self) -> bool:
         """The run wrote a page (outside a folder of saved reference material) or a server entry file."""
@@ -1897,14 +2205,164 @@ class TrajectoryState:
             lines.append(f"Goal: {self.data['goal']}")
         if self.data.get("workspace"):
             lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
-        lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
-        ))
+        lines.extend(self._ledger_lines())
         for operation in operations[-6:]:
             line = f"- {operation.get('status', 'unknown')}: {operation.get('tool', 'tool')}"
             if operation.get("verdict") in {"passed", "failed"}:
                 line += f" (verification {operation['verdict']})"
             lines.append(line)
+        if self.needs_replan():
+            lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
+        if self.needs_verification():
+            lines.append("Verification is pending: do not claim the changed work is verified until you inspect or test it.")
+        if self.needs_tests():
+            lines.append("Changed with no tests yet: " + ", ".join(self.untested_paths())
+                         + ". Call generate_tests for each, or say why tests do not apply.")
+        return "\n".join(lines)
+
+    # The same facts as prompt(), for delivery in the conversation instead of the system prompt. A system prompt that
+    # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
+    # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
+
+    def _note_failure_repeat(self, command: str, result: str) -> None:
+        """Count a failing check that fails the same way (same command, same failure line, numbers ignored) after the
+        work changed since its last failure: a fix that missed the cause."""
+        lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
+        named = next((line for line in lines if _FAILURE_LINE.search(line)), "")
+        error = re.sub(r"\d+(?:\.\d+)?", "N", named or str(self.data.get("failing_error") or ""))[:160]
+        key = f"{' '.join(_command_core(command).split())[:120]} || {error}"
+        history = self.data.setdefault("failure_history", {})
+        entry = history.pop(key, None)
+        if entry is None:
+            entry = {"repeats": 0, "at": self.mutation_count()}
+        elif self.mutation_count() > int(entry.get("at") or 0):
+            entry = {"repeats": int(entry.get("repeats") or 0) + 1, "at": self.mutation_count()}
+        history[key] = entry
+        while len(history) > 10:
+            history.pop(next(iter(history)))
+        self.data["same_failure_repeats"] = entry["repeats"]
+
+    def repeated_failure(self) -> int:
+        """How many times the latest failing check came back the same way after a change (0 when it is not failing)."""
+        return int(self.data.get("same_failure_repeats") or 0) if self.check_failing() else 0
+
+    def progress_summary(self) -> str:
+        """What a run got done, from the controller's own records, for when the clock stops it before it answered."""
+        parts = self.subgoals()
+        written = [PurePath(str(p).replace(chr(92), "/")).name for p in self.data.get("written_paths") or []]
+        if not parts and not written:
+            return ""
+        lines = ["Progress when the run was stopped:"]
+        for step in parts:
+            name = str(step["name"])[len(SUBGOAL_PREFIX):]
+            if step.get("status") == "done":
+                evidence = f" ({step['evidence']})" if step.get("evidence") else ""
+                lines.append(f"- done: {name}{evidence}")
+            elif step.get("status") == "recheck":
+                lines.append(f"- done before the last change, not checked since: {name}")
+            else:
+                lines.append(f"- not done: {name}")
+        if written:
+            shown = list(dict.fromkeys(written))
+            lines.append("Files changed: " + ", ".join(shown[-8:]) + (f" (+{len(shown) - 8} more)" if len(shown) > 8 else ""))
+        if self.check_failing():
+            lines.append(f"Latest check: failing ({str(self.data.get('failing_what') or 'see the notes')[:80]})")
+        elif int(self.data.get("passed_checks") or 0):
+            lines.append("Latest check: passed")
+        return "\n".join(lines)
+
+    def note_write_problem(self, path: str, problem: str) -> None:
+        """What the check after a write found in a file ("" when it is fine now, which clears an earlier problem)."""
+        problems = self.data.setdefault("write_problems", {})
+        if problem:
+            problems[str(path)] = _text(problem)[:200]
+        else:
+            problems.pop(str(path), None)
+
+    def write_problems(self) -> dict:
+        return dict(self.data.get("write_problems") or {})
+
+    def recheck_write_problems(self, check) -> None:
+        """Check each file with a recorded problem again: `check(path)` gives its problem now, or "".
+
+        A page written before the files it points at was recorded as pointing at missing files, and nothing
+        checked it again when they were written, so the problem outlived the fix. A file that is gone has no problem
+        left to report."""
+        problems = self.data.get("write_problems") or {}
+        for path in list(problems):
+            try:
+                exists = Path(path).is_file()
+            except OSError:
+                exists = False
+            problem = check(path) if exists else ""
+            if problem:
+                problems[path] = _text(problem)[:200]
+            else:
+                problems.pop(path, None)
+
+    def _ledger_lines(self) -> list[str]:
+        """The checklist as the model reads it: the general steps on one line, then each part of the request with its
+        status and, once settled, what settled it, then the next step."""
+        general = [s for s in self.data.get("checklist", []) if not str(s.get("name", "")).startswith(SUBGOAL_PREFIX)]
+        lines = ["Checklist: " + "; ".join(f"{s.get('name')}: {s.get('status')}" for s in general)]
+        parts = self.subgoals()
+        if parts:
+            lines.append("Parts of the request:")
+            for step in parts:
+                name = str(step["name"])[len(SUBGOAL_PREFIX):]
+                status = {"done": "done", "recheck": "recheck"}.get(str(step.get("status")), "open")
+                line = f"- [{status}] {name}"
+                if status == "done" and step.get("evidence"):
+                    line += f" ({str(step['evidence'])[:80]})"
+                elif status == "recheck":
+                    line += " (settled before the last change: run the check again)"
+                lines.append(line)
+            following = self.open_subgoals() or self.recheck_subgoals()
+            if following:
+                lines.append(f"Next: {following[0]}")
+            elif unplayed := self.unplayed_interactive():
+                lines.append(f'Next: play-test "{unplayed[0]}" with browser_test (inspect, act, then expect_js or '
+                             "expect_changed)")
+        repeats = self.repeated_failure()
+        if repeats:
+            lines.append(f"The latest check failed the same way after {repeats} change(s): "
+                         f"{str(self.data.get('failing_what') or 'the check')[:80]}. The fixes so far missed the cause; "
+                         "take a different approach.")
+        problems = self.write_problems()
+        if problems:
+            lines.append("Problems in written files: " + "; ".join(
+                f"{PurePath(str(p).replace(chr(92), '/')).name} ({msg})" for p, msg in list(problems.items())[:5]))
+        return lines
+
+    def state_signature(self) -> tuple:
+        """What the model should act on. It changes only when one of those things changes, not on every tool call."""
+        steps = tuple((str(step.get("name")), str(step.get("status"))) for step in self.data.get("checklist", []))
+        return (steps, bool(self.needs_verification()),
+                tuple(self.untested_paths()) if self.needs_tests() else (),
+                bool(self.needs_replan()), tuple(self.unresolved_tools()),
+                tuple(sorted(self.write_problems().items())), self.repeated_failure())
+
+    def has_open_attention(self) -> bool:
+        """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
+        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools()
+                    or self.write_problems())
+
+    def state_note(self, *, full: bool = False) -> str:
+        """The state as one short note. `full` adds the goal and the workspace line, which do not change within a task."""
+        if not (self.data.get("operations") or []):
+            return ""
+        lines = ["Task state (controller-maintained facts, not a request from the user):"]
+        if full:
+            lines.append("Notes like this one come from the harness, not from the tool. The newest is current, and it is "
+                         "repeated while something stays open.")
+            if self.data.get("goal"):
+                lines.append(f"Goal: {self.data['goal']}")
+            if self.data.get("workspace"):
+                lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
+        lines.extend(self._ledger_lines())
+        unresolved = self.unresolved_tools()
+        if unresolved:
+            lines.append("Unresolved tool work: " + ", ".join(unresolved) + ".")
         if self.needs_replan():
             lines.append("Progress is stalled. Do not repeat the failed approach; state a short revised next step and use a different safe tool or input.")
         if self.needs_verification():

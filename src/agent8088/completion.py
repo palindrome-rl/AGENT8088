@@ -135,8 +135,12 @@ def reports_part_not_done(reply: str) -> bool:
 # showed a FAIL in a screenshot, which no check of the run can read. Its answer named the FAIL and called it "a
 # harness timing artifact", and the run ended "verified" over a page whose remove button was broken. A failure the
 # reply says was fixed ("it failed at first; after the fix it passes") is the checks' business, not this rule's.
+# After "a" or "the" only an uppercase FAIL marker counts: "reproduce the failure" names the bug the task is about,
+# not a check of the model's that failed (seen marking a passing fix NOT VERIFIED). A count ("2 failures") may be
+# in any case.
 _OWN_CHECK_FAILED = re.compile(
-    r"\b(?:one|a|the|two|three|[1-9]\d*)\s+[`'\"]?FAIL(?:ED|S|URES?)?\b[`'\"]?"
+    r"\b(?:one|two|three|[1-9]\d*)\s+[`'\"]?FAIL(?:ED|S|URES?)?\b[`'\"]?"
+    r"|\b(?:a|the)\s+[`'\"]?(?-i:FAIL(?:ED|S|URES?)?)\b[`'\"]?"
     r"|\b(?:tests?|checks?|assertions?|steps?|cases?|scenarios?)\s+(?:still\s+)?(?:failed|did\s*n[o']t\s+pass)\b"
     r"|\b(?:failed|failing)\s+(?:tests?|checks?|assertions?|steps?|cases?)\b"
     r"|\b(?:threw|raised)\s+(?:an?\s+)?(?:[\w-]+\s+){0,2}\w*(?:error|exception)\b"
@@ -156,11 +160,46 @@ _FAILURE_FIXED = re.compile(
     re.IGNORECASE)
 
 
+# "the failing test" or "the previously failing one" names the test the task was about, which the fix makes pass:
+# not a check of the model's that failed (seen marking a passing fix NOT VERIFIED). A sentence that says it still
+# fails keeps the phrase.
+_TASK_FAILING_TEST = re.compile(
+    r"\b(?:the|your|this|that)\s+(?:(?:previously|originally|given|one)\s+)?failing\s+"
+    r"(?:tests?|checks?|ones?|cases?)\b",
+    re.IGNORECASE)
+_STILL = re.compile(r"\b(?:still|remains?|again)\b", re.IGNORECASE)
+# A heading over the reply's account of the bug it was asked to fix ("What was wrong", "Root cause", "The bug").
+# What that section says failed is the starting state, not a check of the model's (seen: "The link step failed
+# because ..." under "What was wrong", on a build whose full run passed). A heading is a markdown heading or a line
+# that is only bold text.
+_HEADING_LINE = re.compile(r"^\s*(?:#{1,6}\s*(?P<md>.+?)\s*#*|\*\*(?P<bold>[^*]+?)\*\*:?)\s*$")
+_CAUSE_HEADING = re.compile(
+    r"^\W*(?:what\s+(?:was|went)\s+(?:wrong|broken|failing)|(?:the\s+)?(?:root\s+)?causes?|"
+    r"(?:the\s+)?(?:bug|problem|issue|failure)s?|why\s+it\s+(?:failed|broke)|before\s+the\s+(?:fix|change)|"
+    r"diagnosis|what\s+i\s+found)\b",
+    re.IGNORECASE)
+
+
+def _without_cause_sections(text: str) -> str:
+    """The reply without the lines under a heading about the original bug, except a line that says it still fails."""
+    kept, in_cause = [], False
+    for line in text.splitlines():
+        heading = _HEADING_LINE.match(line)
+        if heading:
+            in_cause = bool(_CAUSE_HEADING.match(heading.group("md") or heading.group("bold") or ""))
+            kept.append("")
+            continue
+        kept.append(line if not in_cause or _STILL.search(line) else "")
+    return "\n".join(kept)
+
+
 def reports_failed_check(reply: str) -> str:
     """The sentence in which the reply says one of its own checks failed and it was not fixed, or ""."""
-    text = _prose(reply).replace("**", "").replace("__", "")
+    text = _without_cause_sections(_prose(reply)).replace("**", "").replace("__", "")
     text = re.sub(r"\bif\s+(?:you|your|it|the)\b[^.\n]*", " ", text, flags=re.IGNORECASE)
     for sentence in _SENTENCE_SPLIT.split(text):
+        if not _STILL.search(sentence):
+            sentence = _TASK_FAILING_TEST.sub(" ", sentence)
         if (_OWN_CHECK_FAILED.search(sentence) and not _NO_FAILURE.search(sentence)
                 and not _FAILURE_FIXED.search(sentence)):
             return " ".join(sentence.split())
@@ -597,13 +636,14 @@ def _moved_copy(path: str, written: Iterable[str], roots: Iterable[Path]) -> boo
 
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
-                    start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
+                    start_files: dict | None = None, landed: Iterable = (),
+                    removed: Iterable[str] = ()) -> list[str]:
     """Named or claimed deliverables that do not exist, are empty, or sit in the
     wrong place.
 
     Three sources: paths the request asked for, directories it asked to be
     filled, and paths this run wrote that the reply names as its result (an empty
-    or removed file is not one). `mirror_roots` (the artifacts folder) is where
+    or removed file is not one; `removed` names the files the run deleted itself). `mirror_roots` (the artifacts folder) is where
     unspecified work goes by default; a requested path found only there is
     reported as misplaced rather than satisfied. The check is deterministic and
     makes no model call.
@@ -631,19 +671,39 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
                 and not _written_under_named_dir(path, request, wrote_at, roots + mirrors, mirrors):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
+    removed_names = {str(n).lower() for n in removed}
     for path in written:
         name = PurePath(path).name
         if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
                 and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
             # A scratch file the run made and removed, or a file it moved to a better place, is not a
             # deliverable that went missing.
-            if (name.startswith("_") or _moved_copy(path, written, roots + mirrors)
+            if (name.startswith("_") or name.lower() in removed_names
+                    or _moved_copy(path, written, roots + mirrors)
                     or is_throwaway_helper(path, request, written, roots + mirrors)):
                 continue
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
     return missing
+
+
+# A delete the run ran itself: `rm -f artifacts/shim.py`, `del x.py`, `Remove-Item x.py`. Any word boundary starts
+# one, because the saved command lines are flattened: a script's second line follows its first after a space.
+_DELETE_STEP = re.compile(r"(?<![\w./\\-])(?:rm|del|erase|remove-item|ri)(?:\.exe)?\s+([^;&|\n]+)", re.IGNORECASE)
+
+
+def removed_by_commands(ran: Iterable[str]) -> set[str]:
+    """Names of the files the run's own finished commands deleted. Seen in a run: a fallback module the run wrote, then
+    deleted once the real package installed, was reported as a missing file because the reply mentioned it."""
+    names = set()
+    for command in ran or ():
+        for match in _DELETE_STEP.finditer(str(command)):
+            for word in match.group(1).split():
+                word = word.strip("\"'")
+                if word and not word.startswith("-") and "*" not in word and "?" not in word:
+                    names.add(PurePath(word.replace("\\", "/")).name.lower())
+    return names
 
 
 def _mirror_equivalent(path: str, roots: Iterable[Path], mirrors: Iterable[Path]) -> Path | None:
@@ -790,6 +850,42 @@ def extract_subgoals(request: str, sentences: bool = True) -> list[str]:
     return [i[:160] for i in items[:MAX_SUBGOALS]]
 
 
+# What a part of a request asks for, for the checklist. Order matters: a part that asks for tests is a test item even
+# when it names the file the tests go in, and one that asks for a click or a key is interactive even when it says run.
+_TEST_ITEM = re.compile(r"\b(?:unit[- ]?tests?|tests?|testing|pytest|jest|vitest|spec)\b", re.IGNORECASE)
+_INTERACTIVE_ITEM = re.compile(
+    r"\b(?:click(?:s|ed|ing)?|press(?:es|ed|ing)?|tap(?:s|ped|ping)?|drag(?:s|ged|ging)?|type(?:s|d)? into|"
+    r"keys?|keyboard|arrow|mouse|button|play(?:s|ed|ing|able)?|player|game)\b", re.IGNORECASE)
+_RUN_ITEM = re.compile(r"\b(?:run(?:s|ning)?|start(?:s|ed|ing)?|serve(?:s|d)?|launch(?:es|ed)?|install(?:s|ed)?|"
+                       r"execute(?:s|d)?|deploy(?:s|ed)?|boot(?:s|ed)?)\b", re.IGNORECASE)
+
+
+def item_kind(item: str) -> str:
+    """test | interactive | file | run | property: what kind of evidence can settle this part of a request.
+
+    file, run, test and interactive parts can be shown by a check (a file present, a command or test run that passed, a
+    played interaction); a property ("keep the layout tidy") only by the work itself."""
+    text = item or ""
+    if _TEST_ITEM.search(text):
+        return "test"
+    if named_output_paths(text) or _FILE_NAME_IN_ITEM.search(text):
+        return "file"   # "draw the board in game.html" asks for a file, whatever the file is for
+    if _INTERACTIVE_ITEM.search(text):
+        return "interactive"
+    if _RUN_ITEM.search(text):
+        return "run"
+    return "property"
+
+
+# A file named in a part ("in game.html", "data/expenses.json"), with or without a verb that writes it.
+_FILE_NAME_IN_ITEM = re.compile(
+    r"(?<![\w/@.-])[\w-]+(?:[/\\][\w.-]+)*\.(?:html?|css|m?js|cjs|jsx|tsx?|py|json|csv|md|txt|ya?ml|xml|svg|sh|"
+    r"toml|ini|cfg|sql|go|rs|java|rb|php|c|cpp|h)\b", re.IGNORECASE)
+
+# Kinds whose evidence is a run of the work: a later change makes it stale.
+RERUN_KINDS = frozenset(("run", "test", "interactive"))
+
+
 def _stem(word: str) -> str:
     for suffix in ("ing", "ed", "es", "s"):
         if word.endswith(suffix) and len(word) - len(suffix) >= 4:
@@ -862,13 +958,36 @@ _ACTION_WORD = re.compile(r"\b(?:run|execute|start|launch|install|serve|restart|
 _NAMED = re.compile(r"`([^`\n]+)`")
 
 
+# An example of what the page shows ("amounts with two decimals, like `$12.34`") is a value the running work prints,
+# not a name its files hold. Seen in a run: `$12.34` was the one named thing the finished page did not contain.
+_EXAMPLE_VALUE = re.compile(
+    r"\b(?:like|e\.g\.,?|such\s+as|for\s+example,?|for\s+instance,?)\s*`([^`\n\w]*\d[^`\n]*)`", re.IGNORECASE)
+
+
+# A part that asks for state to outlast a reload is met by a page that keeps it in browser storage. No file says
+# "still there after the page is reloaded": seen in a run, the page saved the cart in localStorage, a play test
+# reloaded it, and the part stayed open because the code never used the words "reload" or "still".
+_PERSIST_PART = re.compile(
+    r"\b(?:(?:still\s+there|kept|kept\s+safe|remembered|restored|saved|persist(?:s|ed)?)\b[^.]{0,60}?"
+    r"\b(?:reload(?:s|ed|ing)?|refresh(?:es|ed|ing)?)\b"
+    r"|(?:reload(?:s|ed|ing)?|refresh(?:es|ed|ing)?)\b[^.]{0,60}?\b(?:still\s+there|kept|remembered|restored|persist))",
+    re.IGNORECASE)
+_STORAGE_API = re.compile(r"\b(?:localStorage|sessionStorage|indexedDB)\b")
+
+
+def _named_things(item: str) -> list[str]:
+    examples = {m.start(1) for m in _EXAMPLE_VALUE.finditer(item)
+                if not re.search(r"[A-Za-z]", m.group(1))}
+    return [m.group(1) for m in _NAMED.finditer(item) if m.start(1) not in examples]
+
+
 def _named_things_found(item: str, *haystacks: str) -> bool:
     """Whether every thing the part names in backticks (`.venv`, `--verbose`, `cli.py`) shows up, word for word.
 
     The named things are the checkable core of a part, so when each of them is there the part is not forgotten, even
     when the rest of it is described in other words.
     """
-    named = [_words_for_evidence(n).split() for n in _NAMED.findall(item)]
+    named = [_words_for_evidence(n).split() for n in _named_things(item)]
     named = [words for words in named if words]
     return bool(named) and all(
         any(all(f" {w} " in hay for w in words) for hay in haystacks) for words in named)
@@ -1074,6 +1193,8 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
         if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
             continue
         if _met_by_running_what_was_made(item, words, ran, written_names):
+            continue
+        if _PERSIST_PART.search(item) and _STORAGE_API.search(evidence):
             continue
         # The file the part asks for is there: the words that only restate making a file are met by it.
         made = {_root(w) for w in _MAKE_ACT_STEMS} if _made_file_named(item, written_names) else set()
@@ -1302,6 +1423,25 @@ class Nudge:
     kind: str
     text: str
     unmet: str = ""  # what to tell the user if the budget runs out before this is met
+
+
+# Words that say the request is about how the result looks. Used only together with a page or image the run wrote.
+_VISUAL_WORDS = re.compile(
+    r"\b(?:visual(?:ly)?|aesthetic\w*|polish(?:ed)?|graphics?|artwork|pixel[- ]?art|animat\w+|illustrat\w+|layout|user interface|"
+    r"ui|ux|responsive|styled|styling|palette|colou?rs?|colou?rful|sprites?|beautiful|attractive|stunning|landing page|mock-?up|"
+    r"looks?\s+(?:good|great|nice|professional|polished|beautiful))\b", re.IGNORECASE)
+
+
+def wants_visual_result(request: str) -> bool:
+    """The request is about how the result looks, not only what it does."""
+    return bool(_VISUAL_WORDS.search(request or ""))
+
+
+VISUAL_LOOK_ASK = (
+    "What you built is meant to be seen, and nothing in this run has looked at it yet. Render it with screenshot_page (a page that "
+    "needs input to reach a state can be driven with browser_test), say plainly what looks wrong or weak (layout, text that is hard "
+    "to read, missing or overlapping parts, anything the request asked to be visible), and fix it. If it already looks right, say so in "
+    "one line, then give your final answer.")
 
 
 def continue_text(problem: str, ask: str) -> str:

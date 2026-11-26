@@ -319,3 +319,31 @@ def test_a_missing_agent_stops_before_any_run(tmp_path, monkeypatch):
         bench_run.resolve_agent("agent8088")
     with pytest.raises(SystemExit):
         bench_run.resolve_agent(str(Path("missing") / "agent8088.exe"))
+
+
+# ----------------------------------------------------------------- the four-level verdict line
+
+@pytest.mark.parametrize("line, level, verdict", [
+    ("Verdict: VERIFIED (a test run passed after the last change).", "verified", "verified"),
+    ("Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it).", "partly verified",
+     "done_unchecked"),
+    ("Verdict: COULD NOT VERIFY (the sandbox could not start the server).", "could not verify", "not_verified"),
+])
+def test_the_verdict_line_is_read_even_far_below_the_reply(line, level, verdict):
+    """The verdict leads the end-of-run notes, which come after the reply, often past the 600 characters kept."""
+    reply = "Here is what I did. " * 60
+    level_note = " Verification: exercised." if level != "partly verified" else " Verification: inspected."
+    steps = [_answer(reply + "\n\n" + line + level_note)]
+    summary = benchlib.summarize_trace(_trace(steps), end_reason="answered")
+    assert summary["verdict_level"] == level
+    assert summary["harness_verdict"] == verdict
+
+
+def test_the_not_verified_headline_is_a_verdict_level_too():
+    steps = [_answer("NOT VERIFIED: the latest check failed.\n\nI fixed it.")]
+    assert benchlib.summarize_trace(_trace(steps), end_reason="answered")["verdict_level"] == "not verified"
+
+
+def test_an_answer_without_a_verdict_line_has_no_level():
+    steps = [_answer("Done. Verification: tested.")]
+    assert benchlib.summarize_trace(_trace(steps), end_reason="answered")["verdict_level"] == ""

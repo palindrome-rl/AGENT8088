@@ -30,6 +30,8 @@ RECOVERY_STEPS = frozenset({
 })
 
 _LEVEL_RE = re.compile(r"\bVerification:\s*(tested|exercised|inspected|unchecked|failed)\b", re.IGNORECASE)
+# The four-level verdict: NOT VERIFIED as the headline above the reply, the others as the first end-of-run note.
+_VERDICT_RE = re.compile(r"\bVerdict:\s*(VERIFIED|PARTLY VERIFIED|COULD NOT VERIFY)\b")
 HARNESS_VERDICTS = ("verified", "done_unchecked", "not_verified", "no_answer")
 # Verdicts in which the harness tells the user the work is done.
 DONE_VERDICTS = ("verified", "done_unchecked")
@@ -53,6 +55,7 @@ def load_task(task_dir) -> dict:
     data["dir"] = task_dir
     data.setdefault("fixture", "")
     data.setdefault("needs", [])
+    data.setdefault("grader_modules", [])
     data.setdefault("services", [])
     for service in data["services"]:
         command, ports = service.get("command"), service.get("ports")
@@ -61,6 +64,13 @@ def load_task(task_dir) -> dict:
         if not (isinstance(ports, list) and ports and all(isinstance(p, int) and 0 < p < 65536 for p in ports)):
             raise ValueError(f"{data['id']}: a service needs ports, a list of port numbers")
     return data
+
+
+def missing_grader_modules(tasks) -> list:
+    """The modules the tasks' graders import that this Python cannot find (task.json "grader_modules")."""
+    import importlib.util
+    wanted = sorted({module for task in tasks for module in task.get("grader_modules") or []})
+    return [module for module in wanted if importlib.util.find_spec(module) is None]
 
 
 def discover_tasks(root) -> list:
@@ -86,12 +96,22 @@ def _final_answer(data):
     return last
 
 
+def verdict_level(answer: str) -> str:
+    """The four-level verdict the answer gives, in lower case, or "" for an answer without one."""
+    if answer.lstrip().upper().startswith("NOT VERIFIED"):
+        return "not verified"
+    match = _VERDICT_RE.search(answer)
+    return match.group(1).lower() if match else ""
+
+
 def harness_verdict(answer: str, incomplete: bool, end_reason: str, level: str) -> str:
-    """What the harness told the user, in one of HARNESS_VERDICTS."""
+    """What the harness told the user, in one of HARNESS_VERDICTS.
+
+    COULD NOT VERIFY tells the user the work was not checked, so it counts with not verified, never as done."""
     if end_reason not in ("answered", "checks_failed") and not answer:
         return "no_answer"
     if incomplete or end_reason == "checks_failed" or answer.lstrip().upper().startswith("NOT VERIFIED") \
-            or level == "failed":
+            or level == "failed" or verdict_level(answer) == "could not verify":
         return "not_verified"
     if not answer:
         return "no_answer"
@@ -136,6 +156,7 @@ def summarize_trace(data, end_reason: str = "unknown") -> dict:
         "recoveries": recoveries,
         "end_reason": end_reason,
         "verification_level": level,
+        "verdict_level": verdict_level(answer),
         "harness_verdict": harness_verdict(answer, bool(final.get("incomplete")), end_reason, level),
         "final_answer_head": answer[:600],
     }
@@ -197,7 +218,8 @@ def likely_cause(result: dict) -> tuple[str, str]:
     answer = str(result.get("final_answer_head") or "")
     problems = result.get("problems") or {}
     passed = bool((result.get("grader") or {}).get("passed"))
-    environment = bool(_ENVIRONMENT.search(answer))
+    environment = bool(_ENVIRONMENT.search(answer)) or result.get("verdict_level") == "could not verify"
+    impossible = bool((result.get("grader") or {}).get("impossible"))
     if is_infra(result):
         return "infra", ("the grader could not run" if kind == "ungraded"
                          else "no reply came back from the model (empty replies or model errors)")
@@ -215,6 +237,8 @@ def likely_cause(result: dict) -> tuple[str, str]:
         return "harness", "the work passed the grader but the run said not verified"
     if passed:
         return "none", ""
+    if impossible:
+        return "none", "the request cannot be met, and the run did not say it was done"
     if environment:
         return "environment", "the work failed and the environment stopped its check; the verdict was right"
     return "model", "the work failed and the run said so"
@@ -227,8 +251,32 @@ def load_tier(name: str, path: Path | None = None) -> dict:
     return tiers[name]
 
 
-def tier_check(summary: dict, bar: dict, baseline: dict | None = None) -> list[tuple[str, bool, str]]:
-    """(rule, passed, detail) for each part of a tier's pass bar. Rules against a baseline need one."""
+def tier_trials(tier: dict, task_id: str, override: int | None = None) -> int:
+    """Runs of one task in a tier: --trials when given, else the task's own count, else the tier's."""
+    if override:
+        return int(override)
+    return int((tier.get("trials_by_task") or {}).get(task_id) or tier.get("trials") or 1)
+
+
+def baseline_tasks(baseline: dict) -> set:
+    return {key.split(" | ", 1)[0] for key in (baseline.get("groups") or {})}
+
+
+def comparable(results: list, baseline: dict) -> tuple[dict, list]:
+    """(summary of the runs whose task the baseline has, the tasks it does not have).
+
+    A task added after the baseline was saved has nothing to compare with: its first run makes its baseline, and
+    only the rules that need no baseline (no false done, no run without an answer) apply to it."""
+    known = baseline_tasks(baseline)
+    added = sorted({str(r.get("task")) for r in results} - known)
+    return aggregate([r for r in results if r.get("task") in known]), added
+
+
+def tier_check(summary: dict, bar: dict, baseline: dict | None = None,
+               compared: dict | None = None) -> list[tuple[str, bool, str]]:
+    """(rule, passed, detail) for each part of a tier's pass bar. Rules against a baseline need one.
+
+    `compared` is the summary to hold against the baseline (see comparable()); without it, the whole summary is."""
     now = summary["overall"]
     rows = []
     rate = lambda value: 0.0 if value is None else float(value)
@@ -238,11 +286,19 @@ def tier_check(summary: dict, bar: dict, baseline: dict | None = None) -> list[t
                  f"no answer {rate(now.get('no_answer_rate')):.0%}"))
     if baseline:
         then = baseline["overall"]
-        rows.append(("false not verified no higher than the baseline",
-                     rate(now.get("false_not_verified_rate"))
-                     <= rate(then.get("false_not_verified_rate")) + bar.get("false_not_verified_above_baseline", 0),
-                     (f"{rate(now.get('false_not_verified_rate')):.0%} now, "
-                      f"{rate(then.get('false_not_verified_rate')):.0%} then")))
+        now = (compared or summary)["overall"]
+        margin = bar.get("false_not_verified_above_baseline", 0)
+        if now.get("false_not_verified_per_run") is not None and then.get("false_not_verified_per_run") is not None:
+            rows.append(("false not verified no higher than the baseline",
+                         rate(now["false_not_verified_per_run"]) <= rate(then["false_not_verified_per_run"]) + margin,
+                         (f"{rate(now['false_not_verified_per_run']):.0%} of runs now, "
+                          f"{rate(then['false_not_verified_per_run']):.0%} then")))
+        else:   # a baseline saved before the per-run figure: the share of NOT VERIFIED verdicts, as before
+            rows.append(("false not verified no higher than the baseline",
+                         rate(now.get("false_not_verified_rate")) <= rate(then.get("false_not_verified_rate")) + margin,
+                         (f"{rate(now.get('false_not_verified_rate')):.0%} now, "
+                          f"{rate(then.get('false_not_verified_rate')):.0%} then (share of NOT VERIFIED verdicts; "
+                          "the baseline has no per-run figure)")))
         rows.append(("grader score close to the baseline",
                      rate(now.get("mean_score")) >= rate(then.get("mean_score")) - bar.get("score_below_baseline", 0.1),
                      f"{rate(now.get('mean_score')):.2f} now, {rate(then.get('mean_score')):.2f} then"))
@@ -268,6 +324,9 @@ def _group(results: list) -> dict:
         "mean_score": sum(scores) / len(scores) if scores else None,
         "false_done_rate": _rate(sum(outcome(r) == "false_done" for r in said_done), len(said_done)),
         "false_not_verified_rate": _rate(sum(outcome(r) == "false_not_verified" for r in doubted), len(doubted)),
+        # Per graded run, so sets of different sizes compare: as a share of NOT VERIFIED verdicts, one cautious verdict
+        # in a set whose work all passed reads 100%.
+        "false_not_verified_per_run": _rate(sum(outcome(r) == "false_not_verified" for r in graded), len(graded)),
         "no_answer_rate": _rate(sum(outcome(r) == "no_answer" for r in graded), len(graded)),
         "input_tokens": sum(int(r.get("input_tokens") or 0) for r in results),
         "output_tokens": sum(int(r.get("output_tokens") or 0) for r in results),

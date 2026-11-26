@@ -6,6 +6,12 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _base_cap(engine, monkeypatch):
+    """These tests are about the base mechanics, where every quiet turn counts. The new-evidence hold has its own tests."""
+    monkeypatch.setattr(engine, "POST_CHECK_NEW_EVIDENCE", False)
+
+
 def _response(content):
     message = type("M", (), {"content": content, "tool_calls": None})()
     return type("R", (), {"choices": [type("C", (), {"message": message,

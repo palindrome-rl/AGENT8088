@@ -16,7 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 TASKS = ROOT / "bench" / "tasks"
 REFS = Path(__file__).resolve().parent / "bench_references"
-WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape")
+WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix", "sales-bar-chart")
 
 
 def _browser_env():
@@ -79,10 +79,39 @@ def test_an_empty_workspace_fails(task, tmp_path):
     assert report.get("passed") is not True
 
 
-@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page"])
+@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page", "canvas-play-fix",
+                                  "sales-bar-chart"])
 def test_the_reference_page_passes(task, tmp_path, browser):
     report = _grade(task, _with_reference(task, tmp_path), tmp_path)
     assert report["passed"], report
+
+
+# ----------------------------------------------------------------- canvas-play-fix
+
+def test_canvas_play_fails_the_game_as_given(tmp_path, browser):
+    report = _grade("canvas-play-fix", _workspace("canvas-play-fix", tmp_path), tmp_path)
+    assert not report["passed"]
+    assert not report["checks"]["ArrowLeft moves the paddle left"]
+    assert not report["checks"]["a click on the coin scores"]
+
+
+@pytest.mark.parametrize("edit, check", [
+    (lambda s: s.replace("Math.max(0, game.paddle - 20)", "game.paddle - 20"), "the paddle stops at the left edge"),
+    # Offset only by the box, not the border: a click lands 2 px off, still on the coin; scaled clicks are not.
+    (lambda s: s.replace("(event.clientX - rect.left - board.clientLeft) * board.width / board.clientWidth",
+                         "event.clientX"), "a click on the coin scores"),
+    (lambda s: s.replace("game.coin += 1;", ""), "the coin moves after a score"),
+])
+def test_canvas_play_fails_a_partial_fix(tmp_path, browser, edit, check):
+    report = _grade("canvas-play-fix", _with_reference("canvas-play-fix", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"][check], report
+
+
+def test_canvas_play_fails_a_changed_server(tmp_path, browser):
+    workspace = _with_reference("canvas-play-fix", tmp_path)
+    (workspace / "server.py").write_text("print('no')\n", encoding="utf-8")
+    report = _grade("canvas-play-fix", workspace, tmp_path)
+    assert not report["passed"] and not report["checks"]["server.py unchanged"]
 
 
 # ----------------------------------------------------------------- tile-flip-game
@@ -223,6 +252,42 @@ def test_scrape_fails_a_scraper_that_stops_at_the_first_page(tmp_path):
     assert not report["checks"]["every row is right on the second shop"]
 
 
+# ----------------------------------------------------------------- sales-bar-chart
+# The small visual task: a chart that looks right is measured, not taken on trust.
+
+def test_bar_chart_passes_a_chart_drawn_with_divs(tmp_path, browser):
+    workspace = _workspace("sales-bar-chart", tmp_path)
+    (workspace / "chart.html").write_text((REFS / "sales-bar-chart-divs" / "chart.html").read_text(encoding="utf-8"),
+                                          encoding="utf-8")
+    report = _grade("sales-bar-chart", workspace, tmp_path)
+    assert report["passed"], report
+
+
+@pytest.mark.parametrize("edit, check", [
+    # Every bar 40 px taller: the order is right but the heights are no longer in proportion.
+    (lambda s: s.replace("const scale = 2;", "const scale = 2; const extra = 40;")
+               .replace("const h = value * scale;", "const h = value * scale + extra;"),
+     "bar heights are in proportion to the sales"),
+    (lambda s: s.replace("best ? '#d9822b' : '#4a78b5'", "'#4a78b5'"), "the best month has its own colour"),
+    (lambda s: s.replace("addText(x + 20, top - 8, String(value));", ""), "each bar has its number above it"),
+    (lambda s: s.replace('width="640"', 'width="1100"'), "the chart fits in 800 by 600 without scrolling"),
+    (lambda s: s.replace("const months = MONTHS;", "const months = MONTHS.slice().reverse();"),
+     "six bars, one per month, in order"),
+    (lambda s: s.replace("<title>", '<link rel="stylesheet" href="https://fonts.example.com/a.css"><title>'),
+     "no console errors or outside requests"),
+])
+def test_bar_chart_fails_a_chart_that_only_looks_finished(tmp_path, browser, edit, check):
+    report = _grade("sales-bar-chart", _with_reference("sales-bar-chart", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"][check], report
+
+
+def test_bar_chart_fails_labels_that_overlap(tmp_path, browser):
+    # Month names drawn 2 px apart pile on top of each other.
+    edit = lambda s: s.replace("const gap = 90;", "const gap = 2;")
+    report = _grade("sales-bar-chart", _with_reference("sales-bar-chart", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"]["no labels overlap"], report
+
+
 # ----------------------------------------------------------------- the runner lists them
 
 def test_the_runner_lists_the_tasks_without_a_profile():
@@ -237,3 +302,12 @@ def test_the_runner_still_needs_a_profile_to_run():
     run = subprocess.run([sys.executable, str(ROOT / "bench" / "run.py"), "--task", "cart-page"],
                          capture_output=True, text=True, timeout=60, check=False)
     assert run.returncode == 2 and "--profile" in run.stderr
+
+
+def test_tile_flip_passes_a_status_that_says_not_solved(tmp_path, browser):
+    # Seen in a run: a correct game whose status read "Not solved" at the start failed "not solved at the start".
+    workspace = _with_reference("tile-flip-game", tmp_path, lambda s: s.replace(
+        'solved() ? "Solved" : ""', 'solved() ? "Solved" : "Not solved"'))
+    report = _grade("tile-flip-game", workspace, tmp_path)
+    assert report["checks"]["not solved at the start"], report
+    assert report["passed"], report

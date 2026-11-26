@@ -1,0 +1,11 @@
+{
+  "id": "sales-bar-chart",
+  "title": "Draw a small offline bar chart page; bars, colours and labels are measured on screen (visual task)",
+  "kind": "sandbox",
+  "prompt": "prompt.md",
+  "fixture": "",
+  "grader": "grade.py",
+  "budget_sec": 900,
+  "needs": ["chromium for the grader"],
+  "grader_modules": ["playwright"]
+}

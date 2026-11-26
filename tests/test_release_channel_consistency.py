@@ -86,12 +86,12 @@ def test_installer_bootstrap_and_update_urls_stay_on_the_channel():
 
 
 def test_every_branch_carries_the_production_channel():
-    """development, staging-1.3 and AGENT8088-v1.3 share one tree. The installers
+    """development, staging-1.4 and AGENT8088-v1.4 share one tree. The installers
     default to production, other channels are chosen with AGENT8088_BRANCH, and
     `--update` follows the branch an install is on (tests/test_update_follows_installed_branch.py)."""
-    assert _channel() == "AGENT8088-v1.3"
+    assert _channel() == "AGENT8088-v1.4"
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "/tree/AGENT8088-v1.3" in readme
+    assert "/tree/AGENT8088-v1.4" in readme
     wiki_home = (ROOT / "docs" / "wiki" / "README.md").read_text(encoding="utf-8")
     assert "Staging 1.2 documentation" not in wiki_home
 

@@ -18,16 +18,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml"><img src="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml/badge.svg?branch=AGENT8088-v1.3" alt="CI status"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml"><img src="https://github.com/palindrome-rl/AGENT8088/actions/workflows/ci.yml/badge.svg?branch=AGENT8088-v1.4" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
-  <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.3"><img src="https://img.shields.io/badge/release-v1.3-f59e0b" alt="Agent8088 v1.3 branch"></a>
+  <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.4"><img src="https://img.shields.io/badge/release-v1.4-f59e0b" alt="Agent8088 v1.4 branch"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
   <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/61%20built--in%20tools-execution%20grounded-10b981" alt="61 built-in tools">
+  <img src="https://img.shields.io/badge/67%20built--in%20tools-execution%20grounded-10b981" alt="67 built-in tools">
   <img src="https://img.shields.io/badge/verification--gated%20completion-optional%20audit%20%2B%20rollback-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
   <img src="https://img.shields.io/badge/40%20skill%20packages-extensible-6366f1" alt="40 skill packages">
@@ -107,38 +107,40 @@ Apart from focusing on small models reliability, Agent8088 is a complete agentic
 
 ---
 
-## What's new in v1.3
+## What's new in v1.4
 
-- **Task completion:** each part of a request is checked against delivered output; smoke tests separate "could not start here" from real crashes.
-- **Verification you can read:** each answer says how well its changes were checked (tested, only run, or failed), and a failing check shows as NOT VERIFIED at the top.
-- **Long-running tasks:** time and round budget warnings, stall decisions, and your rules kept word for word through compaction.
-- **Credential safety:** secret scanning on pasted text and written files; attachments isolated per session.
-- **File handling:** byte-exact `copy_file` and `move_file`; a generated project stays in one folder, and a folder you ask to put in `artifacts/` goes there.
-- **Visual verification:** the new `screenshot_page` tool renders what the agent built (a page, a chart, a UI, an SVG or other image file) in a guarded headless browser and shows the model the picture, with deterministic evidence: page errors, a blank-render warning and the change since the last render. `view_image` lets it look at any image in the workspace, and the `browser-qa` skill turns this into a check-and-fix workflow.
-- **Image input for any model:** whether a model reads images comes from your setting, the catalog, the endpoint or one small cached probe, never from its name, so new and self-hosted vision models work without setup. `/vision` shows what decided it.
+- **A verdict you can trust:** a run that changed files ends with one of four levels, VERIFIED, PARTLY VERIFIED, NOT VERIFIED or COULD NOT VERIFY, taken from the harness's own evidence, not from the model's reply.
+- **No credit for weakened tests:** a given test that was edited, skipped or deleted, or code that hard-codes a test's case, keeps the work from being VERIFIED.
+- **Checks after every write:** each file is parsed as it lands, and a stale problem clears once the file is fixed.
+- **Every part of the request tracked:** multi-part requests go on a checklist from the first turn, and an interactive part counts as checked only after a passing play test.
+- **Auto QA and retry with change:** changed work with a test suite nearby gets its tests run, and a check that fails the same way again asks for a different approach.
+- **Unattended runs:** headless runs get a clock and end with what is done, with evidence, and what is not. Eval mode judges a run on what it leaves on disk.
+- **Sub-agents report back:** each sub-agent ends with a STATUS line, and its result returns as a report to check, not as fact.
+- **WSL sandbox on Windows:** commands run in a dedicated WSL distro with its own temporary folder, and Windows programs are called correctly from it.
+- **Fewer false alarms:** a log poll, an example value or a file the run deleted itself no longer turns finished work into NOT VERIFIED.
 
-Includes the v1.2 reliability fixes; existing configuration and memory are preserved. See the [CHANGELOG](CHANGELOG.md).
+Includes everything in v1.3; existing configuration and memory are preserved. Existing v1.3 installs stay on v1.3 when they run `agent8088 --update`; reinstall with the commands below to move to v1.4. See the [CHANGELOG](CHANGELOG.md).
 
 ## Quick start
 
-### Install Agent8088 v1.3
+### Install Agent8088 v1.4
 
-The commands below install the public v1.3 branch. `agent8088 --update`
+The commands below install the public v1.4 branch. `agent8088 --update`
 continues to use this branch.
 
 **macOS, Linux, or WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | AGENT8088_BRANCH=AGENT8088-v1.3 bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | AGENT8088_BRANCH=AGENT8088-v1.4 bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = "AGENT8088-v1.3"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
+$env:AGENT8088_BRANCH = "AGENT8088-v1.4"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.ps1)
 ```
 
-Use these branch-specific installers for v1.3; the generic Pages installer
+Use these branch-specific installers for v1.4; the generic Pages installer
 may track a different release.
 
 Run the Windows command in PowerShell, not Command Prompt. On macOS/Linux,
@@ -358,7 +360,7 @@ Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
 GitIngest-backed repository overviews, search and source reads.
 
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
-The [hosted v1.3 wiki](https://github.com/palindrome-rl/AGENT8088/wiki) mirrors
+The [hosted v1.4 wiki](https://github.com/palindrome-rl/AGENT8088/wiki) mirrors
 these versioned pages.
 
 | Read this | To learn about |
@@ -383,7 +385,7 @@ these versioned pages.
 To inspect this release or propose a change, clone its public branch:
 
 ```sh
-git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.4 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 uv sync --all-extras
 ```

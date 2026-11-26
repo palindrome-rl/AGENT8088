@@ -21,6 +21,17 @@ def test_browser_qa_is_a_progressive_skill_that_needs_the_render_tool(engine):
         assert tool in text, tool
 
 
+def test_browser_qa_plans_and_plays_a_running_app_with_browser_test(engine):
+    text = engine.read_skill_resource("browser-qa", "SKILL.md")
+    # look first, plan what a user would do and see, act with the mouse and keys, check, look at the images
+    for word in ('"inspect": true', "click_at", "hold", "expect_js", "expect_changed", "screenshot", "grid",
+                 "Plan the steps", "look at each one"):
+        assert word in text, word
+    steps = engine.TOOL_SPECS["browser_test"]["description"]
+    for action in ("click_at", "hold", "drag", "inspect", "screenshot", "expect_js", "expect_changed"):
+        assert action in steps, action
+
+
 def test_browser_qa_is_listed_for_the_model(engine):
     assert "browser-qa" in engine.current_system_prompt(native_tools=True)
 

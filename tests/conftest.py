@@ -24,6 +24,19 @@ def _load_engine():
     # Tests that overwrite files must not drop backups in the developer's real data
     # directory; the backup tests switch this back on and point it at a tmp path.
     mod.FILE_BACKUPS = False
+    # Never start an egress proxy or clear Docker containers on the developer's
+    # Docker from an ordinary test: a test of a command path that reaches Docker
+    # gets no network instead. The opt-in attack tests use the real proxy.
+    if os.environ.get("AGENT8088_ATTACK_TESTS") != "1":
+        mod._unguarded_start_docker_egress = mod._start_docker_egress  # for tests that fake `docker`
+        mod._start_docker_egress = lambda key: ("none", [])
+    mod._docker_stale_cleaned = True
+    # Never import or set up a WSL distro from an ordinary test: `install_native_sandbox` sets one up on Windows,
+    # and a test of the ACL runner's setup would download Alpine and register a distro on the developer's machine.
+    # The WSL tests turn it back on and fake wsl.exe; the opt-in attack tests use a distro set up beforehand.
+    mod.SANDBOX_WSL = False
+    mod._unguarded_install_wsl_sandbox = mod.install_wsl_sandbox
+    mod.install_wsl_sandbox = lambda log=None: "WSL sandbox not set up in tests."
     return mod
 
 

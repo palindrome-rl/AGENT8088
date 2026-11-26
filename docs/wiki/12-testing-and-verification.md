@@ -15,12 +15,66 @@ isolated environment.
 
 ## Runtime completion evidence
 
-These runtime checks ship with AGENT8088-v1.3 and do not require a root
+These runtime checks ship with AGENT8088-v1.4 and do not require a root
 `tests/` directory. End-of-run notes distinguish a passing test run (`tested`)
 from running or loading the result without an error (`exercised`), inspecting
 files, and making changes without fresh verification. `Tested` means the run's
 own tests passed after the last change; it does not prove the result satisfies
 everything the user requested. Later edits invalidate earlier positive evidence.
+
+A request with several parts (a numbered or bulleted list, "and also / then"
+clauses, or several "it should ..." sentences) gets a checklist from its first turn.
+Each part has a kind: a file to make, something to run, tests, an interaction to
+play (a click, a key, a game), or a property of the work. The task-state note the
+model reads lists each part as open, done (with what settled it, such as
+"file present: report.csv") or recheck, and names the next step. A part settled by
+running the work goes back to recheck when the work changes after that, and only a
+passing check settles it again. The note is rebuilt from the controller's own state,
+so a compaction that drops older messages loses none of it.
+
+Every file that `write_file` or `edit_file` lands is checked at once by a parse
+that runs nothing: Python and JSON are parsed, JavaScript goes through
+`node --check`, and an HTML page's local `src` and `href` files must exist. A
+problem is added to the tool result in one line ("[check: app.js: line 12:
+SyntaxError ...]") and stays in the task-state note until the file is written
+cleanly. Appends are not checked, since a file written in parts is incomplete
+until its last part, and files over 1 MB are skipped.
+
+A run that changed files ends with a verdict in one of four levels, decided by
+the controller's own evidence only (what the reply claims never raises it):
+
+| Level | When |
+|---|---|
+| NOT VERIFIED | A check failed, a part of the request was not addressed, a file was cut off or still does not parse, or the reply says something was not done. It goes above the reply. |
+| COULD NOT VERIFY | Nothing failed and nothing passed, because the machine or the sandbox stopped a check from running; the note names what stopped it. |
+| VERIFIED | A test run passed after the last change, no part of the request waits for a recheck, and every interactive part was play-tested. |
+| PARTLY VERIFIED | Anything else that changed files: it ran without an error but no test passed, it was only read back, or a part was settled before the last change. The note says what is missing. |
+
+An interactive part of the request (a click, a key, a drag, a game) is shown to work only by
+playing it: a passing `browser_test` since the last change. A unit test or loading the page settles
+other parts but not that one, so without the play test the verdict stays PARTLY VERIFIED and the
+task-state note names the play test as the next step. The browser-qa skill teaches the test seam
+that makes such a build easy to drive: a read-only `window.__test.state()`, an optional `?seed=N`
+for the random parts, and for timed games `step(ms)`, none of which changes normal play.
+
+When changed work has no passing test since the change and a test suite sits above
+the changed files (pytest, unittest or `npm test`), the end-of-run check runs that
+suite itself in the sandbox (auto QA, `auto_qa_seconds`, once per state of the
+work) before asking the model to. A pass marks the change tested with no turn
+spent; a failure sends the model back with the command and the end of the output;
+no suite, or a result that says nothing either way, keeps the usual ask. It is
+skipped in the last stretch of the clock; `auto_qa=0` turns it off.
+
+A check that fails, then fails the same way again after the model changed files
+(same command, same failure line, numbers ignored), is a fix that missed the cause.
+The tool result says so once per repeat, and the task-state note names it until a
+check passes, so the next attempt changes approach instead of trying another small
+variation. A failure that changes after the edit counts as progress.
+
+The last three lead the end-of-run notes as one line, for example
+`Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
+the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
+turns the headline and the verdict line off.
 
 The notes also appear when output cut-offs, repeated calls or the turn limit
 stop a run. A post-check cap alone does not mark freshly tested or exercised

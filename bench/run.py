@@ -41,6 +41,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import benchlib
+import graderlib
 
 # Same budget rules as the Terminal-Bench adapter: the loop stops itself a little
 # before the watchdog, and no one shell call can use up the run's time.
@@ -104,6 +105,8 @@ def copy_env(profile: dict, dest: Path) -> list:
 # original; the large ones are linked.
 COPIED = ("runtime",)
 LINKED = ("node", "playwright-browsers")
+# The WSL sandbox's setup record (Windows): which distro the shared install set up, so a run uses it too.
+COPIED_FILES = ("wsl-sandbox.json",)
 
 
 def _link_dir(source: Path, dest: Path) -> None:
@@ -140,6 +143,10 @@ def share_runtime(profile: dict, home: Path) -> list:
         else:
             _link_dir(source / name, home / name)
         shared.append(name)
+    for name in COPIED_FILES:
+        if (source / name).is_file() and not (home / name).exists():
+            shutil.copy2(source / name, home / name)
+            shared.append(name)
     return shared
 
 
@@ -266,6 +273,9 @@ def grader_env(profile: dict) -> dict:
     browsers = Path(profile.get("shared_from") or "").expanduser() / "playwright-browsers"
     if profile.get("shared_from") and browsers.is_dir() and "PLAYWRIGHT_BROWSERS_PATH" not in env:
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+    # A venv the agent built in the WSL sandbox runs in that distro (graderlib.venv_python_command).
+    distro = (profile.get("config") or {}).get("wsl_distro") or "agent8088-sandbox"
+    env.setdefault(graderlib.GRADER_WSL_DISTRO_ENV, distro)
     return env
 
 
@@ -404,12 +414,11 @@ def main(argv=None) -> int:
     if not args.profile:
         parser.error("the following arguments are required: --profile")
     repeat_infra = False
+    tier = None
     if args.tier:
         tier = benchlib.load_tier(args.tier)
         args.task = args.task or list(tier["tasks"])
-        args.trials = args.trials or int(tier.get("trials", 1))
         repeat_infra = True
-    args.trials = args.trials or 1
     if args.task:
         unknown = set(args.task) - {task["id"] for task in tasks}
         if unknown:
@@ -417,12 +426,18 @@ def main(argv=None) -> int:
         tasks = [task for task in tasks if task["id"] in args.task]
     if args.kind:
         tasks = [task for task in tasks if task["kind"] == args.kind]
+    missing = benchlib.missing_grader_modules(tasks)
+    if missing:
+        # Seen in a run: a venv without pytest failed every "the given tests pass" check, over work that passed.
+        parser.error("the graders need modules this Python does not have: " + ", ".join(missing)
+                     + f". Install them into {sys.prefix} (pip install -e \".[dev]\" playwright) and run again.")
     agent = resolve_agent(args.agent)
     profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        for trial in range(1, args.trials + 1):
+        trials = benchlib.tier_trials(tier, task["id"], args.trials) if tier else (args.trials or 1)
+        for trial in range(1, trials + 1):
             stamp = time.strftime("%Y%m%d-%H%M%S")
             run_dir = out / f"{stamp}_{task['id']}_{profile.get('name', 'unnamed')}_{trial}"
             print(f"{benchlib.clock(benchlib.now_iso())} start {run_dir.name}", flush=True)

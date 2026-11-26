@@ -131,6 +131,7 @@ def test_tool_description_names_the_directory_actually_used(engine, monkeypatch,
 def test_sandboxed_tool_description_names_the_sandbox_workspace(engine, monkeypatch, tmp_path):
     launch, _ = _layout(engine, monkeypatch, tmp_path)
     monkeypatch.setattr(engine, "ARTIFACTS_ROOT", launch / "artifacts")
+    monkeypatch.setattr(engine, "SHELL_WORKSPACE", "artifacts")
     specs = {"execute_shell": {"description": "Run a command."}}
     engine._ground_execute_shell_description(specs)
     assert (f"Working directory: {launch / 'artifacts'} (the sandbox workspace; "

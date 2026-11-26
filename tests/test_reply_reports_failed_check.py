@@ -40,6 +40,63 @@ def test_described_behaviour_is_not():
     assert not reports_failed_check("If the server is down, the fetch step fails with a clear message.")
 
 
+def test_the_word_failure_about_the_original_bug_is_not():
+    # Seen in a benchmark run: a fix whose full build passed was marked NOT VERIFIED because the reply said how it
+    # reproduced the bug it was asked to fix. "the failure" is the bug, not a check of the model's that failed.
+    assert not reports_failed_check("First ran `BUILD_FAST=1 python build.py` to quickly reproduce the failure and "
+                                    "pinpoint the exact link error.")
+    assert not reports_failed_check("The failure came from a typo in module_077, which I corrected.")
+    assert not reports_failed_check("A failure in the link step stopped the build before my change.")
+
+
+def test_the_failing_test_the_task_is_about_is_not():
+    # Seen in a benchmark run: "Off-by-one at the 5 kg boundary (the failing test)." named the test the task gave,
+    # which the fix made pass, and the run ended NOT VERIFIED.
+    assert not reports_failed_check("Off-by-one at the 5 kg boundary (the failing test).")
+    assert not reports_failed_check("All 8 tests pass, including the previously failing one.")
+    assert not reports_failed_check("The originally failing test now passes along with the rest.")
+
+
+def test_your_failing_test_is_the_task_s_test():
+    # Seen in a benchmark run: "the bug your failing test caught" named the test the task gave.
+    assert not reports_failed_check("1. weight_kg < 5 -> weight_kg <= 5, the bug your failing test caught.")
+    assert not reports_failed_check("This failing test now passes with the rest.")
+
+
+def test_a_section_about_the_original_bug_is_not_a_failed_check():
+    # Seen in a benchmark run: a reply under "What was wrong" said "The link step failed because ..." about the bug
+    # it fixed; the full build passed and the run ended NOT VERIFIED.
+    for heading in ("## What was wrong", "**What was wrong**", "### Root cause", "**The bug:**", "## Problem"):
+        reply = (f"Done. The build passes now.\n\n{heading}\nThe link step failed because module_077 used "
+                 "parse_heder.\n\n## What I changed\nOne line in module_077.txt.")
+        assert not reports_failed_check(reply), heading
+
+
+def test_a_cause_section_that_says_it_still_fails_counts():
+    reply = "## What was wrong\nThe link step still failed after my change, on module_078.\n"
+    assert reports_failed_check(reply)
+
+
+def test_the_same_sentence_outside_a_cause_section_counts():
+    assert reports_failed_check("## Result\nThe link step failed because module_078 is missing a symbol.")
+
+
+def test_past_tense_descriptions_are_not_a_failed_check():
+    assert not reports_failed_check("The test was failing because of the off-by-one; it passes now.")
+    assert not reports_failed_check("The checkout test used to fail on reload.")
+    assert not reports_failed_check("The step that originally failed is the link step.")
+
+
+def test_the_failing_test_that_still_fails_counts():
+    assert reports_failed_check("The failing test still fails on the 10 kg case.")
+    assert reports_failed_check("Two failing tests remain in the edge cases.")
+
+
+def test_an_uppercase_fail_marker_still_counts():
+    assert reports_failed_check("The log shows the FAIL on the dec click, which I think is a timing issue.")
+    assert reports_failed_check("2 failures remain in the edge cases.")
+
+
 def test_an_answer_to_the_harness_failing_check_note_is_not():
     # The run's own checks already track that failure; the reply is answering the harness, not reporting its own.
     assert not reports_failed_check("Failing check: `set BUILD_FAST=1 && python build.py` (link error in module_077).")
