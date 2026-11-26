@@ -5440,8 +5440,9 @@ def _ground_execute_shell_description(specs: dict) -> None:
     wsl = not spec.get("host") and _wsl_shell_expected()
     shell_kind = ("PowerShell/cmd.exe" if sys.platform == "win32" and not wsl else
                   "bash in Agent8088's WSL sandbox (Alpine Linux). This computer's drives are under /mnt there "
-                  "(E:\\ is /mnt/e) and Windows paths in a command are rewritten to those; Windows programs "
-                  "(.exe, cmd, PowerShell) cannot run in it" if wsl else "a POSIX shell (bash/sh)")
+                  "(E:\\ is /mnt/e) and Windows paths in a command are rewritten to those. A command that starts a "
+                  "Windows program (.exe, cmd, PowerShell, dotnet, msbuild) runs in the Windows sandbox instead, "
+                  "where the shell is cmd" if wsl else "a POSIX shell (bash/sh)")
     check_cmd = "where <name>" if sys.platform == "win32" and not wsl else "command -v <name>"
     if wsl:
         python_hint = "If you need Python, use `python3` (or `python`); `pip install` installs for the user. "
@@ -14343,11 +14344,52 @@ def _interactive_session() -> bool:
         return False
 
 
+# Programs that exist only on Windows. The WSL sandbox runs Linux, with interop off so no Linux command can start a
+# Windows program; a command that starts one of these goes to the Windows sandbox instead. Builtins of cmd.exe that
+# Linux also has a program for (dir, type) are not listed: those work in bash.
+_WINDOWS_PROGRAMS = frozenset((
+    "powershell", "pwsh", "cmd", "dotnet", "msbuild", "nuget", "csc", "vbc", "cl", "link", "devenv", "vstest.console",
+    "reg", "wmic", "robocopy", "xcopy", "certutil", "tasklist", "taskkill", "winget", "choco", "icacls", "sc", "where",
+))
+_WINDOWS_SUFFIXES = (".exe", ".bat", ".cmd", ".ps1", ".com", ".msi")
+_COMMAND_START_RE = re.compile(r"(?:^|&&|\|\||[;|&\n(])\s*")
+
+
+def _windows_program(command: str) -> str:
+    """The Windows-only program a shell command starts (its name), or "". Each part of a chained command counts."""
+    for match in _COMMAND_START_RE.finditer(command or ""):
+        rest = command[match.end():].lstrip()
+        while True:   # VAR=value prefixes
+            assignment = re.match(r"[A-Za-z_][A-Za-z0-9_]*=\S*\s+", rest)
+            if not assignment:
+                break
+            rest = rest[assignment.end():]
+        word = re.match(r'"([^"]+)"|\'([^\']+)\'|(\S+)', rest)
+        if not word:
+            continue
+        program = next(group for group in word.groups() if group)
+        name = re.split(r"[\\/]", program)[-1]
+        lowered = name.lower()
+        if lowered.endswith(_WINDOWS_SUFFIXES) or lowered in _WINDOWS_PROGRAMS:
+            return name
+    return ""
+
+
 def _run_sandbox_command(command: str, timeout: int = 25,
                          python_code: bool = False, image: str = "") -> str:
     backend = _resolve_sandbox_backend()
     if backend == "unavailable":
         return _sandbox_required_error()
+    routed_note = ""
+    program = _windows_program(command) if backend == "wsl" and not python_code else ""
+    if program:
+        if _native_sandbox_missing_requirements() or _native_sandbox_broken:
+            return (f"Error: {program} is a Windows program, and the WSL sandbox runs Linux only. The Windows sandbox "
+                    "that could run it is not available here (agent8088 --sandbox-setup installs it). Nothing was run.")
+        backend = "native"
+        command = wsl_sandbox.command_to_windows(command)
+        routed_note = (f"[note: {program} is a Windows program, so this ran in the Windows sandbox, not WSL: its "
+                       "shell is cmd, file writes are limited to the project, and the network is not filtered there]")
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
     temporary = None
     workspace = ARTIFACTS_ROOT
@@ -14389,6 +14431,8 @@ def _run_sandbox_command(command: str, timeout: int = 25,
     finally:
         if temporary:
             cleanup_note = _cleanup_audit_workspace(temporary)
+    if routed_note and isinstance(result, str):
+        result = f"{result}\n{routed_note}"
     return f"{result}\n{cleanup_note}" if cleanup_note else result
 
 
