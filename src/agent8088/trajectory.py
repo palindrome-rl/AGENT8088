@@ -10,7 +10,7 @@ from copy import deepcopy
 from pathlib import PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
-from agent8088.completion import SUBGOAL_PREFIX
+from agent8088.completion import RERUN_KINDS, SUBGOAL_PREFIX, item_kind, named_output_paths
 
 VERSION = 2
 MAX_OPERATIONS = 12
@@ -992,6 +992,11 @@ def _blank(goal: str = "", workspace: str = "") -> dict:
     }
 
 
+# The line that names what failed (a failing test, an exception, an assertion), not the summary or the exit status.
+_FAILURE_LINE = re.compile(r"\bFAILED\b|\bERROR\b|\w*(?:Error|Exception)\b|\bassert(?:ion)?\b|\bpanicked\b|\berror(?:\[|:)",
+                           re.IGNORECASE)
+
+
 class TrajectoryState:
     """Mutates one JSON-serializable session dictionary in place.
 
@@ -1177,6 +1182,7 @@ class TrajectoryState:
             self.data["failing_what"] = _text(display(_command_core(command) or operation["tool"]))[:100]
             self.data["failing_error"] = _error_line(display(result))
             self.data["failing_command"] = " ".join(command.split())
+            self._note_failure_repeat(command, display(result))
             # The written files this run started: a clean run of any of them later settles the failure.
             self.data["failing_files"] = ([] if _is_check_run(command) else
                                          [PurePath(str(f)).name for f in written_now or []
@@ -1216,8 +1222,13 @@ class TrajectoryState:
                 self.data["inspected_by_page_check"] = None
                 self.data["verification_requested"] = False
                 self._set_step("Verify changed work", "pending")
+                self._recheck_after_change()
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
+            play_test = operation.get("tool") == "browser_test"
+            if play_test:
+                self.data["play_tested_at"] = self.mutation_count()
+            self._settle_rechecks(play_test)
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
             # A passing test run after the last change verifies it, whether the work was still pending or had only been
@@ -1407,7 +1418,7 @@ class TrajectoryState:
         self.data["subgoals_built"] = True
         checklist = self.data.setdefault("checklist", [])
         for item in items:
-            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending"})
+            checklist.append({"name": SUBGOAL_PREFIX + _text(item), "status": "pending", "kind": item_kind(item)})
 
     def subgoals_built(self) -> bool:
         return bool(self.data.get("subgoals_built"))
@@ -1417,14 +1428,69 @@ class TrajectoryState:
                 if str(step.get("name", "")).startswith(SUBGOAL_PREFIX)]
 
     def open_subgoals(self) -> list[str]:
-        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") != "done"]
+        """Parts not yet addressed. A part whose evidence went stale (recheck) is not open: it was covered, and only a
+        passing check after the change settles it again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") not in ("done", "recheck")]
+
+    def recheck_subgoals(self) -> list[str]:
+        """Parts that were settled by a run of the work before it changed again."""
+        return [s["name"][len(SUBGOAL_PREFIX):] for s in self.subgoals() if s.get("status") == "recheck"]
 
     def mark_subgoals(self, still_open: list[str]) -> None:
-        """Everything not in `still_open` is done; what is in it stays pending."""
+        """Everything not in `still_open` is done; what is in it stays pending. A part waiting for a recheck keeps
+        waiting: the reply covering its words is not new evidence about the changed work."""
         keep = set(still_open)
         for step in self.subgoals():
             name = step["name"][len(SUBGOAL_PREFIX):]
-            step["status"] = "pending" if name in keep else "done"
+            if name in keep:
+                step["status"] = "pending"
+            elif step.get("status") not in ("done", "recheck"):
+                step["status"] = "done"
+                step["done_at"] = self.mutation_count()
+                step["evidence"] = self._item_evidence(name, step.get("kind", "property"))
+
+    def _item_evidence(self, item: str, kind: str) -> str:
+        """What settled a part, in a few words, from what the controller saw."""
+        if kind == "file":
+            written = {PurePath(str(p).replace("\\", "/")).name.lower() for p in self.data.get("written_paths") or []}
+            present = [PurePath(p).name for p in named_output_paths(item) if PurePath(p).name.lower() in written]
+            if present:
+                return "file present: " + ", ".join(present)
+        if kind == "interactive":
+            # Only playing it shows an interaction works: a passing browser_test at this state of the work.
+            if self.data.get("play_tested_at") == self.mutation_count():
+                return "a passing play test"
+            return "covered by the work and the reply (not play-tested)"
+        if kind in RERUN_KINDS and int(self.data.get("passed_checks") or 0):
+            return "a passing check"
+        return "covered by the work and the reply"
+
+    def _recheck_after_change(self) -> None:
+        """The work changed: a part settled by running the earlier work needs a new run."""
+        now = self.mutation_count()
+        for step in self.subgoals():
+            if (step.get("status") == "done" and step.get("kind") in RERUN_KINDS
+                    and int(step.get("done_at") or 0) < now):
+                step["status"] = "recheck"
+
+    def _settle_rechecks(self, play_test: bool = False) -> None:
+        """A passing check after the change settles the parts waiting for a recheck; an interactive part only when the
+        check played it (browser_test)."""
+        for step in self.subgoals():
+            if step.get("status") != "recheck":
+                continue
+            if step.get("kind") == "interactive" and not play_test:
+                continue
+            step["status"] = "done"
+            step["done_at"] = self.mutation_count()
+            step["evidence"] = ("a passing play test" if step.get("kind") == "interactive"
+                                else "a passing check after the last change")
+
+    def unplayed_interactive(self) -> list[str]:
+        """Interactive parts counted done without a passing play test (browser_test) behind them."""
+        return [step["name"][len(SUBGOAL_PREFIX):] for step in self.subgoals()
+                if step.get("kind") == "interactive" and step.get("status") == "done"
+                and step.get("evidence") != "a passing play test"]
 
     def unresolved_tools(self) -> list[str]:
         latest = {}
@@ -1952,9 +2018,7 @@ class TrajectoryState:
             lines.append(f"Goal: {self.data['goal']}")
         if self.data.get("workspace"):
             lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
-        lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
-        ))
+        lines.extend(self._ledger_lines())
         for operation in operations[-6:]:
             line = f"- {operation.get('status', 'unknown')}: {operation.get('tool', 'tool')}"
             if operation.get("verdict") in {"passed", "failed"}:
@@ -1973,16 +2037,110 @@ class TrajectoryState:
     # changes every turn makes the server re-read the whole conversation every turn (its prompt cache can only reuse a
     # request that starts with the whole previous one). These helpers let the loop say a thing once, when it changes.
 
+    def _note_failure_repeat(self, command: str, result: str) -> None:
+        """Count a failing check that fails the same way (same command, same failure line, numbers ignored) after the
+        work changed since its last failure: a fix that missed the cause."""
+        lines = [line.strip() for line in str(result or "").splitlines() if line.strip()]
+        named = next((line for line in lines if _FAILURE_LINE.search(line)), "")
+        error = re.sub(r"\d+(?:\.\d+)?", "N", named or str(self.data.get("failing_error") or ""))[:160]
+        key = f"{' '.join(_command_core(command).split())[:120]} || {error}"
+        history = self.data.setdefault("failure_history", {})
+        entry = history.pop(key, None)
+        if entry is None:
+            entry = {"repeats": 0, "at": self.mutation_count()}
+        elif self.mutation_count() > int(entry.get("at") or 0):
+            entry = {"repeats": int(entry.get("repeats") or 0) + 1, "at": self.mutation_count()}
+        history[key] = entry
+        while len(history) > 10:
+            history.pop(next(iter(history)))
+        self.data["same_failure_repeats"] = entry["repeats"]
+
+    def repeated_failure(self) -> int:
+        """How many times the latest failing check came back the same way after a change (0 when it is not failing)."""
+        return int(self.data.get("same_failure_repeats") or 0) if self.check_failing() else 0
+
+    def progress_summary(self) -> str:
+        """What a run got done, from the controller's own records, for when the clock stops it before it answered."""
+        parts = self.subgoals()
+        written = [PurePath(str(p).replace(chr(92), "/")).name for p in self.data.get("written_paths") or []]
+        if not parts and not written:
+            return ""
+        lines = ["Progress when the run was stopped:"]
+        for step in parts:
+            name = str(step["name"])[len(SUBGOAL_PREFIX):]
+            if step.get("status") == "done":
+                evidence = f" ({step['evidence']})" if step.get("evidence") else ""
+                lines.append(f"- done: {name}{evidence}")
+            elif step.get("status") == "recheck":
+                lines.append(f"- done before the last change, not checked since: {name}")
+            else:
+                lines.append(f"- not done: {name}")
+        if written:
+            shown = list(dict.fromkeys(written))
+            lines.append("Files changed: " + ", ".join(shown[-8:]) + (f" (+{len(shown) - 8} more)" if len(shown) > 8 else ""))
+        if self.check_failing():
+            lines.append(f"Latest check: failing ({str(self.data.get('failing_what') or 'see the notes')[:80]})")
+        elif int(self.data.get("passed_checks") or 0):
+            lines.append("Latest check: passed")
+        return "\n".join(lines)
+
+    def note_write_problem(self, path: str, problem: str) -> None:
+        """What the check after a write found in a file ("" when it is fine now, which clears an earlier problem)."""
+        problems = self.data.setdefault("write_problems", {})
+        if problem:
+            problems[str(path)] = _text(problem)[:200]
+        else:
+            problems.pop(str(path), None)
+
+    def write_problems(self) -> dict:
+        return dict(self.data.get("write_problems") or {})
+
+    def _ledger_lines(self) -> list[str]:
+        """The checklist as the model reads it: the general steps on one line, then each part of the request with its
+        status and, once settled, what settled it, then the next step."""
+        general = [s for s in self.data.get("checklist", []) if not str(s.get("name", "")).startswith(SUBGOAL_PREFIX)]
+        lines = ["Checklist: " + "; ".join(f"{s.get('name')}: {s.get('status')}" for s in general)]
+        parts = self.subgoals()
+        if parts:
+            lines.append("Parts of the request:")
+            for step in parts:
+                name = str(step["name"])[len(SUBGOAL_PREFIX):]
+                status = {"done": "done", "recheck": "recheck"}.get(str(step.get("status")), "open")
+                line = f"- [{status}] {name}"
+                if status == "done" and step.get("evidence"):
+                    line += f" ({str(step['evidence'])[:80]})"
+                elif status == "recheck":
+                    line += " (settled before the last change: run the check again)"
+                lines.append(line)
+            following = self.open_subgoals() or self.recheck_subgoals()
+            if following:
+                lines.append(f"Next: {following[0]}")
+            elif unplayed := self.unplayed_interactive():
+                lines.append(f'Next: play-test "{unplayed[0]}" with browser_test (inspect, act, then expect_js or '
+                             "expect_changed)")
+        repeats = self.repeated_failure()
+        if repeats:
+            lines.append(f"The latest check failed the same way after {repeats} change(s): "
+                         f"{str(self.data.get('failing_what') or 'the check')[:80]}. The fixes so far missed the cause; "
+                         "take a different approach.")
+        problems = self.write_problems()
+        if problems:
+            lines.append("Problems in written files: " + "; ".join(
+                f"{PurePath(str(p).replace(chr(92), '/')).name} ({msg})" for p, msg in list(problems.items())[:5]))
+        return lines
+
     def state_signature(self) -> tuple:
         """What the model should act on. It changes only when one of those things changes, not on every tool call."""
         steps = tuple((str(step.get("name")), str(step.get("status"))) for step in self.data.get("checklist", []))
         return (steps, bool(self.needs_verification()),
                 tuple(self.untested_paths()) if self.needs_tests() else (),
-                bool(self.needs_replan()), tuple(self.unresolved_tools()))
+                bool(self.needs_replan()), tuple(self.unresolved_tools()),
+                tuple(sorted(self.write_problems().items())), self.repeated_failure())
 
     def has_open_attention(self) -> bool:
         """Something the model has been asked to deal with is still open, so the note is worth repeating now and then."""
-        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools())
+        return bool(self.needs_verification() or self.needs_tests() or self.needs_replan() or self.unresolved_tools()
+                    or self.write_problems())
 
     def state_note(self, *, full: bool = False) -> str:
         """The state as one short note. `full` adds the goal and the workspace line, which do not change within a task."""
@@ -1996,9 +2154,7 @@ class TrajectoryState:
                 lines.append(f"Goal: {self.data['goal']}")
             if self.data.get("workspace"):
                 lines.append("Workspace: use relative paths from the project workspace; shell tools are isolated.")
-        lines.append("Checklist: " + "; ".join(
-            f"{step.get('name')}: {step.get('status')}" for step in self.data.get("checklist", [])
-        ))
+        lines.extend(self._ledger_lines())
         unresolved = self.unresolved_tools()
         if unresolved:
             lines.append("Unresolved tool work: " + ", ".join(unresolved) + ".")
