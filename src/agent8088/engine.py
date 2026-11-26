@@ -11474,7 +11474,7 @@ def _exec_browser(args: dict) -> str:
 # Python, Node and git), published with each release. Until it can be pulled --
 # no network, a registry that refuses it -- the plain Python image is used, as
 # before. docker_image in config.txt picks any other image, with no fallback.
-_SANDBOX_IMAGE = "ghcr.io/palindrome-rl/agent8088-sandbox:1.3.0"
+_SANDBOX_IMAGE = "ghcr.io/palindrome-rl/agent8088-sandbox:1.4.0"
 # Pinned by digest: a tag can be moved to other content, a digest cannot.
 _SANDBOX_IMAGE_FALLBACK = "python:3.11-slim@sha256:61e01f72680f86a5279ad510818ab7b2ee9f049822589d4e34e33e044360356c"
 DOCKER_IMAGE_CONFIGURED = bool(str(APP_CONFIG.get("docker_image", "")).strip())

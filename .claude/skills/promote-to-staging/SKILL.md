@@ -1,18 +1,18 @@
 ---
 name: promote-to-staging
-description: Use when promoting merged `development` work to `staging-1.3` or `staging-1.3` to production `AGENT8088-v1.3` — "move the latest commits to staging", "release to production", "cut a staging release" — or when a promotion conflicts or a branch seems to have drifted from the others.
+description: Use when promoting merged `development` work to `staging-1.4` or `staging-1.4` to production `AGENT8088-v1.4` — "move the latest commits to staging", "release to production", "cut a staging release" — or when a promotion conflicts or a branch seems to have drifted from the others.
 ---
 
-# Promoting `development` → `staging-1.3` → `AGENT8088-v1.3`
+# Promoting `development` → `staging-1.4` → `AGENT8088-v1.4`
 
 Since 2026-11-19 the three branches share one history, with production
-(`AGENT8088-v1.3`) as the base, and they carry **the same tree**. A promotion is
+(`AGENT8088-v1.4`) as the base, and they carry **the same tree**. A promotion is
 an ordinary merge commit: nothing is trimmed and no URL is rewritten.
 
 What makes one tree work on every channel:
 
-- **Installers** default to `AGENT8088-v1.3`. Other channels install with
-  `AGENT8088_BRANCH=development` or `AGENT8088_BRANCH=staging-1.3`.
+- **Installers** default to `AGENT8088-v1.4`. Other channels install with
+  `AGENT8088_BRANCH=development` or `AGENT8088_BRANCH=staging-1.4`.
 - **`agent8088 --update`** follows the branch the install has checked out
   (`_resolve_update_branch` in `cli.py`). It falls back to `UPDATE_BRANCH`
   (production) only when that branch is gone from the remote.
@@ -28,11 +28,11 @@ What makes one tree work on every channel:
    commit** as the merge method:
 
    ```bash
-   gh pr create --repo palindrome-rl/AGENT8088 --base staging-1.3 --head development \
-     --title "release: promote development to staging-1.3" --body-file PROMOTE_BODY.md
+   gh pr create --repo palindrome-rl/AGENT8088 --base staging-1.4 --head development \
+     --title "release: promote development to staging-1.4" --body-file PROMOTE_BODY.md
    ```
 
-   For production the base is `AGENT8088-v1.3` and the head is `staging-1.3`.
+   For production the base is `AGENT8088-v1.4` and the head is `staging-1.4`.
    Keep the body file outside the repository. Write it with a file tool, not a
    shell heredoc, because backticks in Markdown run as commands in a shell.
 3. **Expect no conflicts.** If one appears, something was committed directly to
@@ -49,7 +49,7 @@ What makes one tree work on every channel:
 
 ## Production is a publication
 
-Merging into `AGENT8088-v1.3`:
+Merging into `AGENT8088-v1.4`:
 - changes what the public installers and `agent8088 --update` install
 - builds and pushes the GHCR image (`publish-image.yml`)
 - syncs the public wiki when `docs/wiki/` changed (`wiki.yml`)
@@ -79,7 +79,7 @@ wiki workflow runs succeeded.
 ## Rules that keep the branches identical
 
 - **All changes enter through `development`.** Never commit directly to
-  `staging-1.3` or `AGENT8088-v1.3`. An urgent production fix goes in as a PR to
+  `staging-1.4` or `AGENT8088-v1.4`. An urgent production fix goes in as a PR to
   production and is merged back into `development` the same day.
 - **Never squash, rebase, cherry-pick or force-push** any of the three branches.
 - **Rollback is a revert PR**, never a reset.

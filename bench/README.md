@@ -138,7 +138,7 @@ Of the 93 cases, 3 are known gaps:
 
 ## Tier 1: the smoke set, before a production release
 
-Tier 1 runs on demand, before `staging-1.3` is released to `AGENT8088-v1.3`. It does not run on every PR or before
+Tier 1 runs on demand, before `staging-1.4` is released to `AGENT8088-v1.4`. It does not run on every PR or before
 `development` goes to staging.
 - **What runs:** twelve tasks, 26 runs, about four hours on one model. The set, the trial counts and the pass bar are
   in `bench/tiers.json`.
