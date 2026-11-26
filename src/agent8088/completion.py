@@ -636,13 +636,14 @@ def _moved_copy(path: str, written: Iterable[str], roots: Iterable[Path]) -> boo
 
 def missing_outputs(request: str, reply: str, written: Iterable[str],
                     roots: Iterable[Path], mirror_roots: Iterable[Path] = (),
-                    start_files: dict | None = None, landed: Iterable = ()) -> list[str]:
+                    start_files: dict | None = None, landed: Iterable = (),
+                    removed: Iterable[str] = ()) -> list[str]:
     """Named or claimed deliverables that do not exist, are empty, or sit in the
     wrong place.
 
     Three sources: paths the request asked for, directories it asked to be
     filled, and paths this run wrote that the reply names as its result (an empty
-    or removed file is not one). `mirror_roots` (the artifacts folder) is where
+    or removed file is not one; `removed` names the files the run deleted itself). `mirror_roots` (the artifacts folder) is where
     unspecified work goes by default; a requested path found only there is
     reported as misplaced rather than satisfied. The check is deterministic and
     makes no model call.
@@ -670,19 +671,39 @@ def missing_outputs(request: str, reply: str, written: Iterable[str],
                 and not _written_under_named_dir(path, request, wrote_at, roots + mirrors, mirrors):
             missing.append(f"{path}/ (missing or empty)")
     lowered = (reply or "").lower()
+    removed_names = {str(n).lower() for n in removed}
     for path in written:
         name = PurePath(path).name
         if (name.lower() in lowered and not _exists_somewhere(path, roots + mirrors)
                 and not _landed_copy(path, landed, roots + mirrors) and path not in missing):
             # A scratch file the run made and removed, or a file it moved to a better place, is not a
             # deliverable that went missing.
-            if (name.startswith("_") or _moved_copy(path, written, roots + mirrors)
+            if (name.startswith("_") or name.lower() in removed_names
+                    or _moved_copy(path, written, roots + mirrors)
                     or is_throwaway_helper(path, request, written, roots + mirrors)):
                 continue
             if not any(PurePath(m.replace("\\", "/")).name.startswith(name) for m in missing):
                 missing.append(path)
     missing.extend(_claimed_but_unwritten(lowered, written, roots + mirrors))
     return missing
+
+
+# A delete the run ran itself: `rm -f artifacts/shim.py`, `del x.py`, `Remove-Item x.py`. Any word boundary starts
+# one, because the saved command lines are flattened: a script's second line follows its first after a space.
+_DELETE_STEP = re.compile(r"(?<![\w./\\-])(?:rm|del|erase|remove-item|ri)(?:\.exe)?\s+([^;&|\n]+)", re.IGNORECASE)
+
+
+def removed_by_commands(ran: Iterable[str]) -> set[str]:
+    """Names of the files the run's own finished commands deleted. Seen in a run: a fallback module the run wrote, then
+    deleted once the real package installed, was reported as a missing file because the reply mentioned it."""
+    names = set()
+    for command in ran or ():
+        for match in _DELETE_STEP.finditer(str(command)):
+            for word in match.group(1).split():
+                word = word.strip("\"'")
+                if word and not word.startswith("-") and "*" not in word and "?" not in word:
+                    names.add(PurePath(word.replace("\\", "/")).name.lower())
+    return names
 
 
 def _mirror_equivalent(path: str, roots: Iterable[Path], mirrors: Iterable[Path]) -> Path | None:
@@ -937,13 +958,36 @@ _ACTION_WORD = re.compile(r"\b(?:run|execute|start|launch|install|serve|restart|
 _NAMED = re.compile(r"`([^`\n]+)`")
 
 
+# An example of what the page shows ("amounts with two decimals, like `$12.34`") is a value the running work prints,
+# not a name its files hold. Seen in a run: `$12.34` was the one named thing the finished page did not contain.
+_EXAMPLE_VALUE = re.compile(
+    r"\b(?:like|e\.g\.,?|such\s+as|for\s+example,?|for\s+instance,?)\s*`([^`\n\w]*\d[^`\n]*)`", re.IGNORECASE)
+
+
+# A part that asks for state to outlast a reload is met by a page that keeps it in browser storage. No file says
+# "still there after the page is reloaded": seen in a run, the page saved the cart in localStorage, a play test
+# reloaded it, and the part stayed open because the code never used the words "reload" or "still".
+_PERSIST_PART = re.compile(
+    r"\b(?:(?:still\s+there|kept|kept\s+safe|remembered|restored|saved|persist(?:s|ed)?)\b[^.]{0,60}?"
+    r"\b(?:reload(?:s|ed|ing)?|refresh(?:es|ed|ing)?)\b"
+    r"|(?:reload(?:s|ed|ing)?|refresh(?:es|ed|ing)?)\b[^.]{0,60}?\b(?:still\s+there|kept|remembered|restored|persist))",
+    re.IGNORECASE)
+_STORAGE_API = re.compile(r"\b(?:localStorage|sessionStorage|indexedDB)\b")
+
+
+def _named_things(item: str) -> list[str]:
+    examples = {m.start(1) for m in _EXAMPLE_VALUE.finditer(item)
+                if not re.search(r"[A-Za-z]", m.group(1))}
+    return [m.group(1) for m in _NAMED.finditer(item) if m.start(1) not in examples]
+
+
 def _named_things_found(item: str, *haystacks: str) -> bool:
     """Whether every thing the part names in backticks (`.venv`, `--verbose`, `cli.py`) shows up, word for word.
 
     The named things are the checkable core of a part, so when each of them is there the part is not forgotten, even
     when the rest of it is described in other words.
     """
-    named = [_words_for_evidence(n).split() for n in _NAMED.findall(item)]
+    named = [_words_for_evidence(n).split() for n in _named_things(item)]
     named = [words for words in named if words]
     return bool(named) and all(
         any(all(f" {w} " in hay for w in words) for hay in haystacks) for words in named)
@@ -1149,6 +1193,8 @@ def unaddressed_subgoals(items: Iterable[str], reply: str, written: Iterable[str
         if _named_things_found(item, in_files, *((in_commands,) if acts else ())):
             continue
         if _met_by_running_what_was_made(item, words, ran, written_names):
+            continue
+        if _PERSIST_PART.search(item) and _STORAGE_API.search(evidence):
             continue
         # The file the part asks for is there: the words that only restate making a file are met by it.
         made = {_root(w) for w in _MAKE_ACT_STEMS} if _made_file_named(item, written_names) else set()
