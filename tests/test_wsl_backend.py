@@ -132,7 +132,7 @@ def test_settings_are_in_mnt_paths_and_hide_wsl_sockets(engine, wsl, tmp_path, m
     monkeypatch.setattr(engine.Path, "home", classmethod(lambda cls: home))
     data = engine._wsl_settings_data(False, project)
     fs = data["filesystem"]
-    assert all(path.startswith("/mnt/") or path in ("/run/WSL", "/mnt/wslg", "/tmp/.X11-unix")
+    assert all(path.startswith("/mnt/") or path in ("/run/WSL", "/mnt/wslg", "/tmp/.X11-unix", W.TMP_DIR)
                for key in fs for path in fs[key])
     assert W.to_linux((home / ".ssh").resolve()) in fs["denyRead"]
     # A secret path that does not exist is left out: srt would skip it anyway, at 0.2 s a path over WSL's share.
