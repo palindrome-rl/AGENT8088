@@ -104,6 +104,26 @@ When a step fails, the result says what the page showed and attaches the state i
 the app with a small change, restart the service if it serves built files, and run the same test
 again. A test without `expect_*` steps only shows that the steps ran.
 
+## 2b. Make interactive work testable: the test seam
+
+A game or any app driven by clicks, keys and timers is hard to check from outside: the state lives
+in variables, and real timers make a test wait or guess. When you build one, add a small test seam
+while you write it, the same way every time:
+
+- **A read-only state function.** `window.__test = { state: () => ({ score, lives, player: {x, y},
+  turn, over }) }`: a plain object of what a person would judge the app by. A test reads it with
+  `expect_js`, for example `"window.__test.state().score === 1"`.
+- **An optional seed.** Read `?seed=N` from the URL and use it for every random choice (a small
+  seeded generator), so a test can load the same board, deck or level every time. Without a seed
+  the app stays random as before.
+- **Optional, for timed games:** `window.__test.step(ms)` advances the game by that much time
+  without waiting on real timers.
+
+The seam must not change normal play: no visible controls, no extra output, the same behaviour when
+nobody calls it. Then play-test each interaction the request asks for with `browser_test` (section
+2a). An interactive part of the request counts as checked only after a passing play test since the
+last change; a unit test of a helper or loading the page does not show the interaction works.
+
 ## 3. It looks right
 
 Render it with `screenshot_page` and look at the attached image. Then compare it with the request,
