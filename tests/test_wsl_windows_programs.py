@@ -107,3 +107,32 @@ def test_the_shell_description_says_where_windows_programs_run(engine, monkeypat
     engine._ground_execute_shell_description(specs)
     text = specs["execute_shell"]["description"]
     assert "Windows sandbox" in text and "cannot run in it" not in text
+
+
+# The model writes these commands for bash (the WSL sandbox's shell); they run in cmd. Seen in a benchmark run: bash
+# quoting reached cmd as is, so `cmd /c 'cd /d ... && node run.js'` failed with "''cd' is not recognized", and the
+# work, which passed, ended NOT VERIFIED because its browser check never ran.
+@pytest.mark.parametrize("bash, cmd", [
+    (r"cmd /c 'cd /d E:\a b\w && node run.js'", r'cmd /c "cd /d E:\a b\w && node run.js"'),
+    (r'cmd /c "\"E:\a b\run_test.bat\""', r'cmd /c "E:\a b\run_test.bat"'),
+    (r"""powershell -Command 'Get-Item "x y"'""", r'powershell -Command "Get-Item \"x y\""'),
+    ("echo hi; dotnet build", "echo hi & dotnet build"),
+    (r"dotnet build E:\proj\App.csproj 2>&1", r"dotnet build E:\proj\App.csproj 2>&1"),
+    (r'powershell -File "C:\Users\First Last\x.ps1"', r'powershell -File "C:\Users\First Last\x.ps1"'),
+    ("cmd /c dir", "cmd /c dir"),
+    ("setup.bat && echo ok || echo no", "setup.bat && echo ok || echo no"),
+    ("tool.exe --name ''", 'tool.exe --name ""'),
+])
+def test_bash_quoting_becomes_cmd_quoting(bash, cmd):
+    assert W.bash_quoting_to_cmd(bash) == cmd
+
+
+@pytest.mark.parametrize("command", ["cmd /c 'unbalanced", "cat <<EOF | cmd\nx\nEOF", "tool.exe $(pwd)",
+                                     "tool.exe `pwd`"])
+def test_what_cannot_be_translated_is_left_alone(command):
+    assert W.bash_quoting_to_cmd(command) == command
+
+
+def test_a_routed_command_gets_cmd_quoting(engine, routed):
+    engine._run_sandbox_command(r"cmd /c 'cd /d E:\w && node x.js'")
+    assert routed == [("native", r'cmd /c "cd /d E:\w && node x.js"')]
