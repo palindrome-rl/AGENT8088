@@ -40,6 +40,20 @@ def test_described_behaviour_is_not():
     assert not reports_failed_check("If the server is down, the fetch step fails with a clear message.")
 
 
+def test_the_word_failure_about_the_original_bug_is_not():
+    # Seen in a benchmark run: a fix whose full build passed was marked NOT VERIFIED because the reply said how it
+    # reproduced the bug it was asked to fix. "the failure" is the bug, not a check of the model's that failed.
+    assert not reports_failed_check("First ran `BUILD_FAST=1 python build.py` to quickly reproduce the failure and "
+                                    "pinpoint the exact link error.")
+    assert not reports_failed_check("The failure came from a typo in module_077, which I corrected.")
+    assert not reports_failed_check("A failure in the link step stopped the build before my change.")
+
+
+def test_an_uppercase_fail_marker_still_counts():
+    assert reports_failed_check("The log shows the FAIL on the dec click, which I think is a timing issue.")
+    assert reports_failed_check("2 failures remain in the edge cases.")
+
+
 def test_an_answer_to_the_harness_failing_check_note_is_not():
     # The run's own checks already track that failure; the reply is answering the harness, not reporting its own.
     assert not reports_failed_check("Failing check: `set BUILD_FAST=1 && python build.py` (link error in module_077).")

@@ -135,8 +135,12 @@ def reports_part_not_done(reply: str) -> bool:
 # showed a FAIL in a screenshot, which no check of the run can read. Its answer named the FAIL and called it "a
 # harness timing artifact", and the run ended "verified" over a page whose remove button was broken. A failure the
 # reply says was fixed ("it failed at first; after the fix it passes") is the checks' business, not this rule's.
+# After "a" or "the" only an uppercase FAIL marker counts: "reproduce the failure" names the bug the task is about,
+# not a check of the model's that failed (seen marking a passing fix NOT VERIFIED). A count ("2 failures") may be
+# in any case.
 _OWN_CHECK_FAILED = re.compile(
-    r"\b(?:one|a|the|two|three|[1-9]\d*)\s+[`'\"]?FAIL(?:ED|S|URES?)?\b[`'\"]?"
+    r"\b(?:one|two|three|[1-9]\d*)\s+[`'\"]?FAIL(?:ED|S|URES?)?\b[`'\"]?"
+    r"|\b(?:a|the)\s+[`'\"]?(?-i:FAIL(?:ED|S|URES?)?)\b[`'\"]?"
     r"|\b(?:tests?|checks?|assertions?|steps?|cases?|scenarios?)\s+(?:still\s+)?(?:failed|did\s*n[o']t\s+pass)\b"
     r"|\b(?:failed|failing)\s+(?:tests?|checks?|assertions?|steps?|cases?)\b"
     r"|\b(?:threw|raised)\s+(?:an?\s+)?(?:[\w-]+\s+){0,2}\w*(?:error|exception)\b"
