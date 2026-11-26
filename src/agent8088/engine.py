@@ -14387,7 +14387,7 @@ def _run_sandbox_command(command: str, timeout: int = 25,
             return (f"Error: {program} is a Windows program, and the WSL sandbox runs Linux only. The Windows sandbox "
                     "that could run it is not available here (agent8088 --sandbox-setup installs it). Nothing was run.")
         backend = "native"
-        command = wsl_sandbox.command_to_windows(command)
+        command = wsl_sandbox.bash_quoting_to_cmd(wsl_sandbox.command_to_windows(command))
         routed_note = (f"[note: {program} is a Windows program, so this ran in the Windows sandbox, not WSL: its "
                        "shell is cmd, file writes are limited to the project, and the network is not filtered there]")
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)

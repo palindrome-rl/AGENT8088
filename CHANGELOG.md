@@ -4,6 +4,19 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (Tier 1 fixes under the WSL sandbox)
+
+### Fixed
+
+- A Windows program started from the WSL sandbox gets its bash quoting rewritten for cmd. Before, a command such as
+  `cmd /c 'cd /d ... && node x.js'` reached cmd as written and failed, so a check that would have passed never ran.
+- A reply that says how it reproduced the bug it fixed ("reproduce the failure") is no longer read as saying one of
+  its own checks failed. Only an uppercase `FAIL` after "a" or "the" counts; a count such as "2 failures" still does.
+- Bench graders:
+  - `run.py` checks that its Python has the modules the graders import before the first run.
+  - `pip-venv-report` runs a venv built inside the WSL sandbox in that distro, instead of failing "venv exists".
+  - `tile-flip-game` no longer reads a status of "Not solved" as saying Solved.
+
 ## v1.3 branch maintenance - 2026-11-26 (Tier 1 smoke set)
 
 ### Added

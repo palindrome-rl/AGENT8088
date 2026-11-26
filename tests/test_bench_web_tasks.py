@@ -302,3 +302,12 @@ def test_the_runner_still_needs_a_profile_to_run():
     run = subprocess.run([sys.executable, str(ROOT / "bench" / "run.py"), "--task", "cart-page"],
                          capture_output=True, text=True, timeout=60, check=False)
     assert run.returncode == 2 and "--profile" in run.stderr
+
+
+def test_tile_flip_passes_a_status_that_says_not_solved(tmp_path, browser):
+    # Seen in a run: a correct game whose status read "Not solved" at the start failed "not solved at the start".
+    workspace = _with_reference("tile-flip-game", tmp_path, lambda s: s.replace(
+        'solved() ? "Solved" : ""', 'solved() ? "Solved" : "Not solved"'))
+    report = _grade("tile-flip-game", workspace, tmp_path)
+    assert report["checks"]["not solved at the start"], report
+    assert report["passed"], report

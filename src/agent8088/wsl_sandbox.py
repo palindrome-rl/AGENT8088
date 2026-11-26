@@ -236,6 +236,92 @@ def command_to_windows(command: str) -> str:
     return _MNT_WORD_RE.sub(lambda m: to_windows(f"/mnt/{m.group(1)}{m.group(2)}"), command)
 
 
+
+# Operators bash and cmd share, longest first; ";" and a newline end a command in bash and become "&" in cmd.
+_SHELL_OPERATORS = ("2>&1", "1>&2", "&&", "||", ">>", "2>", "1>", "|", "&", ";", ">", "<", "(", ")", "\n")
+_CMD_NEEDS_QUOTES = set(' \t"&|<>^()')
+
+
+def _cmd_word(text: str, quoted: bool, after_cmd_c: bool) -> str:
+    """One word of a bash command, written for cmd."""
+    if text == "":
+        return '""' if quoted else ""
+    if not _CMD_NEEDS_QUOTES.intersection(text):
+        return text
+    if after_cmd_c:
+        # cmd /c takes the rest of its line as a command of its own: a word already in quotes is passed as written.
+        return text if '"' in text else f'"{text}"'
+    if '"' in text:
+        return subprocess.list2cmdline([text])
+    return f'"{text}"'
+
+
+def bash_quoting_to_cmd(command: str) -> str:
+    """A command the model wrote for bash, rewritten for cmd, which runs it when it starts a Windows program.
+
+    Single quotes become double quotes, bash's backslash escapes inside double quotes are undone, and ";" becomes
+    "&". A backslash outside quotes stays, since on its way to Windows it is part of a path. What cmd has no
+    equivalent for (a heredoc, $(...), backticks) or an unbalanced quote leaves the command as written."""
+    if "<<" in command or "$(" in command or "`" in command:
+        return command
+    parts: list[str] = []
+    segment: list[str] = []
+    word: list[str] = []
+    quoted = False
+    in_word = False
+
+    def finish():
+        nonlocal word, quoted, in_word
+        if in_word:
+            text = "".join(word)
+            after_cmd_c = (len(segment) >= 2 and segment[0].lower() in ("cmd", "cmd.exe")
+                           and segment[1].lower() in ("/c", "/k"))
+            segment.append(text)
+            parts.append(_cmd_word(text, quoted, after_cmd_c))
+        word, quoted, in_word = [], False, False
+
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        if char == "'":
+            end = command.find("'", i + 1)
+            if end < 0:
+                return command
+            word.append(command[i + 1:end])
+            quoted = in_word = True
+            i = end + 1
+            continue
+        if char == '"':
+            i += 1
+            while i < n and command[i] != '"':
+                if command[i] == "\\" and i + 1 < n and command[i + 1] in '"\\$':
+                    i += 1
+                word.append(command[i])
+                i += 1
+            if i >= n:
+                return command
+            quoted = in_word = True
+            i += 1
+            continue
+        operator = next((op for op in _SHELL_OPERATORS if command.startswith(op, i)), "")
+        if operator and not (operator[0].isdigit() and in_word):
+            finish()
+            parts.append("&" if operator in (";", "\n") else operator)
+            if operator not in (">", ">>", "<", "2>", "1>", "2>&1", "1>&2"):
+                segment.clear()
+            i += len(operator)
+            continue
+        if char in " \t":
+            finish()
+            i += 1
+            continue
+        word.append(char)
+        in_word = True
+        i += 1
+    finish()
+    return " ".join(part for part in parts if part)
+
+
 # ---- the distro --------------------------------------------------------------------------------------------------
 
 def wsl_executable() -> str | None:
