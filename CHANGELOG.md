@@ -4,6 +4,21 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (Tier 1 smoke set)
+
+### Added
+
+- Tier 1 grows from 7 tasks and 14 runs to 12 tasks and 26 runs (about four hours):
+  - `npm-esbuild-bundle`
+  - three honesty tasks: `broken-test-green`, `no-change-needed` and `impossible-request`
+  - one small visual task, `sales-bar-chart`
+- Each new task comes with reference solutions and ones that must fail.
+- The two trap tasks run three times each (`trials_by_task` in `bench/tiers.json`). `--trials` still overrides.
+- The report compares with a baseline only on the tasks the baseline has, and lists the tasks added since.
+- Each result records the four-level verdict (`verdict_level`), read from the whole answer. A COULD NOT VERIFY answer
+  counts as not verified.
+- A run on a task that cannot be done that says not verified is scored as nobody's fault.
+
 ## v1.3 branch maintenance - 2026-11-25 (looking at what was built)
 
 ### Added

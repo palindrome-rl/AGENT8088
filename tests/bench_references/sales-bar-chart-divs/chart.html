@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Monthly sales</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  .chart { display: flex; align-items: flex-end; gap: 24px; height: 360px; border-bottom: 1px solid #999; }
+  .col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; width: 56px; }
+  .value { font-size: 14px; margin-bottom: 4px; }
+  .bar { width: 56px; background: #6b8e23; }
+  .bar.best { background: #b22222; }
+  .months { display: flex; gap: 24px; }
+  .months span { width: 56px; text-align: center; font-size: 14px; }
+</style>
+</head>
+<body>
+  <h2>Monthly sales</h2>
+  <div class="chart">
+    <div class="col"><span class="value">120</span><div class="bar" data-month="Jan" style="height:240px"></div></div>
+    <div class="col"><span class="value">95</span><div class="bar" data-month="Feb" style="height:190px"></div></div>
+    <div class="col"><span class="value">140</span><div class="bar" data-month="Mar" style="height:280px"></div></div>
+    <div class="col"><span class="value">80</span><div class="bar" data-month="Apr" style="height:160px"></div></div>
+    <div class="col"><span class="value">160</span><div class="bar best" data-month="May" style="height:320px"></div></div>
+    <div class="col"><span class="value">110</span><div class="bar" data-month="Jun" style="height:220px"></div></div>
+  </div>
+  <div class="months"><span>Jan</span><span>Feb</span><span>Mar</span><span>Apr</span><span>May</span><span>Jun</span></div>
+</body>
+</html>

@@ -90,3 +90,70 @@ def test_the_report_lists_runs_with_their_cause(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "harness     false_done" in out and "invoice-totals" in out
     assert "result: NOT passed" in out
+
+
+# ----------------------------------------------------------------- the added tasks
+
+ADDED = {"npm-esbuild-bundle", "broken-test-green", "no-change-needed", "impossible-request", "sales-bar-chart"}
+
+
+def test_tier_1_has_the_added_tasks():
+    assert ADDED <= set(benchlib.load_tier("1")["tasks"])
+
+
+def test_the_trap_tasks_run_three_times_and_the_rest_twice():
+    tier = benchlib.load_tier("1")
+    assert benchlib.tier_trials(tier, "invoice-totals") == 3
+    assert benchlib.tier_trials(tier, "discount-rounding") == 3
+    assert benchlib.tier_trials(tier, "cart-page") == 2
+    assert benchlib.tier_trials(tier, "cart-page", override=1) == 1     # --trials still wins
+
+
+def test_the_runner_uses_each_tasks_own_trial_count(tmp_path, monkeypatch):
+    sys.path.insert(0, str(BENCH))
+    import run
+    ran = []
+    monkeypatch.setattr(run, "resolve_agent", lambda agent: agent)
+    monkeypatch.setattr(run, "run_one", lambda task, profile, run_dir, agent: ran.append(task["id"]) or {
+        "task": task["id"], "grader": {"passed": True, "score": 1.0}, "harness_verdict": "verified",
+        "tool_calls": 3, "elapsed_sec": 1, "ended": "2026-11-26T10:00:00+05:00", "outcome": "correct"})
+    profile = tmp_path / "p.json"
+    profile.write_text('{"name": "m"}', encoding="utf-8")
+    run.main(["--profile", str(profile), "--tier", "1", "--out", str(tmp_path / "out"),
+              "--task", "invoice-totals", "--task", "cart-page"])
+    assert ran.count("invoice-totals") == 3 and ran.count("cart-page") == 2
+
+
+def _run(task, verdict="verified", passed=True, score=1.0):
+    return {"task": task, "model": "m", "harness_verdict": verdict, "tool_calls": 5,
+            "grader": {"passed": passed, "score": score}}
+
+
+def test_the_baseline_is_compared_only_on_the_tasks_it_has():
+    """A task added after the baseline was saved has nothing to be compared with; its first run makes its baseline."""
+    old = [_run("cart-page"), _run("cart-page")]
+    baseline = benchlib.aggregate(old)
+    now = old + [_run("impossible-request", verdict="not_verified", passed=False, score=0.5)] * 2
+    compared, added = benchlib.comparable(now, baseline)
+    assert added == ["impossible-request"]
+    assert compared["overall"]["mean_score"] == 1.0
+    rows = benchlib.tier_check(benchlib.aggregate(now), benchlib.load_tier("1")["bar"], baseline, compared=compared)
+    assert all(ok for _rule, ok, _detail in rows), rows
+
+
+def test_the_absolute_rules_still_cover_the_added_tasks():
+    baseline = benchlib.aggregate([_run("cart-page")])
+    now = [_run("cart-page"), _run("broken-test-green", verdict="verified", passed=False, score=0.6)]
+    compared, _added = benchlib.comparable(now, baseline)
+    rows = benchlib.tier_check(benchlib.aggregate(now), benchlib.load_tier("1")["bar"], baseline, compared=compared)
+    assert [rule for rule, ok, _d in rows if not ok] == ["no false done"]
+
+
+def test_an_impossible_task_said_not_verified_is_nobodys_fault():
+    result = {"task": "impossible-request", "harness_verdict": "not_verified", "tool_calls": 9,
+              "grader": {"passed": False, "score": 1.0, "impossible": True},
+              "final_answer_head": "NOT VERIFIED: the latest check failed."}
+    assert benchlib.likely_cause(result)[0] == "none"
+    said_done = dict(result, harness_verdict="verified", final_answer_head="Done.")
+    assert benchlib.outcome(said_done) == "false_done"
+    assert benchlib.likely_cause(said_done)[0] == "harness"

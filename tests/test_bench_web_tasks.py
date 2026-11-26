@@ -16,7 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 TASKS = ROOT / "bench" / "tasks"
 REFS = Path(__file__).resolve().parent / "bench_references"
-WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix")
+WEB_TASKS = ("tile-flip-game", "three-in-row-game", "cart-page", "catalog-scrape", "canvas-play-fix", "sales-bar-chart")
 
 
 def _browser_env():
@@ -79,7 +79,8 @@ def test_an_empty_workspace_fails(task, tmp_path):
     assert report.get("passed") is not True
 
 
-@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page", "canvas-play-fix"])
+@pytest.mark.parametrize("task", ["tile-flip-game", "three-in-row-game", "cart-page", "canvas-play-fix",
+                                  "sales-bar-chart"])
 def test_the_reference_page_passes(task, tmp_path, browser):
     report = _grade(task, _with_reference(task, tmp_path), tmp_path)
     assert report["passed"], report
@@ -249,6 +250,42 @@ def test_scrape_fails_a_scraper_that_stops_at_the_first_page(tmp_path):
     report = _grade("catalog-scrape", workspace, tmp_path)
     assert not report["passed"]
     assert not report["checks"]["every row is right on the second shop"]
+
+
+# ----------------------------------------------------------------- sales-bar-chart
+# The small visual task: a chart that looks right is measured, not taken on trust.
+
+def test_bar_chart_passes_a_chart_drawn_with_divs(tmp_path, browser):
+    workspace = _workspace("sales-bar-chart", tmp_path)
+    (workspace / "chart.html").write_text((REFS / "sales-bar-chart-divs" / "chart.html").read_text(encoding="utf-8"),
+                                          encoding="utf-8")
+    report = _grade("sales-bar-chart", workspace, tmp_path)
+    assert report["passed"], report
+
+
+@pytest.mark.parametrize("edit, check", [
+    # Every bar 40 px taller: the order is right but the heights are no longer in proportion.
+    (lambda s: s.replace("const scale = 2;", "const scale = 2; const extra = 40;")
+               .replace("const h = value * scale;", "const h = value * scale + extra;"),
+     "bar heights are in proportion to the sales"),
+    (lambda s: s.replace("best ? '#d9822b' : '#4a78b5'", "'#4a78b5'"), "the best month has its own colour"),
+    (lambda s: s.replace("addText(x + 20, top - 8, String(value));", ""), "each bar has its number above it"),
+    (lambda s: s.replace('width="640"', 'width="1100"'), "the chart fits in 800 by 600 without scrolling"),
+    (lambda s: s.replace("const months = MONTHS;", "const months = MONTHS.slice().reverse();"),
+     "six bars, one per month, in order"),
+    (lambda s: s.replace("<title>", '<link rel="stylesheet" href="https://fonts.example.com/a.css"><title>'),
+     "no console errors or outside requests"),
+])
+def test_bar_chart_fails_a_chart_that_only_looks_finished(tmp_path, browser, edit, check):
+    report = _grade("sales-bar-chart", _with_reference("sales-bar-chart", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"][check], report
+
+
+def test_bar_chart_fails_labels_that_overlap(tmp_path, browser):
+    # Month names drawn 2 px apart pile on top of each other.
+    edit = lambda s: s.replace("const gap = 90;", "const gap = 2;")
+    report = _grade("sales-bar-chart", _with_reference("sales-bar-chart", tmp_path, edit), tmp_path)
+    assert not report["passed"] and not report["checks"]["no labels overlap"], report
 
 
 # ----------------------------------------------------------------- the runner lists them

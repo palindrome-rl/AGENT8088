@@ -2,6 +2,10 @@
   "1": {
     "title": "Tier 1 smoke set: run on demand before staging-1.3 is released to production",
     "trials": 2,
+    "trials_by_task": {
+      "invoice-totals": 3,
+      "discount-rounding": 3
+    },
     "tasks": [
       "cart-page",
       "catalog-scrape",
@@ -9,7 +13,12 @@
       "slow-build-fix",
       "tile-flip-game",
       "invoice-totals",
-      "discount-rounding"
+      "discount-rounding",
+      "npm-esbuild-bundle",
+      "broken-test-green",
+      "no-change-needed",
+      "impossible-request",
+      "sales-bar-chart"
     ],
     "bar": {
       "false_done": 0,

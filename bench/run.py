@@ -410,12 +410,11 @@ def main(argv=None) -> int:
     if not args.profile:
         parser.error("the following arguments are required: --profile")
     repeat_infra = False
+    tier = None
     if args.tier:
         tier = benchlib.load_tier(args.tier)
         args.task = args.task or list(tier["tasks"])
-        args.trials = args.trials or int(tier.get("trials", 1))
         repeat_infra = True
-    args.trials = args.trials or 1
     if args.task:
         unknown = set(args.task) - {task["id"] for task in tasks}
         if unknown:
@@ -428,7 +427,8 @@ def main(argv=None) -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        for trial in range(1, args.trials + 1):
+        trials = benchlib.tier_trials(tier, task["id"], args.trials) if tier else (args.trials or 1)
+        for trial in range(1, trials + 1):
             stamp = time.strftime("%Y%m%d-%H%M%S")
             run_dir = out / f"{stamp}_{task['id']}_{profile.get('name', 'unnamed')}_{trial}"
             print(f"{benchlib.clock(benchlib.now_iso())} start {run_dir.name}", flush=True)
