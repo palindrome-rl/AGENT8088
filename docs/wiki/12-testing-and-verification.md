@@ -40,6 +40,21 @@ SyntaxError ...]") and stays in the task-state note until the file is written
 cleanly. Appends are not checked, since a file written in parts is incomplete
 until its last part, and files over 1 MB are skipped.
 
+A run that changed files ends with a verdict in one of four levels, decided by
+the controller's own evidence only (what the reply claims never raises it):
+
+| Level | When |
+|---|---|
+| NOT VERIFIED | A check failed, a part of the request was not addressed, a file was cut off or still does not parse, or the reply says something was not done. It goes above the reply. |
+| COULD NOT VERIFY | Nothing failed and nothing passed, because the machine or the sandbox stopped a check from running; the note names what stopped it. |
+| VERIFIED | A test run passed after the last change, and no part of the request waits for a recheck. |
+| PARTLY VERIFIED | Anything else that changed files: it ran without an error but no test passed, it was only read back, or a part was settled before the last change. The note says what is missing. |
+
+The last three lead the end-of-run notes as one line, for example
+`Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
+the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
+turns the headline and the verdict line off.
+
 The notes also appear when output cut-offs, repeated calls or the turn limit
 stop a run. A post-check cap alone does not mark freshly tested or exercised
 work incomplete, but an unresolved failing check or an explicitly missing
