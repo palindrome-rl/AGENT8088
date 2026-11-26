@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (checklist and ledger)
+
+### Improved
+
+- The parts of a multi-part request are on the checklist from the first turn, not only when the final answer is
+  checked. Each part records its kind (file, run, test, interactive or property), what settled it, and the state of
+  the work at that moment. A run, test or interactive part settled before a later change goes back to "recheck" until
+  a check passes again. The task-state note lists each part with its status and evidence and names the next step; it
+  is rebuilt from the controller's state, so it survives compaction.
+
 ## v1.3 branch maintenance - 2026-11-26 (eval mode)
 
 ### Added

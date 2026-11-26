@@ -22,6 +22,16 @@ files, and making changes without fresh verification. `Tested` means the run's
 own tests passed after the last change; it does not prove the result satisfies
 everything the user requested. Later edits invalidate earlier positive evidence.
 
+A request with several parts (a numbered or bulleted list, "and also / then"
+clauses, or several "it should ..." sentences) gets a checklist from its first turn.
+Each part has a kind: a file to make, something to run, tests, an interaction to
+play (a click, a key, a game), or a property of the work. The task-state note the
+model reads lists each part as open, done (with what settled it, such as
+"file present: report.csv") or recheck, and names the next step. A part settled by
+running the work goes back to recheck when the work changes after that, and only a
+passing check settles it again. The note is rebuilt from the controller's own state,
+so a compaction that drops older messages loses none of it.
+
 The notes also appear when output cut-offs, repeated calls or the turn limit
 stop a run. A post-check cap alone does not mark freshly tested or exercised
 work incomplete, but an unresolved failing check or an explicitly missing

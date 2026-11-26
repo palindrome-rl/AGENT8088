@@ -20157,6 +20157,10 @@ def run_agent(messages, *, budget=None, memory_identity=None, memory_run_id=None
         trajectory_state, goal, len(messages), workspace=str(PROJECT_ROOT),
     )
     if not kwargs.get("depth"):
+        if goal and not run_trajectory.subgoals_built():
+            # The parts of the request are on the checklist from the first turn, so the model works to them, not only
+            # when its final answer is checked against them.
+            run_trajectory.set_subgoals(completion_checks.extract_subgoals(goal, sentences=REQUIREMENT_EVIDENCE))
         try:
             run_trajectory.start_files = completion_checks.inventory([PROJECT_ROOT, ARTIFACTS_ROOT])
         except Exception as exc:  # noqa: BLE001 -- a missing inventory only turns the input rule off
