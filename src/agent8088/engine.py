@@ -709,6 +709,10 @@ REQUIREMENT_EVIDENCE = str(APP_CONFIG.get("requirement_evidence", "1")).strip().
 # result in the answer and never blocks; `enforce` also asks the model to fix a
 # failure, up to COMPLETION_SMOKE_MAX_FAILURES times a request; `off` skips it.
 COMPLETION_SMOKE_TEST = str(APP_CONFIG.get("completion_smoke_test", "report")).strip().lower()
+# Auto QA: when changed work has no fresh check and a test suite sits above the changed files, the end-of-run check runs
+# that suite itself (in the sandbox, once per state of the work) instead of only asking the model to. 0 turns it off.
+AUTO_QA = str(APP_CONFIG.get("auto_qa", "1")).strip().lower() in ("1", "true", "yes", "on")
+AUTO_QA_SECONDS = max(10, _config_int("auto_qa_seconds", 120))
 if COMPLETION_SMOKE_TEST not in ("off", "report", "enforce"):
     COMPLETION_SMOKE_TEST = "report"
 # How the controller's task state (checklist, verification pending, changed files with no tests, unresolved tools) reaches the
@@ -22605,6 +22609,50 @@ def _visual_look_step(trajectory, written: list, request: str):
     return completion_checks.Nudge("look", completion_checks.VISUAL_LOOK_ASK)
 
 
+def _auto_qa_step(trajectory):
+    """Run the project's own tests after the last change, as the harness, and say what happened.
+
+    None when there is nothing to run (no suite above the changed files, nothing changed since the last check, no
+    sandbox, the last stretch of the clock, auto_qa=0), when the suite passed (the change is now tested, so no turn
+    is spent asking), or when the result says nothing either way (the usual ask follows). A Nudge with the command
+    and the tail of the output when it failed. Runs at most once per state of the work."""
+    # No test has passed since the change: pending, or only read back / compiled (inspected).
+    if (not AUTO_QA or trajectory is None or not trajectory.mutation_count()
+            or trajectory.data.get("verification") not in ("pending", "inspected")):
+        return None
+    if trajectory.data.get("auto_qa_at") == trajectory.mutation_count():
+        return None
+    if _answer_time(_active_budget):
+        return None
+    written = [p for p in trajectory.written_paths() if Path(str(p)).is_absolute()]
+    near = completion_checks.tests_near(written)
+    if not near:
+        return None
+    backend = _resolve_sandbox_backend()
+    if backend == "unavailable":
+        return None
+    folder, command = near
+    trajectory.data["auto_qa_at"] = trajectory.mutation_count()
+    if sys.platform == "win32" and backend == "native":
+        prefix = f'cd /d "{folder}" && '
+    else:
+        prefix = f"cd {shlex.quote(str(folder))} && "
+    result = str(_run_sandbox_command(prefix + command, AUTO_QA_SECONDS))
+    verdict = tool_output.detect_verdict(result)
+    operation = trajectory.before_tool("run_tests")
+    trajectory.after_tool(operation, result[-2000:], failed=verdict.status == "failed", blocked=False,
+                          mutated=False, verdict=verdict.status, command=command)
+    if verdict.status != "failed":
+        return None
+    tail = "\n".join(result.strip().splitlines()[-12:])
+    return completion_checks.Nudge(
+        "auto_qa",
+        completion_checks.continue_text(
+            f"The harness ran the project's tests (`{command}` from {folder}) after your last change, and they failed.",
+            f"Fix what failed, run them again, then reply. The end of the output:\n{tail}"),
+        unmet="the project's tests failed after the last change")
+
+
 def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, depth: int,
                            deliverables_due: bool = False, can_search: bool = False):
     """The first completion check a text reply fails, or None to accept it.
@@ -22659,6 +22707,8 @@ def _next_completion_nudge(budget, trajectory, *, reply: str, request: str, dept
             trajectory.mark_subgoals(open_items)
             if open_items:
                 nudge = completion_checks.subgoals_nudge(open_items, evidence=evidence is not None)
+    if nudge is None and depth == 0:
+        nudge = _auto_qa_step(trajectory)
     if nudge is None and trajectory.request_verification():
         nudge = completion_checks.Nudge(
             "verify",
