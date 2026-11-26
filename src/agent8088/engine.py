@@ -22915,6 +22915,16 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+def _remember_test_original(trajectory, args: dict) -> None:
+    """Before a write changes an existing test file, keep its text, so the verdict can see a check made weaker."""
+    filename = str(args.get("filename") or "")
+    try:
+        target = resolve_write_path(filename)
+        trajectory.remember_test_original(filename, target.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, OSError):
+        return
+
+
 # The engine's own words when the model gave no answer at all, and the note on a held answer it falls back to.
 # Neither is the model's account of its work, so neither is read for what "the reply" says.
 NO_ANSWER_TEXT = "I wasn't able to produce an answer to that."
@@ -22945,6 +22955,9 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
         reasons.append("the page/script check failed (" + ", ".join(failed[:3]) + ")")
     if trajectory.check_failing():
         reasons.append("the latest check failed")
+    if weakened := trajectory.weakened_tests():
+        # Seen in a run: a given test's expected value was changed so every test passed, and the run said VERIFIED.
+        reasons.append("a check in a given test was changed or skipped (" + ", ".join(weakened[:3]) + ")")
     if trajectory.open_subgoals():
         reasons.append(f"{len(trajectory.open_subgoals())} part(s) of the request not addressed")
     if trajectory.partial_files():
@@ -24599,6 +24612,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 on_tool(name)
             operation = None
             existed_before = _write_target_existed(name, args)
+            if existed_before and trajectory is not None:
+                _remember_test_original(trajectory, args)
             mutation_seq_before = _MUTATION_SEQ
             if trajectory is not None:
                 operation = trajectory.before_tool(name)

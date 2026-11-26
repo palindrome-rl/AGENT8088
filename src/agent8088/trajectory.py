@@ -7,7 +7,7 @@ import posixpath
 import re
 import shlex
 from copy import deepcopy
-from pathlib import PurePath, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from agent8088.completion import RERUN_KINDS, SUBGOAL_PREFIX, item_kind, named_output_paths
@@ -51,6 +51,27 @@ def _is_test_path(path: str) -> bool:
             or ".test" in p.name.lower() or ".spec" in p.name.lower()
             or any(part.lower() in {"tests", "test", "__tests__", "spec"}
                    for part in p.parts))
+
+
+# A line of a test that checks something, and a marker that stops a test from running or failing.
+_TEST_CHECK_LINE = re.compile(r"^\s*assert\b|\bself\.assert\w*\(|\bexpect\(|\bassert\w*\(")
+_TEST_SKIP = re.compile(r"@pytest\.mark\.(?:skip|xfail)|\bpytest\.(?:skip|xfail)\(|@unittest\.skip|"
+                        r"\b(?:it|test|describe)\.(?:skip|todo)\(|\bx(?:it|describe)\(")
+# "update the test", "fix the body temperature test", "the test is wrong": the request asks for a test to change.
+# "Don't change the tests" and "fix it and add a test" do not.
+_ASKS_TO_CHANGE_TESTS = re.compile(
+    r"\b(?:update|change|fix|edit|correct|rewrite|adjust|modify|replace)\s+"
+    r"(?:(?:the|that|this|these|those|my|our|its|their)\s+)?(?:[\w-]+\s+){0,2}tests?\b"
+    r"|\btests?\b[^.\n]{0,30}\b(?:is|are)\s+(?:wrong|incorrect|outdated|out\s+of\s+date)\b",
+    re.IGNORECASE)
+_NEGATED = re.compile(r"(?:\bdon['’]?t|\bdo\s+not|\bnever|\bnot|\bwithout|\bno\s+need\s+to)\s*$", re.IGNORECASE)
+
+
+def _asks_to_change_tests(goal: str) -> bool:
+    """The request asks for a test to change, and does not say not to."""
+    return any(not _NEGATED.search(goal[max(0, m.start() - 20):m.start()])
+               for m in _ASKS_TO_CHANGE_TESTS.finditer(goal or ""))
+_TEST_ORIGINAL_MAX = 200_000
 
 
 def _is_code_path(path: str) -> bool:
@@ -1302,6 +1323,38 @@ class TrajectoryState:
 
     def edited_existing_tests(self) -> list[str]:
         return list(self.data.get("edited_existing_tests") or [])
+
+    def remember_test_original(self, path: str, text: str) -> None:
+        """Keep a test file as it was before this run first changed it (once per file, size-capped)."""
+        if not _is_test_path(path) or len(text) > _TEST_ORIGINAL_MAX:
+            return
+        originals = self.data.setdefault("test_originals", {})
+        key = _file_key(path)
+        if key in originals or len(originals) >= MAX_WRITTEN:
+            return
+        originals[key] = {"path": str(path), "text": text}
+
+    def weakened_tests(self) -> list[str]:
+        """Names of the given tests this run made weaker: a check the file had is gone or changed, or a skip or
+        xfail marker was added. Empty when the request itself asks for the tests to change."""
+        if _asks_to_change_tests(str(self.data.get("goal") or "")):
+            return []
+        edited = {_file_key(p) for p in self.edited_existing_tests()}
+        weakened = []
+        for key, original in (self.data.get("test_originals") or {}).items():
+            if key not in edited:
+                continue
+            try:
+                now = Path(original["path"]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            before = original["text"]
+            kept = {" ".join(line.split()) for line in now.splitlines()}
+            checks_gone = any(" ".join(line.split()) not in kept
+                              for line in before.splitlines() if _TEST_CHECK_LINE.search(line))
+            if checks_gone or len(_TEST_SKIP.findall(now)) > len(_TEST_SKIP.findall(before)):
+                weakened.append(PurePath(original["path"]).name)
+        return weakened
 
     def _track_tests(self, operation: dict, path: str, *, mutated: bool, command: str = "") -> None:
         """Maintain the list of code files changed this run with no test written.
