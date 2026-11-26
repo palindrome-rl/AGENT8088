@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (checks after every write)
+
+### Added
+
+- A file landed by `write_file` or `edit_file` is checked at once by a parse that runs nothing: Python and JSON are
+  parsed, JavaScript goes through `node --check`, and an HTML page's local `src`/`href` files must exist. A problem
+  is added to the tool result in one line and kept in the task-state note until the file is written cleanly, so a
+  broken file is found on the next turn instead of at the end of the run. Appends and files over 1 MB are not checked.
+
 ## v1.3 branch maintenance - 2026-11-26 (checklist and ledger)
 
 ### Improved

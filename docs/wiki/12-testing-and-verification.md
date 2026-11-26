@@ -32,6 +32,14 @@ running the work goes back to recheck when the work changes after that, and only
 passing check settles it again. The note is rebuilt from the controller's own state,
 so a compaction that drops older messages loses none of it.
 
+Every file that `write_file` or `edit_file` lands is checked at once by a parse
+that runs nothing: Python and JSON are parsed, JavaScript goes through
+`node --check`, and an HTML page's local `src` and `href` files must exist. A
+problem is added to the tool result in one line ("[check: app.js: line 12:
+SyntaxError ...]") and stays in the task-state note until the file is written
+cleanly. Appends are not checked, since a file written in parts is incomplete
+until its last part, and files over 1 MB are skipped.
+
 The notes also appear when output cut-offs, repeated calls or the turn limit
 stop a run. A post-check cap alone does not mark freshly tested or exercised
 work incomplete, but an unresolved failing check or an explicitly missing
