@@ -45,25 +45,25 @@ It matters because a careless live run damages real state:
   (`pkill -f '<venv-path>/bin/agent8088'`), never a broad `chrome`/`chromium`
   match that could close the developer's own windows.
 
-# Promoting: development → staging-1.3 → AGENT8088-v1.3
+# Promoting: development → staging-1.4 → AGENT8088-v1.4
 
-The three branches carry the same tree, with production (`AGENT8088-v1.3`) as
+The three branches carry the same tree, with production (`AGENT8088-v1.4`) as
 the shared base since 2026-11-19, so a promotion is an ordinary merge. The
 recipe is in
 [`.claude/skills/promote-to-staging/SKILL.md`](.claude/skills/promote-to-staging/SKILL.md).
 Claude Code loads it as a skill; Codex and OpenCode read the file directly.
 
-- **How to promote.** Open a PR from `development` into `staging-1.3`, then one
-  from `staging-1.3` into `AGENT8088-v1.3`, and merge each with **Create a merge
+- **How to promote.** Open a PR from `development` into `staging-1.4`, then one
+  from `staging-1.4` into `AGENT8088-v1.4`, and merge each with **Create a merge
   commit**. Never squash, rebase, cherry-pick or force-push.
 - **No per-branch edits.** Nothing is trimmed and no URL is rewritten:
-  - the installers default to `AGENT8088-v1.3`
+  - the installers default to `AGENT8088-v1.4`
   - other channels install with `AGENT8088_BRANCH=<branch>`
   - `agent8088 --update` follows the branch an install has checked out
 - **Changes enter through `development` only.** Nothing is committed directly to
-  `staging-1.3` or `AGENT8088-v1.3`. An urgent production fix is merged back into
+  `staging-1.4` or `AGENT8088-v1.4`. An urgent production fix is merged back into
   `development` the same day, so the branches never drift apart again.
-- **Merging into `AGENT8088-v1.3` publishes.** It changes:
+- **Merging into `AGENT8088-v1.4` publishes.** It changes:
   - what the public installers and `--update` install
   - the GHCR image
   - the public wiki, when `docs/wiki/` changed

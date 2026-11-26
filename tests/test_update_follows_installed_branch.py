@@ -1,8 +1,8 @@
 """`agent8088 --update` stays on the branch the install was made from.
 
-development, staging-1.3 and AGENT8088-v1.3 carry the same tree, so UPDATE_BRANCH
+development, staging-1.4 and AGENT8088-v1.4 carry the same tree, so UPDATE_BRANCH
 (the production branch) is the same on all of them. An install made with
-AGENT8088_BRANCH=development or staging-1.3 must not be moved to production by
+AGENT8088_BRANCH=development or staging-1.4 must not be moved to production by
 its first update: the branch checked out in the install is the channel the user
 chose, and it is followed as long as the remote still has it.
 """
@@ -18,7 +18,7 @@ def cli(engine):
     return importlib.reload(module)
 
 
-def _fake_git(checked_out, remote_heads, default="AGENT8088-v1.3"):
+def _fake_git(checked_out, remote_heads, default="AGENT8088-v1.4"):
     calls = []
 
     def git(_install_dir, *args):
@@ -37,21 +37,21 @@ def _fake_git(checked_out, remote_heads, default="AGENT8088-v1.3"):
     return git, calls
 
 
-@pytest.mark.parametrize("branch", ["development", "staging-1.3", "AGENT8088-v1.3"])
+@pytest.mark.parametrize("branch", ["development", "staging-1.4", "AGENT8088-v1.4"])
 def test_an_install_updates_on_the_branch_it_is_on(cli, monkeypatch, tmp_path, branch):
-    git, _calls = _fake_git(branch, {"development", "staging-1.3", "AGENT8088-v1.3"})
+    git, _calls = _fake_git(branch, {"development", "staging-1.4", "AGENT8088-v1.4"})
     monkeypatch.setattr(cli, "_git", git)
     assert cli._resolve_update_branch(tmp_path) == (branch, "")
 
 
 def test_a_detached_install_updates_on_the_release_branch(cli, monkeypatch, tmp_path):
-    git, _calls = _fake_git(None, {"AGENT8088-v1.3"})
+    git, _calls = _fake_git(None, {"AGENT8088-v1.4"})
     monkeypatch.setattr(cli, "_git", git)
     assert cli._resolve_update_branch(tmp_path) == (cli.UPDATE_BRANCH, "")
 
 
 def test_a_retired_branch_falls_back_to_the_release_branch_and_says_so(cli, monkeypatch, tmp_path):
-    git, _calls = _fake_git("staging-1.2", {"AGENT8088-v1.3"})
+    git, _calls = _fake_git("staging-1.2", {"AGENT8088-v1.4"})
     monkeypatch.setattr(cli, "_git", git)
     branch, note = cli._resolve_update_branch(tmp_path)
     assert branch == cli.UPDATE_BRANCH

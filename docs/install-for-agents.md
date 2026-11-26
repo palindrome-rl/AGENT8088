@@ -22,7 +22,7 @@ shorter.
 
 Ask these before installing, and use the answers below:
 
-1. **Branch** — `AGENT8088-v1.3` (this public release channel) unless they name another.
+1. **Branch** — `AGENT8088-v1.4` (this public release channel) unless they name another.
 2. **Mem0 memory engine** (optional, larger download) — yes or no. Default no.
 3. **LibreOffice** for Word/Excel/PowerPoint conversion (optional, large) — yes
    or no. Default no.
@@ -44,7 +44,7 @@ not install them yourself.
 
 ## 3. Run the installer
 
-Replace `AGENT8088-v1.3` with the chosen public branch in both the installer fetch and
+Replace `AGENT8088-v1.4` with the chosen public branch in both the installer fetch and
 `AGENT8088_BRANCH`, and set the two yes/no answers
 (`1` = yes, `0` = no).
 
@@ -52,8 +52,8 @@ Replace `AGENT8088-v1.3` with the chosen public branch in both the installer fet
 
 ```sh
 set -o pipefail
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh \
-  | AGENT8088_BRANCH=AGENT8088-v1.3 AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh \
+  | AGENT8088_BRANCH=AGENT8088-v1.4 AGENT8088_INSTALL_MEM0=0 AGENT8088_INSTALL_LIBREOFFICE=0 \
     bash -s -- --skip-setup
 ```
 
@@ -61,8 +61,8 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindro
 
 ```powershell
 $installer = Join-Path $env:TEMP ("agent8088-install-" + [guid]::NewGuid().ToString("N") + ".ps1")
-Invoke-RestMethod https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1 -OutFile $installer -ErrorAction Stop
-$env:AGENT8088_BRANCH = "AGENT8088-v1.3"
+Invoke-RestMethod https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.ps1 -OutFile $installer -ErrorAction Stop
+$env:AGENT8088_BRANCH = "AGENT8088-v1.4"
 $env:AGENT8088_INSTALL_MEM0 = "0"
 $env:AGENT8088_INSTALL_LIBREOFFICE = "0"
 powershell -NoProfile -ExecutionPolicy Bypass -File $installer -SkipSetup -SkipTerminalCheck

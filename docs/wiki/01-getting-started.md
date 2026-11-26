@@ -29,15 +29,15 @@ requests. No admin rights are needed for the base install.
 
 ## Install
 
-These commands install the public **AGENT8088-v1.3** branch.
+These commands install the public **AGENT8088-v1.4** branch.
 `agent8088 --update` continues to follow that branch.
 
-For an AI agent helping you install, use the [AI-assisted installation guide](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.3/docs/install-for-agents.md). It keeps secrets out of chat and leaves API-key entry to your own setup wizard.
+For an AI agent helping you install, use the [AI-assisted installation guide](https://github.com/palindrome-rl/AGENT8088/blob/AGENT8088-v1.4/docs/install-for-agents.md). It keeps secrets out of chat and leaves API-key entry to your own setup wizard.
 
 **macOS / Linux / WSL2**
 
 ```sh
-curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.sh | AGENT8088_BRANCH=AGENT8088-v1.3 bash
+curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.sh | AGENT8088_BRANCH=AGENT8088-v1.4 bash
 ```
 
 Run as your normal user, without `sudo`. The installer requests elevation only
@@ -47,8 +47,8 @@ make the command unavailable in your own terminal.
 **Windows (PowerShell)**
 
 ```powershell
-$env:AGENT8088_BRANCH = 'AGENT8088-v1.3'
-iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.3/install.ps1)
+$env:AGENT8088_BRANCH = 'AGENT8088-v1.4'
+iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.ps1)
 ```
 
 Use PowerShell, not `cmd.exe`, and start from a normal, non-administrator window.
@@ -81,7 +81,7 @@ that still fail are listed at the end with the exact repair command.
 **From a clone, to work on the code.** Clone the public release branch:
 
 ```sh
-git clone --branch AGENT8088-v1.3 https://github.com/palindrome-rl/AGENT8088.git
+git clone --branch AGENT8088-v1.4 https://github.com/palindrome-rl/AGENT8088.git
 cd AGENT8088
 python -m venv .venv
 .venv/bin/pip install -e ".[gateway,dev]"

@@ -15,7 +15,7 @@ isolated environment.
 
 ## Runtime completion evidence
 
-These runtime checks ship with AGENT8088-v1.3 and do not require a root
+These runtime checks ship with AGENT8088-v1.4 and do not require a root
 `tests/` directory. End-of-run notes distinguish a passing test run (`tested`)
 from running or loading the result without an error (`exercised`), inspecting
 files, and making changes without fresh verification. `Tested` means the run's
