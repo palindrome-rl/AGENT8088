@@ -4,6 +4,20 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (finished work reported NOT VERIFIED)
+
+### Fixed
+
+- Reading a log or waiting on a job (`tail`, `head`, `wc`, `sleep`, `kill`) is not a check. Before, a
+  `sleep 60 && tail -1 build.log` that found no log counted as a check, because the file name has "build" in it,
+  and the run ended "the latest check failed" after the build itself had passed.
+- An example value in a part of the request ("amounts with two decimals, like `$12.34`") is not a name the
+  delivered files must contain. The part's other named things (`subtotal`, `total`) still must be there.
+- A part asking for state to outlast a reload ("still there after the page is reloaded") is met by a page that keeps
+  it in `localStorage`, `sessionStorage` or IndexedDB.
+- A file the run deleted itself with its own `rm`/`del`/`Remove-Item` is not reported as a missing file because the
+  reply mentions it. A file the request names is still required.
+
 ## v1.3 branch maintenance - 2026-11-26 (hard-coded test cases)
 
 ### Fixed
