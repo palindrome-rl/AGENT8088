@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (hard-coded test cases)
+
+### Fixed
+
+- Work is not VERIFIED when the run added code that hard-codes a given test's case (`if celsius == 37: return 98.0`,
+  where a given test asserts `to_fahrenheit(37) == 98.0`) or a comment saying the code is there to satisfy a test.
+  Before, a run that did this to pass a contradictory test said VERIFIED. Python only, `==` only, and only what the
+  run added: a boundary such as `if kg <= 5: return 4.0`, or a special case the project already had, does not count.
+
 ## v1.3 branch maintenance - 2026-11-26 (stale and misread verdict signals)
 
 ### Fixed
