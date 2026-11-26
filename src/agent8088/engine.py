@@ -726,6 +726,39 @@ COMPLETION_SMOKE_TIMEOUT = max(5, _config_int("completion_smoke_timeout_seconds"
 # When a run built a page or image and the request is about how it looks, one nudge (per state of the work, at most twice a request)
 # to render it and look before the final answer, if nothing in the run has. It never blocks: the answer is accepted either way.
 COMPLETION_VISUAL_LOOK = str(APP_CONFIG.get("completion_visual_look", "1")).strip().lower() in ("1", "true", "yes", "on")
+# Eval mode: a run judged on what it leaves on disk (a measured experiment, a comparison) gets none of the steps that
+# cannot change that: the last-stretch ask to stop and write the answer, the optional look at a page, a screenshot no
+# test asked for. Every check whose result can lead to a fix stays. `full` (the default) changes nothing.
+# AGENT8088_RUN_MODE wins over run_mode in config, so a script can switch one run; /eval and --eval switch a session.
+RUN_MODES = ("full", "eval")
+
+
+def _initial_run_mode(environ=None, config=None) -> str:
+    """The run mode from AGENT8088_RUN_MODE, else run_mode in config; an unknown value is `full`."""
+    environ = os.environ if environ is None else environ
+    config = APP_CONFIG if config is None else config
+    for raw in (environ.get("AGENT8088_RUN_MODE"), config.get("run_mode")):
+        value = str(raw or "").strip().lower()
+        if value:
+            return value if value in RUN_MODES else "full"
+    return "full"
+
+
+RUN_MODE = _initial_run_mode()
+
+
+def eval_mode() -> bool:
+    return RUN_MODE == "eval"
+
+
+def set_run_mode(mode: str) -> str:
+    """Switch the run mode for this session (config.txt is not rewritten)."""
+    global RUN_MODE
+    value = str(mode or "").strip().lower()
+    if value not in RUN_MODES:
+        raise ValueError("The run mode must be full or eval.")
+    RUN_MODE = value
+    return RUN_MODE
 # After the first control, the page check clicks this many more visible controls (within
 # half the timeout) and fails on a page error they raise. 0 = only the first control.
 SMOKE_CLICK_STEPS = max(0, _config_int("smoke_click_through_steps", app_check.CLICK_THROUGH_STEPS))
@@ -8049,7 +8082,8 @@ def _browser_test_images(report) -> list:
     state when a step failed (to see why). At most the number of images the conversation keeps, the latest ones."""
     images = [(shot.label, shot.path) for shot in report.shots if shot.path and Path(shot.path).is_file()]
     failed = not report.error and not report.passed
-    if failed and report.screenshot and Path(report.screenshot).is_file():
+    # Eval mode: only what the test itself asked for (its screenshot steps); the failing step's text says what broke.
+    if failed and not eval_mode() and report.screenshot and Path(report.screenshot).is_file():
         images.append(("the state when the test stopped", report.screenshot))
     keep = _image_keep()
     return images[-keep:] if keep else images
@@ -22523,7 +22557,7 @@ def _record_unmet_checks(budget, trajectory, *, reply: str, request: str, depth:
 
 def _visual_look_step(trajectory, written: list, request: str):
     """Ask once to look at a page or image this run built, when the request is about how it looks and nothing has looked at it."""
-    if not COMPLETION_VISUAL_LOOK or not completion_checks.wants_visual_result(request):
+    if eval_mode() or not COMPLETION_VISUAL_LOOK or not completion_checks.wants_visual_result(request):
         return None
     roots = [PROJECT_ROOT, ARTIFACTS_ROOT, Path.cwd()]
     targets = app_check.deliverable_targets(
@@ -22995,6 +23029,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
     last_cutoff_kind = ""       # kind of the last cut-off
     thinking_sticky_left = 0    # ordinary calls still to run with thinking off after a reasoning-only cut-off
     profile_traced = ""         # the output limits the trace already names
+    if trace is not None and depth == 0:
+        trace.append({"turn": 0, "type": "run_mode", "mode": RUN_MODE})   # results from the two modes are never mixed
     keep_full_cap = False       # the last cut-off's reasoning was kept: the next call keeps the full cap and thinking
     malformed_round = False  # this round's only failure was an unparseable call
     deliverables_checked = False  # disposable-container end-of-run check, once per run
@@ -23124,7 +23160,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
             # The time checks say to finish the outputs; in the last stretch the model is told to answer instead.
             # Without this, runs whose outputs were in place went on checking until the clock stopped them. A short
             # clock is left alone: there the last stretch would be most of the run.
-            if (depth == 0 and not answer_asked and budget.max_seconds >= ANSWER_NOW_MIN_BUDGET
+            # Eval mode keeps working instead: a run graded on its final state gains nothing from the written answer.
+            if (depth == 0 and not answer_asked and not eval_mode() and budget.max_seconds >= ANSWER_NOW_MIN_BUDGET
                     and _answer_time(budget, turn_pace)):
                 answer_asked = True
                 time_nudges = max(time_nudges, crossed)

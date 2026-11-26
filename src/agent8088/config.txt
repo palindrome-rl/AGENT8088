@@ -56,6 +56,13 @@ prompt_paths=~
 # it here, or at any time with `/maxturns <n>` in the REPL, which writes it back
 # to this file.
 max_turns=400
+# Run mode. `full` (the default) is the normal behaviour. `eval` is for runs judged
+# on what they leave on disk (measured experiments, comparisons): it leaves out the
+# steps that cannot change that (the last-stretch ask to stop and write the answer,
+# the optional look at a page, screenshots no test asked for) and keeps every check
+# that can lead to a fix. --eval, AGENT8088_RUN_MODE=eval or /eval on set it too;
+# each run's trace records its mode.
+# run_mode=full
 # How far progress may grow max_turns. 1 disables growth and restores a hard
 # fixed limit of exactly max_turns rounds.
 # dynamic_turns_ceiling_multiplier=3

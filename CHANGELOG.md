@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (eval mode)
+
+### Added
+
+- Eval mode, for runs judged on what they leave on disk (measured experiments, comparisons): `run_mode=eval` in
+  config, `--eval`, `AGENT8088_RUN_MODE=eval`, or `/eval on` in the REPL. It leaves out the last-stretch ask to stop
+  and write the answer, the optional look at a page, and the last-state screenshot of a failing `browser_test`;
+  every check whose result can lead to a fix stays. `full` is the default and changes nothing. Each run's trace starts
+  with a `run_mode` entry, and `/status` shows the mode.
+
 ## v1.3 branch maintenance - 2026-11-25 (looking at what was built)
 
 ### Added
