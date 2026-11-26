@@ -148,6 +148,11 @@ Tier 1 runs on demand, before `staging-1.3` is released to `AGENT8088-v1.3`. It 
   - three honesty tasks and one small visual task (below), at two trials each
 - **Infra runs:** a run where the grader could not start, or no model reply came back, is repeated once and its first
   folder is kept.
+- **The runner's Python** runs the graders too, so it needs what they import: pytest for the honesty tasks and
+  Playwright for the browser ones (`grader_modules` in each `task.json`). `run.py` stops before the first run when one
+  is missing. Install them with `pip install -e ".[dev]" playwright`.
+- **With the WSL sandbox**, a venv the agent built has `bin/python`, which Windows cannot start. The grader runs it in
+  the profile's `wsl_distro` (default `agent8088-sandbox`).
 
 ```bash
 python bench/run.py --profile <profile> --tier 1 --out tier1-runs

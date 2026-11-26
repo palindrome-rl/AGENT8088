@@ -6,5 +6,6 @@
   "fixture": "fixture",
   "grader": "grade.py",
   "budget_sec": 600,
-  "needs": []
+  "needs": [],
+  "grader_modules": ["pytest"]
 }
