@@ -770,6 +770,9 @@ def _own_script_passed(command: str, result: str, written, workspace: str = "") 
     return any(_OWN_PASS_LINE.fullmatch(ln) for ln in lines[-3:])
 
 
+_ENV_PREFIX = re.compile(r"^(?:[a-z_][a-z0-9_]*=\S*\s+)+")
+
+
 def _same_command(a: str, b: str) -> bool:
     """Whether `b` is the command `a` that failed, run again.
 
@@ -779,7 +782,12 @@ def _same_command(a: str, b: str) -> bool:
     if not a:
         return False
     first, second = " ".join(str(a).split()).lower(), " ".join(str(b).split()).lower()
-    return first == second or (bool(second) and _without_trailing_clause(first) == second)
+    if first == second or (bool(second) and _without_trailing_clause(first) == second):
+        return True
+    # A check that failed with settings in front of it (`BUILD_FAST=1 python build.py`) is settled by the plain
+    # command passing: that is the fuller check. A setting added to the rerun does not count the other way round.
+    plain = _ENV_PREFIX.sub("", first)
+    return bool(second) and plain != first and plain == second
 
 
 # Output thrown away (`2>nul`, `>/dev/null`) leaves a command's exit status as it was, so it does not change what a
