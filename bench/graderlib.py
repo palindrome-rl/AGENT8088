@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -92,6 +93,43 @@ class OfflinePage:
 def browser_error(exc: Exception) -> dict:
     """The report for a run the grader could not check because no browser started."""
     return {"error": f"the grader could not start a browser: {str(exc).splitlines()[0][:200] if str(exc) else exc!r}"}
+
+
+GRADER_WSL_DISTRO_ENV = "AGENT8088_GRADER_WSL_DISTRO"
+
+
+def to_wsl_path(path) -> str:
+    """A Windows path as the WSL distro sees it: E:\\a b\\c is /mnt/e/a b/c."""
+    text = str(path).replace("\\", "/")
+    if len(text) >= 2 and text[1] == ":":
+        return f"/mnt/{text[0].lower()}{text[2:]}"
+    return text
+
+
+def venv_python_command(workspace: Path, distro: str | None = None, wsl: str | None = None,
+                        windows: bool | None = None) -> list | None:
+    """The command that starts the venv's Python in workspace/.venv, or None when there is no venv.
+
+    On Windows a venv the agent built inside the WSL sandbox has bin/python, a link to the distro's Python that
+    Windows cannot start; it runs in that distro instead (named by AGENT8088_GRADER_WSL_DISTRO). The command then
+    starts in the workspace, so run it with the workspace as its folder either way."""
+    windows = (sys.platform == "win32") if windows is None else windows
+    venv = Path(workspace) / ".venv"
+    candidates = [venv / "Scripts" / "python.exe"] + ([] if windows else [venv / "bin" / "python"])
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return [str(candidate)]
+        except OSError:
+            continue
+    linux = venv / "bin" / "python"
+    if windows and os.path.lexists(linux):
+        distro = distro if distro is not None else os.environ.get(GRADER_WSL_DISTRO_ENV, "")
+        wsl = wsl if wsl is not None else (shutil.which("wsl.exe") or "")
+        if distro and wsl:
+            where = to_wsl_path(os.path.abspath(workspace))
+            return [wsl, "-d", distro, "--cd", where, "--exec", f"{where}/.venv/bin/python"]
+    return None
 
 
 def report(checks: dict, total: int | None = None, **extra) -> dict:

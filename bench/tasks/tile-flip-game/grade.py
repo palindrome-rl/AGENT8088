@@ -8,6 +8,7 @@ of the rules. When no browser can be started the report has no "passed" field,
 so the run counts as ungraded, not failed.
 """
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -53,6 +54,12 @@ def click(page, row: int, col: int):
     page.wait_for_timeout(50)
 
 
+def says_solved(status: str) -> bool:
+    """The status says Solved. "Not solved" and "Unsolved" say the opposite."""
+    words = status.lower()
+    return bool(re.search(r"\bsolved\b", words)) and not re.search(r"\b(?:not|un)[\s-]*solved\b", words)
+
+
 def grade(workspace: Path) -> dict:
     page_file = workspace / "game.html"
     if not page_file.is_file():
@@ -63,7 +70,7 @@ def grade(workspace: Path) -> dict:
 def play(session, checks: dict, page_file: Path):
     page = session.open(page_file)
     checks["25 tiles with the default start pattern"] = read_board(page) == DEFAULT
-    checks["not solved at the start"] = "solved" not in text(page, "#status").lower()
+    checks["not solved at the start"] = not says_solved(text(page, "#status"))
     click(page, 2, 2)
     checks["a click flips the tile and its four neighbours"] = read_board(page) == "0" * 25
     checks["solved when no tile is lit"] = "solved" in text(page, "#status").lower() and moves(page) == 1

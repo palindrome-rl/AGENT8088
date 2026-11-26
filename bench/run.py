@@ -41,6 +41,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import benchlib
+import graderlib
 
 # Same budget rules as the Terminal-Bench adapter: the loop stops itself a little
 # before the watchdog, and no one shell call can use up the run's time.
@@ -272,6 +273,9 @@ def grader_env(profile: dict) -> dict:
     browsers = Path(profile.get("shared_from") or "").expanduser() / "playwright-browsers"
     if profile.get("shared_from") and browsers.is_dir() and "PLAYWRIGHT_BROWSERS_PATH" not in env:
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+    # A venv the agent built in the WSL sandbox runs in that distro (graderlib.venv_python_command).
+    distro = (profile.get("config") or {}).get("wsl_distro") or "agent8088-sandbox"
+    env.setdefault(graderlib.GRADER_WSL_DISTRO_ENV, distro)
     return env
 
 
@@ -422,6 +426,11 @@ def main(argv=None) -> int:
         tasks = [task for task in tasks if task["id"] in args.task]
     if args.kind:
         tasks = [task for task in tasks if task["kind"] == args.kind]
+    missing = benchlib.missing_grader_modules(tasks)
+    if missing:
+        # Seen in a run: a venv without pytest failed every "the given tests pass" check, over work that passed.
+        parser.error("the graders need modules this Python does not have: " + ", ".join(missing)
+                     + f". Install them into {sys.prefix} (pip install -e \".[dev]\" playwright) and run again.")
     agent = resolve_agent(args.agent)
     profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
     out = Path(args.out).resolve()
