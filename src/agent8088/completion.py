@@ -164,14 +164,38 @@ _FAILURE_FIXED = re.compile(
 # not a check of the model's that failed (seen marking a passing fix NOT VERIFIED). A sentence that says it still
 # fails keeps the phrase.
 _TASK_FAILING_TEST = re.compile(
-    r"\bthe\s+(?:(?:previously|originally|given|one)\s+)?failing\s+(?:tests?|checks?|ones?|cases?)\b",
+    r"\b(?:the|your|this|that)\s+(?:(?:previously|originally|given|one)\s+)?failing\s+"
+    r"(?:tests?|checks?|ones?|cases?)\b",
     re.IGNORECASE)
 _STILL = re.compile(r"\b(?:still|remains?|again)\b", re.IGNORECASE)
+# A heading over the reply's account of the bug it was asked to fix ("What was wrong", "Root cause", "The bug").
+# What that section says failed is the starting state, not a check of the model's (seen: "The link step failed
+# because ..." under "What was wrong", on a build whose full run passed). A heading is a markdown heading or a line
+# that is only bold text.
+_HEADING_LINE = re.compile(r"^\s*(?:#{1,6}\s*(?P<md>.+?)\s*#*|\*\*(?P<bold>[^*]+?)\*\*:?)\s*$")
+_CAUSE_HEADING = re.compile(
+    r"^\W*(?:what\s+(?:was|went)\s+(?:wrong|broken|failing)|(?:the\s+)?(?:root\s+)?causes?|"
+    r"(?:the\s+)?(?:bug|problem|issue|failure)s?|why\s+it\s+(?:failed|broke)|before\s+the\s+(?:fix|change)|"
+    r"diagnosis|what\s+i\s+found)\b",
+    re.IGNORECASE)
+
+
+def _without_cause_sections(text: str) -> str:
+    """The reply without the lines under a heading about the original bug, except a line that says it still fails."""
+    kept, in_cause = [], False
+    for line in text.splitlines():
+        heading = _HEADING_LINE.match(line)
+        if heading:
+            in_cause = bool(_CAUSE_HEADING.match(heading.group("md") or heading.group("bold") or ""))
+            kept.append("")
+            continue
+        kept.append(line if not in_cause or _STILL.search(line) else "")
+    return "\n".join(kept)
 
 
 def reports_failed_check(reply: str) -> str:
     """The sentence in which the reply says one of its own checks failed and it was not fixed, or ""."""
-    text = _prose(reply).replace("**", "").replace("__", "")
+    text = _without_cause_sections(_prose(reply)).replace("**", "").replace("__", "")
     text = re.sub(r"\bif\s+(?:you|your|it|the)\b[^.\n]*", " ", text, flags=re.IGNORECASE)
     for sentence in _SENTENCE_SPLIT.split(text):
         if not _STILL.search(sentence):

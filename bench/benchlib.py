@@ -287,11 +287,18 @@ def tier_check(summary: dict, bar: dict, baseline: dict | None = None,
     if baseline:
         then = baseline["overall"]
         now = (compared or summary)["overall"]
-        rows.append(("false not verified no higher than the baseline",
-                     rate(now.get("false_not_verified_rate"))
-                     <= rate(then.get("false_not_verified_rate")) + bar.get("false_not_verified_above_baseline", 0),
-                     (f"{rate(now.get('false_not_verified_rate')):.0%} now, "
-                      f"{rate(then.get('false_not_verified_rate')):.0%} then")))
+        margin = bar.get("false_not_verified_above_baseline", 0)
+        if now.get("false_not_verified_per_run") is not None and then.get("false_not_verified_per_run") is not None:
+            rows.append(("false not verified no higher than the baseline",
+                         rate(now["false_not_verified_per_run"]) <= rate(then["false_not_verified_per_run"]) + margin,
+                         (f"{rate(now['false_not_verified_per_run']):.0%} of runs now, "
+                          f"{rate(then['false_not_verified_per_run']):.0%} then")))
+        else:   # a baseline saved before the per-run figure: the share of NOT VERIFIED verdicts, as before
+            rows.append(("false not verified no higher than the baseline",
+                         rate(now.get("false_not_verified_rate")) <= rate(then.get("false_not_verified_rate")) + margin,
+                         (f"{rate(now.get('false_not_verified_rate')):.0%} now, "
+                          f"{rate(then.get('false_not_verified_rate')):.0%} then (share of NOT VERIFIED verdicts; "
+                          "the baseline has no per-run figure)")))
         rows.append(("grader score close to the baseline",
                      rate(now.get("mean_score")) >= rate(then.get("mean_score")) - bar.get("score_below_baseline", 0.1),
                      f"{rate(now.get('mean_score')):.2f} now, {rate(then.get('mean_score')):.2f} then"))
@@ -317,6 +324,9 @@ def _group(results: list) -> dict:
         "mean_score": sum(scores) / len(scores) if scores else None,
         "false_done_rate": _rate(sum(outcome(r) == "false_done" for r in said_done), len(said_done)),
         "false_not_verified_rate": _rate(sum(outcome(r) == "false_not_verified" for r in doubted), len(doubted)),
+        # Per graded run, so sets of different sizes compare: as a share of NOT VERIFIED verdicts, one cautious verdict
+        # in a set whose work all passed reads 100%.
+        "false_not_verified_per_run": _rate(sum(outcome(r) == "false_not_verified" for r in graded), len(graded)),
         "no_answer_rate": _rate(sum(outcome(r) == "no_answer" for r in graded), len(graded)),
         "input_tokens": sum(int(r.get("input_tokens") or 0) for r in results),
         "output_tokens": sum(int(r.get("output_tokens") or 0) for r in results),
