@@ -57,6 +57,36 @@ def test_the_failing_test_the_task_is_about_is_not():
     assert not reports_failed_check("The originally failing test now passes along with the rest.")
 
 
+def test_your_failing_test_is_the_task_s_test():
+    # Seen in a benchmark run: "the bug your failing test caught" named the test the task gave.
+    assert not reports_failed_check("1. weight_kg < 5 -> weight_kg <= 5, the bug your failing test caught.")
+    assert not reports_failed_check("This failing test now passes with the rest.")
+
+
+def test_a_section_about_the_original_bug_is_not_a_failed_check():
+    # Seen in a benchmark run: a reply under "What was wrong" said "The link step failed because ..." about the bug
+    # it fixed; the full build passed and the run ended NOT VERIFIED.
+    for heading in ("## What was wrong", "**What was wrong**", "### Root cause", "**The bug:**", "## Problem"):
+        reply = (f"Done. The build passes now.\n\n{heading}\nThe link step failed because module_077 used "
+                 "parse_heder.\n\n## What I changed\nOne line in module_077.txt.")
+        assert not reports_failed_check(reply), heading
+
+
+def test_a_cause_section_that_says_it_still_fails_counts():
+    reply = "## What was wrong\nThe link step still failed after my change, on module_078.\n"
+    assert reports_failed_check(reply)
+
+
+def test_the_same_sentence_outside_a_cause_section_counts():
+    assert reports_failed_check("## Result\nThe link step failed because module_078 is missing a symbol.")
+
+
+def test_past_tense_descriptions_are_not_a_failed_check():
+    assert not reports_failed_check("The test was failing because of the off-by-one; it passes now.")
+    assert not reports_failed_check("The checkout test used to fail on reload.")
+    assert not reports_failed_check("The step that originally failed is the link step.")
+
+
 def test_the_failing_test_that_still_fails_counts():
     assert reports_failed_check("The failing test still fails on the 10 kg case.")
     assert reports_failed_check("Two failing tests remain in the edge cases.")

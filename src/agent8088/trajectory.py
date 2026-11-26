@@ -201,7 +201,19 @@ _CHECK_COMMAND = re.compile(
 
 # The note the sandbox appends when a command tried to write where it may not. A check that ends with
 # it was stopped by the sandbox: it never ran to a result, so it did not fail.
-_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only")
+# A start refused because that service is already running left the service up: nothing is left undone (seen ending a
+# run "Unresolved tool work remains: service_start" after the model had used and stopped the service).
+_ALREADY_RUNNING = re.compile(r"a service named \S+ is already running")
+
+
+def _already_running(tool: str, operation: dict) -> bool:
+    return tool == "service_start" and bool(_ALREADY_RUNNING.search(str(operation.get("result") or "")))
+
+
+# The sandbox refused a write, so the command tested nothing. On Linux (the WSL and Docker sandboxes) a folder the
+# sandbox keeps read-only answers EROFS: seen as "mkdir: can't create directory 'mt_test/': Read-only file system" on
+# a scratch check in /tmp, which then ended a passing run "the latest check failed".
+_SANDBOX_BLOCKED = re.compile(r"\[sandbox\] Shell commands may write only|Read-only file system|\[Errno 30\]")
 
 
 # Commands that move, list or remove files. A folder called `tests\` in their arguments does not make them a
@@ -1347,16 +1359,19 @@ class TrajectoryState:
         xfail marker was added. Empty when the request itself asks for the tests to change."""
         if _asks_to_change_tests(str(self.data.get("goal") or "")):
             return []
-        edited = {_file_key(p) for p in self.edited_existing_tests()}
         weakened = []
-        for key, original in (self.data.get("test_originals") or {}).items():
-            if key not in edited:
-                continue
+        for original in (self.data.get("test_originals") or {}).values():
+            before = original["text"]
             try:
                 now = Path(original["path"]).read_text(encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                # A given test that is gone checks nothing any more (deleted or moved away by any tool).
+                weakened.append(PurePath(original["path"]).name)
+                continue
             except OSError:
                 continue
-            before = original["text"]
+            if now == before:
+                continue
             kept = {" ".join(line.split()) for line in now.splitlines()}
             checks_gone = any(" ".join(line.split()) not in kept
                               for line in before.splitlines() if _TEST_CHECK_LINE.search(line))
@@ -1558,7 +1573,7 @@ class TrajectoryState:
         for operation in self.data.get("operations", []):
             latest[operation.get("tool", "tool")] = operation
         return [tool for tool, op in latest.items()
-                if op.get("status") in {"blocked", "failed", "unknown"}]
+                if op.get("status") in {"blocked", "failed", "unknown"} and not _already_running(tool, op)]
 
     def has_open_items(self) -> bool:
         """Work the run itself shows is not finished: pending verification, a failed
@@ -2155,6 +2170,24 @@ class TrajectoryState:
 
     def write_problems(self) -> dict:
         return dict(self.data.get("write_problems") or {})
+
+    def recheck_write_problems(self, check) -> None:
+        """Check each file with a recorded problem again: `check(path)` gives its problem now, or "".
+
+        A page written before the files it points at was recorded as pointing at missing files, and nothing
+        checked it again when they were written, so the problem outlived the fix. A file that is gone has no problem
+        left to report."""
+        problems = self.data.get("write_problems") or {}
+        for path in list(problems):
+            try:
+                exists = Path(path).is_file()
+            except OSError:
+                exists = False
+            problem = check(path) if exists else ""
+            if problem:
+                problems[path] = _text(problem)[:200]
+            else:
+                problems.pop(path, None)
 
     def _ledger_lines(self) -> list[str]:
         """The checklist as the model reads it: the general steps on one line, then each part of the request with its

@@ -75,6 +75,25 @@ def test_the_tier_bar():
     assert failed(_summary(score=0.7)) == ["grader score close to the baseline"]
 
 
+def test_false_not_verified_is_compared_per_run_when_both_have_it():
+    # As a share of NOT VERIFIED verdicts, one cautious verdict in a set whose work all passed reads 100%. Per run
+    # it is one run in so many, which a baseline of a different size can be held against.
+    bar = benchlib.load_tier("1")["bar"]
+    rule = "false not verified no higher than the baseline"
+    base = {"overall": {**_summary(false_nv=0.6)["overall"], "false_not_verified_per_run": 3 / 14}}
+    ok = {"overall": {**_summary(false_nv=1.0)["overall"], "false_not_verified_per_run": 2 / 16}}
+    too_many = {"overall": {**_summary(false_nv=0.5)["overall"], "false_not_verified_per_run": 5 / 16}}
+    assert dict((r, passed) for r, passed, _d in benchlib.tier_check(ok, bar, base))[rule]
+    assert not dict((r, passed) for r, passed, _d in benchlib.tier_check(too_many, bar, base))[rule]
+    assert "of runs" in dict((r, d) for r, _p, d in benchlib.tier_check(ok, bar, base))[rule]
+
+
+def test_the_summary_counts_false_not_verified_per_graded_run():
+    runs = [_run("cart-page"), _run("cart-page", verdict="not_verified", passed=True),
+            _run("cart-page", verdict="not_verified", passed=False, score=0.5), _run("cart-page")]
+    assert benchlib.aggregate(runs)["overall"]["false_not_verified_per_run"] == 0.25
+
+
 def test_without_a_baseline_only_the_absolute_rules_are_checked():
     rules = [rule for rule, _ok, _d in benchlib.tier_check(_summary(), benchlib.load_tier("1")["bar"])]
     assert rules == ["no false done", "no run without an answer"]
