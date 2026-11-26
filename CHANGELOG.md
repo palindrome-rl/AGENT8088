@@ -4,6 +4,21 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (verdict fixes from the second Tier 1 run)
+
+### Fixed
+
+- Work that changed or skipped a check in a test the task came with is no longer VERIFIED. Before, a run changed a
+  given test's expected value so every test passed, and said VERIFIED with only a test-integrity note. Adding tests,
+  or changing one the request asks to change, still counts as before.
+- The WSL sandbox distro has pytest. Without it, `python -m pytest` checks ended "the test tool 'pytest' is not
+  installed where the check ran" over correct work. The distro's setup version goes to 2, so an existing distro is
+  set up again.
+- A check that failed with a setting in front of it (`BUILD_FAST=1 python build.py`) is settled when the plain
+  command passes. A setting added to the rerun does not settle it.
+- "The failing test" or "the previously failing one" in a reply, naming the test the task was about, is no
+  longer read as a failed check, unless the reply says it still fails.
+
 ## v1.3 branch maintenance - 2026-11-26 (Tier 1 fixes under the WSL sandbox)
 
 ### Fixed
