@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (sub-agent results as reports)
+
+### Improved
+
+- Every sub-agent ends with one STATUS line (complete, incomplete, failed). A sub-agent the model spawned comes back
+  as a labelled report: its status, a reminder that it is a claim to check against the files, its text marked as
+  untrusted content, and a flag on any text addressed to the parent as an instruction. One stopped by its time limit
+  reads "incomplete (stopped by its time limit; unverified)". Internal auditor and test-writer calls are unchanged.
+
 ## v1.3 branch maintenance - 2026-11-26 (a clock for headless runs)
 
 ### Improved
