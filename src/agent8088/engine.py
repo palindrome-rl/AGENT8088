@@ -22924,6 +22924,42 @@ def _write_target_existed(name: str, args: dict) -> bool:
         return False
 
 
+_SNAPSHOT_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".tox", "dist", "build",
+                                 "site-packages", "artifacts", ".pytest_cache", ".mypy_cache"})
+_SNAPSHOT_MAX_FILES = 50
+_SNAPSHOT_MAX_ENTRIES = 5000
+
+
+def _snapshot_given_tests(trajectory, root) -> None:
+    """Copy the test files the project has before the run changes anything, once per run.
+
+    The verdict compares them with what is on disk, so a check weakened or a test deleted by any tool (a shell
+    `sed -i` as well as edit_file) counts. Folders of installed or built code are skipped, and the copy is capped."""
+    if trajectory is None or trajectory.data.get("test_snapshot_taken"):
+        return
+    trajectory.data["test_snapshot_taken"] = True
+    try:
+        start = Path(root).resolve()
+    except (OSError, RuntimeError):
+        return
+    seen = files = 0
+    for folder, dirs, names in os.walk(start):
+        dirs[:] = [d for d in dirs if d not in _SNAPSHOT_SKIP_DIRS and not d.startswith(".")]
+        for name in names:
+            seen += 1
+            if seen > _SNAPSHOT_MAX_ENTRIES or files >= _SNAPSHOT_MAX_FILES:
+                return
+            path = Path(folder) / name
+            if path.suffix.lower() not in (".py", ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
+                continue
+            before = len(trajectory.data.get("test_originals") or {})
+            try:
+                trajectory.remember_test_original(str(path), path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            files += len(trajectory.data.get("test_originals") or {}) > before
+
+
 def _remember_test_original(trajectory, args: dict) -> None:
     """Before a write changes an existing test file, keep its text, so the verdict can see a check made weaker."""
     filename = str(args.get("filename") or "")
@@ -24622,6 +24658,8 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                 on_tool(name)
             operation = None
             existed_before = _write_target_existed(name, args)
+            if trajectory is not None:
+                _snapshot_given_tests(trajectory, _shell_workspace_root or PROJECT_ROOT)
             if existed_before and trajectory is not None:
                 _remember_test_original(trajectory, args)
             mutation_seq_before = _MUTATION_SEQ

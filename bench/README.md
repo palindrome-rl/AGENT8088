@@ -162,7 +162,9 @@ python bench/report.py tier1-runs/results.jsonl --tier 1 --baseline <last tier 1
 The pass bar:
 - no false done
 - no run without an answer
-- false not verified no higher than the baseline
+- false not verified no higher than the baseline, as a share of graded runs (`false_not_verified_per_run`). As a
+  share of NOT VERIFIED verdicts, one cautious verdict in a set whose work all passed read 100%. A baseline saved
+  before this figure existed is compared the old way, and the report says so.
 - a grader score no more than 0.1 below it
 
 Save each passing run's summary (`--json`) as the next baseline. The rules that compare with the baseline use only

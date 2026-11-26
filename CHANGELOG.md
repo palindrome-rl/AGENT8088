@@ -4,6 +4,21 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (stale and misread verdict signals)
+
+### Fixed
+
+- A problem the check after a write recorded is checked again after each write and before the verdict. A page
+  written before the files it points at no longer stays "points at local files that are not there" once they
+  exist, which had made tested, working builds NOT VERIFIED.
+- A reply's account of the bug it fixed is not read as a failed check: "your", "this" or "that" failing test,
+  and lines under a heading such as "What was wrong" or "Root cause", unless the line says it still fails.
+- A write the sandbox refused ("Read-only file system") is not the latest check failing.
+- A `service_start` refused because the service is already running is not unresolved tool work.
+- The given tests are copied on the run's first tool call, so a check weakened by a shell command, or a given test
+  deleted, counts like an edit with `edit_file`.
+- Bench: the Tier 1 false NOT VERIFIED rule compares the share of graded runs (`false_not_verified_per_run`).
+
 ## v1.3 branch maintenance - 2026-11-26 (temporary files in the WSL sandbox)
 
 ### Fixed
