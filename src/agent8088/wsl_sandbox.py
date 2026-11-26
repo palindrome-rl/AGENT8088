@@ -39,14 +39,14 @@ RUNNER = f"{RUNTIME_DIR}/run"
 # A marker file the setup writes last; a distro without it was imported but never finished setting up.
 SETUP_MARKER = f"{RUNTIME_DIR}/setup-version"
 # Bumped when the setup script changes, so an older distro is set up again.
-SETUP_VERSION = "1"
+SETUP_VERSION = "2"
 
 ALPINE_VERSION = "3.24.4"
 _ROOTFS = {
     "x86_64": "cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012",
     "aarch64": "4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de",
 }
-PACKAGES = ("bash", "nodejs", "npm", "python3", "py3-pip", "git", "bubblewrap", "socat", "ripgrep")
+PACKAGES = ("bash", "nodejs", "npm", "python3", "py3-pip", "py3-pytest", "git", "bubblewrap", "socat", "ripgrep")
 
 # The command arrives in an environment variable, not on wsl.exe's command line: wsl.exe re-splits its command line
 # with its own rules, so a quoted command crossing it would not arrive as written. A command too long for one
