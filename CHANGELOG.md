@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (a clock for headless runs)
+
+### Improved
+
+- A run nobody watches (`--prompt-file`, an unattended job, a task container) gets `headless_max_turn_seconds`
+  (3 hours) when `max_turn_seconds` is not set, so its time checks and answer stretch work. An explicit
+  `max_turn_seconds` wins, `headless_max_turn_seconds=0` turns the default off, and the REPL keeps no clock.
+- When the clock stops a run before the model answered, the answer lists what is done (with its evidence), what is
+  not, the files changed and the latest check, from the controller's records.
+
 ## v1.3 branch maintenance - 2026-11-26 (build-test-fix procedure and delegation rules)
 
 ### Improved

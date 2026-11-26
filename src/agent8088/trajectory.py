@@ -2059,6 +2059,31 @@ class TrajectoryState:
         """How many times the latest failing check came back the same way after a change (0 when it is not failing)."""
         return int(self.data.get("same_failure_repeats") or 0) if self.check_failing() else 0
 
+    def progress_summary(self) -> str:
+        """What a run got done, from the controller's own records, for when the clock stops it before it answered."""
+        parts = self.subgoals()
+        written = [PurePath(str(p).replace(chr(92), "/")).name for p in self.data.get("written_paths") or []]
+        if not parts and not written:
+            return ""
+        lines = ["Progress when the run was stopped:"]
+        for step in parts:
+            name = str(step["name"])[len(SUBGOAL_PREFIX):]
+            if step.get("status") == "done":
+                evidence = f" ({step['evidence']})" if step.get("evidence") else ""
+                lines.append(f"- done: {name}{evidence}")
+            elif step.get("status") == "recheck":
+                lines.append(f"- done before the last change, not checked since: {name}")
+            else:
+                lines.append(f"- not done: {name}")
+        if written:
+            shown = list(dict.fromkeys(written))
+            lines.append("Files changed: " + ", ".join(shown[-8:]) + (f" (+{len(shown) - 8} more)" if len(shown) > 8 else ""))
+        if self.check_failing():
+            lines.append(f"Latest check: failing ({str(self.data.get('failing_what') or 'see the notes')[:80]})")
+        elif int(self.data.get("passed_checks") or 0):
+            lines.append("Latest check: passed")
+        return "\n".join(lines)
+
     def note_write_problem(self, path: str, problem: str) -> None:
         """What the check after a write found in a file ("" when it is fine now, which clears an earlier problem)."""
         problems = self.data.setdefault("write_problems", {})

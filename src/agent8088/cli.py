@@ -10137,6 +10137,7 @@ def _run_prompt_file(path: str, resume: str = None) -> int:
     if not query:
         print("agent8088 --prompt-file: the file is empty", file=sys.stderr)
         return 2
+    A.HEADLESS_RUN = True   # nobody is watching: the run gets the headless clock when none is set
     A.PERMISSION_MODE = "full-auto"
     # Saved so --resume has something to load. cmd_resume names the session
     # itself; without it this run would claim a name and leave nothing to
