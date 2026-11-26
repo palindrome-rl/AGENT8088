@@ -22942,6 +22942,13 @@ def _snapshot_given_tests(trajectory, root) -> None:
         start = Path(root).resolve()
     except (OSError, RuntimeError):
         return
+    trajectory.data["test_snapshot_root"] = str(start)
+    _copy_given_tests(trajectory, start)
+    # What the project's code already had: a special case that was there before the run is not the run's doing.
+    trajectory.data["special_case_baseline"] = trajectory.special_case_findings()
+
+
+def _copy_given_tests(trajectory, start: Path) -> None:
     seen = files = 0
     for folder, dirs, names in os.walk(start):
         dirs[:] = [d for d in dirs if d not in _SNAPSHOT_SKIP_DIRS and not d.startswith(".")]
@@ -23003,6 +23010,9 @@ def _not_verified_reasons(trajectory, reply: str = "") -> list:
     if weakened := trajectory.weakened_tests():
         # Seen in a run: a given test's expected value was changed so every test passed, and the run said VERIFIED.
         reasons.append("a check in a given test was changed or skipped (" + ", ".join(weakened[:3]) + ")")
+    if hardcoded := trajectory.hardcoded_test_cases():
+        # Seen in a run: `if celsius == 37: return 98.0` made a contradictory given test pass, and it said VERIFIED.
+        reasons.append("the code hard-codes a given test's case (" + ", ".join(hardcoded[:3]) + ")")
     if trajectory.open_subgoals():
         reasons.append(f"{len(trajectory.open_subgoals())} part(s) of the request not addressed")
     if trajectory.partial_files():
