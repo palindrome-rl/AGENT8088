@@ -12921,6 +12921,7 @@ def _wsl_settings_data(readonly: bool, workspace: Path, service: bool = False) -
         fs["denyRead"].append(hidden)
         fs["denyWrite"].append(hidden)
     data["network"]["allowLocalBinding"] = False
+    fs["allowWrite"].append(wsl_sandbox.TMP_DIR)   # TMPDIR, made by the runner before srt starts
     if service:
         data["network"]["allowAllUnixSockets"] = True
         fs["allowWrite"].append(wsl_sandbox.SERVICE_DIR)
@@ -12952,7 +12953,7 @@ def _wsl_sandbox_command(command: str, cwd: Path, readonly: bool, service: bool 
     linux_home = wsl_sandbox.to_linux(home)
     # The distro's own Python is read-only here, so `pip install` installs for the user (in HOME, which is
     # writable): the externally-managed marker would otherwise refuse it outright.
-    exports = {"HOME": linux_home, "TMPDIR": wsl_sandbox.to_linux(sandbox_tmp),
+    exports = {"HOME": linux_home, "TMPDIR": wsl_sandbox.TMP_DIR,
                "PATH": f"{linux_home}/.local/bin:/usr/local/bin:/usr/bin:/bin", "PIP_BREAK_SYSTEM_PACKAGES": "1",
                **{name: wsl_sandbox.to_linux(value) for name, value in _sandbox_cache_env().items()}}
     full = (f"cd {shlex.quote(linux_cwd)} && export "
