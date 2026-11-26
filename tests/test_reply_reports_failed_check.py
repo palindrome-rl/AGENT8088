@@ -49,6 +49,19 @@ def test_the_word_failure_about_the_original_bug_is_not():
     assert not reports_failed_check("A failure in the link step stopped the build before my change.")
 
 
+def test_the_failing_test_the_task_is_about_is_not():
+    # Seen in a benchmark run: "Off-by-one at the 5 kg boundary (the failing test)." named the test the task gave,
+    # which the fix made pass, and the run ended NOT VERIFIED.
+    assert not reports_failed_check("Off-by-one at the 5 kg boundary (the failing test).")
+    assert not reports_failed_check("All 8 tests pass, including the previously failing one.")
+    assert not reports_failed_check("The originally failing test now passes along with the rest.")
+
+
+def test_the_failing_test_that_still_fails_counts():
+    assert reports_failed_check("The failing test still fails on the 10 kg case.")
+    assert reports_failed_check("Two failing tests remain in the edge cases.")
+
+
 def test_an_uppercase_fail_marker_still_counts():
     assert reports_failed_check("The log shows the FAIL on the dec click, which I think is a timing issue.")
     assert reports_failed_check("2 failures remain in the edge cases.")
