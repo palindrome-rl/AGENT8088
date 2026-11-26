@@ -114,6 +114,20 @@ def test_setup_turns_interop_and_windows_path_off():
     assert script.rstrip().endswith(W.SETUP_MARKER)
 
 
+def test_setup_installs_pytest():
+    # A Python task's check is usually `python -m pytest`. Without pytest in the distro every such check ended
+    # "the test tool 'pytest' is not installed where the check ran", and correct work was reported NOT VERIFIED.
+    assert "py3-pytest" in W.PACKAGES
+    assert "py3-pytest" in W.setup_script("0.0.73")
+
+
+def test_a_distro_set_up_before_pytest_is_set_up_again():
+    # The marker records the setup version; a distro from the older setup no longer counts as ready.
+    assert W.SETUP_VERSION != "1"
+    old = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": b"1 0.0.73\n"})()  # noqa: E731
+    assert not W.is_ready("wsl.exe", "agent8088-sandbox", "0.0.73", run=old)
+
+
 def test_setup_refuses_a_version_that_is_not_one():
     with pytest.raises(ValueError):
         W.setup_script("1.0; rm -rf /")
