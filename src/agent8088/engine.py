@@ -22749,7 +22749,15 @@ def _write_check_note(name: str, args: dict, mutated: bool, trajectory) -> str:
         return ""
     problem = write_checks.check_file(target, _write_check_node())
     trajectory.note_write_problem(str(target), problem)
+    _recheck_write_problems(trajectory)   # this write may be a file an earlier page pointed at
     return f"\n[check: {target.name}: {problem}. Fix it before going on.]" if problem else ""
+
+
+def _recheck_write_problems(trajectory) -> None:
+    """Check again every file with a recorded problem, so a problem fixed since (by any tool) no longer counts."""
+    if trajectory is not None and trajectory.write_problems():
+        node = _write_check_node()
+        trajectory.recheck_write_problems(lambda path: write_checks.check_file(Path(path), node))
 
 
 def _visual_look_step(trajectory, written: list, request: str):
@@ -22989,6 +22997,7 @@ def _verdict(trajectory, reply: str = "") -> tuple[str, str]:
     if trajectory is None:
         return "", ""
     reasons = list(_not_verified_reasons(trajectory, reply))
+    _recheck_write_problems(trajectory)
     problems = trajectory.write_problems()
     if problems:
         names = sorted({Path(str(p)).name for p in problems})

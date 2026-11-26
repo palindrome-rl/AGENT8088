@@ -90,6 +90,7 @@ def test_an_environment_limit_with_nothing_passed_could_not_verify(engine, state
 
 
 def test_a_file_that_still_does_not_parse_is_not_verified(engine, state, tmp_path):
+    (tmp_path / "a.py").write_text("x = (\n", encoding="utf-8")   # still broken when the verdict checks it again
     _write(state, tmp_path / "a.py")
     _test_run(state)
     state.mark_subgoals([])

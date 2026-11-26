@@ -2156,6 +2156,24 @@ class TrajectoryState:
     def write_problems(self) -> dict:
         return dict(self.data.get("write_problems") or {})
 
+    def recheck_write_problems(self, check) -> None:
+        """Check each file with a recorded problem again: `check(path)` gives its problem now, or "".
+
+        A page written before the files it points at was recorded as pointing at missing files, and nothing
+        checked it again when they were written, so the problem outlived the fix. A file that is gone has no problem
+        left to report."""
+        problems = self.data.get("write_problems") or {}
+        for path in list(problems):
+            try:
+                exists = Path(path).is_file()
+            except OSError:
+                exists = False
+            problem = check(path) if exists else ""
+            if problem:
+                problems[path] = _text(problem)[:200]
+            else:
+                problems.pop(path, None)
+
     def _ledger_lines(self) -> list[str]:
         """The checklist as the model reads it: the general steps on one line, then each part of the request with its
         status and, once settled, what settled it, then the next step."""
