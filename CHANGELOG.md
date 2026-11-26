@@ -4,6 +4,15 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-25 (the output cap in force)
+
+### Improved
+
+- The output limits named in the trace and the log are the ones a reply is really cut at. The `output_profile` trace entry
+  adds `cap_in_force` and `cap_source` (the model profile, `initial_completion_cap` in config, or the model's completion
+  limit), and a cap below the model profile's is logged once as a warning that says which setting set it. Before, an
+  explicit `initial_completion_cap=16384` cut replies at 16,384 tokens while the announced limit said 20,000.
+
 ## v1.3 branch maintenance - 2026-11-26 (sub-agent results as reports)
 
 ### Improved
