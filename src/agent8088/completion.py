@@ -808,14 +808,19 @@ def item_kind(item: str) -> str:
     text = item or ""
     if _TEST_ITEM.search(text):
         return "test"
+    if named_output_paths(text) or _FILE_NAME_IN_ITEM.search(text):
+        return "file"   # "draw the board in game.html" asks for a file, whatever the file is for
     if _INTERACTIVE_ITEM.search(text):
         return "interactive"
-    if named_output_paths(text):
-        return "file"
     if _RUN_ITEM.search(text):
         return "run"
     return "property"
 
+
+# A file named in a part ("in game.html", "data/expenses.json"), with or without a verb that writes it.
+_FILE_NAME_IN_ITEM = re.compile(
+    r"(?<![\w/@.-])[\w-]+(?:[/\\][\w.-]+)*\.(?:html?|css|m?js|cjs|jsx|tsx?|py|json|csv|md|txt|ya?ml|xml|svg|sh|"
+    r"toml|ini|cfg|sql|go|rs|java|rb|php|c|cpp|h)\b", re.IGNORECASE)
 
 # Kinds whose evidence is a run of the work: a later change makes it stale.
 RERUN_KINDS = frozenset(("run", "test", "interactive"))

@@ -1219,7 +1219,10 @@ class TrajectoryState:
                 self._recheck_after_change()
         if operation["verdict"] == "passed":
             self.data["passed_checks"] = int(self.data.get("passed_checks") or 0) + 1
-            self._settle_rechecks()
+            play_test = operation.get("tool") == "browser_test"
+            if play_test:
+                self.data["play_tested_at"] = self.mutation_count()
+            self._settle_rechecks(play_test)
             self.data["evidence"].append({"tool": operation["tool"], "result": operation["result"]})
             del self.data["evidence"][:-MAX_EVIDENCE]
             # A passing test run after the last change verifies it, whether the work was still pending or had only been
@@ -1447,6 +1450,11 @@ class TrajectoryState:
             present = [PurePath(p).name for p in named_output_paths(item) if PurePath(p).name.lower() in written]
             if present:
                 return "file present: " + ", ".join(present)
+        if kind == "interactive":
+            # Only playing it shows an interaction works: a passing browser_test at this state of the work.
+            if self.data.get("play_tested_at") == self.mutation_count():
+                return "a passing play test"
+            return "covered by the work and the reply (not play-tested)"
         if kind in RERUN_KINDS and int(self.data.get("passed_checks") or 0):
             return "a passing check"
         return "covered by the work and the reply"
@@ -1459,12 +1467,24 @@ class TrajectoryState:
                     and int(step.get("done_at") or 0) < now):
                 step["status"] = "recheck"
 
-    def _settle_rechecks(self) -> None:
+    def _settle_rechecks(self, play_test: bool = False) -> None:
+        """A passing check after the change settles the parts waiting for a recheck; an interactive part only when the
+        check played it (browser_test)."""
         for step in self.subgoals():
-            if step.get("status") == "recheck":
-                step["status"] = "done"
-                step["done_at"] = self.mutation_count()
-                step["evidence"] = "a passing check after the last change"
+            if step.get("status") != "recheck":
+                continue
+            if step.get("kind") == "interactive" and not play_test:
+                continue
+            step["status"] = "done"
+            step["done_at"] = self.mutation_count()
+            step["evidence"] = ("a passing play test" if step.get("kind") == "interactive"
+                                else "a passing check after the last change")
+
+    def unplayed_interactive(self) -> list[str]:
+        """Interactive parts counted done without a passing play test (browser_test) behind them."""
+        return [step["name"][len(SUBGOAL_PREFIX):] for step in self.subgoals()
+                if step.get("kind") == "interactive" and step.get("status") == "done"
+                and step.get("evidence") != "a passing play test"]
 
     def unresolved_tools(self) -> list[str]:
         latest = {}
@@ -2042,6 +2062,9 @@ class TrajectoryState:
             following = self.open_subgoals() or self.recheck_subgoals()
             if following:
                 lines.append(f"Next: {following[0]}")
+            elif unplayed := self.unplayed_interactive():
+                lines.append(f'Next: play-test "{unplayed[0]}" with browser_test (inspect, act, then expect_js or '
+                             "expect_changed)")
         problems = self.write_problems()
         if problems:
             lines.append("Problems in written files: " + "; ".join(

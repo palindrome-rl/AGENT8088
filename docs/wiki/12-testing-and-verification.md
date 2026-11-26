@@ -47,8 +47,15 @@ the controller's own evidence only (what the reply claims never raises it):
 |---|---|
 | NOT VERIFIED | A check failed, a part of the request was not addressed, a file was cut off or still does not parse, or the reply says something was not done. It goes above the reply. |
 | COULD NOT VERIFY | Nothing failed and nothing passed, because the machine or the sandbox stopped a check from running; the note names what stopped it. |
-| VERIFIED | A test run passed after the last change, and no part of the request waits for a recheck. |
+| VERIFIED | A test run passed after the last change, no part of the request waits for a recheck, and every interactive part was play-tested. |
 | PARTLY VERIFIED | Anything else that changed files: it ran without an error but no test passed, it was only read back, or a part was settled before the last change. The note says what is missing. |
+
+An interactive part of the request (a click, a key, a drag, a game) is shown to work only by
+playing it: a passing `browser_test` since the last change. A unit test or loading the page settles
+other parts but not that one, so without the play test the verdict stays PARTLY VERIFIED and the
+task-state note names the play test as the next step. The browser-qa skill teaches the test seam
+that makes such a build easy to drive: a read-only `window.__test.state()`, an optional `?seed=N`
+for the random parts, and for timed games `step(ms)`, none of which changes normal play.
 
 The last three lead the end-of-run notes as one line, for example
 `Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after

@@ -22782,12 +22782,15 @@ def _verdict(trajectory, reply: str = "") -> tuple[str, str]:
     limit = trajectory.environment_note() or trajectory.backend_note()
     if level not in ("tested", "exercised") and limit:
         return "COULD NOT VERIFY", limit
-    if level == "tested" and not rechecks:
+    unplayed = trajectory.unplayed_interactive()
+    if level == "tested" and not rechecks and not unplayed:
         return "VERIFIED", ("a test run passed after the last change"
                             + (", and every part of the request is settled" if trajectory.subgoals() else ""))
     missing = []
     if rechecks:
         missing.append(f"{len(rechecks)} part(s) of the request were checked before the last change and not since")
+    if unplayed:
+        missing.append(f"{len(unplayed)} interactive part(s) were not play-tested with browser_test")
     if level == "exercised":
         # Worded apart from the "Verification: exercised" note, which already says no test run passed.
         missing.append("it ran without an error, but nothing tested it after the last change")
