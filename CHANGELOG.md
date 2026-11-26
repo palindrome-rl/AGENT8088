@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v1.3 branch maintenance - 2026-11-26 (build-test-fix procedure and delegation rules)
+
+### Improved
+
+- The skill index in the system prompt ends with a short "Build, test, fix" block naming the installed skills by
+  situation (runnable slice first, test-first for logic, debugging when a check fails, browser-qa for what a person
+  sees or plays). The note for a check that keeps failing the same way points at the debugging skill.
+- `spawn_subagent` says when to delegate (independent multi-step work only, never to review its own work), that a
+  child's report is a claim to check, and not to retry a spawn refused for a limit.
+
 ## v1.3 branch maintenance - 2026-11-26 (retry with change)
 
 ### Improved
