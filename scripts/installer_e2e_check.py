@@ -67,10 +67,15 @@ if hasattr(engine, "_secret_env_names"):
     check("a secret variable is not inherited", "e2e-secret-value" not in out, out.strip()[-120:])
 
 if backend == "wsl":
-    # The WSL sandbox's own promises: interop is off, so no Windows program starts, and Node can start a child
-    # with piped output (what the Windows runner refuses with spawn EPERM).
-    out = run("/mnt/c/Windows/System32/cmd.exe /c echo INTEROP-RAN; echo done")
+    # The WSL sandbox's own promises: interop is off, so no Windows program starts inside it, and Node can start a
+    # child with piped output (what the Windows runner refuses with spawn EPERM). A command that names a Windows
+    # program is sent to the Windows sandbox on purpose and says so; one that hides the program behind a variable
+    # stays in WSL, where interop must refuse it.
+    out = run('x=/mnt/c/Windows/System32/cmd.exe; "$x" /c echo INTEROP-RAN; echo done')
     check("a Windows program cannot be started from the WSL sandbox", "INTEROP-RAN" not in out, out.strip()[-200:])
+    out = run("/mnt/c/Windows/System32/cmd.exe /c echo ROUTED-RAN")
+    check("a named Windows program goes to the Windows sandbox and says so",
+          "ROUTED-RAN" in out and "ran in the Windows sandbox, not WSL" in out, out.strip()[-200:])
     out = run("node -e \"require('child_process').execFileSync(process.execPath, ['-e', '0']); console.log('SPAWNED')\"")
     check("Node can start a child process in the WSL sandbox", "SPAWNED" in out, out.strip()[-200:])
 
