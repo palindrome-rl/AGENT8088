@@ -65,6 +65,12 @@ spent; a failure sends the model back with the command and the end of the output
 no suite, or a result that says nothing either way, keeps the usual ask. It is
 skipped in the last stretch of the clock; `auto_qa=0` turns it off.
 
+A check that fails, then fails the same way again after the model changed files
+(same command, same failure line, numbers ignored), is a fix that missed the cause.
+The tool result says so once per repeat, and the task-state note names it until a
+check passes, so the next attempt changes approach instead of trying another small
+variation. A failure that changes after the edit counts as progress.
+
 The last three lead the end-of-run notes as one line, for example
 `Verdict: PARTLY VERIFIED (it ran without an error, but nothing tested it after
 the last change).` A run that changed nothing gets no verdict. `not_verified_headline=0`
