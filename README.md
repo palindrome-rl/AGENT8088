@@ -105,12 +105,14 @@ Apart from its focus on small-model reliability, Agent8088 is a complete agentic
 
 ## What's new in v1.4
 
-**v1.4 is about one promise. When Agent8088 says a task is done, it shows the evidence.**
-
-- **Verified, not claimed.** Every run that changes files ends with a verdict the harness earns from its own checks, not from the model's word: VERIFIED, PARTLY VERIFIED, NOT VERIFIED or COULD NOT VERIFY. Tests that were weakened, skipped or hard-coded can't earn VERIFIED.
-- **Nothing in your request gets dropped.** Multi-part requests become a checklist on the first turn. Each file is checked as it's written, nearby tests run automatically, and a failure that repeats forces a different approach.
-- **Runs you can leave alone.** Headless runs track their time and finish with a report of what's done, with evidence, and what isn't. Sub-agents return a status line to be checked, not trusted.
-- **First-class on Windows.** Commands run in a dedicated WSL sandbox, and Windows programs are called correctly from inside it.
+- **Verified, not claimed.** Every run that changes files ends with a verdict earned from the harness's own checks: VERIFIED, PARTLY VERIFIED, NOT VERIFIED or COULD NOT VERIFY. Weakened, skipped or hard-coded tests can't earn VERIFIED.
+- **Auto QA and play tests.** Changed work with a test suite nearby gets its tests run automatically. Interactive work (clicks, keys, games) counts as checked only after a passing play test in a headless browser.
+- **Multimodal checks.** The agent renders pages and images and looks at them (`screenshot_page`, `view_image`), with layout notes when something is off. Vision support is detected per model, and models without it fall back to local OCR.
+- **Nothing in your request gets dropped.** Multi-part requests become a checklist on the first turn. Each file is checked as it's written, and a failure that repeats asks for a different approach.
+- **Adaptive limits.** Runs start with 150 rounds and extend up to 450 while they keep making progress. Repeats get warnings in steps before a stop, and `/limits` changes any limit.
+- **Runs you can leave alone.** Headless runs get a clock and end with what's done, with evidence, and what isn't. Eval mode judges a run by what it leaves on disk, and sub-agents return a status line to be checked, not trusted.
+- **First-class on Windows.** Commands run in a dedicated WSL sandbox with network isolation, and Windows programs are called correctly from inside it.
+- **Clearer local-model setup.** Ollama models are sized to the context they're really served, with a plain message and fix when it's too small.
 
 Fewer false alarms, and everything from v1.3. [Full CHANGELOG](CHANGELOG.md) · [How to upgrade](#upgrading-from-v13)
 
@@ -173,7 +175,7 @@ not needed to install or run Agent8088.
 | Gateway adapters (Slack, Discord, WhatsApp, Telegram) | yes | yes |
 | Playwright Chromium (`browse_page`) | yes | yes |
 | Node.js 22 + WhatsApp bridge npm deps | yes | yes (portable, no admin) |
-| Native sandbox runtime | yes (auto-setup) | yes (auto-setup, no admin needed) |
+| Native sandbox runtime | yes (auto-setup) | yes (auto-setup, no admin needed; WSL sandbox when WSL 2 is installed) |
 
 ### Supported platforms
 
@@ -225,14 +227,14 @@ On Windows, set the context length in the Ollama app's settings, or set
 give Agent8088 the same value by adding `provider.ollama.context_window=16384`
 to `~/.agent8088/config.txt`.
 
-`/models local` checks your hardware and suggests models that fit, and `/doctor`
+`/local check` checks your hardware and suggests models that fit, and `/doctor`
 shows the context Ollama is actually serving. If the context is too small,
 Agent8088 says so and shows the fix instead of sending a truncated prompt. See
 [troubleshooting](docs/wiki/13-troubleshooting.md#the-models-context-is-too-small-for-agent8088).
 
 `full-auto` is the default permission mode: the agent works without per-action prompts inside the workspace, with the always-on safety floor still enforced. Use `--mode readonly` to approve writes, network access, and shell commands one at a time.
 
-> The installer sets up the native sandbox automatically. If setup did not finish, run `agent8088 --sandbox-setup` to retry. On Windows, use your normal, non-admin terminal: the backend restricts file writes using the current account and does not create a separate sandbox account. For network isolation on Windows, use `sandbox_backend=docker`.
+> The installer sets up the native sandbox automatically. If setup did not finish, run `agent8088 --sandbox-setup` to retry. On Windows with WSL 2, commands run in Agent8088's own WSL distro, with the same network allowlist as on Linux. Without WSL 2, the Windows runner restricts file writes only, so use `sandbox_backend=docker` for network isolation. Run it from your normal, non-admin terminal either way. See [Sandboxing](docs/wiki/06-sandboxing.md).
 
 ### Use the web UI
 
@@ -277,7 +279,7 @@ runs at a time. A running chat cannot be renamed, deleted, reset, or compacted.
 
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
-- **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on your disk. With a local model, nothing leaves your machine; with a hosted model, the conversation goes to that provider. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
+- **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/local check` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on your disk. With a local model, nothing leaves your machine; with a hosted model, the conversation goes to that provider. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
 - **Small-model-first and grounded.** Efficient prompts, minimized tool schemas, and model-aware routing make small local models practical, while a persistent control loop plans, acts through structured tools, observes results, and recovers when execution fails.
 - **Verification before confidence.** Tool results, tests, smoke checks, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry, preserve useful progress, or surface a clear failure instead of pretending the task succeeded.
 - **Security at the floor.** Credential paths, shell startup-file writes, destructive Git operations, and system-prompt exfiltration are blocked in every mode. SSRF and egress controls, command allowlists, and credential scanning of pasted text and written files are enforced in code, not by prompt, and an optional audit log (`audit_log=1`) keeps a persistent trail.
@@ -304,7 +306,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Make smaller models practical** | Hardware-aware local-model recommendations, automatic model routing, hybrid tool selection, and on-demand tool schemas reduce unnecessary context and escalate only when a model is genuinely struggling. |
 | **Work safely** | `full-auto` is the default, inside the workspace and the always-on safety floor; switch to `readonly` for per-action approval. One-time approvals, path zones, credential protection, SSRF and egress controls, command allowlists, and an audit trail are enforced in code. |
 | **Plan before changing things** | `/plan` lets the agent investigate first, present a plan for approval, then carry it out. Optional audits use a read-only sub-agent to verify mutating work. |
-| **Verify and recover** | Optional step verification checks mutating work, failed verification can restore the previous file state, and completion checks keep required deliverables from being silently skipped: each part of the request is checked against what was delivered, and a run is not marked done while its latest check fails. |
+| **Verify and recover** | Every run that changes files ends with a four-level verdict from the harness's own evidence, and nearby tests run automatically (Auto QA). Optional step verification checks mutating work, failed verification can restore the previous file state, and completion checks keep required deliverables from being silently skipped: each part of the request is checked against what was delivered, and a run is not marked done while its latest check fails. |
 | **Review code and generate tests** | `review_code` reports findings with file, line, and severity; `generate_tests` has a sub-agent write and run tests for a source file, with the file hashed and restored if the sub-agent touches it. |
 | **Survey a codebase before touching it** | `repository_read` gives bounded overviews, search, and source reads of local directories or GitHub repos; `repo_map` outlines the most depended-on classes and functions. |
 | **Schedule recurring work** | `schedule_task` adds, lists, and removes scheduled runs through cron or Windows Task Scheduler, with the same unattended safety floor as every other run. |
@@ -312,6 +314,7 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Protect long-running work** | Context budgeting, automatic compaction, content handles, persistent trajectory state, and durable tasks help lengthy workflows retain their instructions and completed progress. The model is warned as time or rounds run out, stalled runs are asked to decide, and your rules survive compaction word for word. A reply cut off at the output limit is discarded, not replayed, and retried with a smaller cap and then with thinking off, so a run ends with an answer instead of a timeout. Checks after a final answer are capped, and a missing working directory falls back to one that exists. |
 | **Delegate without losing context** | Six restricted sub-agent profiles handle exploration, research, coding, test writing, verification, and general-purpose work in separate runs. |
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
+| **See and test what it builds** | `screenshot_page` renders pages and images for the model to look at, `view_image` opens any local image, and the `browser-qa` skill play-tests interactive work in a headless browser. |
 | **Read images without a vision model** | Attached screenshots and scanned PDFs are transcribed by a local OCR engine when the active model has no vision of its own. Multimodal models are untouched and keep using their own capability. |
 | **Work across documents** | Read and process PDFs, Word documents, spreadsheets, and presentations, with checkpointed handling for larger files and OCR fallback for scanned content. |
 | **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store kept on your machine. |
@@ -392,8 +395,12 @@ these versioned pages.
 | [Skills and sub-agents](docs/wiki/09-skills-and-subagents.md) | Bundled profiles, isolation, skills, and personas. |
 | [CLI reference](docs/wiki/10-cli-reference.md) | Flags and slash commands. |
 | [Architecture](docs/wiki/11-architecture.md) | The agent loop, front ends, permissions, and state on disk. |
+| [Configuration](docs/wiki/02-configuration.md) | The `config.txt` settings by area: paths, providers, security, approvals, sandbox, gateway, MCP and memory. |
+| [Sandboxing](docs/wiki/06-sandboxing.md) | Sandbox backends per platform, the WSL sandbox, services, and Docker fallback. |
+| [Docker](docs/wiki/17-docker.md) | Running Agent8088 itself in a container. |
 | [Testing and verification](docs/wiki/12-testing-and-verification.md) | Local test, feature-verification, and release checks. |
 | [Troubleshooting](docs/wiki/13-troubleshooting.md) | Install failures, provider and model errors, permissions, and network problems. |
+| [FAQ](docs/wiki/15-faq.md) | Short answers to common questions. |
 | [Repository ingestion](docs/repository-ingestion.md) | Optional GitIngest-backed repository overviews, search, and source reads. |
 
 ---
