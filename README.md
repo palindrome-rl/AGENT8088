@@ -29,6 +29,7 @@
   <img src="https://img.shields.io/badge/verification--gated%20completion-evidence%2C%20not%20claims-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/67%20built--in%20tools-execution%20grounded-10b981" alt="67 built-in tools">
   <img src="https://img.shields.io/badge/12%20provider%20profiles-any%20OpenAI--compatible-8b5cf6" alt="12 provider profiles">
+  <img src="https://img.shields.io/badge/40%20skill%20packages-extensible-6366f1" alt="40 skill packages">
 </p>
 
 <p align="center">
