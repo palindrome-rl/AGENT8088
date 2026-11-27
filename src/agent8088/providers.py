@@ -264,7 +264,29 @@ def is_local_ollama(provider_name="", base_url=""):
     return provider_name == "ollama" or ":11434" in (base_url or "")
 
 
-def ollama_served_context(base_url, model_id, api_key="", timeout=MODEL_LIST_TIMEOUT_SECONDS):
+# Loading a model to read its served context can take a while on a slow disk.
+# The first request would wait for the same load, so it is not extra time.
+OLLAMA_LOAD_TIMEOUT_SECONDS = 120
+
+
+def _ollama_ps_context(root, model_id, headers, timeout):
+    """The loaded model's context from /api/ps, or None when it isn't loaded."""
+    import httpx
+    bare = model_id[:-len(":latest")] if model_id.endswith(":latest") else model_id
+    r = httpx.get(f"{root}/api/ps", headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        return None
+    for entry in r.json().get("models", []) or []:
+        name = str(entry.get("name") or entry.get("model") or "")
+        if name in (model_id, bare, f"{bare}:latest"):
+            value = entry.get("context_length")
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def ollama_served_context(base_url, model_id, api_key="", timeout=MODEL_LIST_TIMEOUT_SECONDS,
+                          load=False):
     """The context Ollama will actually run `model_id` with, and where it came from.
 
     /api/show's "<arch>.context_length" is the model's *maximum*; Ollama loads
@@ -275,25 +297,25 @@ def ollama_served_context(base_url, model_id, api_key="", timeout=MODEL_LIST_TIM
     rejecting it. So the engine must size its window to the served value:
       1. the loaded model's context in /api/ps (newer Ollama reports it),
       2. a `num_ctx` PARAMETER baked into the model (/api/show parameters),
-      3. OLLAMA_CONTEXT_LENGTH in this environment (when Ollama runs here).
+      3. with load=True, loading the model (/api/generate with no prompt,
+         which only loads it) and reading /api/ps again,
+      4. OLLAMA_CONTEXT_LENGTH in this environment (when Ollama runs here).
     Returns (tokens, source), or (None, "unknown") when none of those say --
     Ollama's own default depends on the server's VRAM. Never raises.
+
+    Without step 3 a model that wasn't loaded yet had no served value, so the
+    engine sized the window to the model's maximum and Ollama silently cut
+    the prompt at its real, smaller context.
     """
     import httpx
     root = str(base_url or "").rstrip("/")
     if root.endswith("/v1"):
         root = root[:-3]
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    bare = model_id[:-len(":latest")] if model_id.endswith(":latest") else model_id
     try:
-        r = httpx.get(f"{root}/api/ps", headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            for entry in r.json().get("models", []) or []:
-                name = str(entry.get("name") or entry.get("model") or "")
-                if name in (model_id, bare, f"{bare}:latest"):
-                    value = entry.get("context_length")
-                    if isinstance(value, int) and value > 0:
-                        return value, "ollama ps"
+        value = _ollama_ps_context(root, model_id, headers, timeout)
+        if value:
+            return value, "ollama ps"
     except Exception:  # noqa: BLE001 -- best-effort probe
         pass
     try:
@@ -305,6 +327,16 @@ def ollama_served_context(base_url, model_id, api_key="", timeout=MODEL_LIST_TIM
                 return int(match.group(1)), "model num_ctx"
     except Exception:  # noqa: BLE001
         pass
+    if load:
+        try:
+            r = httpx.post(f"{root}/api/generate", json={"model": model_id}, headers=headers,
+                           timeout=OLLAMA_LOAD_TIMEOUT_SECONDS)
+            if r.status_code == 200:
+                value = _ollama_ps_context(root, model_id, headers, timeout)
+                if value:
+                    return value, "ollama ps"
+        except Exception:  # noqa: BLE001 -- a model that won't load answers below
+            pass
     env = os.environ.get("OLLAMA_CONTEXT_LENGTH", "").strip()
     if env.isdigit() and int(env) > 0:
         return int(env), "OLLAMA_CONTEXT_LENGTH"

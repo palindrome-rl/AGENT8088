@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from openai import OpenAI
 from agent8088.mcp import MCPRuntime
-from agent8088.errors import is_context_overflow
+from agent8088.errors import ContextTooSmall, is_context_overflow
 from agent8088 import capabilities
 from agent8088 import (app_check, backend_check, cli_anything, completion as completion_checks, diffview,
                        documents, efficiency, local_models,
@@ -3175,15 +3175,17 @@ def _ollama_served_cap(provider_name: str, model: str, probed_ctx: int) -> int:
     if not providers.is_local_ollama(provider_name, base_url):
         return probed_ctx
     try:
+        # load=True: a model that isn't loaded yet is loaded now, as the first
+        # request would load it anyway, so its real served context is known.
         served, source = providers.ollama_served_context(
-            base_url, model, api_key=str(getattr(client, "api_key", "") or ""))
+            base_url, model, api_key=str(getattr(client, "api_key", "") or ""), load=True)
     except Exception as exc:  # noqa: BLE001 -- best-effort, like the probe
         _log.debug("ollama served-context probe failed: %s", exc)
         return probed_ctx
     if not served:
-        # Not loaded yet and nothing configured: Ollama will pick 4k-256k by
-        # the server's VRAM. Capping to 4k would cripple a big GPU, trusting
-        # the max can truncate silently on a small one -- say so instead.
+        # The model would not load and nothing is configured: Ollama will pick
+        # 4k-256k by the server's VRAM. Capping to 4k would cripple a big GPU,
+        # trusting the max can truncate silently on a small one -- say so.
         if probed_ctx > providers.OLLAMA_DEFAULT_NUM_CTX:
             _config_warn(
                 f"Ollama may run {model} with less than its {probed_ctx}-token maximum "
@@ -4337,9 +4339,13 @@ def _check_model_budget():
 
 def _completion_token_budget(provider, model, messages, tools, system_prompt, requested):
     context, completion = _active_model_token_limits(provider, model)
+    system = system_prompt or current_system_prompt()
+    fixed_tokens = _estimate_tokens(len(system) + _sent_tool_schema_chars(tools, provider))
+    if fixed_tokens + CONTEXT_SAFETY_TOKENS >= context:
+        # The instructions and tools alone don't fit: no /compact can help.
+        raise ContextTooSmall(provider, model, fixed_tokens + CONTEXT_SAFETY_TOKENS, context)
     prompt_tokens = _estimate_tokens(
-        _estimate_context_chars(messages, system_prompt or current_system_prompt())
-        + _sent_tool_schema_chars(tools, provider))
+        _estimate_context_chars(messages, system) + _sent_tool_schema_chars(tools, provider))
     headroom = context - prompt_tokens - CONTEXT_SAFETY_TOKENS
     if headroom < 1:
         raise ValueError(f"The conversation exceeds the available context for {provider}:{model}.")
@@ -4567,7 +4573,10 @@ def _create_completion_with_fallback(messages, tools, *, temperature, system_pro
             if not _retryable_model_error(error):
                 # A configured target can repair provider-specific auth,
                 # missing-model or capacity errors; malformed requests still stop.
+                # A fallback with a larger context can also serve a request
+                # whose instructions alone don't fit this model.
                 if (_status_code(error) in (401, 403) or is_context_overflow(error) or
+                        isinstance(error, ContextTooSmall) or
                         _status_code(error) == 404 and
                         _explain(error, model=active_model).kind == "model_not_found"):
                     break
