@@ -3218,6 +3218,18 @@ def _native_tools_enabled(tools, provider_name: str = "") -> bool:
     return value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
 
 
+def _sent_tool_schema_chars(tools, provider_name: str = "") -> int:
+    """Characters of tool schemas that actually go with the request.
+
+    With native tool calling the JSON schemas are sent beside the messages.
+    Without it the tool catalogue is already written into the system prompt
+    and no schemas are sent, so counting them too measured the tools twice
+    and refused a request that fitted (an 11k prompt counted as 20k)."""
+    if not _native_tools_enabled(tools, provider_name):
+        return 0
+    return len(json.dumps(tools or [], default=str))
+
+
 def _raise_if_interrupted(interrupt_check, stream=None):
     if not interrupt_check or not interrupt_check():
         return
@@ -4327,7 +4339,7 @@ def _completion_token_budget(provider, model, messages, tools, system_prompt, re
     context, completion = _active_model_token_limits(provider, model)
     prompt_tokens = _estimate_tokens(
         _estimate_context_chars(messages, system_prompt or current_system_prompt())
-        + len(json.dumps(tools or [], default=str)))
+        + _sent_tool_schema_chars(tools, provider))
     headroom = context - prompt_tokens - CONTEXT_SAFETY_TOKENS
     if headroom < 1:
         raise ValueError(f"The conversation exceeds the available context for {provider}:{model}.")
@@ -4411,7 +4423,7 @@ def _fallback_max_tokens(messages, system_prompt, tools, provider_name, model_na
         # json.dumps(messages) counted its base64 and left a fallback model a few
         # hundred output tokens after one screenshot.
         chars = (_estimate_context_chars(messages, system_prompt or "")
-                 + len(json.dumps(tools or [], default=str)))
+                 + _sent_tool_schema_chars(tools, provider_name))
     except Exception:  # noqa: BLE001
         chars = 0
     headroom = window - int(chars / CHARS_PER_TOKEN) - 512  # CONTEXT_SAFETY_TOKENS
@@ -23631,12 +23643,13 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         # doesn't retry (and fail) the same summarization call every turn.
         # Compaction failure must never abort the turn -- a broken summary
         # degrades a run, it must not kill it.
-        # The estimate includes the tool schemas: they are sent with every
-        # request, so leaving them out let the real prompt pass the overflow
-        # line before compaction fired.
+        # The estimate includes the tool schemas when they are sent with every
+        # request (native tool calling), so the real prompt can't pass the
+        # overflow line before compaction fires. Text tools are already in
+        # the system prompt.
         context_tokens_estimate = _estimate_tokens(
             _estimate_context_chars(messages, round_system_prompt or "")
-            + len(json.dumps(round_tools_def or [], default=str)))
+            + _sent_tool_schema_chars(round_tools_def, loop_provider))
         if (COMPACTION_THRESHOLD_PCT > 0 and turn_context_window
                 and len(messages) >= COMPACTION_KEEP_MESSAGES + 2
                 and turn >= compaction_retry_turn
@@ -23678,7 +23691,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
                               "tokens_before": context_tokens_estimate,
                               "tokens_after": _estimate_tokens(
                                   _estimate_context_chars(messages, round_system_prompt or "")
-                                  + len(json.dumps(round_tools_def or [], default=str)))})
+                                  + _sent_tool_schema_chars(round_tools_def, loop_provider))})
         if trajectory is not None and TASK_STATE_DELIVERY == "history":
             # After any compaction above, so a summary that dropped the earlier notes is followed by a fresh full one.
             if state_notes.deliver(messages, trajectory) and trace is not None:
@@ -23755,7 +23768,7 @@ def _run_agent_loop(messages, *, max_turns=DEFAULT_MAX_TURNS, temperature=0.8, s
         if turn_context_window:
             prompt_tokens_estimate = _estimate_tokens(
                 _estimate_context_chars(messages, round_system_prompt or "")
-                + len(json.dumps(round_tools_def or [], default=str)))
+                + _sent_tool_schema_chars(round_tools_def, loop_provider))
             headroom = turn_context_window - prompt_tokens_estimate - CONTEXT_SAFETY_TOKENS
             turn_max_tokens = max(MIN_TURN_COMPLETION_TOKENS, min(turn_max_tokens, headroom))
         loop_watch = None
