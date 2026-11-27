@@ -593,6 +593,9 @@ def _set_limits(monkeypatch, engine, ctx, comp):
     engine.PROVIDERS["ollama-cloud"] = {
         "model": "qwen-small-window", "context_window": str(ctx),
         "max_completion_tokens": str(comp),
+        # Native tools, so the schemas are sent with the request and the
+        # clamp below must make room for them too.
+        "native_tools": True,
     }
 
 
