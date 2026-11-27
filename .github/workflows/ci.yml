@@ -3,7 +3,21 @@ name: CI
 on:
   push:
     branches: [development, staging-1.4, AGENT8088-v1.4]
+    paths-ignore:
+      # Docs-only changes skip CI. Markdown under src/ (prompts, agent
+      # profiles, skills) is code and still runs everything.
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
