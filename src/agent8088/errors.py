@@ -130,6 +130,20 @@ _OVERFLOW_MARKERS = (
 )
 
 
+class ContextTooSmall(ValueError):
+    """agent8088's own instructions and tool list do not fit the model's context.
+
+    Raised before sending, so nothing reached the model. It is not a context
+    overflow: shrinking the conversation cannot help, only a larger context
+    can, so it is never retried with compaction."""
+
+    def __init__(self, provider: str, model: str, needed: int, context: int):
+        self.provider, self.model, self.needed, self.context = provider, model, needed, context
+        super().__init__(
+            f"agent8088's instructions and tool list need about {needed:,} tokens, but "
+            f"{provider}:{model} has a {context:,}-token context")
+
+
 def is_context_overflow(exc) -> bool:
     """Whether the server rejected the request for being too long."""
     if exc is None:
@@ -217,6 +231,17 @@ def explain_model_error(exc, *, provider=None, base_url=None, model=None,
     status = status_code(exc)
     text = _text(exc)
     ollama = _is_ollama(provider, base_url)
+
+    if isinstance(exc, ContextTooSmall):
+        window = f"provider.{provider}.context_window" if provider else "context_window"
+        if ollama:
+            fix = ("Raise Ollama's context: set OLLAMA_CONTEXT_LENGTH (16384 or more, 32768 if it "
+                   "fits in GPU memory) before `ollama serve`, or the context length in the Ollama "
+                   f"app. Then set {window} to the same value.")
+        else:
+            fix = f"Use a model with a larger context, or raise {window} if this model supports more."
+        return Friendly("context_too_small", "This model's context is too small for agent8088.",
+                        fix, False)
 
     if is_context_overflow(exc):
         window = f"provider.{provider}.context_window" if provider else "context_window"
