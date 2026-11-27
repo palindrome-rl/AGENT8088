@@ -1,0 +1,64 @@
+name: Model compatibility report
+description: How a model worked, or didn't, with Agent8088.
+title: "model: "
+labels: ["model-compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from real hardware help us tune Agent8088 for small and local
+        models. Please remove API keys, tokens and personal data from anything
+        you paste.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Provider and model as shown by `/model`, including the quantization if local.
+      placeholder: ollama:qwen3.5:9b (Q4_K_M)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `agent8088 --version`.
+      placeholder: agent8088 1.4.0
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: GPU and its memory, or CPU only, plus the operating system.
+      placeholder: RTX 2060 6 GB, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Context window
+      description: The context `/doctor` reports, and its source.
+      placeholder: 16,384 (ollama-served)
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: How did it go?
+      options:
+        - Worked well
+        - Worked with problems
+        - Did not work
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What you tried and what happened
+      description: The task, the final verdict line, and any errors or odd behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: dump
+    attributes:
+      label: Logs or `/dump` output
+      description: Run `/dump` in the CLI to collect a redacted bug-report bundle.
+      render: text
