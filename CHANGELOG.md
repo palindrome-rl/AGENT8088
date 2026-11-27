@@ -4,6 +4,16 @@ All notable changes to Agent8088 are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Models without native tool calling (local Ollama by default) were refused with "The conversation exceeds the
+  available context" before the first request, even with a 16k context. The prompt-size check counted the tool
+  list twice: once in the system prompt, where it is sent, and again as JSON schemas, which are not sent. A
+  roughly 11k prompt was counted as about 20k. The send check, the fallback budget, the compaction trigger and
+  the per-turn output budget now count tool schemas only when they are sent.
+
 ## [1.4.0] - 2026-11-27
 
 v1.4 gathers the v1.3 branch maintenance work from 2026-11-20 to 2026-11-26, listed in full below. The release
