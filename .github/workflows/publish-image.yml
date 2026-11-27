@@ -4,6 +4,14 @@ on:
   push:
     branches: [AGENT8088-v1.4]
     tags: ["v*"]
+    # Docs-only releases don't rebuild the image. Tag pushes ignore path
+    # filters, so a version tag always publishes.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "LICENSE"
   workflow_dispatch:
 
 env:
