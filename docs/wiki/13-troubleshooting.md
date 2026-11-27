@@ -182,6 +182,24 @@ agent8088 --setup
 
 ## Model & providers
 
+### This model's context is too small for agent8088
+
+Agent8088's instructions and tool list need a context of at least 16K tokens.
+Ollama picks its default context from your GPU memory, which is 4K on GPUs
+under 24 GB. Agent8088 stops before sending a truncated prompt and shows the
+context it found.
+
+1. Set `OLLAMA_CONTEXT_LENGTH=16384`, or 32768 if it fits, before starting
+   Ollama. On Windows, set the context length in the Ollama app's settings, or
+   set the variable as a user environment variable and restart Ollama.
+2. Add `provider.ollama.context_window=16384` (the same value) to
+   `~/.agent8088/config.txt`.
+3. Run `/doctor` to check the context Ollama is now serving.
+
+`/compact` and `/reset` don't help here, because the instructions alone don't
+fit. A model that isn't loaded yet is loaded first so its real context can be
+read, so the first reply can take longer.
+
 ### `'anthropic' is not a known provider`
 
 `anthropic` **is** one of the 12 built-in providers — check

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Reliable AI agents&mdash;even on small, local models.</strong>
+  <strong>Reliable AI agents, even on small local models.</strong>
 </p>
 
 <p align="center">
@@ -23,17 +23,12 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
   <a href="https://github.com/palindrome-rl/AGENT8088/tree/AGENT8088-v1.4"><img src="https://img.shields.io/badge/release-v1.4-f59e0b" alt="Agent8088 v1.4 branch"></a>
   <img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="macOS, Linux, Windows">
-  <img src="https://img.shields.io/badge/MCP-client%20%2B%20server-8b5cf6" alt="MCP client and server">
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/verification--gated%20completion-evidence%2C%20not%20claims-059669" alt="Verification-gated completion">
   <img src="https://img.shields.io/badge/67%20built--in%20tools-execution%20grounded-10b981" alt="67 built-in tools">
-  <img src="https://img.shields.io/badge/verification--gated%20completion-optional%20audit%20%2B%20rollback-059669" alt="Verification-gated completion">
-  <img src="https://img.shields.io/badge/6%20sub--agent%20profiles-context%20isolation-3b82f6" alt="6 sub-agent profiles">
-  <img src="https://img.shields.io/badge/40%20skill%20packages-extensible-6366f1" alt="40 skill packages">
   <img src="https://img.shields.io/badge/12%20provider%20profiles-any%20OpenAI--compatible-8b5cf6" alt="12 provider profiles">
-  <img src="https://img.shields.io/badge/messaging-Slack%20%7C%20Discord%20%7C%20WhatsApp%20%7C%20Telegram%20%7C%20email-f43f5e" alt="Slack, Discord, WhatsApp, Telegram, email">
-  <img src="https://img.shields.io/badge/local%20OCR-vision--free%20image%20reading-a3a3a3" alt="Local OCR">
 </p>
 
 <p align="center">
@@ -46,13 +41,13 @@
 
 Agent8088 is an open-source agentic harness from Palindrome Research Labs, built to make small local models finish real agentic tasks reliably.
 
-Most harnesses assume a large model and trust whatever it reports. Agent8088 fixes the limitations and failure modes of small models through research-backed harness engineering.
+Most harnesses assume a large model and trust whatever it reports. Agent8088 addresses the failure modes of small models through research-backed harness engineering.
 
 Small models mostly fail in specific ways. Their context overflows without warning, their tool calls are malformed or wrongly chosen, they say they are done when they are not, and long runs end up looping or losing progress.
 
-Agent8088 handles these areas around the model through Context Management, Tool Intelligence, Verification-Gated Completion, Grounded Execution, a Reliable Control Loop, Failure Recovery and code-enforced safety. Bigger models mostly show similar failures but less often, so it helps them too.
+Agent8088 handles these areas around the model through context management, tool intelligence, verification-gated completion, grounded execution, a reliable control loop, failure recovery, and transparent, code-enforced safety. Bigger models mostly show similar failures but less often, so it helps them too.
 
-Apart from focusing on small models reliability, Agent8088 is a complete agentic harness, with broad tooling, web research, documents, MCP, sub-agents, memory and a choice of terminal, web and chat front ends.
+Apart from its focus on small-model reliability, Agent8088 is a complete agentic harness, with broad tooling, web research, documents, MCP, sub-agents, memory and a choice of terminal, web and chat front ends.
 
 <table>
   <tr>
@@ -65,7 +60,7 @@ Apart from focusing on small models reliability, Agent8088 is a complete agentic
       <sub>Hybrid tool selection, tolerant call parsing, validated arguments, shaped tool results, and lazy-loaded skills help models choose and use the right tools.</sub>
     </td>
     <td width="33%" valign="top">
-      <strong>Robust context management</strong><br>
+      <strong>Context management</strong><br>
       <sub>Pre-call token budgeting, overflow prevention, compaction that keeps your instructions word for word, content handles, and persistent task state preserve what matters within the window.</sub>
     </td>
   </tr>
@@ -109,17 +104,14 @@ Apart from focusing on small models reliability, Agent8088 is a complete agentic
 
 ## What's new in v1.4
 
-- **A verdict you can trust:** a run that changed files ends with one of four levels, VERIFIED, PARTLY VERIFIED, NOT VERIFIED or COULD NOT VERIFY, taken from the harness's own evidence, not from the model's reply.
-- **No credit for weakened tests:** a given test that was edited, skipped or deleted, or code that hard-codes a test's case, keeps the work from being VERIFIED.
-- **Checks after every write:** each file is parsed as it lands, and a stale problem clears once the file is fixed.
-- **Every part of the request tracked:** multi-part requests go on a checklist from the first turn, and an interactive part counts as checked only after a passing play test.
-- **Auto QA and retry with change:** changed work with a test suite nearby gets its tests run, and a check that fails the same way again asks for a different approach.
-- **Unattended runs:** headless runs get a clock and end with what is done, with evidence, and what is not. Eval mode judges a run on what it leaves on disk.
-- **Sub-agents report back:** each sub-agent ends with a STATUS line, and its result returns as a report to check, not as fact.
-- **WSL sandbox on Windows:** commands run in a dedicated WSL distro with its own temporary folder, and Windows programs are called correctly from it.
-- **Fewer false alarms:** a log poll, an example value or a file the run deleted itself no longer turns finished work into NOT VERIFIED.
+**v1.4 is about one promise. When Agent8088 says a task is done, it shows the evidence.**
 
-Includes everything in v1.3; existing configuration and memory are preserved. Existing v1.3 installs stay on v1.3 when they run `agent8088 --update`; reinstall with the commands below to move to v1.4. See the [CHANGELOG](CHANGELOG.md).
+- **Verified, not claimed.** Every run that changes files ends with a verdict the harness earns from its own checks, not from the model's word: VERIFIED, PARTLY VERIFIED, NOT VERIFIED or COULD NOT VERIFY. Tests that were weakened, skipped or hard-coded can't earn VERIFIED.
+- **Nothing in your request gets dropped.** Multi-part requests become a checklist on the first turn. Each file is checked as it's written, nearby tests run automatically, and a failure that repeats forces a different approach.
+- **Runs you can leave alone.** Headless runs track their time and finish with a report of what's done, with evidence, and what isn't. Sub-agents return a status line to be checked, not trusted.
+- **First-class on Windows.** Commands run in a dedicated WSL sandbox, and Windows programs are called correctly from inside it.
+
+Fewer false alarms, and everything from v1.3. [Full CHANGELOG](CHANGELOG.md) · [How to upgrade](#upgrading-from-v13)
 
 ## Quick start
 
@@ -140,12 +132,23 @@ curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/palindro
 $env:AGENT8088_BRANCH = "AGENT8088-v1.4"; iex (irm https://raw.githubusercontent.com/palindrome-rl/AGENT8088/AGENT8088-v1.4/install.ps1)
 ```
 
-Use these branch-specific installers for v1.4; the generic Pages installer
-may track a different release.
-
 Run the Windows command in PowerShell, not Command Prompt. On macOS/Linux,
-run as your normal user, without `sudo`; the installer asks for elevated access
-only when a system component needs it.
+run as your normal user, without `sudo`.
+
+The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
+
+#### Upgrading from v1.3
+
+Existing configuration and memory are preserved. A v1.3 install stays on v1.3
+when it runs `agent8088 --update`, because updates follow the installed branch.
+Rerun the install command above to move to v1.4.
+
+<details>
+<summary><b>Install notes, what the installer provisions, and supported platforms</b></summary>
+
+Use these branch-specific installers for v1.4; the generic Pages installer
+may track a different release. On macOS/Linux the installer asks for elevated
+access only when a system component needs it.
 
 If Windows Terminal cannot be installed or launched, you can install in the
 current PowerShell window by setting `$env:AGENT8088_SKIP_TERMINAL_CHECK = "1"`
@@ -153,10 +156,13 @@ and rerunning the Windows command above. This skips only the terminal-host check
 it does not disable antivirus or change execution policy. Windows Terminal
 remains the supported host for the best display.
 
-The installer provisions an isolated Python environment, installs the global `agent8088` command, and can run the setup wizard. No administrator access is required for the base install.
+The Windows installer verifies dependencies by running their executables,
+importing installed Python/Node packages, checking Chromium and OCR resources,
+and validating WebUI assets. A stale resume marker or partial dependency folder
+triggers repair instead of being treated as success.
 
-<details>
-<summary><b>What the installer provisions, and supported platforms</b></summary>
+The installers do not add the `[dev]` extra (pytest, ruff, pip-audit). It is
+not needed to install or run Agent8088.
 
 **What the installer provisions automatically:**
 
@@ -192,14 +198,6 @@ and prints a retry command. Logs are saved to
 Rerun the same command to resume; optional failures are listed separately from
 core startup failures. See [installation troubleshooting](docs/wiki/13-troubleshooting.md#installation-fails-or-stops).
 
-The Windows installer verifies dependencies by running their executables,
-importing installed Python/Node packages, checking Chromium and OCR resources,
-and validating WebUI assets. A stale resume marker or partial dependency folder
-triggers repair instead of being treated as success.
-
-The installers do not add the `[dev]` extra (pytest, ruff, pip-audit). It is
-not needed to install or run Agent8088.
-
 ---
 
 ## Configure and run
@@ -210,6 +208,26 @@ agent8088                    # start the interactive agent
 ```
 
 The setup wizard stores API keys in `~/.agent8088/.env` rather than `config.txt`. Start with a local Ollama model or select a hosted provider; the agent can switch models later with `/model` or `/models`.
+
+### Run with a local model
+
+Agent8088's instructions and tool list need a context of at least 16K tokens.
+Ollama picks a smaller default on GPUs under 24 GB (4K on a 6 GB card), so set
+the context before starting Ollama:
+
+```sh
+OLLAMA_CONTEXT_LENGTH=16384 ollama serve   # or 32768 if it fits
+```
+
+On Windows, set the context length in the Ollama app's settings, or set
+`OLLAMA_CONTEXT_LENGTH` as a user environment variable and restart Ollama. Then
+give Agent8088 the same value by adding `provider.ollama.context_window=16384`
+to `~/.agent8088/config.txt`.
+
+`/models local` checks your hardware and suggests models that fit, and `/doctor`
+shows the context Ollama is actually serving. If the context is too small,
+Agent8088 says so and shows the fix instead of sending a truncated prompt. See
+[troubleshooting](docs/wiki/13-troubleshooting.md#the-models-context-is-too-small-for-agent8088).
 
 `full-auto` is the default permission mode: the agent works without per-action prompts inside the workspace, with the always-on safety floor still enforced. Use `--mode readonly` to approve writes, network access, and shell commands one at a time.
 
@@ -233,7 +251,7 @@ Web flags: `--web` · `--web-port PORT` · `--web-host HOST` · `--web-dev`
 | Command | Purpose |
 | --- | --- |
 | `agent8088` | Start an interactive session. The first message automatically creates a saved chat; use `/sessions` and `/resume <name>` after restarting. |
-| `agent8088 --memory-setup` | Add the mem0 memory engine to an existing install (installs the backend deps and makes mem0 the default engine). The installers offer the same choice up front: `-WithMem0`/`-SkipMem0` (PowerShell) or `--memory mem0`/`--memory native` (bash), plus an interactive prompt. Switch engines any time with `/memory engine native\|mem0` — both stores are kept. |
+| `agent8088 --memory-setup` | Add the optional mem0 memory engine; switch any time with `/memory engine native\|mem0`. See [Memory](docs/wiki/16-memory.md). |
 | `agent8088 --uninstall` | Remove the install dir, config, env vars, and cron/scheduled-task entries. Add `--workspace` to also remove trace logs + WhatsApp session data, or `--dry-run` to preview first. |
 | `agent8088 --gateway-setup` | Configure Slack, Discord, WhatsApp, Telegram, or email. |
 | `agent8088 --gateway` | Run the messaging gateway. |
@@ -258,7 +276,7 @@ runs at a time. A running chat cannot be renamed, deleted, reset, or compacted.
 
 Most agent harnesses assume a hosted model and trust the model by default. Agent8088 is built the other way round:
 
-- **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on disk and never uploaded. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
+- **Local-first and context-aware.** It runs on your own machine with local Ollama models. `/models local` checks your hardware and suggests models that fit. Memory, OCR, and session history are stored on your disk. With a local model, nothing leaves your machine; with a hosted model, the conversation goes to that provider. Context budgeting and compaction help long tasks continue without silently overflowing the model window.
 - **Small-model-first and grounded.** Efficient prompts, minimized tool schemas, and model-aware routing make small local models practical, while a persistent control loop plans, acts through structured tools, observes results, and recovers when execution fails.
 - **Verification before confidence.** Tool results, tests, smoke checks, expected deliverables, and execution state provide evidence for completion. Recovery paths help the agent retry, preserve useful progress, or surface a clear failure instead of pretending the task succeeded.
 - **Security at the floor.** Credential paths, shell startup-file writes, destructive Git operations, and system-prompt exfiltration are blocked in every mode. SSRF and egress controls, command allowlists, and credential scanning of pasted text and written files are enforced in code, not by prompt, and an optional audit log (`audit_log=1`) keeps a persistent trail.
@@ -295,9 +313,9 @@ Most agent harnesses assume a hosted model and trust the model by default. Agent
 | **Use tools without lock-in** | Built-in tools for files, shell, web research, browser access, scheduling, Git, sandboxed code, CLI-Anything, and more. Connect external MCP servers or expose Agent8088's safe tools to Codex, Claude Code, or Cursor. |
 | **Read images without a vision model** | Attached screenshots and scanned PDFs are transcribed by a local OCR engine when the active model has no vision of its own. Multimodal models are untouched and keep using their own capability. |
 | **Work across documents** | Read and process PDFs, Word documents, spreadsheets, and presentations, with checkpointed handling for larger files and OCR fallback for scanned content. |
-| **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store. Nothing leaves your machine. |
+| **Remember across sessions** | Durable facts about you and your projects are learned from finished turns and recalled automatically, using hybrid keyword + semantic search over a local SQLite store kept on your machine. |
 | **Stay in your workflow** | Use the interactive CLI, the browser-based web UI with live diffs and approvals, or run a gateway for Slack, Discord, WhatsApp, Telegram, and email. Sessions and approvals follow the same engine and permission layer. |
-| **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it (not enforced by the Windows native backend, which restricts file writes only; use the Docker backend there). On Windows the native sandbox also blocks Node build tools that start piped child processes (Vite, esbuild, Vitest); `/doctor` reports it and the Docker backend runs them. |
+| **Run contained commands** | Native OS sandboxing is preferred, with Docker as a fallback. Network access from sandboxed commands is off unless you allow it. Platform differences are in [Sandboxing](docs/wiki/06-sandboxing.md). |
 | **Keep research current** | Search can use SearXNG, Tavily, Exa, or the bundled keyless DDGS fallback, with date-aware queries and the same network controls as every other outbound request. |
 | **See what the agent is using** | Per-turn token and timing summaries, optional local cost telemetry, provider-limit indicators where supported, and audit logs make resource use and execution visible. |
 
@@ -356,9 +374,6 @@ The CLI and gateway share the same agent loop, session model, tool registry, and
 
 ## Documentation
 
-Optional [repository ingestion](docs/repository-ingestion.md) provides bounded
-GitIngest-backed repository overviews, search and source reads.
-
 The versioned [documentation wiki](docs/wiki/README.md) is the source of truth for this branch.
 The [hosted v1.4 wiki](https://github.com/palindrome-rl/AGENT8088/wiki) mirrors
 these versioned pages.
@@ -377,6 +392,8 @@ these versioned pages.
 | [CLI reference](docs/wiki/10-cli-reference.md) | Flags and slash commands. |
 | [Architecture](docs/wiki/11-architecture.md) | The agent loop, front ends, permissions, and state on disk. |
 | [Testing and verification](docs/wiki/12-testing-and-verification.md) | Local test, feature-verification, and release checks. |
+| [Troubleshooting](docs/wiki/13-troubleshooting.md) | Install failures, provider and model errors, permissions, and network problems. |
+| [Repository ingestion](docs/repository-ingestion.md) | Optional GitIngest-backed repository overviews, search, and source reads. |
 
 ---
 
@@ -390,7 +407,7 @@ cd AGENT8088
 uv sync --all-extras
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started, the [full contribution guide](docs/wiki/14-contributing.md) for isolation rules and local verification, and the [Code of Conduct](CODE_OF_CONDUCT.md). The root unit-test suite is maintained outside this release branch. For security reports, use [private vulnerability reporting](SECURITY.md); never include credentials or exploit details in a public issue.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started, the [full contribution guide](docs/wiki/14-contributing.md) for isolation rules and local verification, and the [Code of Conduct](CODE_OF_CONDUCT.md). Run the unit tests with `uv run pytest`. For security reports, use [private vulnerability reporting](SECURITY.md); never include credentials or exploit details in a public issue.
 
 ## License
 
