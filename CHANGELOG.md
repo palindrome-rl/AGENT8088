@@ -13,6 +13,14 @@ All notable changes to Agent8088 are recorded here. The format follows
   list twice: once in the system prompt, where it is sent, and again as JSON schemas, which are not sent. A
   roughly 11k prompt was counted as about 20k. The send check, the fallback budget, the compaction trigger and
   the per-turn output budget now count tool schemas only when they are sent.
+- A local Ollama model that was not loaded yet had no served context to read, so agent8088 sized the conversation
+  to the model's maximum (262k for some models) and Ollama silently cut the prompt at its real, smaller context.
+  The model is now loaded when its context is first needed, as the first request would load it anyway, and the
+  served context is read from `ollama ps`.
+- When agent8088's own instructions and tool list do not fit the model's context, the error now says so, with the
+  model's context and how to raise it (for Ollama, `OLLAMA_CONTEXT_LENGTH` and `provider.ollama.context_window`).
+  It used to suggest /compact or /reset, which cannot help on a first message, and it is no longer retried with
+  compaction.
 
 ## [1.4.0] - 2026-11-27
 

@@ -34,7 +34,9 @@ def test_text_tools_do_not_count_the_unsent_schemas(limits, monkeypatch):
 
 def test_native_tools_still_count_the_schemas(limits, monkeypatch):
     _native(limits, monkeypatch, True)
-    with pytest.raises(ValueError, match="exceeds the available context"):
+    # The instructions plus the sent schemas alone don't fit 16k.
+    from agent8088.errors import ContextTooSmall
+    with pytest.raises(ContextTooSmall):
         limits._completion_token_budget("p", "m", MESSAGES, TOOLS, SYSTEM, 16_384)
 
 
