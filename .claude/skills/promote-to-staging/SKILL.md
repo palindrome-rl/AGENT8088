@@ -54,6 +54,14 @@ Merging into `AGENT8088-v1.4`:
 - builds and pushes the GHCR image (`publish-image.yml`)
 - syncs the public wiki when `docs/wiki/` changed (`wiki.yml`)
 
+**Docs-only releases skip the steps below.** When the promoted commits touch only
+the root `*.md` files, `docs/`, `assets/`, `.github/ISSUE_TEMPLATE/` or `LICENSE`:
+- CI and the image build don't run
+- Tier 1 isn't needed
+
+Merge the development PR and both promotion PRs straight away. `.md` files under
+`src/` are prompts and skills, so they don't count as docs.
+
 Before asking, run the Tier 1 smoke set on the staging tip and compare it with the
 last Tier 1 baseline (see `bench/README.md`, "Tier 1"):
 

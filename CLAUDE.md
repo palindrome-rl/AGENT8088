@@ -74,6 +74,18 @@ Claude Code loads it as a skill; Codex and OpenCode read the file directly.
 
   Run the Tier 1 smoke set first (`bench/README.md`, "Tier 1") and put its
   result in the release PR, then ask the release owner before merging.
+- **Docs-only changes are the exception.** A change that touches only the
+  root `*.md` files (README, CHANGELOG, CONTRIBUTING and so on), `docs/`,
+  `assets/`, `.github/ISSUE_TEMPLATE/` or `LICENSE`:
+  - skips CI, and doesn't rebuild the image
+  - skips Tier 1
+  - can be merged into development and promoted straight through both PRs
+    without waiting for checks
+
+  It still goes through the chain, so the three branches stay equal. Markdown
+  under `src/` (the system prompt, agent profiles, skills) is code, not docs.
+  The next code PR's test suite catches any README badge or branch name that a
+  docs change got wrong.
 - **After each merge**, check `git merge-base --is-ancestor <promoted SHA> origin/<target>`.
 
 # Development memory
