@@ -109,7 +109,7 @@ Apart from its focus on small-model reliability, Agent8088 is a complete agentic
 - **Auto QA and play tests.** Changed work with a test suite nearby gets its tests run automatically. Interactive work (clicks, keys, games) counts as checked only after a passing play test in a headless browser.
 - **Multimodal checks.** The agent renders pages and images and looks at them (`screenshot_page`, `view_image`), with layout notes when something is off. Vision support is detected per model, and models without it fall back to local OCR.
 - **Nothing in your request gets dropped.** Multi-part requests become a checklist on the first turn. Each file is checked as it's written, and a failure that repeats asks for a different approach.
-- **Adaptive limits.** Runs start with 150 rounds and extend up to 450 while they keep making progress. Repeats get warnings in steps before a stop, and `/limits` changes any limit.
+- **Adapts to the model.** How long a reply may run, and how soon a loop is caught, are tuned per model, by name or by size, and by whether it thinks before answering. Larger models keep room for long reasoning, and small models are stopped sooner once they lose their way.
 - **Runs you can leave alone.** Headless runs get a clock and end with what's done, with evidence, and what isn't. Eval mode judges a run by what it leaves on disk, and sub-agents return a status line to be checked, not trusted.
 - **First-class on Windows.** Commands run in a dedicated WSL sandbox with network isolation, and Windows programs are called correctly from inside it.
 - **Clearer local-model setup.** Ollama models are sized to the context they're really served, with a plain message and fix when it's too small.
